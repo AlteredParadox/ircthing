@@ -21,7 +21,7 @@ ESBUILD_FLAGS := --bundle --minify --format=esm \
 	--jsx=automatic --jsx-import-source=preact \
 	--target=es2020
 
-.PHONY: build build-debug frontend check vet staticcheck test binary-size-gate bundle-size-gate integration memcheck clean
+.PHONY: build build-debug frontend check vet staticcheck test binary-size-gate bundle-size-gate integration irctest memcheck clean
 
 build: frontend
 	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN) ./cmd/ircd-web
@@ -94,6 +94,30 @@ ergo: .cache/bin/ergo
 	rm -rf .cache/ergo-src
 	git clone --depth 1 --branch $(ERGO_REF) https://github.com/ergochat/ergo.git .cache/ergo-src
 	cd .cache/ergo-src && GOTOOLCHAIN=auto $(GO) build -o ../bin/ergo .
+
+# irctest (https://github.com/progval/irctest) client-behavior tests:
+# irctest plays the server and drives our CAP/SASL/TLS/STS handshake via
+# the controller in integration/irctest/. Needs python3-venv installed.
+IRCTEST_REF := a468d9fcd64abc72b02ecb20f4f8612fd72c8829
+
+irctest: build .cache/irctest-src .cache/irctest-venv
+	cd .cache/irctest-src && \
+	IRCTHING_BIN=$(CURDIR)/bin/ircd-web \
+	PYTHONPATH=$(CURDIR)/integration/irctest \
+	$(CURDIR)/.cache/irctest-venv/bin/pytest irctest/client_tests \
+		--controller=ircthing_irctest -p no:cacheprovider --timeout=60
+
+.cache/irctest-src:
+	rm -rf .cache/irctest-src
+	git init -q .cache/irctest-src
+	cd .cache/irctest-src && \
+	git remote add origin https://github.com/progval/irctest.git && \
+	git fetch -q --depth 1 origin $(IRCTEST_REF) && \
+	git checkout -q FETCH_HEAD
+
+.cache/irctest-venv:
+	python3 -m venv .cache/irctest-venv
+	.cache/irctest-venv/bin/pip install --quiet pytest pytest-timeout filelock
 
 # RSS scenario: 5 networks / 50 channels / 10k hot messages under
 # GOMEMLIMIT=64MiB, verified against the 72 MB target.

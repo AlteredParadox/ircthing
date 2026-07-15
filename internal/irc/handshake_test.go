@@ -35,8 +35,10 @@ func parseWant(t *testing.T, lines []string) []string {
 	return out
 }
 
+// b64 builds the expected PLAIN payload; the authzid defaults to the
+// login (see newMech).
 func b64(login, pass string) string {
-	return base64.StdEncoding.EncodeToString(saslPlain("", login, pass))
+	return base64.StdEncoding.EncodeToString(saslPlain(login, login, pass))
 }
 
 func TestHandshake(t *testing.T) {
@@ -168,10 +170,14 @@ func TestHandshake(t *testing.T) {
 			},
 		},
 		{
-			name: "SASL PLAIN not in mechanism list fails",
+			// The mechanism mismatch is only fatal after the ACK: we still
+			// REQ sasl (the conventional client flow, asserted by irctest),
+			// then part with a QUIT instead of authenticating.
+			name: "SASL PLAIN not in mechanism list quits after ACK",
 			cfg:  saslCfg,
 			steps: []step{
-				{in: "CAP * LS :sasl=EXTERNAL,SCRAM-SHA-256", errSub: "PLAIN not offered"},
+				{in: "CAP * LS :sasl=EXTERNAL,SCRAM-SHA-256", want: []string{"CAP REQ sasl"}},
+				{in: "CAP * ACK :sasl", want: []string{"QUIT :SASL mechanism unavailable"}, errSub: "PLAIN not offered"},
 			},
 		},
 		{
@@ -315,6 +321,13 @@ func TestHandshake(t *testing.T) {
 				if st.errSub != "" {
 					if err == nil || !strings.Contains(err.Error(), st.errSub) {
 						t.Fatalf("step %d (%q): err = %v, want containing %q", i, st.in, err, st.errSub)
+					}
+					// A failing step may still have parting words (QUIT,
+					// AUTHENTICATE *) that must go to the wire.
+					if st.want != nil {
+						if got, want := wire(out), parseWant(t, st.want); !reflect.DeepEqual(got, want) {
+							t.Fatalf("step %d (%q):\n got %q\nwant %q", i, st.in, got, want)
+						}
 					}
 					return
 				}

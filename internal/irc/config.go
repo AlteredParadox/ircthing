@@ -1,8 +1,11 @@
 package irc
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -23,6 +26,11 @@ type Config struct {
 	// (e.g. client certificates). ServerName is derived from Addr when
 	// empty. Nil gets sane defaults.
 	TLSConfig *tls.Config
+	// TrustedFingerprints pins the server certificate: hex SHA-256 digests
+	// of the leaf certificate (case-insensitive, ':' separators allowed).
+	// When set, a matching fingerprint replaces CA verification — the way
+	// to trust a self-signed IRC server without disabling verification.
+	TrustedFingerprints []string
 
 	Nick     string
 	Username string // defaults to Nick
@@ -92,7 +100,30 @@ func (c *Config) validate() error {
 			return errors.New("irc: config: SASL EXTERNAL requires a TLS connection with a client certificate")
 		}
 	}
+	if _, err := fingerprintSet(c.TrustedFingerprints); err != nil {
+		return err
+	}
 	return nil
+}
+
+// fingerprintSet normalizes the configured fingerprints (lowercase hex,
+// ':' separators stripped) into a lookup set.
+func fingerprintSet(fps []string) (map[string]bool, error) {
+	if len(fps) == 0 {
+		return nil, nil
+	}
+	set := make(map[string]bool, len(fps))
+	for _, fp := range fps {
+		norm := strings.ToLower(strings.ReplaceAll(fp, ":", ""))
+		if len(norm) != sha256.Size*2 {
+			return nil, fmt.Errorf("irc: config: trusted fingerprint %q is not a hex SHA-256 digest", fp)
+		}
+		if _, err := hex.DecodeString(norm); err != nil {
+			return nil, fmt.Errorf("irc: config: trusted fingerprint %q is not a hex SHA-256 digest", fp)
+		}
+		set[norm] = true
+	}
+	return set, nil
 }
 
 func (c *Config) applyDefaults() {

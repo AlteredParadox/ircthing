@@ -2,9 +2,12 @@ package irc
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -450,13 +453,25 @@ drain:
 			return fmt.Errorf("registration: %w", connError(cctx, err))
 		}
 		out, done, err := hs.handle(in)
+		// A failing handshake can still have parting words (SASL abort
+		// "AUTHENTICATE *", QUIT) — flush them before the deferred cancel
+		// tears down the socket.
+		if sendErr := send(out); sendErr != nil {
+			return sendErr
+		}
 		if err != nil {
+			if len(out) > 0 {
+				flushDeadline := time.Now().Add(500 * time.Millisecond)
+				for len(internal) > 0 && time.Now().Before(flushDeadline) {
+					time.Sleep(5 * time.Millisecond)
+				}
+				// One more beat for a message the writer has dequeued but
+				// not yet written.
+				time.Sleep(20 * time.Millisecond)
+			}
 			return fmt.Errorf("registration: %w", err)
 		}
 		m.emit(ctx, Event{Kind: EventMessage, Msg: in})
-		if err := send(out); err != nil {
-			return err
-		}
 		if done {
 			break
 		}
@@ -651,12 +666,39 @@ func (m *Manager) dial(ctx context.Context) (net.Conn, error) {
 		}
 		tcfg.ServerName = host
 	}
+	// Pinned fingerprints replace CA verification: the leaf certificate's
+	// SHA-256 must be in the trusted set. Verified after the handshake
+	// (nothing has been sent yet) rather than mid-handshake, so a mismatch
+	// is a clean close instead of a TLS alert. Config validation already
+	// vetted the fingerprint format.
+	fps, _ := fingerprintSet(m.cfg.TrustedFingerprints)
+	if fps != nil {
+		tcfg.InsecureSkipVerify = true
+	}
 	tconn := tls.Client(conn, tcfg)
 	hctx, hcancel := context.WithTimeout(ctx, m.cfg.DialTimeout)
 	defer hcancel()
 	if err := tconn.HandshakeContext(hctx); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("tls handshake: %w", err)
+	}
+	if fps != nil {
+		certs := tconn.ConnectionState().PeerCertificates
+		if len(certs) == 0 {
+			conn.Close()
+			return nil, errors.New("tls: server presented no certificate")
+		}
+		sum := sha256.Sum256(certs[0].Raw)
+		if !fps[hex.EncodeToString(sum[:])] {
+			// Absorb post-handshake messages (TLS 1.3 session tickets)
+			// briefly, then close with close_notify — the server sees a
+			// clean EOF instead of a reset.
+			tconn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			_, _ = io.Copy(io.Discard, tconn)
+			tconn.Close()
+			return nil, fmt.Errorf("tls: server certificate SHA-256 %s does not match any trusted fingerprint",
+				hex.EncodeToString(sum[:]))
+		}
 	}
 	return tconn, nil
 }

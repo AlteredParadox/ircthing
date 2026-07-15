@@ -39,16 +39,20 @@ type userConfig struct {
 }
 
 type netConfig struct {
-	Name           string      `json:"name"`
-	Addr           string      `json:"addr"`
-	TLS            bool        `json:"tls"`
-	AllowPlaintext bool        `json:"allow_plaintext"`
-	Nick           string      `json:"nick"`
-	Username       string      `json:"username"`
-	Realname       string      `json:"realname"`
-	Pass           string      `json:"pass"`
-	SASL           *saslConfig `json:"sasl"`
-	Channels       []string    `json:"channels"`
+	Name           string `json:"name"`
+	Addr           string `json:"addr"`
+	TLS            bool   `json:"tls"`
+	AllowPlaintext bool   `json:"allow_plaintext"`
+	// TrustedFingerprints pins the server certificate: hex SHA-256 of the
+	// leaf cert. A match replaces CA verification (for self-signed
+	// servers).
+	TrustedFingerprints []string    `json:"trusted_fingerprints"`
+	Nick                string      `json:"nick"`
+	Username            string      `json:"username"`
+	Realname            string      `json:"realname"`
+	Pass                string      `json:"pass"`
+	SASL                *saslConfig `json:"sasl"`
+	Channels            []string    `json:"channels"`
 }
 
 type saslConfig struct {
@@ -117,15 +121,16 @@ func (n *netConfig) effectiveName() string {
 
 func (n *netConfig) ircConfig() (irc.Config, error) {
 	cfg := irc.Config{
-		Name:           n.Name,
-		Addr:           n.Addr,
-		TLS:            n.TLS,
-		AllowPlaintext: n.AllowPlaintext,
-		Nick:           n.Nick,
-		Username:       n.Username,
-		Realname:       n.Realname,
-		Pass:           n.Pass,
-		Channels:       n.Channels,
+		Name:                n.Name,
+		Addr:                n.Addr,
+		TLS:                 n.TLS,
+		AllowPlaintext:      n.AllowPlaintext,
+		TrustedFingerprints: n.TrustedFingerprints,
+		Nick:                n.Nick,
+		Username:            n.Username,
+		Realname:            n.Realname,
+		Pass:                n.Pass,
+		Channels:            n.Channels,
 	}
 	if n.SASL != nil {
 		cfg.SASL = &irc.SASLConfig{

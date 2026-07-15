@@ -76,7 +76,14 @@ func newMech(cfg *SASLConfig, offered string) (saslMech, error) {
 	}
 	switch mech {
 	case "PLAIN":
-		return &plainMech{authzid: cfg.Authzid, authcid: cfg.Login, passwd: cfg.Password}, nil
+		// Default the authorization identity to the login. RFC 4616 allows
+		// leaving it empty, but authzid == authcid is what established IRC
+		// clients send and what irctest asserts; services treat them alike.
+		authzid := cfg.Authzid
+		if authzid == "" {
+			authzid = cfg.Login
+		}
+		return &plainMech{authzid: authzid, authcid: cfg.Login, passwd: cfg.Password}, nil
 	case "EXTERNAL":
 		return &externalMech{authzid: cfg.Authzid}, nil
 	case "SCRAM-SHA-256":

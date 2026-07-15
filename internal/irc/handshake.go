@@ -88,6 +88,7 @@ type handshake struct {
 	nakRetried bool // one sasl-only retry after a NAK of the full set
 	lastReq    []string
 	mech       saslMech // chosen SASL mechanism, built at CAP LS
+	mechErr    error    // mechanism unavailable; abort after CAP ACK
 }
 
 func newHandshake(cfg *Config) *handshake {
@@ -227,12 +228,15 @@ func (h *handshake) handleCAP(m *ircv4.Message) ([]*ircv4.Message, bool, error) 
 			if !offered {
 				return nil, false, errors.New("SASL configured but the server does not offer the sasl capability")
 			}
-			// Choose and build the mechanism now so an unsupported choice
-			// fails before we CAP REQ. (mechs is empty when the server
-			// didn't advertise its list under CAP 302.)
+			// Choose and build the mechanism now, from the advertised list
+			// (empty when the server didn't advertise one under CAP 302).
+			// When our mechanism isn't offered we still REQ sasl and only
+			// quit after the ACK — the conventional client flow (and the
+			// one irctest asserts); either way we never fall through to an
+			// unauthenticated session.
 			mech, err := newMech(h.cfg.SASL, mechs)
 			if err != nil {
-				return nil, false, err
+				h.mechErr = err
 			}
 			h.mech = mech
 		}
@@ -255,6 +259,9 @@ func (h *handshake) handleCAP(m *ircv4.Message) ([]*ircv4.Message, bool, error) 
 			} else {
 				h.enabled[tok] = true
 			}
+		}
+		if h.cfg.SASL != nil && h.enabled["sasl"] && h.mechErr != nil {
+			return []*ircv4.Message{newMsg("QUIT", "SASL mechanism unavailable")}, false, h.mechErr
 		}
 		if h.mech != nil && h.enabled["sasl"] && !h.saslDone {
 			h.phase = hsAuthChallenge
