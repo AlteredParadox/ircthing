@@ -401,5 +401,35 @@ func storeMessage(ev irc.Event) store.Message {
 		Sender:  sender,
 		Command: ev.Msg.Command,
 		Raw:     ev.Msg.String(),
+		Text:    searchText(ev.Msg),
 	}
+}
+
+// searchText extracts the body indexed for full-text search: PRIVMSG and
+// NOTICE content, with CTCP ACTION unwrapped to its text. Non-ACTION CTCP
+// and every other command index nothing (empty), so search returns only
+// real messages.
+func searchText(m *ircv4.Message) string {
+	switch m.Command {
+	case "PRIVMSG", "NOTICE":
+		body := m.Trailing()
+		if a, ok := ctcpAction(body); ok {
+			return a
+		}
+		if len(body) > 0 && body[0] == '\x01' {
+			return "" // other CTCP (VERSION, PING, ...): not searchable text
+		}
+		return body
+	}
+	return ""
+}
+
+// ctcpAction returns the action text of a CTCP ACTION body
+// (\x01ACTION <text>\x01), or ok=false if the body is not an action.
+func ctcpAction(body string) (string, bool) {
+	const prefix = "\x01ACTION "
+	if !strings.HasPrefix(body, prefix) {
+		return "", false
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(body, prefix), "\x01"), true
 }

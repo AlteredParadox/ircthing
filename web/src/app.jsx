@@ -3,6 +3,7 @@ import { Chat } from "./chat.jsx";
 import { bufKey, isChannelName, mentionsMe, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
 import { Login } from "./login.jsx";
 import { Members } from "./members.jsx";
+import { SearchOverlay } from "./search.jsx";
 import { Sidebar } from "./sidebar.jsx";
 import { Socket } from "./ws.js";
 
@@ -34,6 +35,8 @@ export function App() {
 	const [chanInfo, setChanInfo] = useState(null);
 	const [chanTick, setChanTick] = useState(0);
 	const [cmdError, setCmdError] = useState("");
+	const [searchOpen, setSearchOpen] = useState(false);
+	const [focusId, setFocusId] = useState(null);
 	// typers: bufKey -> { nick: { state, at } }; ephemeral, never stored.
 	const [typers, setTypers] = useState({});
 	const sock = useRef(null);
@@ -58,6 +61,18 @@ export function App() {
 		};
 		window.addEventListener("hashchange", onHash);
 		return () => window.removeEventListener("hashchange", onHash);
+	}, []);
+
+	// Ctrl/Cmd+K opens search.
+	useEffect(() => {
+		const onKey = (e) => {
+			if ((e.ctrlKey || e.metaKey) && e.key === "k") {
+				e.preventDefault();
+				setSearchOpen(true);
+			}
+		};
+		window.addEventListener("keydown", onKey);
+		return () => window.removeEventListener("keydown", onKey);
 	}, []);
 
 	// Socket lifecycle, once authed.
@@ -124,10 +139,15 @@ export function App() {
 		s.on("event", (ev) => {
 			const key = bufKey(ev.network, ev.buffer);
 			setMsgs((m) => {
+				const cur = m[key];
+				// When a buffer is showing a search-jump window (not the
+				// live tail), appending would leave a temporal gap — skip
+				// it; the message is on disk and appears when the user
+				// returns to the tail.
+				if (cur?.loaded && cur.atTail === false) return m;
 				// Accumulate even before history is loaded — the fetch
 				// response merges and dedupes, so events racing an
 				// in-flight history request are never lost.
-				const cur = m[key];
 				let list = [...(cur?.list || []), ev];
 				let reachedTop = cur?.reachedTop;
 				if (list.length > TRIM_AT) {
@@ -279,6 +299,7 @@ export function App() {
 							list: [...pageMsgs, ...streamed],
 							loaded: true,
 							reachedTop: pageMsgs.length < PAGE,
+							atTail: true,
 						},
 					};
 				});
@@ -294,19 +315,54 @@ export function App() {
 		select(firstBuf.network, firstBuf.buffer);
 	}, [buffers, activeKey]);
 
+	function makeBuffer(network, buffer) {
+		return { key: bufKey(network, buffer), network, buffer, lastTime: 0, marker: 0, unread: 0, mention: false };
+	}
+
 	function select(network, buffer) {
 		const key = bufKey(network, buffer);
 		// A buffer may not exist yet (/join, /msg to a fresh target):
 		// create a placeholder so the view renders while events arrive.
-		setBuffers((b) =>
-			b[key] ? b : {
-				...b,
-				[key]: { key, network, buffer, lastTime: 0, marker: 0, unread: 0, mention: false },
-			});
+		setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(network, buffer) }));
+		// Returning to a buffer that's showing a search-jump window drops
+		// it so the live tail reloads.
+		setMsgs((m) => {
+			if (m[key] && m[key].atTail === false) {
+				const next = { ...m };
+				delete next[key];
+				return next;
+			}
+			return m;
+		});
+		setFocusId(null);
 		location.hash = toHash(network, buffer);
 		setActiveKey(key);
 		setCmdError("");
 		if (window.innerWidth < 760) setSideOpen(false);
+	}
+
+	// jumpTo opens a search result: load a window centered on the message
+	// and highlight it. The window is not the live tail, so incoming
+	// events won't append (see the event handler).
+	function jumpTo(ev) {
+		const key = bufKey(ev.network, ev.buffer);
+		setSearchOpen(false);
+		sock.current
+			?.request("get_history", {
+				network: ev.network, buffer: ev.buffer,
+				around: { ts: ev.time, id: ev.id }, limit: PAGE,
+			})
+			.then((page) => {
+				setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(ev.network, ev.buffer) }));
+				setMsgs((m) => ({
+					...m,
+					[key]: { list: page.messages || [], loaded: true, reachedTop: false, atTail: false },
+				}));
+				location.hash = toHash(ev.network, ev.buffer);
+				setActiveKey(key);
+				setFocusId(ev.id);
+			})
+			.catch(() => {});
 	}
 
 	function loadOlder() {
@@ -424,6 +480,10 @@ export function App() {
 					<div class="topic-sep" />
 					<div class="topic-text" title={topicText}>{topicText}</div>
 					<button
+						class="icon-btn" title="Search (Ctrl+K)"
+						onClick={() => setSearchOpen(true)}
+					>⌕</button>
+					<button
 						class="icon-btn" title="Toggle theme"
 						onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
 					>{theme === "dark" ? "☀" : "☾"}</button>
@@ -442,6 +502,7 @@ export function App() {
 						connected={connected && netState === "registered"}
 						error={cmdError}
 						typers={Object.keys(typers[activeKey] || {})}
+						focusId={focusId}
 						onSend={sendInput} onLoadOlder={loadOlder} onRead={markRead}
 						onTyping={(state) =>
 							sock.current?.notify("typing", {
@@ -456,6 +517,9 @@ export function App() {
 				<div class={"rightbar" + (rightOpen ? " open" : "")}>
 					<Members info={chanInfo} theme={theme} />
 				</div>
+			)}
+			{searchOpen && (
+				<SearchOverlay sock={sock} onJump={jumpTo} onClose={() => setSearchOpen(false)} />
 			)}
 		</div>
 	);

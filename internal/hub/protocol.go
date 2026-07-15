@@ -56,16 +56,36 @@ type Cursor struct {
 }
 
 // HistoryReq asks for a page of history ("get_history"). At most one
-// anchor may be set; none means "the newest page". Limit is clamped
-// server-side.
+// anchor may be set; none means "the newest page". Around returns a page
+// centered on (and including) the cursor, for jumping to a search hit.
+// Limit is clamped server-side.
 type HistoryReq struct {
 	Network     string  `json:"network"`
 	Buffer      string  `json:"buffer"`
 	Before      *Cursor `json:"before,omitempty"`
 	After       *Cursor `json:"after,omitempty"`
+	Around      *Cursor `json:"around,omitempty"`
 	BeforeMsgID string  `json:"before_msgid,omitempty"`
 	AfterMsgID  string  `json:"after_msgid,omitempty"`
 	Limit       int     `json:"limit,omitempty"`
+}
+
+// SearchReq is a full-text search ("search"). Network (then Buffer)
+// narrow the scope; both empty searches everything. Before paginates to
+// older matches.
+type SearchReq struct {
+	Network string  `json:"network,omitempty"`
+	Buffer  string  `json:"buffer,omitempty"`
+	Query   string  `json:"query"`
+	Before  *Cursor `json:"before,omitempty"`
+	Limit   int     `json:"limit,omitempty"`
+}
+
+// SearchData is the "search_results" response: matching messages, newest
+// first, each carrying its own network/buffer (results span buffers).
+type SearchData struct {
+	Query    string      `json:"query"`
+	Messages []EventData `json:"messages"`
 }
 
 // HistoryData is the "history" response: messages in ascending time order.

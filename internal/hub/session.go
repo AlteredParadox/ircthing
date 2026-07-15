@@ -93,6 +93,8 @@ func (s *Session) Handle(ctx context.Context, env Envelope) {
 		s.handleTyping(ctx, env)
 	case "get_history":
 		s.handleGetHistory(ctx, env)
+	case "search":
+		s.handleSearch(ctx, env)
 	case "get_read_marker":
 		s.handleGetMarker(ctx, env)
 	case "set_read_marker":
@@ -140,6 +142,7 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 			Sender:  conn.Nick(),
 			Command: "PRIVMSG",
 			Raw:     msg.String(),
+			Text:    line,
 		})
 		if err != nil {
 			s.push(errEnvelope(env.Seq, "persist_failed", err.Error()))
@@ -300,6 +303,8 @@ func (s *Session) handleGetHistory(ctx context.Context, env Envelope) {
 		msgs, err = s.hub.store.Before(ctx, d.Network, d.Buffer, store.Cursor(*d.Before), d.Limit)
 	case d.After != nil:
 		msgs, err = s.hub.store.After(ctx, d.Network, d.Buffer, store.Cursor(*d.After), d.Limit)
+	case d.Around != nil:
+		msgs, err = s.hub.store.Around(ctx, d.Network, d.Buffer, store.Cursor(*d.Around), d.Limit)
 	case d.BeforeMsgID != "":
 		var c store.Cursor
 		if c, err = s.hub.store.CursorForMsgID(ctx, d.Network, d.Buffer, d.BeforeMsgID); err == nil {
@@ -331,6 +336,34 @@ func (s *Session) handleGetHistory(ctx context.Context, env Envelope) {
 		page.Messages = append(page.Messages, eventData(m))
 	}
 	s.push(envelope("history", env.Seq, page))
+}
+
+func (s *Session) handleSearch(ctx context.Context, env Envelope) {
+	var d SearchReq
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", "malformed search data"))
+		return
+	}
+	if strings.TrimSpace(d.Query) == "" {
+		s.push(errEnvelope(env.Seq, "bad_request", "search needs a query"))
+		return
+	}
+	opts := store.SearchOptions{
+		Query: d.Query, Network: d.Network, Target: d.Buffer, Limit: d.Limit,
+	}
+	if d.Before != nil {
+		opts.Before = store.Cursor(*d.Before)
+	}
+	msgs, err := s.hub.store.Search(ctx, opts)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "search failed"))
+		return
+	}
+	out := SearchData{Query: d.Query, Messages: make([]EventData, 0, len(msgs))}
+	for _, m := range msgs {
+		out.Messages = append(out.Messages, eventData(m))
+	}
+	s.push(envelope("search_results", env.Seq, out))
 }
 
 func (s *Session) handleGetMarker(ctx context.Context, env Envelope) {

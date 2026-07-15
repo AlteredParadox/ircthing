@@ -25,6 +25,7 @@ export function VirtualList({
 	header,
 	onNearTop,
 	onPinned,
+	focusId,
 	overscan = 600,
 	nearTopPx = 400,
 }) {
@@ -38,10 +39,24 @@ export function VirtualList({
 	const prevFirstId = useRef(null);
 	const prevLastId = useRef(null);
 	const pendingPrepend = useRef(0);
+	const pendingFocus = useRef(false);
+	const prevFocus = useRef(undefined);
 	const width = useRef(0);
 	const rowEls = useRef(new Map()); // id -> element
 
 	geo.setItems(items);
+
+	// A new focus target (a search jump) unpins and requests a scroll-to
+	// once the item is present. Set synchronously so the window below
+	// renders around the target rather than the tail.
+	const focusIdx = focusId != null ? geo.indexOf(focusId) : -1;
+	if (focusId !== prevFocus.current) {
+		prevFocus.current = focusId;
+		if (focusId != null && focusIdx !== -1) {
+			pendingFocus.current = true;
+			pinned.current = false;
+		}
+	}
 
 	// Detect a prepend during render; the layout effect below compensates
 	// scrollTop after the new spacers apply.
@@ -65,6 +80,12 @@ export function VirtualList({
 		const bottom = geo.total();
 		const r = geo.range(bottom - viewH - overscan, bottom);
 		start = Math.min(start, r.start);
+	}
+	if (pendingFocus.current && focusIdx !== -1) {
+		// Force the target and its neighbors into the DOM so the layout
+		// effect can scroll to a rendered, measurable row.
+		start = Math.min(start, Math.max(0, focusIdx - 12));
+		end = Math.max(end, Math.min(items.length, focusIdx + 12));
 	}
 
 	const topPad = geo.offsetOf(start);
@@ -146,6 +167,14 @@ export function VirtualList({
 	useLayoutEffect(() => {
 		const sc = scroller.current;
 		if (!sc) return;
+		if (pendingFocus.current && focusIdx !== -1) {
+			// Center the target row in the viewport.
+			const hh = headerEl.current?.offsetHeight || 0;
+			const rowH = geo.offsetOf(focusIdx + 1) - geo.offsetOf(focusIdx);
+			sc.scrollTop = hh + geo.offsetOf(focusIdx) - (sc.clientHeight - rowH) / 2;
+			pendingFocus.current = false;
+			return;
+		}
 		if (pendingPrepend.current > 0) {
 			sc.scrollTop += geo.offsetOf(pendingPrepend.current);
 			pendingPrepend.current = 0;

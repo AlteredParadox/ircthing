@@ -12,11 +12,11 @@ function Body({ text }) {
 	);
 }
 
-function Row({ ev, prev, selfNick, theme }) {
+function Row({ ev, prev, selfNick, theme, focused }) {
 	const r = renderable(ev);
 	if (r.kind === "system") {
 		return (
-			<div class="sys-row">
+			<div class={"sys-row" + (focused ? " flash" : "")}>
 				<span class="msg-time">{fmtTime(ev.time)}</span>
 				<span class={"sys-mark " + r.markClass}>{r.mark}</span>
 				<span>{r.text}</span>
@@ -30,7 +30,7 @@ function Row({ ev, prev, selfNick, theme }) {
 	const grouped = !mention && sameGroup(prev && { ...renderable(prev), sender: prev.sender, time: prev.time }, { ...r, sender: ev.sender, time: ev.time });
 	const color = self ? "var(--accent)" : nickColor(ev.sender, theme);
 	return (
-		<div class={"msg-row" + (mention ? " mention" : "")}>
+		<div class={"msg-row" + (mention ? " mention" : "") + (focused ? " flash" : "")}>
 			<span class="msg-time">{grouped ? "" : fmtTime(ev.time)}</span>
 			<span class="msg-nick" style={{ color }} title={ev.sender}>
 				{r.kind === "action" ? "*" : grouped ? "" : ev.sender}
@@ -49,7 +49,7 @@ function estimate(ev) {
 }
 
 // Chat renders the active buffer: virtualized scrollback plus composer.
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, onSend, onLoadOlder, onRead, onTyping }) {
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, onSend, onLoadOlder, onRead, onTyping }) {
 	const [draft, setDraft] = useState("");
 	const pinned = useRef(true);
 	const loadingOlder = useRef(false);
@@ -112,13 +112,14 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, onS
 				items={list}
 				estimate={estimate}
 				header={header}
+				focusId={focusId}
 				onNearTop={nearTop}
 				onPinned={(p) => {
 					pinned.current = p;
 					if (p) markRead();
 				}}
 				renderItem={(ev, i) => (
-					<Row ev={ev} prev={list[i - 1]} selfNick={selfNick} theme={theme} />
+					<Row ev={ev} prev={list[i - 1]} selfNick={selfNick} theme={theme} focused={ev.id === focusId} />
 				)}
 			/>
 			<div class="composer">

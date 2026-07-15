@@ -184,6 +184,80 @@ func TestSessionHistoryPaging(t *testing.T) {
 	}
 }
 
+func TestSessionSearch(t *testing.T) {
+	h := newTestHub(t)
+	ctxb := context.Background()
+	seed := func(network, target string, tsMs int64, text string) {
+		if _, err := h.store.Append(ctxb, network, target, store.Message{
+			Time:    time.UnixMilli(tsMs),
+			Sender:  "alice",
+			Command: "PRIVMSG",
+			Raw:     "@msgid=x" + text + " :alice!u@h PRIVMSG " + target + " :" + text,
+			Text:    text,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed("libera", "#go", 1000, "hello world")
+	seed("libera", "#go", 2000, "goodbye world")
+	seed("libera", "#rust", 3000, "world of rust")
+
+	s := h.NewSession()
+	defer s.Close()
+
+	// Broad search across buffers, newest first.
+	s.Handle(ctxb, request(t, "search", 4, SearchReq{Query: "world"}))
+	env := recv(t, s, "search_results")
+	if env.Seq != 4 {
+		t.Fatalf("seq = %d", env.Seq)
+	}
+	data := decode[SearchData](t, env)
+	if data.Query != "world" || len(data.Messages) != 3 {
+		t.Fatalf("results = %+v", data)
+	}
+	if data.Messages[0].Buffer != "#rust" || data.Messages[0].Network != "libera" {
+		t.Fatalf("first result misrouted: %+v", data.Messages[0])
+	}
+
+	// Scoped + multi-term.
+	s.Handle(ctxb, request(t, "search", 5, SearchReq{Query: "goodbye world", Network: "libera", Buffer: "#go"}))
+	data = decode[SearchData](t, recv(t, s, "search_results"))
+	if len(data.Messages) != 1 || data.Messages[0].Raw == "" {
+		t.Fatalf("scoped search = %+v", data.Messages)
+	}
+
+	// Empty query is a bad request, not a crash.
+	s.Handle(ctxb, request(t, "search", 6, SearchReq{Query: "   "}))
+	if got := decode[ErrorData](t, recv(t, s, "error")); got.Code != "bad_request" {
+		t.Fatalf("empty query code = %q", got.Code)
+	}
+}
+
+func TestSessionGetHistoryAround(t *testing.T) {
+	h := newTestHub(t)
+	seedHub(t, h, 10) // msgs 1..10 at ts 1000..10000
+	s := h.NewSession()
+	defer s.Close()
+
+	s.Handle(context.Background(), request(t, "get_history", 8, HistoryReq{
+		Network: "libera", Buffer: "#go", Around: &Cursor{TS: 5000, ID: 5}, Limit: 4,
+	}))
+	page := decode[HistoryData](t, recv(t, s, "history"))
+	if len(page.Messages) != 4 {
+		t.Fatalf("around page size = %d", len(page.Messages))
+	}
+	// Centered on msg 5: 3,4,5,6.
+	if page.Messages[0].Raw != "msg 3" || page.Messages[3].Raw != "msg 6" {
+		t.Fatalf("around window = %v", func() []string {
+			out := make([]string, len(page.Messages))
+			for i, m := range page.Messages {
+				out[i] = m.Raw
+			}
+			return out
+		}())
+	}
+}
+
 func TestSessionReadMarkers(t *testing.T) {
 	h := newTestHub(t)
 	a := h.NewSession()

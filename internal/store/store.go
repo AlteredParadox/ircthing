@@ -36,6 +36,10 @@ type Message struct {
 	Sender  string // prefix name (nick or server)
 	Command string
 	Raw     string // full IRC line including tags
+	// Text is the searchable message body (PRIVMSG/NOTICE content, CTCP
+	// ACTION unwrapped), set by the hub. Empty for lines that are not
+	// indexed for search (system events, non-ACTION CTCP).
+	Text string
 }
 
 // Cursor is a position in a buffer's history: unix-millisecond timestamp
@@ -152,13 +156,16 @@ func (s *Store) Append(ctx context.Context, network, target string, m Message) (
 	if err != nil {
 		return Message{}, err
 	}
-	var msgid any
+	var msgid, text any
 	if m.MsgID != "" {
 		msgid = m.MsgID
 	}
+	if m.Text != "" {
+		text = m.Text // NULL otherwise: not indexed for search
+	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT OR IGNORE INTO messages (buffer_id, ts, msgid, sender, command, raw) VALUES (?, ?, ?, ?, ?, ?)`,
-		bufID, m.Time.UnixMilli(), msgid, m.Sender, m.Command, m.Raw)
+		`INSERT OR IGNORE INTO messages (buffer_id, ts, msgid, sender, command, raw, text) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		bufID, m.Time.UnixMilli(), msgid, m.Sender, m.Command, m.Raw, text)
 	if err != nil {
 		return Message{}, fmt.Errorf("store: append: %w", err)
 	}
