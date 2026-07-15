@@ -133,7 +133,11 @@ func (s *Store) Close() error {
 
 // Append persists m to the (network, target) buffer, creating network and
 // buffer rows as needed, and returns the message with its assigned ID.
-// A zero Time is stamped with the current time.
+// A zero Time is stamped with the current time. Appends are idempotent on
+// msgid: if the buffer already holds a message with the same msgid
+// (chathistory backfill overlapping stored history), nothing is written
+// and the zero Message (ID 0) is returned — callers use that to skip
+// broadcasting.
 func (s *Store) Append(ctx context.Context, network, target string, m Message) (Message, error) {
 	if network == "" || target == "" {
 		return Message{}, errors.New("store: network and target must be non-empty")
@@ -153,10 +157,13 @@ func (s *Store) Append(ctx context.Context, network, target string, m Message) (
 		msgid = m.MsgID
 	}
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO messages (buffer_id, ts, msgid, sender, command, raw) VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT OR IGNORE INTO messages (buffer_id, ts, msgid, sender, command, raw) VALUES (?, ?, ?, ?, ?, ?)`,
 		bufID, m.Time.UnixMilli(), msgid, m.Sender, m.Command, m.Raw)
 	if err != nil {
 		return Message{}, fmt.Errorf("store: append: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return Message{}, nil // duplicate msgid: already stored
 	}
 	m.ID, err = res.LastInsertId()
 	if err != nil {

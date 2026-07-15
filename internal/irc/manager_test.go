@@ -109,8 +109,13 @@ func (s *srvConn) send(line string) {
 // exchange, ACKing whatever the client requests.
 func (s *srvConn) register(nick string) {
 	s.t.Helper()
+	s.registerCaps(nick, "multi-prefix server-time")
+}
+
+func (s *srvConn) registerCaps(nick, lsCaps string) {
+	s.t.Helper()
 	s.readCmd("USER") // client sends CAP LS, [PASS,] NICK, USER
-	s.send("CAP * LS :multi-prefix server-time")
+	s.send("CAP * LS :" + lsCaps)
 	for {
 		m := s.readCmd("CAP")
 		switch m.Param(0) {
@@ -416,6 +421,115 @@ func TestManagerCapsAndNotify(t *testing.T) {
 			t.Fatal("server-time never disabled after DEL")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestManagerRequestsChatHistory(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+
+	s := accept(t, conns)
+	s.registerCaps("AlteredParadox", "batch server-time message-tags draft/chathistory draft/event-playback")
+	waitState(t, m, StateRegistered)
+	s.send(":irc.test 005 AlteredParadox CHATHISTORY=50 :are supported by this server")
+
+	// The limit clamps to the server's advertised maximum once 005 lands.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if v, ok := m.isup.Raw("CHATHISTORY"); ok && v == "50" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("005 never applied")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	since := int64(1752570000000)
+	m.RequestChatHistory("#go", since)
+	got := s.readCmd("CHATHISTORY")
+	wantTS := time.UnixMilli(since).UTC().Format("2006-01-02T15:04:05.000Z")
+	if got.Param(0) != "AFTER" || got.Param(1) != "#go" ||
+		got.Param(2) != "timestamp="+wantTS || got.Param(3) != "50" {
+		t.Fatalf("wire = %q", got.String())
+	}
+}
+
+func TestManagerChatHistoryWithoutCapIsNoop(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+	s := accept(t, conns)
+	s.register("AlteredParadox") // no chathistory in LS
+	waitState(t, m, StateRegistered)
+
+	m.RequestChatHistory("#go", 1000)
+	// A marker message must be the next thing on the wire.
+	if err := m.Send(newMsg("PRIVMSG", "#go", "marker")); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.read(); got.Command != "PRIVMSG" {
+		t.Fatalf("expected marker PRIVMSG, got %q", got.String())
+	}
+}
+
+func TestManagerPlaybackDoesNotTouchLiveState(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+	s := accept(t, conns)
+	s.registerCaps("AlteredParadox", "batch draft/chathistory draft/event-playback")
+	waitState(t, m, StateRegistered)
+
+	s.send(":AlteredParadox!u@h JOIN #go")
+	s.send(":srv 353 AlteredParadox = #go :AlteredParadox")
+	s.send(":srv 366 AlteredParadox #go :end")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, members, ok := m.Channel("#go"); ok && len(members) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never joined #go")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Replayed JOIN/NICK inside a chathistory batch must not alter the
+	// roster or our own nick.
+	s.send(":irc.test BATCH +r1 chathistory #go")
+	s.send("@batch=r1 :ghost!u@h JOIN #go")
+	s.send("@batch=r1 :AlteredParadox!u@h NICK ghost2")
+	s.send(":irc.test BATCH -r1")
+	// A live JOIN after the batch still lands (and proves processing).
+	s.send(":carol!u@h JOIN #go")
+	for {
+		_, members, _ := m.Channel("#go")
+		if len(members) == 2 {
+			if members[0].Nick != "AlteredParadox" || members[1].Nick != "carol" {
+				t.Fatalf("members = %v", members)
+			}
+			break
+		}
+		if len(members) > 2 {
+			t.Fatalf("playback polluted the roster: %v", members)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("live JOIN never applied")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if m.Nick() != "AlteredParadox" {
+		t.Fatalf("playback NICK changed our nick to %q", m.Nick())
 	}
 }
 

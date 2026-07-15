@@ -29,6 +29,9 @@ type Conn interface {
 	CapEnabled(name string) bool
 	IsChannel(target string) bool // per the network's ISUPPORT CHANTYPES
 	ChanTypes() string
+	// RequestChatHistory backfills target with messages newer than
+	// sinceMs; a no-op on networks without draft/chathistory.
+	RequestChatHistory(target string, sinceMs int64)
 }
 
 type Hub struct {
@@ -67,6 +70,11 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 		h.mu.Unlock()
 	}()
 
+	// Open chathistory batches on this connection: ref -> target.
+	// Messages inside are replayed history — persisted, but not pushed
+	// as live events; a history_changed hint follows when the batch ends.
+	histBatch := make(map[string]string)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -89,14 +97,26 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					State:   ev.State.String(),
 					Error:   errStr,
 				}))
+				if ev.State == irc.StateRegistered {
+					h.backfill(ctx, c)
+				}
 			case irc.EventMessage:
-				if hint, affected := membersHint(ev.Msg); affected {
-					h.broadcast(envelope("members_changed", 0, MembersChangedData{
-						Network: ev.Network, Buffer: hint,
-					}))
+				if ev.Msg.Command == "BATCH" {
+					h.trackHistoryBatch(ev, histBatch)
+					continue
+				}
+				replay := ev.Msg.Tags["batch"] != "" && histBatch[ev.Msg.Tags["batch"]] != ""
+				if !replay {
+					if hint, affected := membersHint(ev.Msg); affected {
+						h.broadcast(envelope("members_changed", 0, MembersChangedData{
+							Network: ev.Network, Buffer: hint,
+						}))
+					}
 				}
 				if ev.Msg.Command == "TAGMSG" {
-					h.relayTyping(ev, c)
+					if !replay {
+						h.relayTyping(ev, c)
+					}
 					continue // TAGMSG is ephemeral, never persisted
 				}
 				target, ok := persistTarget(ev.Msg, c.Nick(), c.IsChannel)
@@ -111,8 +131,51 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
 					continue
 				}
-				h.broadcast(envelope("event", 0, eventData(stored)))
+				if stored.ID == 0 {
+					continue // duplicate msgid: already stored and announced
+				}
+				if !replay {
+					h.broadcast(envelope("event", 0, eventData(stored)))
+				}
 			}
+		}
+	}
+}
+
+// backfill requests missed history for every known buffer of the network
+// after (re)registration; the store's newest timestamp per buffer is the
+// resume point. Buffers with no stored history yet have nothing to resume
+// from and are skipped.
+func (h *Hub) backfill(ctx context.Context, c Conn) {
+	infos, err := h.store.Buffers(ctx)
+	if err != nil {
+		log.Printf("irc[%s]: backfill: %v", c.Name(), err)
+		return
+	}
+	for _, b := range infos {
+		if b.Network == c.Name() && b.LastTS > 0 {
+			c.RequestChatHistory(b.Target, b.LastTS)
+		}
+	}
+}
+
+// trackHistoryBatch follows BATCH open/close for chathistory replays and
+// announces the affected buffer when a replay finishes, so clients drop
+// stale pages and refetch.
+func (h *Hub) trackHistoryBatch(ev irc.Event, histBatch map[string]string) {
+	if len(ev.Msg.Params) == 0 {
+		return
+	}
+	ref := ev.Msg.Params[0]
+	switch {
+	case strings.HasPrefix(ref, "+") && strings.Contains(ev.Msg.Param(1), "chathistory"):
+		histBatch[ref[1:]] = ev.Msg.Param(2)
+	case strings.HasPrefix(ref, "-"):
+		if target := histBatch[ref[1:]]; target != "" {
+			delete(histBatch, ref[1:])
+			h.broadcast(envelope("history_changed", 0, HistoryChangedData{
+				Network: ev.Network, Buffer: target,
+			}))
 		}
 	}
 }

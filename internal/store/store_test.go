@@ -441,6 +441,46 @@ func TestAppendStampsZeroTime(t *testing.T) {
 	}
 }
 
+func TestAppendDedupesMsgID(t *testing.T) {
+	s, _ := openTest(t, 10)
+	first, err := s.Append(ctx, "net", "#chan", Message{
+		Time: time.UnixMilli(1000), MsgID: "m1", Sender: "a", Command: "PRIVMSG", Raw: "one",
+	})
+	if err != nil || first.ID == 0 {
+		t.Fatalf("first append: %+v, %v", first, err)
+	}
+
+	// Same msgid in the same buffer: skipped, signaled by ID 0.
+	dup, err := s.Append(ctx, "net", "#chan", Message{
+		Time: time.UnixMilli(2000), MsgID: "m1", Sender: "a", Command: "PRIVMSG", Raw: "one again",
+	})
+	if err != nil || dup.ID != 0 {
+		t.Fatalf("dup append: %+v, %v", dup, err)
+	}
+	if msgs, _ := s.Latest(ctx, "net", "#chan", 10); len(msgs) != 1 || msgs[0].Raw != "one" {
+		t.Fatalf("after dup: %v", raws(msgs))
+	}
+
+	// Same msgid in a different buffer is a different message.
+	if m, err := s.Append(ctx, "net", "#other", Message{
+		Time: time.UnixMilli(1000), MsgID: "m1", Sender: "a", Command: "PRIVMSG", Raw: "elsewhere",
+	}); err != nil || m.ID == 0 {
+		t.Fatalf("other-buffer append: %+v, %v", m, err)
+	}
+
+	// Messages without msgids never deduplicate.
+	for i := 0; i < 2; i++ {
+		if m, err := s.Append(ctx, "net", "#chan", Message{
+			Time: time.UnixMilli(3000), Sender: "a", Command: "PRIVMSG", Raw: "no msgid",
+		}); err != nil || m.ID == 0 {
+			t.Fatalf("tagless append %d: %+v, %v", i, m, err)
+		}
+	}
+	if msgs, _ := s.Latest(ctx, "net", "#chan", 10); len(msgs) != 3 {
+		t.Fatalf("row count = %d, want 3", len(msgs))
+	}
+}
+
 func TestAppendRejectsEmptyKeys(t *testing.T) {
 	s, _ := openTest(t, 10)
 	if _, err := s.Append(ctx, "", "#chan", Message{Raw: "x"}); err == nil {
@@ -476,14 +516,14 @@ func TestMigrationsIdempotentAndRecorded(t *testing.T) {
 	if err := s2.db.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Fatalf("schema_migrations rows = %d, want 1", n)
+	if n != 2 {
+		t.Fatalf("schema_migrations rows = %d, want 2", n)
 	}
 	var name string
-	if err := s2.db.QueryRow(`SELECT name FROM schema_migrations WHERE version = 1`).Scan(&name); err != nil {
+	if err := s2.db.QueryRow(`SELECT name FROM schema_migrations WHERE version = 2`).Scan(&name); err != nil {
 		t.Fatal(err)
 	}
-	if name != "0001_initial.sql" {
+	if name != "0002_unique_msgid.sql" {
 		t.Fatalf("recorded name = %q", name)
 	}
 	// WAL mode actually took effect.

@@ -66,23 +66,30 @@ export function App() {
 		const s = new Socket(wsURL());
 		sock.current = s;
 
+		const applyBuffers = (data) => {
+			const nets = {};
+			for (const n of data.networks || []) nets[n.name] = { state: n.state, nick: n.nick };
+			setNetworks(nets);
+			setBuffers((prev) => {
+				const bufs = {};
+				for (const b of data.buffers || []) {
+					const key = bufKey(b.network, b.buffer);
+					bufs[key] = {
+						key, network: b.network, buffer: b.buffer,
+						lastTime: b.last_time, marker: b.marker,
+						unread: b.unread,
+						// The mention flag is client-side state; keep it.
+						mention: prev[key]?.mention || false,
+					};
+				}
+				return bufs;
+			});
+		};
+
 		s.on("_open", async () => {
 			setConnected(true);
 			try {
-				const data = await s.request("get_buffers", null);
-				const nets = {};
-				for (const n of data.networks || []) nets[n.name] = { state: n.state, nick: n.nick };
-				setNetworks(nets);
-				const bufs = {};
-				for (const b of data.buffers || []) {
-					bufs[bufKey(b.network, b.buffer)] = {
-						key: bufKey(b.network, b.buffer),
-						network: b.network, buffer: b.buffer,
-						lastTime: b.last_time, marker: b.marker,
-						unread: b.unread, mention: false,
-					};
-				}
-				setBuffers(bufs);
+				applyBuffers(await s.request("get_buffers", null));
 				// History may have advanced while we were away; refetch the
 				// open buffer.
 				setMsgs({});
@@ -91,6 +98,24 @@ export function App() {
 			}
 		});
 		s.on("_close", () => setConnected(false));
+
+		// Chathistory backfill rewrote a buffer's history: drop cached
+		// pages (the active buffer refetches automatically) and refresh
+		// sidebar counts, debounced across a burst of backfills.
+		let bufRefresh;
+		s.on("history_changed", (d) => {
+			const key = bufKey(d.network, d.buffer);
+			setMsgs((m) => {
+				if (!m[key]) return m;
+				const next = { ...m };
+				delete next[key];
+				return next;
+			});
+			clearTimeout(bufRefresh);
+			bufRefresh = setTimeout(() => {
+				s.request("get_buffers", null).then(applyBuffers).catch(() => {});
+			}, 300);
+		});
 
 		s.on("state", (d) => {
 			setNetworks((n) => ({ ...n, [d.network]: { ...(n[d.network] || {}), state: d.state } }));

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -130,6 +131,28 @@ func (m *Manager) ChanTypes() string {
 // ok is false for channels we are not in (or before registration).
 func (m *Manager) Channel(name string) (topic string, members []Member, ok bool) {
 	return m.roster.channel(name)
+}
+
+// RequestChatHistory asks the server for messages in target newer than
+// sinceMs (unix ms) — gap-free scrollback after reconnects
+// (draft/chathistory AFTER; https://ircv3.net/specs/extensions/
+// chathistory, fetched 2026-07-15). No-op unless the server offers the
+// cap. Single page, clamped to the CHATHISTORY ISUPPORT limit: if more
+// messages than that were missed, the older remainder is not fetched
+// (paginated backfill is a later refinement).
+func (m *Manager) RequestChatHistory(target string, sinceMs int64) {
+	if !m.CapEnabled("draft/chathistory") {
+		return
+	}
+	limit := 100
+	if v, ok := m.isup.Raw("CHATHISTORY"); ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n < limit {
+			limit = n
+		}
+	}
+	ts := time.UnixMilli(sinceMs).UTC().Format("2006-01-02T15:04:05.000Z")
+	// Best-effort: a full queue just means no backfill this round.
+	_ = m.Send(newMsg("CHATHISTORY", "AFTER", target, "timestamp="+ts, strconv.Itoa(limit)))
 }
 
 // CapEnabled reports whether an IRCv3 capability was negotiated on the
@@ -328,6 +351,11 @@ drain:
 	// after PingInterval of silence we PING, and if the server stays
 	// silent for PingTimeout more, the connection is dead.
 	pinged := false
+	// Open chathistory batches: messages tagged with these refs are
+	// replayed history, not live traffic, and must not touch live state
+	// (roster, nick, rejoin intent). Nested batches are not tracked —
+	// servers do not nest chathistory in practice.
+	histBatch := make(map[string]bool)
 	for {
 		idle := m.cfg.PingInterval
 		if pinged {
@@ -362,16 +390,28 @@ drain:
 				}
 			}
 		}
-		// Track our own nick changes, compared under the server's
-		// casemapping.
-		if in.Command == "NICK" && in.Prefix != nil && m.isup.FoldEqual(in.Prefix.Name, m.Nick()) {
-			if n := in.Param(0); n != "" {
-				m.nick.Store(n)
+		if in.Command == "BATCH" && len(in.Params) > 0 {
+			ref := in.Params[0]
+			switch {
+			case strings.HasPrefix(ref, "+") && strings.Contains(in.Param(1), "chathistory"):
+				histBatch[ref[1:]] = true
+			case strings.HasPrefix(ref, "-"):
+				delete(histBatch, ref[1:])
 			}
 		}
+		playback := in.Tags["batch"] != "" && histBatch[in.Tags["batch"]]
 		m.isup.handle(in) // 005, ignored otherwise
-		m.roster.handle(m.Nick(), in)
-		m.trackJoinIntent(in)
+		if !playback {
+			// Track our own nick changes, compared under the server's
+			// casemapping.
+			if in.Command == "NICK" && in.Prefix != nil && m.isup.FoldEqual(in.Prefix.Name, m.Nick()) {
+				if n := in.Param(0); n != "" {
+					m.nick.Store(n)
+				}
+			}
+			m.roster.handle(m.Nick(), in)
+			m.trackJoinIntent(in)
+		}
 		m.emit(ctx, Event{Kind: EventMessage, Msg: in})
 	}
 }

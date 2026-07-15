@@ -170,6 +170,14 @@ type MembersChangedData struct {
 	Buffer  string `json:"buffer"`
 }
 
+// HistoryChangedData announces that stored history for a buffer changed
+// outside the live event flow (chathistory backfill); clients should
+// drop cached pages for the buffer and refetch ("history_changed").
+type HistoryChangedData struct {
+	Network string `json:"network"`
+	Buffer  string `json:"buffer"`
+}
+
 // TypingData carries draft/typing state ("typing", both directions).
 // Client -> server it sets our state for a buffer (Nick ignored, Seq may
 // be 0 for fire-and-forget); server -> client it reports someone else's.

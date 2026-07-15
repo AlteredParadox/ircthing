@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -118,6 +119,7 @@ type fakeConn struct {
 	mu      sync.Mutex
 	sent    []*ircv4.Message
 	sendErr error
+	hist    []string // RequestChatHistory calls as "target@sinceMs"
 }
 
 func (f *fakeConn) Events() <-chan irc.Event     { return f.ch }
@@ -146,6 +148,18 @@ func (f *fakeConn) sentMsgs() []*ircv4.Message {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]*ircv4.Message(nil), f.sent...)
+}
+
+func (f *fakeConn) RequestChatHistory(target string, sinceMs int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hist = append(f.hist, fmt.Sprintf("%s@%d", target, sinceMs))
+}
+
+func (f *fakeConn) histReqs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.hist...)
 }
 
 func TestHubPersistsEvents(t *testing.T) {

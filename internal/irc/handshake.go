@@ -10,9 +10,10 @@ import (
 	ircv4 "gopkg.in/irc.v4"
 )
 
-// wantedCaps is the ratified IRCv3 capability set we negotiate (Phase 2
-// scope; sasl is appended when configured). Caps the server doesn't offer
-// are simply not requested. STS and draft caps come in later chunks.
+// wantedCaps is the capability set we negotiate: the ratified IRCv3 set
+// plus the draft caps CLAUDE.md treats as required (sasl is appended when
+// configured). Caps the server doesn't offer are simply not requested.
+// STS and the remaining drafts come in later chunks.
 var wantedCaps = []string{
 	"account-notify",
 	"account-tag",
@@ -20,6 +21,8 @@ var wantedCaps = []string{
 	"batch",
 	"cap-notify",
 	"chghost",
+	"draft/chathistory",
+	"draft/event-playback",
 	"echo-message",
 	"extended-join",
 	"invite-notify",

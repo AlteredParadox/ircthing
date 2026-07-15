@@ -621,6 +621,84 @@ func TestTypingInbound(t *testing.T) {
 	}
 }
 
+func TestChatHistoryBackfillFlow(t *testing.T) {
+	h := newTestHub(t)
+	// Existing history: the resume point for backfill.
+	if _, err := h.store.Append(context.Background(), "libera", "#go", store.Message{
+		Time: time.UnixMilli(5000), MsgID: "seed", Sender: "alice", Command: "PRIVMSG", Raw: "seed msg",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	conn := &fakeConn{ch: make(chan irc.Event, 16), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+
+	s := h.NewSession()
+	defer s.Close()
+
+	// Registration triggers a backfill request from the newest stored ts.
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered}
+	recv(t, s, "state")
+	deadline := time.Now().Add(5 * time.Second)
+	for len(conn.histReqs()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("backfill never requested")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := conn.histReqs()[0]; got != "#go@5000" {
+		t.Fatalf("backfill request = %q", got)
+	}
+
+	// The replay batch: persisted, but no live event/members pushes; a
+	// history_changed hint follows the batch close.
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+	conn.ch <- ev(":srv BATCH +r1 chathistory #go")
+	conn.ch <- ev("@batch=r1;msgid=h1;time=2026-07-15T00:00:06.000Z :bob!u@h PRIVMSG #go :missed one")
+	conn.ch <- ev("@batch=r1;msgid=h2;time=2026-07-15T00:00:07.000Z :bob!u@h JOIN #go")
+	conn.ch <- ev(":srv BATCH -r1")
+	hint := decode[HistoryChangedData](t, recv(t, s, "history_changed"))
+	if hint.Network != "libera" || hint.Buffer != "#go" {
+		t.Fatalf("hint = %+v", hint)
+	}
+
+	msgs, err := h.store.Latest(ctx, "libera", "#go", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 3 || msgs[1].Raw == "" || msgs[1].MsgID != "h1" {
+		t.Fatalf("persisted: %+v", msgs)
+	}
+	if !msgs[1].Time.Equal(time.Date(2026, 7, 15, 0, 0, 6, 0, time.UTC)) {
+		t.Fatalf("server-time not applied: %v", msgs[1].Time)
+	}
+
+	// Re-delivery of an already-stored msgid (overlapping backfill) is
+	// dropped silently, even outside a batch.
+	conn.ch <- ev("@msgid=h1;time=2026-07-15T00:00:06.000Z :bob!u@h PRIVMSG #go :missed one")
+	expectSilence(t, s)
+	if msgs, _ := h.store.Latest(ctx, "libera", "#go", 10); len(msgs) != 3 {
+		t.Fatalf("duplicate persisted: %d rows", len(msgs))
+	}
+
+	// Live traffic still pushes normally.
+	conn.ch <- ev("@msgid=live1 :bob!u@h PRIVMSG #go :fresh")
+	if got := decode[EventData](t, recv(t, s, "event")); got.Raw == "" || got.MsgID != "live1" {
+		t.Fatalf("live event = %+v", got)
+	}
+
+	// Buffers with no stored history are not backfilled.
+	for _, r := range conn.histReqs() {
+		if r != "#go@5000" {
+			t.Fatalf("unexpected backfill %q", r)
+		}
+	}
+}
+
 func TestSessionIgnoresUnknownInput(t *testing.T) {
 	h := newTestHub(t)
 	s := h.NewSession()
