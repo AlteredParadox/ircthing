@@ -1,0 +1,23 @@
+{
+  "listen": "127.0.0.1:8067",
+  "database": "ircthing.db",
+  "user": {
+    "username": "AlteredParadox",
+    "password_hash": "<output of: ircd-web -hash-password>"
+  },
+  "networks": [
+    {
+      "name": "libera",
+      "addr": "irc.libera.chat:6697",
+      "tls": true,
+      "nick": "mynick",
+      "realname": "My Name",
+      "sasl": {
+        "login": "mynick",
+        "password": "my-nickserv-password"
+      },
+      "channels": ["#go-nuts", "#linux"]
+    }
+  ],
+  "session_ttl_days": 30
+}

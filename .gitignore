@@ -1,6 +1,9 @@
 # Built binary
 /bin/
 
+# Local config (contains credentials); config.example.json is the template
+/config.json
+
 # SQLite databases
 *.db
 *.db-wal
