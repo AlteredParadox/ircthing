@@ -38,6 +38,11 @@ type Conn interface {
 	EnsureNames(channel string)
 	// SendMultiline sends the lines as one draft/multiline batch.
 	SendMultiline(target string, lines []string) error
+	// SetMonitored replaces the MONITOR list; MonitorAdd/MonitorRemove
+	// adjust it by one nick (MONITOR extension).
+	SetMonitored(nicks []string)
+	MonitorAdd(nick string)
+	MonitorRemove(nick string)
 }
 
 type Hub struct {
@@ -45,7 +50,8 @@ type Hub struct {
 
 	mu       sync.Mutex
 	networks map[string]Conn
-	states   map[string]string // last known connection state per network
+	states   map[string]string          // last known connection state per network
+	presence map[string]map[string]bool // network -> monitored nick -> online (MONITOR)
 	sessions map[*Session]struct{}
 }
 
@@ -54,6 +60,7 @@ func New(st *store.Store) *Hub {
 		store:    st,
 		networks: make(map[string]Conn),
 		states:   make(map[string]string),
+		presence: make(map[string]map[string]bool),
 		sessions: make(map[*Session]struct{}),
 	}
 }
@@ -105,10 +112,27 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 				}))
 				if ev.State == irc.StateRegistered {
 					h.backfill(ctx, c)
+					h.startMonitor(ctx, c)
+				}
+				if ev.State == irc.StateDisconnected {
+					h.clearPresence(ev.Network)
 				}
 			case irc.EventMessage:
 				if ev.Msg.Command == "FAIL" { // standard-replies
 					log.Printf("irc[%s]: server failure: %s", ev.Network, ev.Msg.String())
+				}
+				switch ev.Msg.Command {
+				case "730": // RPL_MONONLINE
+					h.updatePresence(ev.Network, ev.Msg, true)
+					continue
+				case "731": // RPL_MONOFFLINE
+					h.updatePresence(ev.Network, ev.Msg, false)
+					continue
+				case "734": // ERR_MONLISTFULL
+					log.Printf("irc[%s]: MONITOR list full: %s", ev.Network, ev.Msg.Trailing())
+					continue
+				case "732", "733": // RPL_MONLIST / end — the store is our source of truth
+					continue
 				}
 				if ev.Msg.Command == "BATCH" {
 					h.trackHistoryBatch(ev, histBatch)
@@ -173,6 +197,64 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 // buffers after (re)registration; channels backfill on their own JOIN
 // echo instead. The store's newest timestamp per buffer is the resume
 // point; buffers with no stored history have nothing to resume from.
+// startMonitor re-establishes the persisted MONITOR buddy list on the
+// network after (re)registration; the server's 730/731 replies then seed
+// presence.
+func (h *Hub) startMonitor(ctx context.Context, c Conn) {
+	nicks, err := h.store.Monitors(ctx, c.Name())
+	if err != nil {
+		log.Printf("irc[%s]: monitor load: %v", c.Name(), err)
+		return
+	}
+	if len(nicks) > 0 {
+		c.SetMonitored(nicks)
+	}
+}
+
+// updatePresence applies a 730/731 reply (comma-separated targets, which
+// may carry nick!user@host masks) and pushes each changed nick.
+func (h *Hub) updatePresence(network string, m *ircv4.Message, online bool) {
+	for _, target := range strings.Split(m.Trailing(), ",") {
+		nick := strings.TrimSpace(target)
+		if i := strings.IndexByte(nick, '!'); i != -1 {
+			nick = nick[:i]
+		}
+		if nick == "" {
+			continue
+		}
+		h.mu.Lock()
+		if h.presence[network] == nil {
+			h.presence[network] = make(map[string]bool)
+		}
+		h.presence[network][nick] = online
+		h.mu.Unlock()
+		h.broadcast(envelope("presence", 0, PresenceData{Network: network, Nick: nick, Online: online}))
+	}
+}
+
+func (h *Hub) clearPresence(network string) {
+	h.mu.Lock()
+	delete(h.presence, network)
+	h.mu.Unlock()
+}
+
+// monitorList returns the persisted buddy list for a network with each
+// nick's last-known presence (false when unknown).
+func (h *Hub) monitorList(ctx context.Context, network string) ([]MonitorEntry, error) {
+	nicks, err := h.store.Monitors(ctx, network)
+	if err != nil {
+		return nil, err
+	}
+	h.mu.Lock()
+	pres := h.presence[network]
+	out := make([]MonitorEntry, len(nicks))
+	for i, nick := range nicks {
+		out[i] = MonitorEntry{Nick: nick, Online: pres[nick]}
+	}
+	h.mu.Unlock()
+	return out, nil
+}
+
 func (h *Hub) backfill(ctx context.Context, c Conn) {
 	infos, err := h.store.Buffers(ctx)
 	if err != nil {

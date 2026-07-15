@@ -44,6 +44,32 @@ type EventData struct {
 	RedactReason string `json:"redact_reason,omitempty"`
 }
 
+// MonitorEntry is one monitored nick and its last-known presence.
+type MonitorEntry struct {
+	Nick   string `json:"nick"`
+	Online bool   `json:"online"`
+}
+
+// MonitorReq names a network and nick for monitor_add / monitor_remove.
+type MonitorReq struct {
+	Network string `json:"network"`
+	Nick    string `json:"nick"`
+}
+
+// MonitorsData answers "get_monitors": the buddy list for a network.
+type MonitorsData struct {
+	Network  string         `json:"network"`
+	Monitors []MonitorEntry `json:"monitors"`
+}
+
+// PresenceData announces a monitored nick's online/offline change
+// ("presence").
+type PresenceData struct {
+	Network string `json:"network"`
+	Nick    string `json:"nick"`
+	Online  bool   `json:"online"`
+}
+
 // RedactReq asks to delete one of our messages ("redact",
 // draft/message-redaction). The server decides whether it is allowed.
 type RedactReq struct {

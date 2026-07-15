@@ -201,6 +201,9 @@ func (f *fakeConn) RequestChatHistory(string, int64, string) {}
 func (f *fakeConn) EnsureNames(string) {}
 
 func (f *fakeConn) SendMultiline(string, []string) error { return nil }
+func (f *fakeConn) SetMonitored([]string)                {}
+func (f *fakeConn) MonitorAdd(string)                    {}
+func (f *fakeConn) MonitorRemove(string)                 {}
 
 func (f *fakeConn) privmsg(line string) irc.Event {
 	return irc.Event{

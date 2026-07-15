@@ -579,6 +579,97 @@ func TestMultilineSendFallbackWithoutCap(t *testing.T) {
 	}
 }
 
+func TestMonitorFlow(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+
+	// Add two buddies: persisted, and forwarded to the connection.
+	s.Handle(ctx, request(t, "monitor_add", 1, MonitorReq{Network: "libera", Nick: "alice"}))
+	recv(t, s, "ok")
+	s.Handle(ctx, request(t, "monitor_add", 2, MonitorReq{Network: "libera", Nick: "bob"}))
+	recv(t, s, "ok")
+	deadline := time.Now().Add(5 * time.Second)
+	for len(conn.monAdds()) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("MonitorAdd calls = %v", conn.monAdds())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// The server reports alice online, bob offline (730/731); both push.
+	conn.ch <- ev(":srv 730 AlteredParadox :alice!u@h")
+	if p := decode[PresenceData](t, recv(t, s, "presence")); p.Nick != "alice" || !p.Online {
+		t.Fatalf("presence = %+v", p)
+	}
+	conn.ch <- ev(":srv 731 AlteredParadox :bob")
+	if p := decode[PresenceData](t, recv(t, s, "presence")); p.Nick != "bob" || p.Online {
+		t.Fatalf("presence = %+v", p)
+	}
+
+	// get_monitors reflects the persisted list with current presence.
+	s.Handle(ctx, request(t, "get_monitors", 3, map[string]string{"network": "libera"}))
+	data := decode[MonitorsData](t, recv(t, s, "monitors"))
+	want := map[string]bool{"alice": true, "bob": false}
+	if len(data.Monitors) != 2 {
+		t.Fatalf("monitors = %+v", data.Monitors)
+	}
+	for _, m := range data.Monitors {
+		if want[m.Nick] != m.Online {
+			t.Fatalf("%s online = %v, want %v", m.Nick, m.Online, want[m.Nick])
+		}
+	}
+
+	// Removing forwards to the connection and pushes an offline presence.
+	s.Handle(ctx, request(t, "monitor_remove", 4, MonitorReq{Network: "libera", Nick: "alice"}))
+	recv(t, s, "ok", "presence")
+	if got := conn.monRemoves(); len(got) != 1 || got[0] != "alice" {
+		t.Fatalf("MonitorRemove = %v", got)
+	}
+	if list, _ := h.store.Monitors(ctx, "libera"); len(list) != 1 || list[0] != "bob" {
+		t.Fatalf("stored monitors after remove = %v", list)
+	}
+
+	// A bad nick is rejected without touching the store.
+	s.Handle(ctx, request(t, "monitor_add", 5, MonitorReq{Network: "libera", Nick: "bad nick"}))
+	if got := decode[ErrorData](t, recv(t, s, "error")); got.Code != "bad_request" {
+		t.Fatalf("bad nick code = %q", got.Code)
+	}
+}
+
+func TestMonitorReestablishedOnRegistration(t *testing.T) {
+	h := newTestHub(t)
+	if err := h.store.AddMonitor(context.Background(), "libera", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	conn := &fakeConn{ch: make(chan irc.Event, 4), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if got := conn.monitoredNicks(); len(got) == 1 && got[0] == "alice" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("SetMonitored not called with the persisted list; got %v", conn.monitoredNicks())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 func TestSessionCommand(t *testing.T) {
 	h := newTestHub(t)
 	conn := &fakeConn{ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox"}

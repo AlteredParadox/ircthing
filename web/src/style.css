@@ -293,6 +293,103 @@ input::placeholder {
 	color: var(--accent-ink);
 }
 
+/* ---- monitor / buddy list ---- */
+
+.monitor-section {
+	margin-top: 6px;
+}
+
+.monitor-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 4px 10px 4px 8px;
+	font-family: var(--mono-font);
+	font-size: 10px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--text-faint);
+}
+
+.monitor-addbtn {
+	border: none;
+	background: transparent;
+	color: var(--text-faint);
+	cursor: pointer;
+	font-size: 14px;
+	line-height: 1;
+	padding: 0 2px;
+}
+
+.monitor-addbtn:hover {
+	color: var(--text);
+}
+
+.monitor-add {
+	padding: 0 8px 4px;
+}
+
+.monitor-input {
+	width: 100%;
+	height: 26px;
+	padding: 0 8px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	background: var(--panel-2);
+	color: var(--text);
+	font-size: 13px;
+	outline: none;
+}
+
+.monitor-input:focus {
+	border-color: var(--accent-line);
+}
+
+.monitor-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 4px 10px;
+	border-radius: 7px;
+	cursor: pointer;
+	font-size: 13px;
+}
+
+.monitor-row:hover {
+	background: var(--hover);
+}
+
+.monitor-nick {
+	flex: 1;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	color: var(--text);
+}
+
+.monitor-nick.off {
+	color: var(--text-faint);
+}
+
+.monitor-remove {
+	border: none;
+	background: transparent;
+	color: var(--text-faint);
+	cursor: pointer;
+	font-size: 11px;
+	opacity: 0;
+	padding: 0 2px;
+}
+
+.monitor-row:hover .monitor-remove {
+	opacity: 1;
+}
+
+.monitor-remove:hover {
+	color: var(--away);
+}
+
 .side-foot {
 	flex: 0 0 auto;
 	border-top: 1px solid var(--border);

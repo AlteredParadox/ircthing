@@ -1,3 +1,4 @@
+import { useState } from "preact/hooks";
 import { bufKey, nickColor } from "./irc.js";
 
 function stateDot(state) {
@@ -6,7 +7,7 @@ function stateDot(state) {
 	return "offline";
 }
 
-export function Sidebar({ networks, buffers, activeKey, theme, onSelect, onSettings }) {
+export function Sidebar({ networks, buffers, activeKey, monitors, theme, onSelect, onSettings, onAddMonitor, onRemoveMonitor }) {
 	// Group buffers under their network; networks without buffers still
 	// get a section so a fresh install isn't a blank panel.
 	const names = new Set(Object.keys(networks));
@@ -57,6 +58,13 @@ export function Sidebar({ networks, buffers, activeKey, theme, onSelect, onSetti
 								</div>
 							);
 						})}
+						<MonitorSection
+							network={sec.name}
+							list={monitors?.[sec.name] || []}
+							onOpen={(nick) => onSelect(sec.name, nick)}
+							onAdd={onAddMonitor}
+							onRemove={onRemoveMonitor}
+						/>
 					</div>
 				))}
 			</div>
@@ -73,6 +81,56 @@ export function Sidebar({ networks, buffers, activeKey, theme, onSelect, onSetti
 				</div>
 				<button class="foot-gear" title="Settings" onClick={onSettings}>⚙</button>
 			</div>
+		</div>
+	);
+}
+
+// MonitorSection is the per-network MONITOR buddy list: nicks with an
+// online/offline dot, click to open a query, hover to remove, plus an
+// inline add field.
+function MonitorSection({ network, list, onOpen, onAdd, onRemove }) {
+	const [adding, setAdding] = useState(false);
+	const [value, setValue] = useState("");
+
+	function submit(e) {
+		e.preventDefault();
+		onAdd(network, value);
+		setValue("");
+		setAdding(false);
+	}
+
+	return (
+		<div class="monitor-section">
+			<div class="monitor-head">
+				<span>monitor</span>
+				<button class="monitor-addbtn" title="Add buddy" onClick={() => setAdding((a) => !a)}>+</button>
+			</div>
+			{adding && (
+				<form class="monitor-add" onSubmit={submit}>
+					<input
+						class="monitor-input"
+						autofocus
+						value={value}
+						placeholder="nick…"
+						onInput={(e) => setValue(e.currentTarget.value)}
+						onBlur={() => !value && setAdding(false)}
+					/>
+				</form>
+			)}
+			{list.map((m) => (
+				<div class="monitor-row" key={m.nick} onClick={() => onOpen(m.nick)}>
+					<span class={"dot " + (m.online ? "online" : "offline")} />
+					<span class={"monitor-nick" + (m.online ? "" : " off")}>{m.nick}</span>
+					<button
+						class="monitor-remove"
+						title="Stop monitoring"
+						onClick={(e) => {
+							e.stopPropagation();
+							onRemove(network, m.nick);
+						}}
+					>✕</button>
+				</div>
+			))}
 		</div>
 	);
 }

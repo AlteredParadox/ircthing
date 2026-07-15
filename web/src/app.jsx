@@ -40,6 +40,8 @@ export function App() {
 	const [searchOpen, setSearchOpen] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const [focusId, setFocusId] = useState(null);
+	// monitors: network -> [{nick, online}]; the MONITOR buddy list.
+	const [monitors, setMonitors] = useState({});
 	const [rules, setRules] = useState(loadRules);
 	const rulesRef = useRef(rules);
 	rulesRef.current = rules;
@@ -93,6 +95,12 @@ export function App() {
 			const nets = {};
 			for (const n of data.networks || []) nets[n.name] = { state: n.state, nick: n.nick };
 			setNetworks(nets);
+			// Load each network's MONITOR buddy list with current presence.
+			for (const name of Object.keys(nets)) {
+				s.request("get_monitors", { network: name })
+					.then((md) => setMonitors((all) => ({ ...all, [name]: md.monitors || [] })))
+					.catch(() => {});
+			}
 			setBuffers((prev) => {
 				const bufs = {};
 				for (const b of data.buffers || []) {
@@ -206,6 +214,17 @@ export function App() {
 					setActiveKey(key);
 				});
 			}
+		});
+
+		s.on("presence", (d) => {
+			setMonitors((all) => {
+				const list = all[d.network] || [];
+				const idx = list.findIndex((m) => m.nick === d.nick);
+				if (idx === -1) return all; // not (or no longer) in the list
+				const next = list.slice();
+				next[idx] = { ...next[idx], online: d.online };
+				return { ...all, [d.network]: next };
+			});
 		});
 
 		s.on("redact", (d) => {
@@ -371,6 +390,23 @@ export function App() {
 		select(firstBuf.network, firstBuf.buffer);
 	}, [buffers, activeKey]);
 
+	function addMonitor(network, nick) {
+		nick = nick.trim();
+		if (!nick) return;
+		// Optimistic: show it immediately (offline until the server replies).
+		setMonitors((all) => {
+			const list = all[network] || [];
+			if (list.some((m) => m.nick === nick)) return all;
+			return { ...all, [network]: [...list, { nick, online: false }].sort((a, b) => a.nick.localeCompare(b.nick)) };
+		});
+		sock.current?.request("monitor_add", { network, nick }).catch(() => {});
+	}
+
+	function removeMonitor(network, nick) {
+		setMonitors((all) => ({ ...all, [network]: (all[network] || []).filter((m) => m.nick !== nick) }));
+		sock.current?.request("monitor_remove", { network, nick }).catch(() => {});
+	}
+
 	function makeBuffer(network, buffer) {
 		return { key: bufKey(network, buffer), network, buffer, lastTime: 0, marker: 0, unread: 0, mention: false };
 	}
@@ -516,7 +552,9 @@ export function App() {
 			<div class={"sidebar" + (sideOpen ? " open" : "")}>
 				<Sidebar
 					networks={networks} buffers={buffers} activeKey={activeKey}
-					theme={theme} onSelect={select} onSettings={() => setSettingsOpen(true)}
+					monitors={monitors} theme={theme} onSelect={select}
+					onSettings={() => setSettingsOpen(true)}
+					onAddMonitor={addMonitor} onRemoveMonitor={removeMonitor}
 				/>
 			</div>
 			{sideOpen && <div class="side-scrim" onClick={() => setSideOpen(false)} />}

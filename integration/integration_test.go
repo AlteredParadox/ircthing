@@ -93,6 +93,37 @@ func TestSASL(t *testing.T) {
 	s.waitRegistered()
 }
 
+// TestMonitorPresence: add a buddy to MONITOR and observe real
+// online/offline transitions as they connect and quit (Ergo supports
+// MONITOR).
+func TestMonitorPresence(t *testing.T) {
+	addr := startErgo(t)
+	st, h := newStoreAndHub(t)
+	s := startStack(t, st, h, irc.Config{Name: "ergo", Addr: addr, Nick: "webuser"})
+	s.waitRegistered()
+
+	// Monitor "pal" while they are offline -> a presence(false) push.
+	s.sess.Handle(context.Background(), envelope(t, "monitor_add", 1, hub.MonitorReq{Network: "ergo", Nick: "pal"}))
+	s.waitEnvelope("presence", func(d json.RawMessage) bool {
+		var p hub.PresenceData
+		return json.Unmarshal(d, &p) == nil && p.Nick == "pal" && !p.Online
+	})
+
+	// pal connects -> presence(true).
+	pal := dialRaw(t, addr, "pal")
+	s.waitEnvelope("presence", func(d json.RawMessage) bool {
+		var p hub.PresenceData
+		return json.Unmarshal(d, &p) == nil && p.Nick == "pal" && p.Online
+	})
+
+	// pal quits -> presence(false).
+	pal.send("QUIT :bye")
+	s.waitEnvelope("presence", func(d json.RawMessage) bool {
+		var p hub.PresenceData
+		return json.Unmarshal(d, &p) == nil && p.Nick == "pal" && !p.Online
+	})
+}
+
 // TestNoImplicitNames: Ergo advertises no-implicit-names, so it sends no
 // membership on JOIN. Our lazy fetch must still populate the members
 // panel when a channel is viewed.

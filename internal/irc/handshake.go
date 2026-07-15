@@ -28,6 +28,7 @@ var wantedCaps = []string{
 	"draft/read-marker",
 	"echo-message",
 	"extended-join",
+	"extended-monitor",
 	"invite-notify",
 	"labeled-response",
 	"message-tags",

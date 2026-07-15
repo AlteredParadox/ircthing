@@ -123,6 +123,9 @@ type fakeConn struct {
 	hist      []string // RequestChatHistory calls as "target@sinceMs"
 	names     []string // EnsureNames calls
 	multiline []string // SendMultiline calls
+	monitored []string // SetMonitored
+	monAdd    []string // MonitorAdd
+	monRemove []string // MonitorRemove
 }
 
 func (f *fakeConn) Events() <-chan irc.Event     { return f.ch }
@@ -191,6 +194,42 @@ func (f *fakeConn) multilineSends() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.multiline...)
+}
+
+func (f *fakeConn) SetMonitored(nicks []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.monitored = append([]string(nil), nicks...)
+}
+
+func (f *fakeConn) MonitorAdd(nick string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.monAdd = append(f.monAdd, nick)
+}
+
+func (f *fakeConn) MonitorRemove(nick string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.monRemove = append(f.monRemove, nick)
+}
+
+func (f *fakeConn) monitoredNicks() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.monitored...)
+}
+
+func (f *fakeConn) monAdds() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.monAdd...)
+}
+
+func (f *fakeConn) monRemoves() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.monRemove...)
 }
 
 func TestHubPersistsEvents(t *testing.T) {

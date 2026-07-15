@@ -87,6 +87,12 @@ func (s *Session) Handle(ctx context.Context, env Envelope) {
 		s.handleCommand(ctx, env)
 	case "redact":
 		s.handleRedact(ctx, env)
+	case "get_monitors":
+		s.handleGetMonitors(ctx, env)
+	case "monitor_add":
+		s.handleMonitor(ctx, env, true)
+	case "monitor_remove":
+		s.handleMonitor(ctx, env, false)
 	case "get_channel":
 		s.handleGetChannel(ctx, env)
 	case "get_buffers":
@@ -208,6 +214,59 @@ func (s *Session) handleTyping(ctx context.Context, env Envelope) {
 	if env.Seq != 0 {
 		s.push(envelope("ok", env.Seq, nil))
 	}
+}
+
+func (s *Session) handleGetMonitors(ctx context.Context, env Envelope) {
+	var d struct {
+		Network string `json:"network"`
+	}
+	if err := json.Unmarshal(env.Data, &d); err != nil || d.Network == "" {
+		s.push(errEnvelope(env.Seq, "bad_request", "get_monitors needs a network"))
+		return
+	}
+	list, err := s.hub.monitorList(ctx, d.Network)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "monitor list query failed"))
+		return
+	}
+	if list == nil {
+		list = []MonitorEntry{}
+	}
+	s.push(envelope("monitors", env.Seq, MonitorsData{Network: d.Network, Monitors: list}))
+}
+
+// handleMonitor adds or removes a monitored nick: it persists the change
+// and tells the connection to update its MONITOR list, which prompts the
+// server for the nick's current presence.
+func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
+	var d MonitorReq
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", "malformed monitor data"))
+		return
+	}
+	if d.Network == "" || d.Nick == "" || strings.ContainsAny(d.Nick, " ,\r\n") {
+		s.push(errEnvelope(env.Seq, "bad_request", "monitor needs a network and a valid nick"))
+		return
+	}
+	var err error
+	if add {
+		err = s.hub.store.AddMonitor(ctx, d.Network, d.Nick)
+	} else {
+		err = s.hub.store.RemoveMonitor(ctx, d.Network, d.Nick)
+	}
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "updating the monitor list failed"))
+		return
+	}
+	if conn := s.hub.network(d.Network); conn != nil {
+		if add {
+			conn.MonitorAdd(d.Nick)
+		} else {
+			conn.MonitorRemove(d.Nick)
+			s.hub.broadcast(envelope("presence", 0, PresenceData{Network: d.Network, Nick: d.Nick, Online: false}))
+		}
+	}
+	s.push(envelope("ok", env.Seq, nil))
 }
 
 // handleRedact issues a REDACT for one of our messages

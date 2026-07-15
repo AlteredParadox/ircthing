@@ -443,6 +443,45 @@ func TestManagerCapsAndNotify(t *testing.T) {
 	}
 }
 
+func TestManagerMonitor(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+	s.send(":irc.test 005 AlteredParadox MONITOR=3 :are supported by this server")
+	deadline := time.Now().Add(5 * time.Second)
+	for m.monitorLimit() != 3 {
+		if time.Now().After(deadline) {
+			t.Fatal("005 MONITOR never applied")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// SetMonitored clears then adds, clamped to the ISUPPORT limit of 3.
+	m.SetMonitored([]string{"a", "b", "c", "d"})
+	if got := s.readCmd("MONITOR"); got.Param(0) != "C" {
+		t.Fatalf("first MONITOR = %q, want C", got.String())
+	}
+	add := s.readCmd("MONITOR")
+	if add.Param(0) != "+" || add.Param(1) != "a,b,c" {
+		t.Fatalf("MONITOR + = %q, want a,b,c (clamped)", add.String())
+	}
+
+	m.MonitorAdd("e")
+	if got := s.readCmd("MONITOR"); got.Param(0) != "+" || got.Param(1) != "e" {
+		t.Fatalf("MonitorAdd = %q", got.String())
+	}
+	m.MonitorRemove("a")
+	if got := s.readCmd("MONITOR"); got.Param(0) != "-" || got.Param(1) != "a" {
+		t.Fatalf("MonitorRemove = %q", got.String())
+	}
+}
+
 func TestManagerLazyNames(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -188,6 +188,64 @@ func (m *Manager) SendMultiline(target string, lines []string) error {
 	return nil
 }
 
+// SetMonitored replaces the MONITOR list with nicks (MONITOR extension,
+// https://ircv3.net/specs/extensions/monitor, fetched 2026-07-15). The
+// hub drives this on every registration from the persisted buddy list, so
+// the list is re-established after reconnects. Requests are clamped to the
+// ISUPPORT MONITOR limit and chunked to stay within the line length; the
+// server replies 730/731 with each target's current presence.
+func (m *Manager) SetMonitored(nicks []string) {
+	if !m.registered.Load() {
+		return
+	}
+	if limit := m.monitorLimit(); limit > 0 && len(nicks) > limit {
+		nicks = nicks[:limit]
+	}
+	_ = m.Send(newMsg("MONITOR", "C")) // clear any stale list on this connection
+	for _, chunk := range chunkTargets(nicks, 10) {
+		_ = m.Send(newMsg("MONITOR", "+", strings.Join(chunk, ",")))
+	}
+}
+
+// MonitorAdd starts monitoring one nick; MonitorRemove stops. Both no-op
+// before registration (the hub re-sends the whole list on registration).
+func (m *Manager) MonitorAdd(nick string) {
+	if m.registered.Load() {
+		_ = m.Send(newMsg("MONITOR", "+", nick))
+	}
+}
+
+func (m *Manager) MonitorRemove(nick string) {
+	if m.registered.Load() {
+		_ = m.Send(newMsg("MONITOR", "-", nick))
+	}
+}
+
+// monitorLimit returns the ISUPPORT MONITOR target limit, or 0 for no
+// limit / not advertised.
+func (m *Manager) monitorLimit() int {
+	if v, ok := m.isup.Raw("MONITOR"); ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return 0
+}
+
+// chunkTargets splits a target list into groups of at most n.
+func chunkTargets(targets []string, n int) [][]string {
+	var out [][]string
+	for len(targets) > 0 {
+		end := n
+		if end > len(targets) {
+			end = len(targets)
+		}
+		out = append(out, targets[:end])
+		targets = targets[end:]
+	}
+	return out
+}
+
 // RequestChatHistory asks the server for messages in target newer than
 // the given resume point — gap-free scrollback after reconnects
 // (draft/chathistory AFTER; https://ircv3.net/specs/extensions/
