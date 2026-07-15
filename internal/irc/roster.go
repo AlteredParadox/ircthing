@@ -11,16 +11,22 @@ import (
 // Channel membership and topic tracking for one connection.
 //
 // Sources: NAMES on join (353 accumulated until 366), then live
-// JOIN/PART/KICK/QUIT/NICK/MODE/TOPIC/332/331. Status prefixes are kept
-// as display characters ("~&@%+"), highest only — multi-prefix arrives
-// with the IRCv3 work. Casemapping is ASCII lowering and MODE parsing
-// assumes the RFC 1459 defaults (PREFIX=(qaohv)~&@%+ superset,
-// CHANMODES=b,k,l,imnpst) until ISUPPORT parsing lands in Phase 2.
+// JOIN/PART/KICK/QUIT/NICK/MODE/TOPIC/332/331/AWAY. Status prefixes are
+// kept as display characters ("~&@%+"), all of them ordered highest
+// first when multi-prefix (https://ircv3.net/specs/extensions/
+// multi-prefix, fetched 2026-07-15) is negotiated — without it only the
+// highest is known. NAMES entries may be full nick!user@host hostmasks
+// under userhost-in-names (spec fetched 2026-07-15). Away state comes
+// from away-notify AWAY lines (spec fetched 2026-07-15). Casemapping is
+// ASCII lowering and MODE parsing assumes the RFC 1459 defaults
+// (PREFIX=(qaohv)~&@%+ superset, CHANMODES=b,k,l,imnpst) until ISUPPORT
+// parsing lands.
 
 // Member is one channel occupant.
 type Member struct {
 	Nick   string
-	Prefix string // highest status prefix: "~", "&", "@", "%", "+" or ""
+	Prefix string // status prefixes, highest first: e.g. "@+", "" for none
+	Away   bool   // known only when away-notify is negotiated
 }
 
 type channelState struct {
@@ -153,6 +159,15 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 			}
 		}
 
+	case "AWAY": // away-notify: a parameter means away, none means back
+		away := len(m.Params) > 0
+		for _, st := range r.chans {
+			if mem, ok := st.members[lower(sender)]; ok {
+				mem.Away = away
+				st.members[lower(sender)] = mem
+			}
+		}
+
 	case "MODE":
 		if st := r.chans[lower(m.Param(0))]; st != nil {
 			applyChannelMode(st, m.Params)
@@ -160,18 +175,20 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 	}
 }
 
-// splitNamesPrefix splits a NAMES entry like "@nick" into its highest
-// status prefix and the nick. Without multi-prefix only the first status
-// char is present, but strip any extras defensively.
-func splitNamesPrefix(raw string) (prefix, nick string) {
+// splitNamesPrefix splits a NAMES entry like "@+nick" or, under
+// userhost-in-names, "@+nick!user@host" into its status prefixes and the
+// bare nick. multi-prefix sends all prefixes "in order of 'rank', from
+// highest to lowest" — keep them as-is.
+func splitNamesPrefix(raw string) (prefixes, nick string) {
 	i := 0
-	for i < len(raw) && strings.IndexByte("~&@%+", raw[i]) != -1 {
+	for i < len(raw) && strings.IndexByte(prefixRank, raw[i]) != -1 {
 		i++
 	}
-	if i > 0 {
-		return raw[:1], raw[i:]
+	prefixes, nick = raw[:i], raw[i:]
+	if bang := strings.IndexByte(nick, '!'); bang != -1 {
+		nick = nick[:bang]
 	}
-	return "", raw
+	return prefixes, nick
 }
 
 // prefixForMode maps a PREFIX mode letter to its display char.
@@ -212,7 +229,11 @@ func applyChannelMode(st *channelState, params []string) {
 			if !ok {
 				continue
 			}
-			mem.Prefix = recomputePrefix(mem.Prefix, prefixForMode[c], adding)
+			if adding {
+				mem.Prefix = addPrefix(mem.Prefix, prefixForMode[c])
+			} else {
+				mem.Prefix = strings.ReplaceAll(mem.Prefix, prefixForMode[c], "")
+			}
 			st.members[lower(nick)] = mem
 		case 'b', 'k': // always take an argument
 			takeArg()
@@ -225,21 +246,21 @@ func applyChannelMode(st *channelState, params []string) {
 	}
 }
 
-// recomputePrefix collapses status changes onto the single stored prefix.
-// Without multi-prefix we can't know lower statuses hidden behind the
-// displayed one, so removing the shown status clears it entirely; the
-// next NAMES refresh corrects any hidden voice/op the user still holds.
-func recomputePrefix(current, changed string, adding bool) string {
-	if adding {
-		if current == "" || strings.Index(prefixRank, changed) < strings.Index(prefixRank, current) {
-			return changed
-		}
+// addPrefix inserts a status prefix keeping rank order (highest first).
+// With multi-prefix negotiated the stored set is exact; without it NAMES
+// only reveals the highest, so lower statuses may be missing until a
+// MODE grants them again.
+func addPrefix(current, changed string) string {
+	if strings.Contains(current, changed) {
 		return current
 	}
-	if current == changed {
-		return ""
+	rank := strings.Index(prefixRank, changed)
+	for i := 0; i < len(current); i++ {
+		if strings.IndexByte(prefixRank, current[i]) > rank {
+			return current[:i] + changed + current[i:]
+		}
 	}
-	return current
+	return current + changed
 }
 
 func lower(s string) string {

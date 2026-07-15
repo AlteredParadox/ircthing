@@ -159,6 +159,8 @@ func (f *fakeConn) Channel(string) (string, []irc.Member, bool) {
 	return "", nil, false
 }
 
+func (f *fakeConn) CapEnabled(string) bool { return false }
+
 func (f *fakeConn) privmsg(line string) irc.Event {
 	return irc.Event{
 		Network: f.name,

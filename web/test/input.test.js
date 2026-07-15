@@ -67,12 +67,13 @@ test("groupMembers", () => {
 	const got = groupMembers([
 		{ nick: "owner", prefix: "~" },
 		{ nick: "op", prefix: "@" },
+		{ nick: "stacked", prefix: "@+" }, // multi-prefix: highest wins
 		{ nick: "half", prefix: "%" },
 		{ nick: "voiced", prefix: "+" },
 		{ nick: "plain", prefix: "" },
 		{ nick: "also" },
 	]);
-	eq(got.map((g) => [g.label, g.members.length]), [["Ops", 2], ["Voice", 2], ["Members", 2]]);
+	eq(got.map((g) => [g.label, g.members.length]), [["Ops", 3], ["Voice", 2], ["Members", 2]]);
 	// Empty groups are dropped.
 	eq(groupMembers([{ nick: "a" }]).map((g) => g.label), ["Members"]);
 	eq(groupMembers([]), []);

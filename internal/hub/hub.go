@@ -26,6 +26,7 @@ type Conn interface {
 	Events() <-chan irc.Event
 	Send(*ircv4.Message) error
 	Channel(name string) (topic string, members []irc.Member, ok bool)
+	CapEnabled(name string) bool
 }
 
 type Hub struct {
@@ -145,7 +146,7 @@ func membersHint(m *ircv4.Message) (buffer string, affected bool) {
 		return m.Param(0), true
 	case "366": // end of NAMES: <me> <channel>
 		return m.Param(1), true
-	case "QUIT", "NICK":
+	case "QUIT", "NICK", "AWAY": // span channels the hub doesn't track
 		return "", true
 	}
 	return "", false
@@ -178,11 +179,18 @@ func persistTarget(m *ircv4.Message, ourNick string) (string, bool) {
 		if isChannel(t) {
 			return t, true
 		}
+		if m.Prefix == nil || m.Prefix.Name == "" || ourNick == "" {
+			return "", false
+		}
 		// Addressed to us: file under the sender (queries, NickServ,
 		// server notices under the server's name).
-		if m.Prefix != nil && m.Prefix.Name != "" &&
-			ourNick != "" && strings.EqualFold(t, ourNick) {
+		if strings.EqualFold(t, ourNick) {
 			return m.Prefix.Name, true
+		}
+		// Our own message echoed back (echo-message): file under the
+		// recipient so sent PMs land in the query buffer.
+		if strings.EqualFold(m.Prefix.Name, ourNick) && t != "" {
+			return t, true
 		}
 		return "", false
 	case "JOIN", "PART", "TOPIC", "KICK", "MODE":

@@ -105,17 +105,22 @@ func (s *srvConn) send(line string) {
 	}
 }
 
-// register plays the server side of a minimal CAP + registration exchange.
+// register plays the server side of a minimal CAP + registration
+// exchange, ACKing whatever the client requests.
 func (s *srvConn) register(nick string) {
 	s.t.Helper()
 	s.readCmd("USER") // client sends CAP LS, [PASS,] NICK, USER
 	s.send("CAP * LS :multi-prefix server-time")
 	for {
-		if m := s.readCmd("CAP"); m.Param(0) == "END" {
-			break
+		m := s.readCmd("CAP")
+		switch m.Param(0) {
+		case "REQ":
+			s.send("CAP " + nick + " ACK :" + m.Trailing())
+		case "END":
+			s.send(":irc.test 001 " + nick + " :Welcome to the test network " + nick)
+			return
 		}
 	}
-	s.send(":irc.test 001 " + nick + " :Welcome to the test network " + nick)
 }
 
 // startManager runs the manager in the background for the whole test.
@@ -369,6 +374,48 @@ func TestManagerRejoinsRuntimeChannels(t *testing.T) {
 	s2.c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if msg, err := s2.r.ReadMessage(); err == nil && msg.Command == "JOIN" {
 		t.Fatalf("unexpected second join: %s", msg.String())
+	}
+}
+
+func TestManagerCapsAndNotify(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+
+	s := accept(t, conns)
+	s.register("AlteredParadox") // offers + ACKs multi-prefix, server-time
+	waitState(t, m, StateRegistered)
+	if !m.CapEnabled("multi-prefix") || !m.CapEnabled("server-time") {
+		t.Fatal("negotiated caps not recorded")
+	}
+	if m.CapEnabled("away-notify") {
+		t.Fatal("unoffered cap reported enabled")
+	}
+
+	// cap-notify NEW: the client requests the wanted new cap; ACK
+	// enables it. DEL disables.
+	s.send("CAP AlteredParadox NEW :away-notify example/unwanted")
+	req := s.readCmd("CAP")
+	if req.Param(0) != "REQ" || req.Trailing() != "away-notify" {
+		t.Fatalf("REQ after NEW = %q", req.String())
+	}
+	s.send("CAP AlteredParadox ACK :away-notify")
+	deadline := time.Now().Add(5 * time.Second)
+	for !m.CapEnabled("away-notify") {
+		if time.Now().After(deadline) {
+			t.Fatal("away-notify never enabled after ACK")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	s.send("CAP AlteredParadox DEL :server-time")
+	for m.CapEnabled("server-time") {
+		if time.Now().After(deadline) {
+			t.Fatal("server-time never disabled after DEL")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

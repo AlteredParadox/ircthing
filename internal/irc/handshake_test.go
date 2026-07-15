@@ -61,10 +61,19 @@ func TestHandshake(t *testing.T) {
 			cfg:       baseCfg,
 			wantStart: []string{"CAP LS 302", "NICK AlteredParadox", "USER AlteredParadox 0 * AlteredParadox"},
 			steps: []step{
-				{in: "CAP * LS :multi-prefix server-time", want: []string{"CAP END"}},
+				{in: "CAP * LS :multi-prefix server-time", want: []string{"CAP REQ :multi-prefix server-time"}},
+				{in: "CAP AlteredParadox ACK :multi-prefix server-time", want: []string{"CAP END"}},
 				{in: ":irc.test 001 AlteredParadox :Welcome to the test network", done: true},
 			},
 			wantNick: "AlteredParadox",
+		},
+		{
+			name: "no wanted caps offered goes straight to CAP END",
+			cfg:  baseCfg,
+			steps: []step{
+				{in: "CAP * LS :example/vendor-thing", want: []string{"CAP END"}},
+				{in: ":irc.test 001 AlteredParadox :Welcome", done: true},
+			},
 		},
 		{
 			name: "PASS and explicit username/realname",
@@ -86,8 +95,8 @@ func TestHandshake(t *testing.T) {
 			cfg:       saslCfg,
 			wantStart: []string{"CAP LS 302", "NICK AlteredParadox", "USER AlteredParadox 0 * AlteredParadox"},
 			steps: []step{
-				{in: "CAP * LS :multi-prefix sasl=PLAIN,EXTERNAL server-time", want: []string{"CAP REQ sasl"}},
-				{in: ":irc.test CAP AlteredParadox ACK :sasl", want: []string{"AUTHENTICATE PLAIN"}},
+				{in: "CAP * LS :multi-prefix sasl=PLAIN,EXTERNAL server-time", want: []string{"CAP REQ :multi-prefix sasl server-time"}},
+				{in: ":irc.test CAP AlteredParadox ACK :multi-prefix sasl server-time", want: []string{"AUTHENTICATE PLAIN"}},
 				{in: "AUTHENTICATE +", want: []string{authLine}},
 				{in: ":irc.test 900 AlteredParadox AlteredParadox!u@h AlteredParadox :You are now logged in as AlteredParadox"},
 				{in: ":irc.test 903 AlteredParadox :SASL authentication successful", want: []string{"CAP END"}},
@@ -100,8 +109,30 @@ func TestHandshake(t *testing.T) {
 			steps: []step{
 				{in: "CAP * LS * :multi-prefix server-time echo-message"},
 				{in: "CAP * LS * :batch labeled-response"},
-				{in: "CAP * LS :sasl=PLAIN account-tag", want: []string{"CAP REQ sasl"}},
+				{
+					in:   "CAP * LS :sasl=PLAIN account-tag",
+					want: []string{"CAP REQ :account-tag batch echo-message labeled-response multi-prefix sasl server-time"},
+				},
+				// A partial ACK still enables what it names.
 				{in: "CAP * ACK :sasl", want: []string{"AUTHENTICATE PLAIN"}},
+			},
+		},
+		{
+			name: "NAK of the full set falls back to sasl alone",
+			cfg:  saslCfg,
+			steps: []step{
+				{in: "CAP * LS :batch sasl", want: []string{"CAP REQ :batch sasl"}},
+				{in: "CAP * NAK :batch sasl", want: []string{"CAP REQ sasl"}},
+				{in: "CAP * ACK :sasl", want: []string{"AUTHENTICATE PLAIN"}},
+			},
+		},
+		{
+			name: "NAK without sasl configured proceeds bare",
+			cfg:  baseCfg,
+			steps: []step{
+				{in: "CAP * LS :batch", want: []string{"CAP REQ batch"}},
+				{in: "CAP * NAK :batch", want: []string{"CAP END"}},
+				{in: ":irc.test 001 AlteredParadox :Welcome", done: true},
 			},
 		},
 		{
@@ -130,7 +161,7 @@ func TestHandshake(t *testing.T) {
 			cfg:  saslCfg,
 			steps: []step{
 				{in: "CAP * LS :sasl", want: []string{"CAP REQ sasl"}},
-				{in: "CAP * NAK :sasl", errSub: "refused CAP REQ"},
+				{in: "CAP * NAK :sasl", errSub: "refused the capability request"},
 			},
 		},
 		{
@@ -181,7 +212,7 @@ func TestHandshake(t *testing.T) {
 			steps: []step{
 				{in: ":irc.test 433 * AlteredParadox :Nickname is already in use", want: []string{"NICK AlteredParadox_"}},
 				{in: ":irc.test 433 * AlteredParadox_ :Nickname is already in use", want: []string{"NICK AlteredParadox__"}},
-				{in: "CAP * LS :multi-prefix", want: []string{"CAP END"}},
+				{in: "CAP * LS :example/none", want: []string{"CAP END"}},
 				{in: ":irc.test 001 AlteredParadox__ :Welcome", done: true},
 			},
 			wantNick: "AlteredParadox__",
@@ -215,7 +246,7 @@ func TestHandshake(t *testing.T) {
 			cfg:  baseCfg,
 			steps: []step{
 				{in: "PING :12345", want: []string{"PONG 12345"}},
-				{in: "CAP * LS :multi-prefix", want: []string{"CAP END"}},
+				{in: "CAP * LS :example/none", want: []string{"CAP END"}},
 				{in: ":irc.test 001 AlteredParadox :Welcome", done: true},
 			},
 		},
@@ -238,7 +269,7 @@ func TestHandshake(t *testing.T) {
 			name: "001 with truncated nick is authoritative",
 			cfg:  baseCfg,
 			steps: []step{
-				{in: "CAP * LS :multi-prefix", want: []string{"CAP END"}},
+				{in: "CAP * LS :example/none", want: []string{"CAP END"}},
 				{in: ":irc.test 001 AlteredParadoxtruncated :Welcome", done: true},
 			},
 			wantNick: "AlteredParadoxtruncated",
@@ -281,6 +312,29 @@ func TestHandshake(t *testing.T) {
 				t.Fatalf("final nick = %q, want %q", hs.nick, tc.wantNick)
 			}
 		})
+	}
+}
+
+func TestHandshakeRecordsEnabledCaps(t *testing.T) {
+	cfg := Config{Addr: "irc.test:6667", Nick: "AlteredParadox", AllowPlaintext: true}
+	hs := newHandshake(&cfg)
+	hs.start()
+	feed := func(line string) {
+		t.Helper()
+		if _, _, err := hs.handle(ircv4.MustParseMessage(line)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	feed("CAP * LS :multi-prefix server-time away-notify example/none")
+	feed("CAP AlteredParadox ACK :multi-prefix server-time away-notify")
+	feed(":irc.test 001 AlteredParadox :Welcome")
+	for _, c := range []string{"multi-prefix", "server-time", "away-notify"} {
+		if !hs.enabled[c] {
+			t.Errorf("cap %s not recorded as enabled", c)
+		}
+	}
+	if hs.enabled["example/none"] {
+		t.Error("unrequested cap recorded")
 	}
 }
 

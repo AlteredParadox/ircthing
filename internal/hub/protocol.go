@@ -146,7 +146,8 @@ type ChannelReq struct {
 // MemberData is one channel occupant.
 type MemberData struct {
 	Nick   string `json:"nick"`
-	Prefix string `json:"prefix,omitempty"` // "~", "&", "@", "%", "+" or ""
+	Prefix string `json:"prefix,omitempty"` // status prefixes, highest first ("@+")
+	Away   bool   `json:"away,omitempty"`   // known only with away-notify
 }
 
 // ChannelData answers "get_channel": topic and membership as currently

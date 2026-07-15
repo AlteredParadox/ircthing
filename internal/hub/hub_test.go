@@ -29,6 +29,8 @@ func TestPersistTarget(t *testing.T) {
 		{"nickserv notice files under nickserv", ":NickServ!s@services NOTICE AlteredParadox :identify pls", "AlteredParadox", "NickServ", true},
 		{"server notice files under server name", ":irc.test NOTICE AlteredParadox :*** Looking up your hostname", "AlteredParadox", "irc.test", true},
 		{"privmsg to someone else dropped", ":alice!u@h PRIVMSG bob :hi", "AlteredParadox", "", false},
+		{"our echoed pm files under the recipient", ":AlteredParadox!u@h PRIVMSG alice :hi", "AlteredParadox", "alice", true},
+		{"our echoed notice files under the recipient", ":AlteredParadox!u@h NOTICE alice :psst", "AlteredParadox", "alice", true},
 		{"privmsg to us with no prefix dropped", "PRIVMSG AlteredParadox :hi", "AlteredParadox", "", false},
 		{"pm before nick known dropped", ":alice!u@h PRIVMSG AlteredParadox :hi", "", "", false},
 		{"join", ":alice!u@h JOIN #go", "AlteredParadox", "#go", true},
@@ -111,15 +113,17 @@ type fakeConn struct {
 	nick  string
 	topic string
 	chans map[string][]irc.Member
+	caps  map[string]bool
 
 	mu      sync.Mutex
 	sent    []*ircv4.Message
 	sendErr error
 }
 
-func (f *fakeConn) Events() <-chan irc.Event { return f.ch }
-func (f *fakeConn) Name() string             { return f.name }
-func (f *fakeConn) Nick() string             { return f.nick }
+func (f *fakeConn) Events() <-chan irc.Event    { return f.ch }
+func (f *fakeConn) Name() string                { return f.name }
+func (f *fakeConn) Nick() string                { return f.nick }
+func (f *fakeConn) CapEnabled(name string) bool { return f.caps[name] }
 
 func (f *fakeConn) Channel(name string) (string, []irc.Member, bool) {
 	ms, ok := f.chans[name]

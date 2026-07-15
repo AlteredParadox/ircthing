@@ -16,10 +16,10 @@ export function Members({ info, theme }) {
 					<div class="net-group" key={g.label}>
 						<div class="member-group-head">{g.label} — {g.members.length}</div>
 						{g.members.map((m) => (
-							<div class="member-row" key={m.nick}>
-								<span class="dot online" />
+							<div class={"member-row" + (m.away ? " away" : "")} key={m.nick}>
+								<span class={"dot " + (m.away ? "away" : "online")} />
 								<span class={"member-glyph" + (g.label === "Ops" ? " op" : " voice")}>
-									{m.prefix || ""}
+									{(m.prefix || "")[0] || ""}
 								</span>
 								<span class="member-nick" style={{ color: nickColor(m.nick, theme) }}>
 									{m.nick}

@@ -4,10 +4,41 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	ircv4 "gopkg.in/irc.v4"
 )
+
+// wantedCaps is the ratified IRCv3 capability set we negotiate (Phase 2
+// scope; sasl is appended when configured). Caps the server doesn't offer
+// are simply not requested. STS and draft caps come in later chunks.
+var wantedCaps = []string{
+	"account-notify",
+	"account-tag",
+	"away-notify",
+	"batch",
+	"cap-notify",
+	"chghost",
+	"echo-message",
+	"extended-join",
+	"invite-notify",
+	"labeled-response",
+	"message-tags",
+	"multi-prefix",
+	"server-time",
+	"setname",
+	"standard-replies",
+	"userhost-in-names",
+}
+
+var wantedCapSet = func() map[string]bool {
+	m := make(map[string]bool, len(wantedCaps))
+	for _, c := range wantedCaps {
+		m[c] = true
+	}
+	return m
+}()
 
 // Connection registration: PASS/NICK/USER, capability negotiation, and
 // SASL PLAIN. Implements:
@@ -39,16 +70,25 @@ const (
 )
 
 type handshake struct {
-	cfg       *Config
-	phase     hsPhase
-	caps      map[string]string // accumulated across multiline CAP LS
-	nick      string            // current nick, updated by 433/436 fallback and 001
-	nickTries int
-	saslDone  bool
+	cfg        *Config
+	phase      hsPhase
+	caps       map[string]string // accumulated across multiline CAP LS
+	enabled    map[string]bool   // caps the server ACKed
+	nick       string            // current nick, updated by 433/436 fallback and 001
+	nickTries  int
+	saslDone   bool
+	nakRetried bool // one sasl-only retry after a NAK of the full set
+	lastReq    []string
 }
 
 func newHandshake(cfg *Config) *handshake {
-	return &handshake{cfg: cfg, phase: hsCapLS, caps: make(map[string]string), nick: cfg.Nick}
+	return &handshake{
+		cfg:     cfg,
+		phase:   hsCapLS,
+		caps:    make(map[string]string),
+		enabled: make(map[string]bool),
+		nick:    cfg.Nick,
+	}
 }
 
 func newMsg(cmd string, params ...string) *ircv4.Message {
@@ -173,34 +213,61 @@ func (h *handshake) handleCAP(m *ircv4.Message) ([]*ircv4.Message, bool, error) 
 		if more {
 			return nil, false, nil
 		}
-		if h.cfg.SASL == nil {
+		if h.cfg.SASL != nil {
+			mechs, offered := h.caps["sasl"]
+			if !offered {
+				return nil, false, errors.New("SASL configured but the server does not offer the sasl capability")
+			}
+			// With CAP 302 the sasl value lists mechanisms; an empty
+			// value means the server didn't say, so try PLAIN anyway.
+			if mechs != "" && !mechListed(mechs, "PLAIN") {
+				return nil, false, fmt.Errorf("SASL PLAIN not offered (server mechanisms: %s)", mechs)
+			}
+		}
+		reqs := h.capsToRequest()
+		if len(reqs) == 0 {
 			h.phase = hsAwaitWelcome
 			return []*ircv4.Message{newMsg("CAP", "END")}, false, nil
 		}
-		mechs, offered := h.caps["sasl"]
-		if !offered {
-			return nil, false, errors.New("SASL configured but the server does not offer the sasl capability")
-		}
-		// With CAP 302 the sasl value lists mechanisms; an empty value
-		// means the server didn't say, so try PLAIN anyway.
-		if mechs != "" && !mechListed(mechs, "PLAIN") {
-			return nil, false, fmt.Errorf("SASL PLAIN not offered (server mechanisms: %s)", mechs)
-		}
 		h.phase = hsCapAck
-		return []*ircv4.Message{newMsg("CAP", "REQ", "sasl")}, false, nil
+		h.lastReq = reqs
+		return []*ircv4.Message{newMsg("CAP", "REQ", strings.Join(reqs, " "))}, false, nil
 
 	case "ACK":
 		if h.phase != hsCapAck {
 			return nil, false, nil
 		}
-		h.phase = hsAuthChallenge
-		return []*ircv4.Message{newMsg("AUTHENTICATE", "PLAIN")}, false, nil
+		for _, tok := range strings.Fields(m.Params[len(m.Params)-1]) {
+			if name, ok := strings.CutPrefix(tok, "-"); ok {
+				delete(h.enabled, name)
+			} else {
+				h.enabled[tok] = true
+			}
+		}
+		if h.cfg.SASL != nil && h.enabled["sasl"] && !h.saslDone {
+			h.phase = hsAuthChallenge
+			return []*ircv4.Message{newMsg("AUTHENTICATE", "PLAIN")}, false, nil
+		}
+		h.phase = hsAwaitWelcome
+		return []*ircv4.Message{newMsg("CAP", "END")}, false, nil
 
 	case "NAK":
-		if h.phase == hsCapAck {
-			return nil, false, errors.New("server refused CAP REQ sasl")
+		if h.phase != hsCapAck {
+			return nil, false, nil
 		}
-		return nil, false, nil
+		// REQ is all-or-nothing (spec: "accepted as a whole, or rejected
+		// entirely"). A NAK of offered caps is abnormal; retry once with
+		// just sasl — that one we cannot proceed without.
+		if h.cfg.SASL != nil {
+			if !h.nakRetried && len(h.lastReq) > 1 {
+				h.nakRetried = true
+				h.lastReq = []string{"sasl"}
+				return []*ircv4.Message{newMsg("CAP", "REQ", "sasl")}, false, nil
+			}
+			return nil, false, errors.New("server refused the capability request including sasl")
+		}
+		h.phase = hsAwaitWelcome
+		return []*ircv4.Message{newMsg("CAP", "END")}, false, nil
 	}
 
 	// NEW/DEL/LIST during registration: nothing to do yet.
@@ -223,6 +290,24 @@ func (h *handshake) handleAuthenticate(m *ircv4.Message) ([]*ircv4.Message, bool
 	}
 	h.phase = hsAuthResult
 	return out, false, nil
+}
+
+// capsToRequest is the sorted intersection of what we want and what the
+// server offers.
+func (h *handshake) capsToRequest() []string {
+	var out []string
+	for name := range h.caps {
+		if wantedCapSet[name] {
+			out = append(out, name)
+		}
+	}
+	if h.cfg.SASL != nil {
+		if _, ok := h.caps["sasl"]; ok {
+			out = append(out, "sasl")
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // parseCapList adds the entries of one CAP LS capability list

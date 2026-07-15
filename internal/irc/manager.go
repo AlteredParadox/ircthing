@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -73,6 +74,7 @@ type Manager struct {
 	out        chan *ircv4.Message
 	registered atomic.Bool
 	nick       atomic.Value // string: current nick once registered
+	caps       atomic.Value // map[string]bool, copy-on-write: enabled capabilities
 	roster     *roster
 	// joined is the set of channels to (re)join after registration:
 	// the configured ones plus runtime JOINs, minus runtime PARTs (a KICK
@@ -114,6 +116,60 @@ func NewManager(cfg Config) (*Manager, error) {
 // ok is false for channels we are not in (or before registration).
 func (m *Manager) Channel(name string) (topic string, members []Member, ok bool) {
 	return m.roster.channel(name)
+}
+
+// CapEnabled reports whether an IRCv3 capability was negotiated on the
+// current connection (kept current through cap-notify NEW/DEL).
+func (m *Manager) CapEnabled(name string) bool {
+	caps, _ := m.caps.Load().(map[string]bool)
+	return caps[name]
+}
+
+func (m *Manager) setCaps(caps map[string]bool) {
+	m.caps.Store(caps)
+}
+
+// handleCapNotify processes CAP NEW/DEL/ACK after registration
+// (cap-notify, implicitly enabled by CAP LS 302). Returns messages to
+// send. sasl appearing in NEW is ignored — mid-session re-auth is out of
+// scope here.
+func (m *Manager) handleCapNotify(in *ircv4.Message) []*ircv4.Message {
+	if len(in.Params) < 3 {
+		return nil
+	}
+	list := in.Params[len(in.Params)-1]
+	switch strings.ToUpper(in.Params[1]) {
+	case "NEW":
+		var req []string
+		for _, tok := range strings.Fields(list) {
+			name, _, _ := strings.Cut(tok, "=")
+			if wantedCapSet[name] && !m.CapEnabled(name) {
+				req = append(req, name)
+			}
+		}
+		if len(req) == 0 {
+			return nil
+		}
+		sort.Strings(req)
+		return []*ircv4.Message{newMsg("CAP", "REQ", strings.Join(req, " "))}
+	case "ACK", "DEL":
+		enable := strings.ToUpper(in.Params[1]) == "ACK"
+		old, _ := m.caps.Load().(map[string]bool)
+		caps := make(map[string]bool, len(old))
+		for k, v := range old {
+			caps[k] = v
+		}
+		for _, tok := range strings.Fields(list) {
+			name, removed := strings.CutPrefix(tok, "-")
+			if enable && !removed {
+				caps[name] = true
+			} else {
+				delete(caps, name)
+			}
+		}
+		m.setCaps(caps)
+	}
+	return nil
 }
 
 // Events delivers server messages and state changes. The channel is
@@ -236,12 +292,18 @@ drain:
 	m.registered.Store(true)
 	defer m.registered.Store(false)
 	m.nick.Store(hs.nick)
+	m.setCaps(hs.enabled)
 	bo.reset()
 	m.emit(ctx, Event{Kind: EventState, State: StateRegistered})
 
 	m.roster.clear() // membership is per-connection state
 	defer m.roster.clear()
+	rejoin := make([]string, 0, len(m.joined))
 	for _, ch := range m.joined {
+		rejoin = append(rejoin, ch)
+	}
+	sort.Strings(rejoin)
+	for _, ch := range rejoin {
 		if err := send([]*ircv4.Message{newMsg("JOIN", ch)}); err != nil {
 			return err
 		}
@@ -276,6 +338,13 @@ drain:
 		if in.Command == "PING" {
 			if err := send([]*ircv4.Message{newMsg("PONG", in.Params...)}); err != nil {
 				return err
+			}
+		}
+		if in.Command == "CAP" { // cap-notify: NEW/DEL after registration
+			if out := m.handleCapNotify(in); len(out) > 0 {
+				if err := send(out); err != nil {
+					return err
+				}
 			}
 		}
 		// Track our own nick changes. ASCII folding stands in for proper

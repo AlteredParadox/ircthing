@@ -317,6 +317,43 @@ func TestSessionGetBuffers(t *testing.T) {
 	}
 }
 
+func TestSessionSendWithEchoMessage(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{
+		ch: make(chan irc.Event, 4), name: "libera", nick: "AlteredParadox",
+		caps: map[string]bool{"echo-message": true},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	s := h.NewSession()
+	defer s.Close()
+
+	// With echo-message the send is acked but NOT persisted or broadcast
+	// locally — the server's echo is the source of truth.
+	s.Handle(ctx, request(t, "send", 8, SendData{Network: "libera", Target: "#go", Text: "hello"}))
+	recv(t, s, "ok")
+	if msgs, _ := h.store.Latest(ctx, "libera", "#go", 10); len(msgs) != 0 {
+		t.Fatalf("self-persisted despite echo-message: %v", msgs)
+	}
+
+	// The echo arrives as a normal event and persists once.
+	conn.ch <- irc.Event{
+		Network: "libera", Kind: irc.EventMessage,
+		Msg: ircv4.MustParseMessage(":AlteredParadox!u@h PRIVMSG #go :hello"), Time: time.Now(),
+	}
+	ev := decode[EventData](t, recv(t, s, "event"))
+	if ev.Sender != "AlteredParadox" || ev.Buffer != "#go" {
+		t.Fatalf("echo event = %+v", ev)
+	}
+	msgs, _ := h.store.Latest(ctx, "libera", "#go", 10)
+	if len(msgs) != 1 {
+		t.Fatalf("persisted %d messages, want 1", len(msgs))
+	}
+}
+
 func TestSessionCommand(t *testing.T) {
 	h := newTestHub(t)
 	conn := &fakeConn{ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox"}
@@ -418,7 +455,7 @@ func TestSessionGetChannel(t *testing.T) {
 		ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox",
 		topic: "welcome",
 		chans: map[string][]irc.Member{
-			"#go": {{Nick: "alice", Prefix: "@"}, {Nick: "AlteredParadox"}, {Nick: "bob", Prefix: "+"}},
+			"#go": {{Nick: "alice", Prefix: "@+"}, {Nick: "AlteredParadox"}, {Nick: "bob", Prefix: "+", Away: true}},
 		},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -434,8 +471,11 @@ func TestSessionGetChannel(t *testing.T) {
 	if !got.Joined || got.Topic != "welcome" || len(got.Members) != 3 {
 		t.Fatalf("channel = %+v", got)
 	}
-	if got.Members[0].Nick != "alice" || got.Members[0].Prefix != "@" {
+	if got.Members[0].Nick != "alice" || got.Members[0].Prefix != "@+" {
 		t.Fatalf("members = %+v", got.Members)
+	}
+	if !got.Members[2].Away {
+		t.Fatalf("away flag lost: %+v", got.Members[2])
 	}
 
 	// Unjoined buffer (a PM) answers joined=false, not an error.

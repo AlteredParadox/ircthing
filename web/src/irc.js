@@ -191,8 +191,9 @@ export function parseInput(input, buffer) {
 	}
 }
 
-// groupMembers buckets a channel roster for the members panel:
-// Ops (~ & @), Voice (% +), Members. Empty groups are dropped.
+// groupMembers buckets a channel roster for the members panel by the
+// highest (first) status prefix: Ops (~ & @), Voice (% +), Members.
+// Empty groups are dropped.
 export function groupMembers(members) {
 	const groups = [
 		{ label: "Ops", members: [] },
@@ -200,8 +201,9 @@ export function groupMembers(members) {
 		{ label: "Members", members: [] },
 	];
 	for (const m of members) {
-		if ("~&@".includes(m.prefix || "\x00")) groups[0].members.push(m);
-		else if ("%+".includes(m.prefix || "\x00")) groups[1].members.push(m);
+		const p = (m.prefix || "")[0];
+		if (p && "~&@".includes(p)) groups[0].members.push(m);
+		else if (p && "%+".includes(p)) groups[1].members.push(m);
 		else groups[2].members.push(m);
 	}
 	return groups.filter((g) => g.members.length > 0);

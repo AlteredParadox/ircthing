@@ -39,23 +39,77 @@ func TestRoster(t *testing.T) {
 				":srv 366 AlteredParadox #go :End of /NAMES list",
 			},
 			check: func(t *testing.T, r *roster) {
-				want := []Member{{"AlteredParadox", ""}, {"op", "@"}, {"plain", ""}, {"voiced", "+"}}
+				want := []Member{{Nick: "AlteredParadox"}, {Nick: "op", Prefix: "@"}, {Nick: "plain"}, {Nick: "voiced", Prefix: "+"}}
 				if got := members(t, r, "#go"); !reflect.DeepEqual(got, want) {
 					t.Fatalf("members = %v, want %v", got, want)
 				}
 			},
 		},
 		{
-			name: "extended prefixes keep the highest",
+			name: "multi-prefix NAMES keeps all prefixes ordered",
 			lines: []string{
 				joinGo,
 				":srv 353 AlteredParadox = #go :~owner &admin %half @+multi",
 				":srv 366 AlteredParadox #go :end",
 			},
 			check: func(t *testing.T, r *roster) {
-				want := []Member{{"admin", "&"}, {"half", "%"}, {"multi", "@"}, {"owner", "~"}}
+				want := []Member{
+					{Nick: "admin", Prefix: "&"}, {Nick: "half", Prefix: "%"},
+					{Nick: "multi", Prefix: "@+"}, {Nick: "owner", Prefix: "~"},
+				}
 				if got := members(t, r, "#go"); !reflect.DeepEqual(got, want) {
 					t.Fatalf("members = %v, want %v", got, want)
+				}
+			},
+		},
+		{
+			name: "userhost-in-names hostmasks are stripped to nicks",
+			lines: []string{
+				joinGo,
+				":srv 353 AlteredParadox = #go :@+alice!a@host.example bob!b@2001:db8::1 AlteredParadox!u@h",
+				":srv 366 AlteredParadox #go :end",
+			},
+			check: func(t *testing.T, r *roster) {
+				want := []Member{
+					{Nick: "alice", Prefix: "@+"}, {Nick: "AlteredParadox"}, {Nick: "bob"},
+				}
+				if got := members(t, r, "#go"); !reflect.DeepEqual(got, want) {
+					t.Fatalf("members = %v, want %v", got, want)
+				}
+			},
+		},
+		{
+			name: "away-notify toggles away state",
+			lines: []string{
+				joinGo, ":alice!u@h JOIN #go",
+				":alice!u@h AWAY :gone fishing",
+			},
+			check: func(t *testing.T, r *roster) {
+				if got := members(t, r, "#go"); !got[0].Away {
+					t.Fatalf("alice not away: %v", got)
+				}
+				feed(t, r, ":alice!u@h AWAY")
+				if got := members(t, r, "#go"); got[0].Away {
+					t.Fatalf("alice still away: %v", got)
+				}
+			},
+		},
+		{
+			name: "mode revocation on stacked prefixes keeps the rest",
+			lines: []string{
+				joinGo,
+				":srv 353 AlteredParadox = #go :@+alice AlteredParadox",
+				":srv 366 AlteredParadox #go :end",
+				":op!u@h MODE #go -o alice",
+			},
+			check: func(t *testing.T, r *roster) {
+				if got := members(t, r, "#go"); got[0].Prefix != "+" {
+					t.Fatalf("alice prefix = %q, want +", got[0].Prefix)
+				}
+				// A re-grant inserts in rank order.
+				feed(t, r, ":op!u@h MODE #go +o alice")
+				if got := members(t, r, "#go"); got[0].Prefix != "@+" {
+					t.Fatalf("alice prefix = %q, want @+", got[0].Prefix)
 				}
 			},
 		},
@@ -63,7 +117,7 @@ func TestRoster(t *testing.T) {
 			name:  "join and part",
 			lines: []string{joinGo, ":alice!u@h JOIN #go", ":alice!u@h PART #go :bye"},
 			check: func(t *testing.T, r *roster) {
-				want := []Member{{"AlteredParadox", ""}}
+				want := []Member{{Nick: "AlteredParadox"}}
 				if got := members(t, r, "#go"); !reflect.DeepEqual(got, want) {
 					t.Fatalf("members = %v, want %v", got, want)
 				}
@@ -116,7 +170,7 @@ func TestRoster(t *testing.T) {
 				":alice!u@h NICK alicia",
 			},
 			check: func(t *testing.T, r *roster) {
-				want := []Member{{"alicia", "@"}, {"AlteredParadox", ""}}
+				want := []Member{{Nick: "alicia", Prefix: "@"}, {Nick: "AlteredParadox"}}
 				if got := members(t, r, "#go"); !reflect.DeepEqual(got, want) {
 					t.Fatalf("members = %v, want %v", got, want)
 				}
@@ -132,7 +186,7 @@ func TestRoster(t *testing.T) {
 				":op!u@h MODE #go -o alice",
 			},
 			check: func(t *testing.T, r *roster) {
-				want := []Member{{"alice", ""}, {"AlteredParadox", ""}, {"bob", "+"}}
+				want := []Member{{Nick: "alice"}, {Nick: "AlteredParadox"}, {Nick: "bob", Prefix: "+"}}
 				if got := members(t, r, "#go"); !reflect.DeepEqual(got, want) {
 					t.Fatalf("members = %v, want %v", got, want)
 				}
@@ -149,7 +203,7 @@ func TestRoster(t *testing.T) {
 				":op!u@h MODE #go +bklimo *!*@spam sekrit 42 alice",
 			},
 			check: func(t *testing.T, r *roster) {
-				want := []Member{{"alice", "@"}, {"AlteredParadox", ""}}
+				want := []Member{{Nick: "alice", Prefix: "@"}, {Nick: "AlteredParadox"}}
 				if got := members(t, r, "#go"); !reflect.DeepEqual(got, want) {
 					t.Fatalf("members = %v, want %v", got, want)
 				}
@@ -193,7 +247,7 @@ func TestRoster(t *testing.T) {
 			name:  "case-insensitive channel and nick handling",
 			lines: []string{joinGo, ":Alice!u@h JOIN #GO", ":ALICE!u@h PART #Go"},
 			check: func(t *testing.T, r *roster) {
-				want := []Member{{"AlteredParadox", ""}}
+				want := []Member{{Nick: "AlteredParadox"}}
 				if got := members(t, r, "#gO"); !reflect.DeepEqual(got, want) {
 					t.Fatalf("members = %v, want %v", got, want)
 				}

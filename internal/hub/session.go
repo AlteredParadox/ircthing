@@ -116,6 +116,11 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "unknown_network", "network is not connected"))
 		return
 	}
+	// With echo-message negotiated the server reflects our PRIVMSGs and
+	// the regular event path persists them (with server-time and msgid);
+	// otherwise persist and broadcast ourselves so every device sees
+	// what this one sent.
+	echo := conn.CapEnabled("echo-message")
 	for _, line := range strings.Split(strings.ReplaceAll(d.Text, "\r\n", "\n"), "\n") {
 		if line == "" {
 			continue
@@ -125,9 +130,9 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 			s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
 			return
 		}
-		// Without echo-message the server never reflects our own PRIVMSG,
-		// so persist and broadcast it ourselves — every device sees what
-		// this one sent.
+		if echo {
+			continue
+		}
 		stored, err := s.hub.store.Append(ctx, d.Network, d.Target, store.Message{
 			Time:    time.Now(),
 			Sender:  conn.Nick(),
@@ -206,7 +211,7 @@ func (s *Session) handleGetChannel(ctx context.Context, env Envelope) {
 			data.Joined = true
 			data.Topic = topic
 			for _, m := range members {
-				data.Members = append(data.Members, MemberData{Nick: m.Nick, Prefix: m.Prefix})
+				data.Members = append(data.Members, MemberData{Nick: m.Nick, Prefix: m.Prefix, Away: m.Away})
 			}
 		}
 	}

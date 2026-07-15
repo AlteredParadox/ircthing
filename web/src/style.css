@@ -662,6 +662,10 @@ input::placeholder {
 .member-glyph.op { color: var(--accent); }
 .member-glyph.voice { color: var(--online); }
 
+.member-row.away .member-nick {
+	opacity: 0.55;
+}
+
 .member-nick {
 	flex: 1;
 	font-size: 13px;
