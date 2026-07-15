@@ -6,7 +6,7 @@ function stateDot(state) {
 	return "offline";
 }
 
-export function Sidebar({ networks, buffers, activeKey, theme, onSelect }) {
+export function Sidebar({ networks, buffers, activeKey, theme, onSelect, onSettings }) {
 	// Group buffers under their network; networks without buffers still
 	// get a section so a fresh install isn't a blank panel.
 	const names = new Set(Object.keys(networks));
@@ -71,6 +71,7 @@ export function Sidebar({ networks, buffers, activeKey, theme, onSelect }) {
 					<div class="foot-nick">{me || "—"}</div>
 					<div class="foot-state">{online ? "online" : "offline"}</div>
 				</div>
+				<button class="foot-gear" title="Settings" onClick={onSettings}>⚙</button>
 			</div>
 		</div>
 	);

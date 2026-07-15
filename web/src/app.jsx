@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
-import { bufKey, isChannelName, mentionsMe, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
+import { bufKey, isChannelName, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
+import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
 import { Login } from "./login.jsx";
 import { Members } from "./members.jsx";
 import { SearchOverlay } from "./search.jsx";
+import { Settings } from "./settings.jsx";
 import { Sidebar } from "./sidebar.jsx";
 import { Socket } from "./ws.js";
 
@@ -36,7 +38,13 @@ export function App() {
 	const [chanTick, setChanTick] = useState(0);
 	const [cmdError, setCmdError] = useState("");
 	const [searchOpen, setSearchOpen] = useState(false);
+	const [settingsOpen, setSettingsOpen] = useState(false);
 	const [focusId, setFocusId] = useState(null);
+	const [rules, setRules] = useState(loadRules);
+	const rulesRef = useRef(rules);
+	rulesRef.current = rules;
+	const notifier = useRef();
+	if (!notifier.current) notifier.current = new Notifier();
 	// typers: bufKey -> { nick: { state, at } }; ephemeral, never stored.
 	const [typers, setTypers] = useState({});
 	const sock = useRef(null);
@@ -163,25 +171,41 @@ export function App() {
 				delete cur[ev.sender];
 				return { ...t, [key]: cur };
 			});
+			const r = renderable(ev);
+			const isMsg = r.kind !== "system";
+			const nick = networksRef.current[ev.network]?.nick;
+			const mine = nick && ev.sender === nick;
+			// Highlight = a mention/keyword in a channel, or any message in
+			// a query (PM) buffer. PMs always alert.
+			const isChan = isChannelName(ev.buffer);
+			const highlight = isMsg && !mine &&
+				(!isChan ? true : highlightText(r.text, nick, rulesRef.current, ev.network));
+
 			setBuffers((b) => {
 				const cur = b[key] || {
 					key, network: ev.network, buffer: ev.buffer,
 					lastTime: 0, marker: 0, unread: 0, mention: false,
 				};
-				const r = renderable(ev);
-				const isMsg = r.kind !== "system";
-				const nick = networksRef.current[ev.network]?.nick;
-				const mine = nick && ev.sender === nick;
 				return {
 					...b,
 					[key]: {
 						...cur,
 						lastTime: ev.time,
 						unread: isMsg && !mine ? cur.unread + 1 : cur.unread,
-						mention: cur.mention || (isMsg && !mine && mentionsMe(r.text, nick)),
+						mention: cur.mention || highlight,
 					},
 				};
 			});
+
+			// Desktop notification when a highlight lands somewhere the user
+			// isn't looking (tab hidden, or a different buffer active).
+			if (highlight && (document.hidden || key !== activeKeyRef.current)) {
+				const where = isChan ? `${ev.sender} in ${ev.buffer}` : ev.sender;
+				notifier.current.show(where, r.text, key, () => {
+					location.hash = toHash(ev.network, ev.buffer);
+					setActiveKey(key);
+				});
+			}
 		});
 
 		s.on("typing", (d) => {
@@ -233,6 +257,23 @@ export function App() {
 	buffersRef.current = buffers;
 	const activeKeyRef = useRef(activeKey);
 	activeKeyRef.current = activeKey;
+
+	// Favicon + tab title reflect total unread, red when any is a
+	// highlight. Runs whenever unread state changes.
+	useEffect(() => {
+		let unread = 0;
+		let mention = false;
+		for (const b of Object.values(buffers)) {
+			unread += b.unread || 0;
+			if (b.mention) mention = true;
+		}
+		applyBadge(unread, mention);
+	}, [buffers, theme]);
+
+	function updateRules(next) {
+		setRules(next);
+		saveRules(next);
+	}
 
 	// Expire stale typing states (6s active / 30s paused per spec).
 	useEffect(() => {
@@ -460,7 +501,7 @@ export function App() {
 			<div class={"sidebar" + (sideOpen ? " open" : "")}>
 				<Sidebar
 					networks={networks} buffers={buffers} activeKey={activeKey}
-					theme={theme} onSelect={select}
+					theme={theme} onSelect={select} onSettings={() => setSettingsOpen(true)}
 				/>
 			</div>
 			{sideOpen && <div class="side-scrim" onClick={() => setSideOpen(false)} />}
@@ -503,6 +544,7 @@ export function App() {
 						error={cmdError}
 						typers={Object.keys(typers[activeKey] || {})}
 						focusId={focusId}
+						isHighlight={(t) => highlightText(t, selfNick, rules, activeBuf.network)}
 						onSend={sendInput} onLoadOlder={loadOlder} onRead={markRead}
 						onTyping={(state) =>
 							sock.current?.notify("typing", {
@@ -520,6 +562,12 @@ export function App() {
 			)}
 			{searchOpen && (
 				<SearchOverlay sock={sock} onJump={jumpTo} onClose={() => setSearchOpen(false)} />
+			)}
+			{settingsOpen && (
+				<Settings
+					networks={networks} rules={rules} onRules={updateRules}
+					notifier={notifier.current} onClose={() => setSettingsOpen(false)}
+				/>
 			)}
 		</div>
 	);

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
-import { firstURL, fmtTime, linkify, mentionsMe, nickColor, renderable, sameGroup, TypingSender, typingText } from "./irc.js";
+import { firstURL, fmtTime, linkify, nickColor, renderable, sameGroup, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
 import { estimateMsgHeight } from "./vmath.js";
@@ -12,7 +12,7 @@ function Body({ text }) {
 	);
 }
 
-function Row({ ev, prev, selfNick, theme, focused }) {
+function Row({ ev, prev, selfNick, theme, focused, isHighlight }) {
 	const r = renderable(ev);
 	if (r.kind === "system") {
 		return (
@@ -24,7 +24,7 @@ function Row({ ev, prev, selfNick, theme, focused }) {
 		);
 	}
 	const self = selfNick && ev.sender === selfNick;
-	const mention = !self && mentionsMe(r.text, selfNick);
+	const mention = !self && isHighlight(r.text);
 	// One preview per message (the first link), only for real messages.
 	const link = r.kind === "msg" || r.kind === "action" ? firstURL(r.text) : "";
 	const grouped = !mention && sameGroup(prev && { ...renderable(prev), sender: prev.sender, time: prev.time }, { ...r, sender: ev.sender, time: ev.time });
@@ -49,7 +49,7 @@ function estimate(ev) {
 }
 
 // Chat renders the active buffer: virtualized scrollback plus composer.
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, onSend, onLoadOlder, onRead, onTyping }) {
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, isHighlight, onSend, onLoadOlder, onRead, onTyping }) {
 	const [draft, setDraft] = useState("");
 	const pinned = useRef(true);
 	const loadingOlder = useRef(false);
@@ -119,7 +119,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 					if (p) markRead();
 				}}
 				renderItem={(ev, i) => (
-					<Row ev={ev} prev={list[i - 1]} selfNick={selfNick} theme={theme} focused={ev.id === focusId} />
+					<Row ev={ev} prev={list[i - 1]} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} />
 				)}
 			/>
 			<div class="composer">

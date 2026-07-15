@@ -929,6 +929,151 @@ input::placeholder {
 	white-space: nowrap;
 }
 
+/* ---- settings modal ---- */
+
+.settings-panel {
+	width: min(520px, calc(100vw - 32px));
+	max-height: 80vh;
+	display: flex;
+	flex-direction: column;
+	background: var(--elev);
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+	overflow: hidden;
+}
+
+.settings-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 14px 16px;
+	border-bottom: 1px solid var(--border);
+}
+
+.settings-title {
+	font-weight: 600;
+	font-size: 15px;
+}
+
+.settings-body {
+	padding: 6px 16px 16px;
+	overflow-y: auto;
+}
+
+.settings-section {
+	padding: 14px 0;
+	border-bottom: 1px solid var(--border-soft);
+}
+
+.settings-section:last-child {
+	border-bottom: none;
+}
+
+.settings-label {
+	font-family: var(--mono-font);
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--text-dim);
+	margin-bottom: 8px;
+}
+
+.settings-note {
+	font-size: 12.5px;
+	color: var(--text-faint);
+	margin-bottom: 10px;
+}
+
+.settings-toggle {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 13.5px;
+	cursor: pointer;
+}
+
+.rule-row {
+	display: flex;
+	gap: 8px;
+	margin-bottom: 8px;
+}
+
+.rule-input {
+	flex: 1;
+	min-width: 0;
+	height: 32px;
+	padding: 0 10px;
+	border: 1px solid var(--border);
+	border-radius: 7px;
+	background: var(--panel-2);
+	color: var(--text);
+	font-size: 13.5px;
+	outline: none;
+}
+
+.rule-input:focus {
+	border-color: var(--accent-line);
+}
+
+.rule-net {
+	height: 32px;
+	border: 1px solid var(--border);
+	border-radius: 7px;
+	background: var(--panel-2);
+	color: var(--text);
+	font-size: 13px;
+	padding: 0 6px;
+}
+
+.rule-remove {
+	width: 32px;
+	height: 32px;
+	flex: 0 0 auto;
+	border: 1px solid var(--border);
+	border-radius: 7px;
+	background: var(--panel-2);
+	color: var(--text-faint);
+	cursor: pointer;
+	font-size: 12px;
+}
+
+.rule-remove:hover {
+	color: var(--away);
+}
+
+.settings-add {
+	margin-top: 4px;
+	border: 1px dashed var(--border);
+	background: transparent;
+	color: var(--text-dim);
+	border-radius: 7px;
+	padding: 7px 12px;
+	font-size: 13px;
+	cursor: pointer;
+}
+
+.settings-add:hover {
+	color: var(--text);
+	border-color: var(--text-faint);
+}
+
+.foot-gear {
+	margin-left: auto;
+	border: none;
+	background: transparent;
+	color: var(--text-faint);
+	font-size: 16px;
+	cursor: pointer;
+	padding: 4px;
+	line-height: 1;
+}
+
+.foot-gear:hover {
+	color: var(--text);
+}
+
 /* Flash a jumped-to message briefly. */
 .msg-row.flash,
 .sys-row.flash {
