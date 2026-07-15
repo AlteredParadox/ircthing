@@ -1,8 +1,25 @@
 import { useEffect, useState } from "preact/hooks";
+import { ACCENT_RGB, ACCENTS } from "./prefs.js";
 
-// Settings modal: desktop-notification permission and per-network
-// highlight rules. Rules are edited live and persisted by the parent.
-export function Settings({ networks, rules, onRules, notifier, onClose }) {
+// Seg: a small segmented control — one button per option.
+function Seg({ value, options, labels, onPick }) {
+	return (
+		<div class="seg">
+			{options.map((o, i) => (
+				<button
+					key={o}
+					class={o === value ? "on" : ""}
+					onClick={() => onPick(o)}
+				>{labels ? labels[i] : o}</button>
+			))}
+		</div>
+	);
+}
+
+// Settings modal: appearance preferences, desktop-notification
+// permission, and per-network highlight rules. Everything is edited live
+// and persisted by the parent.
+export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, onClose }) {
 	const [perm, setPerm] = useState(notifier.permission());
 	const [enabled, setEnabled] = useState(notifier.enabled);
 	const netNames = Object.keys(networks).sort();
@@ -35,6 +52,75 @@ export function Settings({ networks, rules, onRules, notifier, onClose }) {
 					<button class="search-close" onClick={onClose} title="Close (Esc)">✕</button>
 				</div>
 				<div class="settings-body scroll">
+					<section class="settings-section">
+						<div class="settings-label">Appearance</div>
+						<div class="pref-row">
+							<span class="pref-name">Theme</span>
+							<Seg
+								value={prefs.theme}
+								options={["system", "dark", "light"]}
+								labels={["System", "Dark", "Light"]}
+								onPick={(theme) => onPrefs({ ...prefs, theme })}
+							/>
+						</div>
+						<div class="pref-row">
+							<span class="pref-name">Accent</span>
+							<div class="swatches">
+								{ACCENTS.map((a) => (
+									<button
+										key={a}
+										class={"swatch" + (a === prefs.accent ? " on" : "")}
+										style={{ background: `rgb(${ACCENT_RGB[a]})` }}
+										title={a}
+										onClick={() => onPrefs({ ...prefs, accent: a })}
+									/>
+								))}
+							</div>
+						</div>
+						<div class="pref-row">
+							<span class="pref-name">Text size</span>
+							<Seg
+								value={prefs.textSize}
+								options={["sm", "md", "lg", "xl"]}
+								labels={["S", "M", "L", "XL"]}
+								onPick={(textSize) => onPrefs({ ...prefs, textSize })}
+							/>
+						</div>
+						<div class="pref-row">
+							<span class="pref-name">Density</span>
+							<Seg
+								value={prefs.density}
+								options={["compact", "cozy", "comfortable"]}
+								labels={["Compact", "Cozy", "Comfortable"]}
+								onPick={(density) => onPrefs({ ...prefs, density })}
+							/>
+						</div>
+						<div class="pref-row">
+							<span class="pref-name">Message font</span>
+							<Seg
+								value={prefs.msgFont}
+								options={["sans", "mono"]}
+								labels={["Sans", "Mono"]}
+								onPick={(msgFont) => onPrefs({ ...prefs, msgFont })}
+							/>
+						</div>
+					</section>
+
+					<section class="settings-section">
+						<div class="settings-label">Custom CSS</div>
+						<div class="settings-note">
+							Applied live, on top of the theme. Saved in this browser.
+						</div>
+						<textarea
+							class="css-input"
+							rows={4}
+							spellcheck={false}
+							placeholder={":root { --accent-rgb: 219 72 120; }"}
+							value={prefs.css}
+							onInput={(e) => onPrefs({ ...prefs, css: e.currentTarget.value })}
+						/>
+					</section>
+
 					<section class="settings-section">
 						<div class="settings-label">Desktop notifications</div>
 						{perm === "unsupported" ? (

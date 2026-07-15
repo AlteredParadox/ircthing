@@ -3,6 +3,7 @@ import { Chat } from "./chat.jsx";
 import { bufKey, isChannelName, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
 import { Login } from "./login.jsx";
+import { applyPrefs, loadPrefs, resolveTheme, savePrefs } from "./prefs.js";
 import { Members } from "./members.jsx";
 import { SearchOverlay } from "./search.jsx";
 import { Settings } from "./settings.jsx";
@@ -31,7 +32,11 @@ export function App() {
 		const h = parseHash(location.hash);
 		return h ? bufKey(h.network, h.buffer) : null;
 	});
-	const [theme, setTheme] = useState(() => localStorage.getItem("theme") || "dark");
+	const [prefs, setPrefs] = useState(loadPrefs);
+	const [sysDark, setSysDark] = useState(
+		() => window.matchMedia("(prefers-color-scheme: dark)").matches,
+	);
+	const theme = resolveTheme(prefs.theme, sysDark);
 	const [sideOpen, setSideOpen] = useState(() => window.innerWidth >= 760);
 	const [rightOpen, setRightOpen] = useState(() => window.innerWidth >= 1000);
 	const [chanInfo, setChanInfo] = useState(null);
@@ -52,9 +57,17 @@ export function App() {
 	const sock = useRef(null);
 
 	useEffect(() => {
-		document.documentElement.dataset.theme = theme;
-		localStorage.setItem("theme", theme);
-	}, [theme]);
+		applyPrefs(prefs, theme);
+		savePrefs(prefs);
+	}, [prefs, theme]);
+
+	// Track the OS theme so the "system" preference follows it live.
+	useEffect(() => {
+		const mq = window.matchMedia("(prefers-color-scheme: dark)");
+		const onChange = (e) => setSysDark(e.matches);
+		mq.addEventListener("change", onChange);
+		return () => mq.removeEventListener("change", onChange);
+	}, []);
 
 	// Auth probe: a plain GET of the ws endpoint answers 401 when the
 	// session cookie is missing/expired, anything else means authed.
@@ -302,7 +315,7 @@ export function App() {
 			if (b.mention) mention = true;
 		}
 		applyBadge(unread, mention);
-	}, [buffers, theme]);
+	}, [buffers, theme, prefs]);
 
 	function updateRules(next) {
 		setRules(next);
@@ -579,7 +592,7 @@ export function App() {
 					>⌕</button>
 					<button
 						class="icon-btn" title="Toggle theme"
-						onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+						onClick={() => setPrefs({ ...prefs, theme: theme === "dark" ? "light" : "dark" })}
 					>{theme === "dark" ? "☀" : "☾"}</button>
 					{isChan && (
 						<button
@@ -623,6 +636,7 @@ export function App() {
 			{settingsOpen && (
 				<Settings
 					networks={networks} rules={rules} onRules={updateRules}
+					prefs={prefs} onPrefs={setPrefs}
 					notifier={notifier.current} onClose={() => setSettingsOpen(false)}
 				/>
 			)}

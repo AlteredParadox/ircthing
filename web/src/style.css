@@ -2,7 +2,11 @@
    layout, spacing, typography, color tokens). Reimplemented by hand.
    One deliberate departure: the mockup loads IBM Plex from Google Fonts;
    a self-contained binary doesn't fetch external fonts, so we use system
-   stacks of the same flavor. */
+   stacks of the same flavor.
+
+   Appearance preferences (see prefs.js) are data attributes on <html>:
+   data-theme, data-accent, data-textsize, data-density, data-msgfont.
+   Text sizes are rem so data-textsize scales everything from one knob. */
 
 :root,
 :root[data-theme="dark"] {
@@ -15,19 +19,27 @@
 	--text: #e7eaf0;
 	--text-dim: #8b93a6;
 	--text-faint: #565e70;
-	--accent: #2a6fdb;
+	--accent-rgb: 42 111 219;
+	--accent: rgb(var(--accent-rgb));
 	--accent-ink: #ffffff;
-	--accent-soft: rgba(42, 111, 219, 0.16);
-	--accent-line: rgba(42, 111, 219, 0.55);
+	--accent-soft: rgb(var(--accent-rgb) / 0.16);
+	--accent-line: rgb(var(--accent-rgb) / 0.55);
 	--hover: rgba(255, 255, 255, 0.045);
 	--hover-2: rgba(255, 255, 255, 0.07);
-	--mention: rgba(42, 111, 219, 0.13);
+	--mention: rgb(var(--accent-rgb) / 0.13);
 	--online: #3ec489;
 	--away: #e0a63a;
 	--offline: #565e70;
 	--ui-font: system-ui, "Segoe UI", Roboto, sans-serif;
 	--mono-font: ui-monospace, "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+	--msg-font: var(--ui-font);
 	--radius: 8px;
+	/* density knobs: message-row / channel-row / small-row vertical
+	   padding and body line-height */
+	--pad-msg: 3px;
+	--pad-row: 6px;
+	--pad-sub: 4px;
+	--lh: 1.5;
 	color-scheme: dark;
 }
 
@@ -41,15 +53,46 @@
 	--text: #1a1e27;
 	--text-dim: #5b6474;
 	--text-faint: #9aa2b2;
-	--accent-soft: rgba(42, 111, 219, 0.1);
-	--accent-line: rgba(42, 111, 219, 0.5);
+	--accent-soft: rgb(var(--accent-rgb) / 0.1);
+	--accent-line: rgb(var(--accent-rgb) / 0.5);
 	--hover: rgba(15, 20, 30, 0.035);
 	--hover-2: rgba(15, 20, 30, 0.06);
-	--mention: rgba(42, 111, 219, 0.08);
+	--mention: rgb(var(--accent-rgb) / 0.08);
 	--online: #16a06a;
 	--away: #c98a1e;
 	--offline: #a7afbd;
 	color-scheme: light;
+}
+
+/* Accent palette — swatches in settings mirror these (prefs.js). */
+:root[data-accent="violet"] { --accent-rgb: 124 92 230; }
+:root[data-accent="teal"] { --accent-rgb: 16 150 138; }
+:root[data-accent="green"] { --accent-rgb: 47 158 89; }
+:root[data-accent="amber"] { --accent-rgb: 200 121 20; }
+:root[data-accent="rose"] { --accent-rgb: 219 72 120; }
+
+/* Text size: 1rem tracks this, so every font scales together. */
+html { font-size: 14px; }
+:root[data-textsize="sm"] { font-size: 13px; }
+:root[data-textsize="lg"] { font-size: 15.5px; }
+:root[data-textsize="xl"] { font-size: 17px; }
+
+:root[data-density="compact"] {
+	--pad-msg: 1px;
+	--pad-row: 4px;
+	--pad-sub: 2px;
+	--lh: 1.38;
+}
+
+:root[data-density="comfortable"] {
+	--pad-msg: 5px;
+	--pad-row: 9px;
+	--pad-sub: 6px;
+	--lh: 1.62;
+}
+
+:root[data-msgfont="mono"] {
+	--msg-font: var(--mono-font);
 }
 
 * {
@@ -67,8 +110,8 @@ body {
 	font-family: var(--ui-font);
 	background: var(--bg);
 	color: var(--text);
-	font-size: 14px;
-	line-height: 1.5;
+	font-size: 1rem;
+	line-height: var(--lh);
 	-webkit-font-smoothing: antialiased;
 	overflow: hidden;
 }
@@ -171,7 +214,7 @@ input::placeholder {
 	color: var(--accent-ink);
 	font-family: var(--mono-font);
 	font-weight: 700;
-	font-size: 13px;
+	font-size: 0.9286rem;
 	flex: 0 0 auto;
 }
 
@@ -183,7 +226,7 @@ input::placeholder {
 .side-meta {
 	margin-left: auto;
 	font-family: var(--mono-font);
-	font-size: 11px;
+	font-size: 0.7857rem;
 	color: var(--text-faint);
 }
 
@@ -202,7 +245,7 @@ input::placeholder {
 	gap: 7px;
 	padding: 4px 8px 6px;
 	font-family: var(--mono-font);
-	font-size: 11px;
+	font-size: 0.7857rem;
 	font-weight: 600;
 	letter-spacing: 0.06em;
 	text-transform: uppercase;
@@ -224,11 +267,11 @@ input::placeholder {
 	display: flex;
 	align-items: center;
 	gap: 8px;
-	padding: 6px 10px;
+	padding: var(--pad-row) 10px;
 	border-radius: 7px;
 	cursor: pointer;
 	margin: 1px 0;
-	font-size: 13.5px;
+	font-size: 0.9643rem;
 	color: var(--text-dim);
 }
 
@@ -252,7 +295,7 @@ input::placeholder {
 
 .chan-hash {
 	font-family: var(--mono-font);
-	font-size: 14px;
+	font-size: 1rem;
 	color: var(--text-faint);
 	width: 12px;
 	text-align: center;
@@ -279,7 +322,7 @@ input::placeholder {
 	border: 1px solid var(--border);
 	color: var(--text-dim);
 	font-family: var(--mono-font);
-	font-size: 11px;
+	font-size: 0.7857rem;
 	font-weight: 600;
 	display: flex;
 	align-items: center;
@@ -305,7 +348,7 @@ input::placeholder {
 	justify-content: space-between;
 	padding: 4px 10px 4px 8px;
 	font-family: var(--mono-font);
-	font-size: 10px;
+	font-size: 0.7143rem;
 	font-weight: 600;
 	letter-spacing: 0.06em;
 	text-transform: uppercase;
@@ -317,7 +360,7 @@ input::placeholder {
 	background: transparent;
 	color: var(--text-faint);
 	cursor: pointer;
-	font-size: 14px;
+	font-size: 1rem;
 	line-height: 1;
 	padding: 0 2px;
 }
@@ -338,7 +381,7 @@ input::placeholder {
 	border-radius: 6px;
 	background: var(--panel-2);
 	color: var(--text);
-	font-size: 13px;
+	font-size: 0.9286rem;
 	outline: none;
 }
 
@@ -350,10 +393,10 @@ input::placeholder {
 	display: flex;
 	align-items: center;
 	gap: 8px;
-	padding: 4px 10px;
+	padding: var(--pad-sub) 10px;
 	border-radius: 7px;
 	cursor: pointer;
-	font-size: 13px;
+	font-size: 0.9286rem;
 }
 
 .monitor-row:hover {
@@ -377,7 +420,7 @@ input::placeholder {
 	background: transparent;
 	color: var(--text-faint);
 	cursor: pointer;
-	font-size: 11px;
+	font-size: 0.7857rem;
 	opacity: 0;
 	padding: 0 2px;
 }
@@ -414,7 +457,7 @@ input::placeholder {
 	color: #0e1015;
 	font-family: var(--mono-font);
 	font-weight: 700;
-	font-size: 13px;
+	font-size: 0.9286rem;
 }
 
 .foot-dot {
@@ -436,7 +479,7 @@ input::placeholder {
 
 .foot-nick {
 	font-weight: 600;
-	font-size: 13px;
+	font-size: 0.9286rem;
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
@@ -444,7 +487,7 @@ input::placeholder {
 
 .foot-state {
 	font-family: var(--mono-font);
-	font-size: 11px;
+	font-size: 0.7857rem;
 	color: var(--text-dim);
 }
 
@@ -472,7 +515,7 @@ input::placeholder {
 	background: var(--panel-2);
 	border-radius: 8px;
 	cursor: pointer;
-	font-size: 15px;
+	font-size: 1.071rem;
 	line-height: 1;
 	color: var(--text-dim);
 	transition: background 0.12s;
@@ -491,7 +534,7 @@ input::placeholder {
 .topic-name {
 	font-family: var(--mono-font);
 	font-weight: 600;
-	font-size: 16px;
+	font-size: 1.143rem;
 	color: var(--text);
 	white-space: nowrap;
 }
@@ -511,7 +554,7 @@ input::placeholder {
 	flex: 1;
 	min-width: 0;
 	color: var(--text-dim);
-	font-size: 13px;
+	font-size: 0.9286rem;
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
@@ -522,7 +565,7 @@ input::placeholder {
 	padding: 5px 16px;
 	background: var(--away);
 	color: #0e1015;
-	font-size: 12.5px;
+	font-size: 0.8929rem;
 	font-weight: 600;
 }
 
@@ -537,7 +580,7 @@ input::placeholder {
 	text-align: center;
 	color: var(--text-faint);
 	font-family: var(--mono-font);
-	font-size: 11px;
+	font-size: 0.7857rem;
 	padding: 6px 0 10px;
 }
 
@@ -545,9 +588,9 @@ input::placeholder {
 	display: flex;
 	align-items: center;
 	gap: 9px;
-	padding: 3px 16px;
+	padding: var(--pad-msg) 16px;
 	color: var(--text-faint);
-	font-size: 12.5px;
+	font-size: 0.8929rem;
 }
 
 .sys-mark {
@@ -567,7 +610,7 @@ input::placeholder {
 .msg-row {
 	display: flex;
 	gap: 10px;
-	padding: 3px 12px 3px 4px;
+	padding: var(--pad-msg) 12px var(--pad-msg) 4px;
 	position: relative;
 }
 
@@ -578,9 +621,9 @@ input::placeholder {
 
 .msg-time {
 	font-family: var(--mono-font);
-	font-size: 11px;
+	font-size: 0.7857rem;
 	color: var(--text-faint);
-	width: 42px;
+	width: 3rem;
 	flex: 0 0 auto;
 	text-align: right;
 	padding-top: 2px;
@@ -588,9 +631,9 @@ input::placeholder {
 
 .msg-nick {
 	font-family: var(--mono-font);
-	font-size: 13px;
+	font-size: 0.9286rem;
 	font-weight: 600;
-	width: 96px;
+	width: 6.9rem;
 	flex: 0 0 auto;
 	text-align: right;
 	white-space: nowrap;
@@ -604,6 +647,13 @@ input::placeholder {
 	min-width: 0;
 	word-wrap: break-word;
 	overflow-wrap: anywhere;
+	font-family: var(--msg-font);
+}
+
+/* Mono runs a touch large at equal size; pull it in slightly. */
+:root[data-msgfont="mono"] .msg-body,
+:root[data-msgfont="mono"] .compose-input {
+	font-size: 0.9286rem;
 }
 
 .msg-body.action {
@@ -625,7 +675,7 @@ input::placeholder {
 	border-radius: 5px;
 	color: var(--text-faint);
 	cursor: pointer;
-	font-size: 11px;
+	font-size: 0.7857rem;
 	line-height: 1;
 	opacity: 0;
 	transition: opacity 0.12s;
@@ -678,13 +728,13 @@ input::placeholder {
 
 .preview-card-site {
 	font-family: var(--mono-font);
-	font-size: 11px;
+	font-size: 0.7857rem;
 	color: var(--text-faint);
 }
 
 .preview-card-title {
 	font-weight: 600;
-	font-size: 13px;
+	font-size: 0.9286rem;
 	color: var(--text);
 	overflow: hidden;
 	text-overflow: ellipsis;
@@ -692,7 +742,7 @@ input::placeholder {
 }
 
 .preview-card-desc {
-	font-size: 12.5px;
+	font-size: 0.8929rem;
 	color: var(--text-dim);
 	display: -webkit-box;
 	-webkit-line-clamp: 2;
@@ -763,7 +813,7 @@ input::placeholder {
 }
 
 .typing-label {
-	font-size: 11.5px;
+	font-size: 0.8214rem;
 	color: var(--text-dim);
 	white-space: nowrap;
 }
@@ -780,7 +830,7 @@ input::placeholder {
 
 .prompt {
 	font-family: var(--mono-font);
-	font-size: 14px;
+	font-size: 1rem;
 	color: var(--text-faint);
 	padding: 6px 0;
 	align-self: flex-start;
@@ -794,8 +844,8 @@ input::placeholder {
 	outline: none;
 	background: transparent;
 	color: var(--text);
-	font-family: var(--ui-font);
-	font-size: 14px;
+	font-family: var(--msg-font);
+	font-size: 1rem;
 	line-height: 1.4;
 	padding: 6px 0;
 	resize: none;
@@ -812,7 +862,7 @@ input::placeholder {
 	color: var(--accent-ink);
 	font-family: var(--ui-font);
 	font-weight: 600;
-	font-size: 13px;
+	font-size: 0.9286rem;
 	cursor: pointer;
 	align-self: flex-start;
 }
@@ -829,7 +879,7 @@ input::placeholder {
 	justify-content: center;
 	color: var(--text-faint);
 	font-family: var(--mono-font);
-	font-size: 13px;
+	font-size: 0.9286rem;
 }
 
 /* ---- members panel ---- */
@@ -865,12 +915,12 @@ input::placeholder {
 }
 
 .right-head .side-meta {
-	font-size: 12px;
+	font-size: 0.8571rem;
 }
 
 .panel-label {
 	font-family: var(--mono-font);
-	font-size: 11px;
+	font-size: 0.7857rem;
 	font-weight: 600;
 	letter-spacing: 0.06em;
 	text-transform: uppercase;
@@ -880,7 +930,7 @@ input::placeholder {
 .member-group-head {
 	padding: 2px 8px 6px;
 	font-family: var(--mono-font);
-	font-size: 10.5px;
+	font-size: 0.75rem;
 	font-weight: 600;
 	letter-spacing: 0.06em;
 	text-transform: uppercase;
@@ -891,7 +941,7 @@ input::placeholder {
 	display: flex;
 	align-items: center;
 	gap: 9px;
-	padding: 5px 8px;
+	padding: var(--pad-sub) 8px;
 	border-radius: 7px;
 }
 
@@ -906,7 +956,7 @@ input::placeholder {
 
 .member-glyph {
 	font-family: var(--mono-font);
-	font-size: 12px;
+	font-size: 0.8571rem;
 	width: 12px;
 	flex: 0 0 auto;
 }
@@ -920,7 +970,7 @@ input::placeholder {
 
 .member-nick {
 	flex: 1;
-	font-size: 13px;
+	font-size: 0.9286rem;
 	font-weight: 500;
 	white-space: nowrap;
 	overflow: hidden;
@@ -930,7 +980,7 @@ input::placeholder {
 .cmd-error {
 	padding: 4px 12px 8px;
 	color: var(--away);
-	font-size: 12.5px;
+	font-size: 0.8929rem;
 	font-family: var(--mono-font);
 }
 
@@ -968,7 +1018,7 @@ input::placeholder {
 }
 
 .search-icon {
-	font-size: 18px;
+	font-size: 1.286rem;
 	color: var(--text-dim);
 }
 
@@ -979,14 +1029,14 @@ input::placeholder {
 	background: transparent;
 	color: var(--text);
 	font-family: var(--ui-font);
-	font-size: 15px;
+	font-size: 1.071rem;
 }
 
 .search-close {
 	border: none;
 	background: transparent;
 	color: var(--text-faint);
-	font-size: 14px;
+	font-size: 1rem;
 	cursor: pointer;
 	padding: 4px 6px;
 }
@@ -1006,7 +1056,7 @@ input::placeholder {
 	text-align: center;
 	color: var(--text-faint);
 	font-family: var(--mono-font);
-	font-size: 12px;
+	font-size: 0.8571rem;
 }
 
 .search-result {
@@ -1028,13 +1078,13 @@ input::placeholder {
 
 .search-result-buf {
 	font-family: var(--mono-font);
-	font-size: 11px;
+	font-size: 0.7857rem;
 	color: var(--accent);
 }
 
 .search-result-time {
 	font-family: var(--mono-font);
-	font-size: 11px;
+	font-size: 0.7857rem;
 	color: var(--text-faint);
 }
 
@@ -1046,14 +1096,14 @@ input::placeholder {
 
 .search-result-nick {
 	font-family: var(--mono-font);
-	font-size: 12.5px;
+	font-size: 0.8929rem;
 	font-weight: 600;
 	color: var(--text-dim);
 	flex: 0 0 auto;
 }
 
 .search-result-text {
-	font-size: 13px;
+	font-size: 0.9286rem;
 	color: var(--text);
 	overflow: hidden;
 	text-overflow: ellipsis;
@@ -1084,7 +1134,7 @@ input::placeholder {
 
 .settings-title {
 	font-weight: 600;
-	font-size: 15px;
+	font-size: 1.071rem;
 }
 
 .settings-body {
@@ -1103,7 +1153,7 @@ input::placeholder {
 
 .settings-label {
 	font-family: var(--mono-font);
-	font-size: 11px;
+	font-size: 0.7857rem;
 	font-weight: 600;
 	letter-spacing: 0.06em;
 	text-transform: uppercase;
@@ -1112,7 +1162,7 @@ input::placeholder {
 }
 
 .settings-note {
-	font-size: 12.5px;
+	font-size: 0.8929rem;
 	color: var(--text-faint);
 	margin-bottom: 10px;
 }
@@ -1121,8 +1171,95 @@ input::placeholder {
 	display: flex;
 	align-items: center;
 	gap: 8px;
-	font-size: 13.5px;
+	font-size: 0.9643rem;
 	cursor: pointer;
+}
+
+/* ---- appearance preferences ---- */
+
+.pref-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+	margin-bottom: 10px;
+	flex-wrap: wrap;
+}
+
+.pref-name {
+	font-size: 0.9643rem;
+	color: var(--text);
+}
+
+.seg {
+	display: inline-flex;
+	border: 1px solid var(--border);
+	border-radius: 7px;
+	background: var(--panel-2);
+	overflow: hidden;
+}
+
+.seg button {
+	border: none;
+	background: transparent;
+	color: var(--text-dim);
+	font-family: var(--ui-font);
+	font-size: 0.8929rem;
+	padding: 5px 11px;
+	cursor: pointer;
+}
+
+.seg button + button {
+	border-left: 1px solid var(--border);
+}
+
+.seg button:hover {
+	color: var(--text);
+	background: var(--hover);
+}
+
+.seg button.on {
+	background: var(--accent-soft);
+	color: var(--accent);
+	font-weight: 600;
+}
+
+.swatches {
+	display: inline-flex;
+	gap: 8px;
+	align-items: center;
+}
+
+.swatch {
+	width: 20px;
+	height: 20px;
+	border-radius: 50%;
+	border: none;
+	cursor: pointer;
+	padding: 0;
+}
+
+.swatch.on {
+	box-shadow: 0 0 0 2px var(--elev), 0 0 0 4px var(--accent);
+}
+
+.css-input {
+	width: 100%;
+	min-height: 84px;
+	padding: 8px 10px;
+	border: 1px solid var(--border);
+	border-radius: 7px;
+	background: var(--panel-2);
+	color: var(--text);
+	font-family: var(--mono-font);
+	font-size: 0.8571rem;
+	line-height: 1.5;
+	outline: none;
+	resize: vertical;
+}
+
+.css-input:focus {
+	border-color: var(--accent-line);
 }
 
 .rule-row {
@@ -1140,7 +1277,7 @@ input::placeholder {
 	border-radius: 7px;
 	background: var(--panel-2);
 	color: var(--text);
-	font-size: 13.5px;
+	font-size: 0.9643rem;
 	outline: none;
 }
 
@@ -1154,7 +1291,7 @@ input::placeholder {
 	border-radius: 7px;
 	background: var(--panel-2);
 	color: var(--text);
-	font-size: 13px;
+	font-size: 0.9286rem;
 	padding: 0 6px;
 }
 
@@ -1167,7 +1304,7 @@ input::placeholder {
 	background: var(--panel-2);
 	color: var(--text-faint);
 	cursor: pointer;
-	font-size: 12px;
+	font-size: 0.8571rem;
 }
 
 .rule-remove:hover {
@@ -1181,7 +1318,7 @@ input::placeholder {
 	color: var(--text-dim);
 	border-radius: 7px;
 	padding: 7px 12px;
-	font-size: 13px;
+	font-size: 0.9286rem;
 	cursor: pointer;
 }
 
@@ -1195,7 +1332,7 @@ input::placeholder {
 	border: none;
 	background: transparent;
 	color: var(--text-faint);
-	font-size: 16px;
+	font-size: 1.143rem;
 	cursor: pointer;
 	padding: 4px;
 	line-height: 1;
@@ -1245,12 +1382,12 @@ input::placeholder {
 
 .login-title {
 	font-weight: 600;
-	font-size: 15px;
+	font-size: 1.071rem;
 }
 
 .login-label {
 	font-family: var(--mono-font);
-	font-size: 11px;
+	font-size: 0.7857rem;
 	font-weight: 600;
 	letter-spacing: 0.06em;
 	text-transform: uppercase;
@@ -1266,7 +1403,7 @@ input::placeholder {
 	background: var(--panel-2);
 	color: var(--text);
 	font-family: var(--ui-font);
-	font-size: 14px;
+	font-size: 1rem;
 	outline: none;
 }
 
@@ -1276,7 +1413,7 @@ input::placeholder {
 
 .login-error {
 	color: var(--away);
-	font-size: 12.5px;
+	font-size: 0.8929rem;
 }
 
 .login-btn {
@@ -1322,10 +1459,10 @@ input::placeholder {
 	}
 
 	.msg-nick {
-		width: 64px;
+		width: 4.6rem;
 	}
 
 	.msg-time {
-		width: 34px;
+		width: 2.5rem;
 	}
 }
