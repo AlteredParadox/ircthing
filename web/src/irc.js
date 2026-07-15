@@ -281,6 +281,34 @@ export function typingExpired(state, at, now) {
 	return now - at > (state === "paused" ? 30000 : 6000);
 }
 
+// firstURL returns the first http(s) link in text, or "".
+export function firstURL(text) {
+	for (const seg of linkify(text)) {
+		if (seg.link) return seg.text;
+	}
+	return "";
+}
+
+// looksLikeImageURL is a cheap client-side guess by extension, used to
+// skip the preview round-trip and render a thumbnail straight away; the
+// server is authoritative either way.
+export function looksLikeImageURL(u) {
+	try {
+		const path = new URL(u).pathname.toLowerCase();
+		return /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/.test(path);
+	} catch {
+		return false;
+	}
+}
+
+export function hostOf(u) {
+	try {
+		return new URL(u).host;
+	} catch {
+		return u;
+	}
+}
+
 export function bufKey(network, buffer) {
 	return network + "\n" + buffer;
 }

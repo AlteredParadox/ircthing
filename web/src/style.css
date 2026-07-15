@@ -512,6 +512,79 @@ input::placeholder {
 	color: var(--text-dim);
 }
 
+/* ---- link previews & thumbnails ---- */
+
+.preview-card {
+	display: flex;
+	margin-top: 6px;
+	max-width: 460px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	overflow: hidden;
+	background: var(--panel);
+	text-decoration: none;
+	color: inherit;
+}
+
+.preview-card:hover {
+	background: var(--panel-2);
+	text-decoration: none;
+}
+
+.preview-card-img {
+	width: 88px;
+	height: 88px;
+	object-fit: cover;
+	flex: 0 0 auto;
+	border-right: 1px solid var(--border);
+	background: var(--elev);
+}
+
+.preview-card-body {
+	padding: 8px 10px;
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.preview-card-site {
+	font-family: var(--mono-font);
+	font-size: 11px;
+	color: var(--text-faint);
+}
+
+.preview-card-title {
+	font-weight: 600;
+	font-size: 13px;
+	color: var(--text);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.preview-card-desc {
+	font-size: 12.5px;
+	color: var(--text-dim);
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+}
+
+.preview-thumb {
+	display: inline-block;
+	margin-top: 6px;
+}
+
+.preview-thumb img {
+	max-width: 320px;
+	max-height: 240px;
+	border-radius: var(--radius);
+	border: 1px solid var(--border);
+	display: block;
+}
+
 /* ---- composer ---- */
 
 .composer {

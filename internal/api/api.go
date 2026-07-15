@@ -39,6 +39,14 @@ type Server struct {
 	hub *hub.Hub
 	mux *http.ServeMux
 
+	// Media proxy: separate fetchers (different size caps), result
+	// caches, and a semaphore bounding concurrent image decodes.
+	htmlFetcher  *fetcher
+	imageFetcher *fetcher
+	previewCache *ttlCache[PreviewData]
+	thumbCache   *ttlCache[thumbResult]
+	thumbSem     chan struct{}
+
 	mu     sync.Mutex
 	tokens map[string]time.Time // session token -> expiry
 }
@@ -54,18 +62,37 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		cfg.SessionTTL = 30 * 24 * time.Hour
 	}
 	s := &Server{
-		cfg:    cfg,
-		hub:    h,
-		mux:    http.NewServeMux(),
-		tokens: make(map[string]time.Time),
+		cfg:          cfg,
+		hub:          h,
+		mux:          http.NewServeMux(),
+		htmlFetcher:  newFetcher(maxHTMLBytes),
+		imageFetcher: newFetcher(maxImageBytes),
+		previewCache: newTTLCache[PreviewData](30*time.Minute, 512),
+		thumbCache:   newTTLCache[thumbResult](24*time.Hour, maxThumbCache),
+		thumbSem:     make(chan struct{}, 4),
+		tokens:       make(map[string]time.Time),
 	}
 	s.mux.HandleFunc("POST /api/login", s.handleLogin)
 	s.mux.HandleFunc("POST /api/logout", s.handleLogout)
 	s.mux.HandleFunc("GET /api/ws", s.handleWS)
+	s.mux.HandleFunc("GET /api/preview", s.requireAuth(s.handlePreview))
+	s.mux.HandleFunc("GET /api/thumb", s.requireAuth(s.handleThumb))
 	if assets != nil {
 		s.mux.Handle("/", http.FileServerFS(assets))
 	}
 	return s, nil
+}
+
+// requireAuth wraps a handler so only authenticated sessions reach it —
+// the media proxy must not become an open relay for the whole internet.
+func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.authed(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h(w, r)
+	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

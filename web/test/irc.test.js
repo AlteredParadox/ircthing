@@ -1,8 +1,8 @@
 import { deepStrictEqual as eq, strictEqual as is } from "node:assert";
 import { test } from "node:test";
 import {
-	bufKey, fmtTime, linkify, mentionsMe, nickColor,
-	parseHash, parseLine, renderable, sameGroup, toHash,
+	bufKey, firstURL, fmtTime, hostOf, linkify, looksLikeImageURL,
+	mentionsMe, nickColor, parseHash, parseLine, renderable, sameGroup, toHash,
 } from "../src/irc.js";
 
 test("parseLine", () => {
@@ -141,4 +141,25 @@ test("fmtTime pads", () => {
 test("bufKey separates network and buffer", () => {
 	is(bufKey("libera", "#go"), "libera\n#go");
 	is(bufKey("ab", "#c") !== bufKey("a", "b#c"), true);
+});
+
+test("firstURL", () => {
+	is(firstURL("no links here"), "");
+	is(firstURL("see https://example.com/x thanks"), "https://example.com/x");
+	is(firstURL("two https://a.com and https://b.com"), "https://a.com");
+	is(firstURL("http://plain.example works"), "http://plain.example");
+});
+
+test("looksLikeImageURL", () => {
+	is(looksLikeImageURL("https://x.com/cat.png"), true);
+	is(looksLikeImageURL("https://x.com/a/b.JPG?q=1"), true);
+	is(looksLikeImageURL("https://x.com/page.html"), false);
+	is(looksLikeImageURL("https://x.com/noext"), false);
+	is(looksLikeImageURL("not a url"), false);
+});
+
+test("hostOf", () => {
+	is(hostOf("https://example.com/path?x=1"), "example.com");
+	is(hostOf("http://sub.example.com:8080/y"), "sub.example.com:8080");
+	is(hostOf("garbage"), "garbage");
 });

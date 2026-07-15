@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
-import { fmtTime, linkify, mentionsMe, nickColor, renderable, sameGroup, TypingSender, typingText } from "./irc.js";
+import { firstURL, fmtTime, linkify, mentionsMe, nickColor, renderable, sameGroup, TypingSender, typingText } from "./irc.js";
+import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
 import { estimateMsgHeight } from "./vmath.js";
 
@@ -24,6 +25,8 @@ function Row({ ev, prev, selfNick, theme }) {
 	}
 	const self = selfNick && ev.sender === selfNick;
 	const mention = !self && mentionsMe(r.text, selfNick);
+	// One preview per message (the first link), only for real messages.
+	const link = r.kind === "msg" || r.kind === "action" ? firstURL(r.text) : "";
 	const grouped = !mention && sameGroup(prev && { ...renderable(prev), sender: prev.sender, time: prev.time }, { ...r, sender: ev.sender, time: ev.time });
 	const color = self ? "var(--accent)" : nickColor(ev.sender, theme);
 	return (
@@ -35,6 +38,7 @@ function Row({ ev, prev, selfNick, theme }) {
 			<div class={"msg-body" + (r.kind === "action" ? " action" : "") + (r.kind === "notice" ? " notice" : "")}>
 				{r.kind === "action" && <span style={{ color, fontWeight: 600 }}>{ev.sender} </span>}
 				<Body text={r.text} />
+				{link && <LinkPreview url={link} />}
 			</div>
 		</div>
 	);

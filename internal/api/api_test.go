@@ -42,6 +42,35 @@ func newTestServer(t *testing.T) (*httptest.Server, *hub.Hub) {
 	return ts, h
 }
 
+// newTestServerWithRef is like newTestServer but also returns the *Server
+// so proxy tests can relax its IP policy for httptest origins.
+func newTestServerWithRef(t *testing.T) (*httptest.Server, *Server) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"), store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	hash, err := bcrypt.GenerateFromPassword([]byte("hunter2"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{Username: "AlteredParadox", PasswordHash: string(hash)}, hub.New(st), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+	return ts, srv
+}
+
+func decodeJSON(t *testing.T, resp *http.Response, v any) {
+	t.Helper()
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+}
+
 func login(t *testing.T, ts *httptest.Server, username, password string) *http.Response {
 	t.Helper()
 	body := strings.NewReader(`{"username":"` + username + `","password":"` + password + `"}`)
