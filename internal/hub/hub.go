@@ -140,6 +140,10 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					h.applyUpstreamMarker(ctx, ev)
 					continue // marker state, never persisted
 				}
+				if ev.Msg.Command == "REDACT" {
+					h.applyRedaction(ctx, ev, c, replay)
+					continue // redaction updates an existing row, not a new one
+				}
 				target, ok := persistTarget(ev.Msg, c.Nick(), c.IsChannel)
 				if !ok {
 					continue
@@ -323,16 +327,55 @@ func newPrivmsg(target, text string) *ircv4.Message {
 	return &ircv4.Message{Command: "PRIVMSG", Params: []string{target, text}}
 }
 
+// applyRedaction handles an incoming REDACT (draft/message-redaction):
+// ":nick REDACT <target> <msgid> [:reason]". It marks the referenced
+// message deleted in the store and, unless this is history replay,
+// announces it so loaded clients tombstone the message live.
+func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay bool) {
+	target := ev.Msg.Param(0)
+	msgid := ev.Msg.Param(1)
+	if target == "" || msgid == "" {
+		return
+	}
+	reason := ""
+	if len(ev.Msg.Params) > 2 {
+		reason = ev.Msg.Trailing()
+	}
+	// A redaction in a query is addressed to our nick; file it under the
+	// other party's buffer, mirroring persistTarget.
+	buffer := target
+	if !c.IsChannel(target) && ev.Msg.Prefix != nil && strings.EqualFold(target, c.Nick()) {
+		buffer = ev.Msg.Prefix.Name
+	}
+	ok, err := h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason)
+	if err != nil {
+		log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)
+		return
+	}
+	if !ok || replay {
+		return
+	}
+	by := ""
+	if ev.Msg.Prefix != nil {
+		by = ev.Msg.Prefix.Name
+	}
+	h.broadcast(envelope("redact", 0, RedactData{
+		Network: ev.Network, Buffer: buffer, MsgID: msgid, By: by, Reason: reason,
+	}))
+}
+
 func eventData(m store.Message) EventData {
 	return EventData{
-		Network: m.Network,
-		Buffer:  m.Target,
-		ID:      m.ID,
-		Time:    m.Time.UnixMilli(),
-		MsgID:   m.MsgID,
-		Sender:  m.Sender,
-		Command: m.Command,
-		Raw:     m.Raw,
+		Network:      m.Network,
+		Buffer:       m.Target,
+		ID:           m.ID,
+		Time:         m.Time.UnixMilli(),
+		MsgID:        m.MsgID,
+		Sender:       m.Sender,
+		Command:      m.Command,
+		Raw:          m.Raw,
+		Redacted:     m.Redacted,
+		RedactReason: m.RedactReason,
 	}
 }
 

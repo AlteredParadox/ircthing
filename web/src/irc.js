@@ -41,6 +41,10 @@ export function parseLine(raw) {
 //   { kind: "msg" | "action" | "notice", text }
 //   { kind: "system", mark, markClass, text }
 export function renderable(ev) {
+	if (ev.redacted) {
+		const why = ev.redact_reason ? ` (${ev.redact_reason})` : "";
+		return { kind: "redacted", mark: "⌫", markClass: "mode", text: `message deleted${why}` };
+	}
 	const line = parseLine(ev.raw);
 	const last = line.params.length ? line.params[line.params.length - 1] : "";
 	switch (ev.command) {

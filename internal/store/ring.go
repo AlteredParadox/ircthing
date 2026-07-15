@@ -80,6 +80,18 @@ func (r *ring) pageAfter(c Cursor, limit int) ([]Message, bool) {
 	return out, ok
 }
 
+// redact marks a cached message (by msgid) as deleted so ring-served
+// history pages reflect the redaction without a database round-trip.
+func (r *ring) redact(msgid, reason string) {
+	for i := range r.msgs {
+		if r.msgs[i].MsgID == msgid {
+			r.msgs[i].Redacted = true
+			r.msgs[i].RedactReason = reason
+			return
+		}
+	}
+}
+
 // clone copies a page out of the ring so callers never alias its backing
 // array (which insert mutates).
 func clone(msgs []Message) []Message {

@@ -85,6 +85,8 @@ func (s *Session) Handle(ctx context.Context, env Envelope) {
 		s.handleSend(ctx, env)
 	case "command":
 		s.handleCommand(ctx, env)
+	case "redact":
+		s.handleRedact(ctx, env)
 	case "get_channel":
 		s.handleGetChannel(ctx, env)
 	case "get_buffers":
@@ -177,6 +179,40 @@ func (s *Session) handleTyping(ctx context.Context, env Envelope) {
 	if env.Seq != 0 {
 		s.push(envelope("ok", env.Seq, nil))
 	}
+}
+
+// handleRedact issues a REDACT for one of our messages
+// (draft/message-redaction). The server decides authorization; on success
+// it echoes the REDACT back, which applyRedaction then stores and
+// broadcasts. A no-op on networks without the cap.
+func (s *Session) handleRedact(ctx context.Context, env Envelope) {
+	var d RedactReq
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", "malformed redact data"))
+		return
+	}
+	if d.Network == "" || d.Buffer == "" || d.MsgID == "" {
+		s.push(errEnvelope(env.Seq, "bad_request", "redact needs network, buffer and msgid"))
+		return
+	}
+	conn := s.hub.network(d.Network)
+	if conn == nil {
+		s.push(errEnvelope(env.Seq, "unknown_network", "network is not connected"))
+		return
+	}
+	if !conn.CapEnabled("draft/message-redaction") {
+		s.push(errEnvelope(env.Seq, "unsupported", "server does not support message redaction"))
+		return
+	}
+	params := []string{d.Buffer, d.MsgID}
+	if d.Reason != "" {
+		params = append(params, d.Reason)
+	}
+	if err := conn.Send(&ircv4.Message{Command: "REDACT", Params: params}); err != nil {
+		s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
+		return
+	}
+	s.push(envelope("ok", env.Seq, nil))
 }
 
 // commandSpec is the allowlist of client-issued IRC commands with their

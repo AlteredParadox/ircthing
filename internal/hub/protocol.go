@@ -32,14 +32,35 @@ type Envelope struct {
 // the elements of a history page. Times are unix milliseconds everywhere
 // in the protocol.
 type EventData struct {
+	Network      string `json:"network"`
+	Buffer       string `json:"buffer"`
+	ID           int64  `json:"id"`
+	Time         int64  `json:"time"`
+	MsgID        string `json:"msgid,omitempty"`
+	Sender       string `json:"sender"`
+	Command      string `json:"command"`
+	Raw          string `json:"raw"`
+	Redacted     bool   `json:"redacted,omitempty"`
+	RedactReason string `json:"redact_reason,omitempty"`
+}
+
+// RedactReq asks to delete one of our messages ("redact",
+// draft/message-redaction). The server decides whether it is allowed.
+type RedactReq struct {
 	Network string `json:"network"`
 	Buffer  string `json:"buffer"`
-	ID      int64  `json:"id"`
-	Time    int64  `json:"time"`
-	MsgID   string `json:"msgid,omitempty"`
-	Sender  string `json:"sender"`
-	Command string `json:"command"`
-	Raw     string `json:"raw"`
+	MsgID   string `json:"msgid"`
+	Reason  string `json:"reason,omitempty"`
+}
+
+// RedactData announces a message was redacted ("redact"): the client
+// tombstones the message with that msgid in the buffer.
+type RedactData struct {
+	Network string `json:"network"`
+	Buffer  string `json:"buffer"`
+	MsgID   string `json:"msgid"`
+	By      string `json:"by,omitempty"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // StateData reports a network connection state change ("state").

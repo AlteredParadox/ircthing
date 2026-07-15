@@ -75,6 +75,17 @@ test("renderable", () => {
 	}
 });
 
+test("renderable: redacted messages become tombstones", () => {
+	const ev = { sender: "alice", command: "PRIVMSG", raw: ":alice!u@h PRIVMSG #go :secret", time: 0, redacted: true };
+	const r = renderable(ev);
+	is(r.kind, "redacted");
+	is(r.text, "message deleted");
+	is(r.mark, "⌫");
+	is(renderable({ ...ev, redact_reason: "spam" }).text, "message deleted (spam)");
+	// A non-redacted message renders normally.
+	is(renderable({ ...ev, redacted: false }).kind, "msg");
+});
+
 test("nickColor is deterministic and theme-aware", () => {
 	is(nickColor("alice", "dark"), nickColor("alice", "dark"));
 	is(nickColor("alice", "dark").startsWith("oklch(0.74 0.13 "), true);

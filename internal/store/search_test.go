@@ -182,6 +182,55 @@ func TestFTSQuery(t *testing.T) {
 	}
 }
 
+func TestSetRedacted(t *testing.T) {
+	s, _ := openTest(t, 4) // small ring so both ring and disk paths are hit
+	var msgs []Message
+	for i := 1; i <= 8; i++ {
+		m, err := s.Append(ctx, "libera", "#go", Message{
+			Time: time.UnixMilli(int64(i) * 1000), MsgID: fmt.Sprintf("m%d", i),
+			Sender: "alice", Command: "PRIVMSG", Raw: fmt.Sprintf(":alice!u@h PRIVMSG #go :secret %d", i),
+			Text: fmt.Sprintf("secret %d", i),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		msgs = append(msgs, m)
+	}
+
+	// Redact a recent (ring-cached) message and an old (disk-only) one.
+	if ok, err := s.SetRedacted(ctx, "libera", "#go", "m8", "spam"); err != nil || !ok {
+		t.Fatalf("redact recent: %v %v", ok, err)
+	}
+	if ok, err := s.SetRedacted(ctx, "libera", "#go", "m1", ""); err != nil || !ok {
+		t.Fatalf("redact old: %v %v", ok, err)
+	}
+
+	// Re-redacting or an unknown msgid reports ok=false.
+	if ok, _ := s.SetRedacted(ctx, "libera", "#go", "m8", ""); ok {
+		t.Fatal("double redact reported success")
+	}
+	if ok, _ := s.SetRedacted(ctx, "libera", "#go", "nope", ""); ok {
+		t.Fatal("unknown msgid reported success")
+	}
+
+	// Ring-served page reflects the redaction (m8 is in the ring).
+	recent, _ := s.Latest(ctx, "libera", "#go", 3)
+	last := recent[len(recent)-1]
+	if last.MsgID != "m8" || !last.Redacted || last.RedactReason != "spam" {
+		t.Fatalf("ring redaction not applied: %+v", last)
+	}
+	// Disk-served page reflects the old redaction.
+	page, _ := s.Before(ctx, "libera", "#go", msgs[3].Cursor(), 5) // m1,m2,m3
+	if !page[0].Redacted || page[0].MsgID != "m1" {
+		t.Fatalf("disk redaction not applied: %+v", page[0])
+	}
+
+	// Redacted messages drop out of search.
+	if got := searchTexts(t, s, SearchOptions{Query: "secret"}); len(got) != 6 {
+		t.Fatalf("search returned %d, want 6 (2 redacted excluded)", len(got))
+	}
+}
+
 func TestAround(t *testing.T) {
 	s, _ := openTest(t, 4)
 	var msgs []Message

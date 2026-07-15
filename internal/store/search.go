@@ -35,12 +35,13 @@ func (s *Store) Search(ctx context.Context, opts SearchOptions) ([]Message, erro
 		sb   strings.Builder
 		args []any
 	)
-	sb.WriteString(`SELECT m.id, m.ts, m.msgid, m.sender, m.command, m.raw, n.name, b.name
+	sb.WriteString(`SELECT m.id, m.ts, m.msgid, m.sender, m.command, m.raw,
+			m.redacted, COALESCE(m.redact_reason,''), n.name, b.name
 		FROM messages m
 		JOIN messages_fts f ON f.rowid = m.id
 		JOIN buffers b ON b.id = m.buffer_id
 		JOIN networks n ON n.id = b.network_id
-		WHERE f.text MATCH ? AND n.user_id = ?`)
+		WHERE f.text MATCH ? AND m.redacted = 0 AND n.user_id = ?`)
 	args = append(args, match, defaultUserID)
 
 	if opts.Network != "" {
@@ -76,7 +77,7 @@ func (s *Store) Around(ctx context.Context, network, target string, c Cursor, li
 	half := limit / 2
 	// Older half plus the pivot itself (<= c), newest first.
 	older, err := s.queryPage(ctx, network, target,
-		`SELECT id, ts, msgid, sender, command, raw FROM messages
+		`SELECT id, ts, msgid, sender, command, raw, redacted, COALESCE(redact_reason,'') FROM messages
 		 WHERE buffer_id = ? AND (ts < ? OR (ts = ? AND id <= ?))
 		 ORDER BY ts DESC, id DESC LIMIT ?`,
 		bufID, c.TS, c.TS, c.ID, half+1)
@@ -86,7 +87,7 @@ func (s *Store) Around(ctx context.Context, network, target string, c Cursor, li
 	reverse(older)
 	// Strictly newer half, ascending.
 	newer, err := s.queryPage(ctx, network, target,
-		`SELECT id, ts, msgid, sender, command, raw FROM messages
+		`SELECT id, ts, msgid, sender, command, raw, redacted, COALESCE(redact_reason,'') FROM messages
 		 WHERE buffer_id = ? AND (ts > ? OR (ts = ? AND id > ?))
 		 ORDER BY ts ASC, id ASC LIMIT ?`,
 		bufID, c.TS, c.TS, c.ID, limit-len(older))
@@ -107,15 +108,20 @@ func (s *Store) scanJoinedRows(ctx context.Context, query string, args ...any) (
 	var out []Message
 	for rows.Next() {
 		var (
-			m     Message
-			ts    int64
-			msgid sql.NullString
+			m        Message
+			ts       int64
+			msgid    sql.NullString
+			redacted int
+			reason   string
 		)
-		if err := rows.Scan(&m.ID, &ts, &msgid, &m.Sender, &m.Command, &m.Raw, &m.Network, &m.Target); err != nil {
+		if err := rows.Scan(&m.ID, &ts, &msgid, &m.Sender, &m.Command, &m.Raw,
+			&redacted, &reason, &m.Network, &m.Target); err != nil {
 			return nil, err
 		}
 		m.Time = time.UnixMilli(ts)
 		m.MsgID = msgid.String
+		m.Redacted = redacted != 0
+		m.RedactReason = reason
 		out = append(out, m)
 	}
 	return out, rows.Err()

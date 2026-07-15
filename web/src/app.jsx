@@ -208,6 +208,21 @@ export function App() {
 			}
 		});
 
+		s.on("redact", (d) => {
+			const key = bufKey(d.network, d.buffer);
+			setMsgs((m) => {
+				const cur = m[key];
+				if (!cur?.list) return m;
+				let hit = false;
+				const list = cur.list.map((ev) => {
+					if (ev.msgid !== d.msgid || ev.redacted) return ev;
+					hit = true;
+					return { ...ev, redacted: true, redact_reason: d.reason };
+				});
+				return hit ? { ...m, [key]: { ...cur, list } } : m;
+			});
+		});
+
 		s.on("typing", (d) => {
 			const key = bufKey(d.network, d.buffer);
 			setTypers((t) => {
@@ -545,6 +560,10 @@ export function App() {
 						typers={Object.keys(typers[activeKey] || {})}
 						focusId={focusId}
 						isHighlight={(t) => highlightText(t, selfNick, rules, activeBuf.network)}
+						onRedact={(msgid) =>
+							sock.current?.request("redact", {
+								network: activeBuf.network, buffer: activeBuf.buffer, msgid,
+							}).catch((e) => setCmdError(e.message || "delete failed"))}
 						onSend={sendInput} onLoadOlder={loadOlder} onRead={markRead}
 						onTyping={(state) =>
 							sock.current?.notify("typing", {

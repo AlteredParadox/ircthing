@@ -428,6 +428,90 @@ func TestSessionSendWithEchoMessage(t *testing.T) {
 	}
 }
 
+func TestRedactionInbound(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+
+	// A message arrives and is stored...
+	conn.ch <- ev("@msgid=bad1 :alice!u@h PRIVMSG #go :something regrettable")
+	got := decode[EventData](t, recv(t, s, "event"))
+	if got.MsgID != "bad1" {
+		t.Fatalf("event = %+v", got)
+	}
+
+	// ...then an op redacts it: a redact push fires and the store row is
+	// tombstoned.
+	conn.ch <- ev(":op!o@h REDACT #go bad1 :off-topic")
+	rd := decode[RedactData](t, recv(t, s, "redact"))
+	if rd.Buffer != "#go" || rd.MsgID != "bad1" || rd.By != "op" || rd.Reason != "off-topic" {
+		t.Fatalf("redact push = %+v", rd)
+	}
+	msgs, _ := h.store.Latest(ctx, "libera", "#go", 10)
+	if len(msgs) != 1 || !msgs[0].Redacted || msgs[0].RedactReason != "off-topic" {
+		t.Fatalf("store not tombstoned: %+v", msgs)
+	}
+
+	// Redacting an unknown msgid announces nothing.
+	conn.ch <- ev(":op!o@h REDACT #go ghost :x")
+	// Follow with a normal message; if a stray redact were queued we'd see
+	// it first.
+	conn.ch <- ev("@msgid=ok1 :alice!u@h PRIVMSG #go :fine message")
+	if got := recv(t, s, "event"); got.Type != "event" {
+		t.Fatalf("unknown-msgid redact leaked: %+v", got)
+	}
+}
+
+func TestRedactionOutbound(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{
+		ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox",
+		caps: map[string]bool{"draft/message-redaction": true},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	s := h.NewSession()
+	defer s.Close()
+
+	s.Handle(ctx, request(t, "redact", 3, RedactReq{Network: "libera", Buffer: "#go", MsgID: "m1", Reason: "my mistake"}))
+	recv(t, s, "ok")
+	deadline := time.Now().Add(5 * time.Second)
+	for len(conn.sentMsgs()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("REDACT never sent")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := conn.sentMsgs()[0].String(); got != "REDACT #go m1 :my mistake" {
+		t.Fatalf("wire = %q", got)
+	}
+
+	// Without the cap, a redact request is refused, not sent.
+	conn.mu.Lock()
+	conn.caps = nil
+	conn.mu.Unlock()
+	before := len(conn.sentMsgs())
+	s.Handle(ctx, request(t, "redact", 4, RedactReq{Network: "libera", Buffer: "#go", MsgID: "m2"}))
+	if got := decode[ErrorData](t, recv(t, s, "error")); got.Code != "unsupported" {
+		t.Fatalf("error code = %q", got.Code)
+	}
+	if len(conn.sentMsgs()) != before {
+		t.Fatal("REDACT sent despite missing cap")
+	}
+}
+
 func TestSessionCommand(t *testing.T) {
 	h := newTestHub(t)
 	conn := &fakeConn{ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox"}

@@ -12,11 +12,11 @@ function Body({ text }) {
 	);
 }
 
-function Row({ ev, prev, selfNick, theme, focused, isHighlight }) {
+function Row({ ev, prev, selfNick, theme, focused, isHighlight, onRedact }) {
 	const r = renderable(ev);
-	if (r.kind === "system") {
+	if (r.kind === "system" || r.kind === "redacted") {
 		return (
-			<div class={"sys-row" + (focused ? " flash" : "")}>
+			<div class={"sys-row" + (r.kind === "redacted" ? " redacted" : "") + (focused ? " flash" : "")}>
 				<span class="msg-time">{fmtTime(ev.time)}</span>
 				<span class={"sys-mark " + r.markClass}>{r.mark}</span>
 				<span>{r.text}</span>
@@ -29,6 +29,8 @@ function Row({ ev, prev, selfNick, theme, focused, isHighlight }) {
 	const link = r.kind === "msg" || r.kind === "action" ? firstURL(r.text) : "";
 	const grouped = !mention && sameGroup(prev && { ...renderable(prev), sender: prev.sender, time: prev.time }, { ...r, sender: ev.sender, time: ev.time });
 	const color = self ? "var(--accent)" : nickColor(ev.sender, theme);
+	// Own messages can be deleted (server decides authorization).
+	const canRedact = self && ev.msgid && onRedact;
 	return (
 		<div class={"msg-row" + (mention ? " mention" : "") + (focused ? " flash" : "")}>
 			<span class="msg-time">{grouped ? "" : fmtTime(ev.time)}</span>
@@ -40,6 +42,9 @@ function Row({ ev, prev, selfNick, theme, focused, isHighlight }) {
 				<Body text={r.text} />
 				{link && <LinkPreview url={link} />}
 			</div>
+			{canRedact && (
+				<button class="msg-redact" title="Delete message" onClick={() => onRedact(ev.msgid)}>⌫</button>
+			)}
 		</div>
 	);
 }
@@ -49,7 +54,7 @@ function estimate(ev) {
 }
 
 // Chat renders the active buffer: virtualized scrollback plus composer.
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, isHighlight, onSend, onLoadOlder, onRead, onTyping }) {
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, isHighlight, onSend, onLoadOlder, onRead, onTyping, onRedact }) {
 	const [draft, setDraft] = useState("");
 	const pinned = useRef(true);
 	const loadingOlder = useRef(false);
@@ -119,7 +124,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 					if (p) markRead();
 				}}
 				renderItem={(ev, i) => (
-					<Row ev={ev} prev={list[i - 1]} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} />
+					<Row ev={ev} prev={list[i - 1]} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} />
 				)}
 			/>
 			<div class="composer">

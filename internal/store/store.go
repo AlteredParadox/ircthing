@@ -40,6 +40,10 @@ type Message struct {
 	// ACTION unwrapped), set by the hub. Empty for lines that are not
 	// indexed for search (system events, non-ACTION CTCP).
 	Text string
+	// Redacted marks a message deleted via draft/message-redaction; the
+	// row is kept as a tombstone. RedactReason is optional.
+	Redacted     bool
+	RedactReason string
 }
 
 // Cursor is a position in a buffer's history: unix-millisecond timestamp
@@ -181,6 +185,41 @@ func (s *Store) Append(ctx context.Context, network, target string, m Message) (
 	return m, nil
 }
 
+// SetRedacted marks the message with the given msgid in a buffer as
+// deleted (draft/message-redaction). It returns ok=false if no such
+// (un-redacted) message exists, so the caller only announces real
+// redactions. The hot ring is updated in step with the database.
+func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason string) (bool, error) {
+	if msgid == "" {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bufID, err := s.bufferID(ctx, network, target, false)
+	if err != nil || bufID == 0 {
+		return false, err
+	}
+	var reasonArg any
+	if reason != "" {
+		reasonArg = reason
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE messages SET redacted = 1, redact_reason = ?
+		 WHERE buffer_id = ? AND msgid = ? AND redacted = 0`,
+		reasonArg, bufID, msgid)
+	if err != nil {
+		return false, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n == 0 {
+		return false, err
+	}
+	if r, ok := s.rings[bufID]; ok {
+		r.redact(msgid, reason)
+	}
+	return true, nil
+}
+
 // Latest returns the newest messages of a buffer, ascending.
 func (s *Store) Latest(ctx context.Context, network, target string, limit int) ([]Message, error) {
 	return s.Before(ctx, network, target, maxCursor, limit)
@@ -203,7 +242,7 @@ func (s *Store) Before(ctx context.Context, network, target string, c Cursor, li
 	}
 	s.stats.dbPages++
 	msgs, err := s.queryPage(ctx, network, target,
-		`SELECT id, ts, msgid, sender, command, raw FROM messages
+		`SELECT id, ts, msgid, sender, command, raw, redacted, COALESCE(redact_reason,'') FROM messages
 		 WHERE buffer_id = ? AND (ts < ? OR (ts = ? AND id < ?))
 		 ORDER BY ts DESC, id DESC LIMIT ?`,
 		bufID, c.TS, c.TS, c.ID, limit)
@@ -231,7 +270,7 @@ func (s *Store) After(ctx context.Context, network, target string, c Cursor, lim
 	}
 	s.stats.dbPages++
 	return s.queryPage(ctx, network, target,
-		`SELECT id, ts, msgid, sender, command, raw FROM messages
+		`SELECT id, ts, msgid, sender, command, raw, redacted, COALESCE(redact_reason,'') FROM messages
 		 WHERE buffer_id = ? AND (ts > ? OR (ts = ? AND id > ?))
 		 ORDER BY ts ASC, id ASC LIMIT ?`,
 		bufID, c.TS, c.TS, c.ID, limit)
@@ -409,7 +448,7 @@ func (s *Store) bufferAndRing(ctx context.Context, network, target string, creat
 	// Warm with the newest ringSize+1 rows: getting fewer proves the ring
 	// now holds the buffer's entire history.
 	msgs, err := s.queryPage(ctx, network, target,
-		`SELECT id, ts, msgid, sender, command, raw FROM messages
+		`SELECT id, ts, msgid, sender, command, raw, redacted, COALESCE(redact_reason,'') FROM messages
 		 WHERE buffer_id = ? ORDER BY ts DESC, id DESC LIMIT ?`,
 		bufID, s.ringSize+1)
 	if err != nil {
@@ -438,15 +477,19 @@ func (s *Store) queryPage(ctx context.Context, network, target, query string, ar
 	var out []Message
 	for rows.Next() {
 		var (
-			m     Message
-			ts    int64
-			msgid sql.NullString
+			m        Message
+			ts       int64
+			msgid    sql.NullString
+			redacted int
+			reason   string
 		)
-		if err := rows.Scan(&m.ID, &ts, &msgid, &m.Sender, &m.Command, &m.Raw); err != nil {
+		if err := rows.Scan(&m.ID, &ts, &msgid, &m.Sender, &m.Command, &m.Raw, &redacted, &reason); err != nil {
 			return nil, err
 		}
 		m.Time = time.UnixMilli(ts)
 		m.MsgID = msgid.String
+		m.Redacted = redacted != 0
+		m.RedactReason = reason
 		m.Network, m.Target = network, target
 		out = append(out, m)
 	}
