@@ -1,0 +1,10 @@
+{
+  "name": "ircthing-web",
+  "private": true,
+  "dependencies": {
+    "preact": "^10.26.9"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.5"
+  }
+}

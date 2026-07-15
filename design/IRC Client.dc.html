@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  :root, [data-theme="dark"] {
+    --bg: #0e1015; --panel: #14171f; --panel-2: #191d27; --elev: #1e232f;
+    --border: #242a37; --border-soft: #1c212c;
+    --text: #e7eaf0; --text-dim: #8b93a6; --text-faint: #565e70;
+    --accent: #2A6FDB; --accent-ink: #ffffff;
+    --accent-soft: rgba(42,111,219,0.16); --accent-line: rgba(42,111,219,0.55);
+    --hover: rgba(255,255,255,0.045); --hover-2: rgba(255,255,255,0.07);
+    --mention: rgba(42,111,219,0.13);
+    --online: #3ec489; --away: #e0a63a; --offline: #565e70;
+    --ui-font: 'IBM Plex Sans', system-ui, sans-serif;
+    --mono-font: 'IBM Plex Mono', ui-monospace, monospace;
+    --radius: 8px;
+  }
+  [data-theme="light"] {
+    --bg: #f3f5f8; --panel: #ffffff; --panel-2: #f7f9fb; --elev: #ffffff;
+    --border: #e4e8ee; --border-soft: #edf0f4;
+    --text: #1a1e27; --text-dim: #5b6474; --text-faint: #9aa2b2;
+    --accent: #2A6FDB; --accent-ink: #ffffff;
+    --accent-soft: rgba(42,111,219,0.1); --accent-line: rgba(42,111,219,0.5);
+    --hover: rgba(15,20,30,0.035); --hover-2: rgba(15,20,30,0.06);
+    --mention: rgba(42,111,219,0.08);
+    --online: #16a06a; --away: #c98a1e; --offline: #a7afbd;
+  }
+  [data-terminal="true"] { --ui-font: var(--mono-font); --radius: 3px; }
+  .irc-scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+  .irc-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 20px; border: 3px solid transparent; background-clip: padding-box; }
+  .irc-scroll::-webkit-scrollbar-thumb:hover { background: var(--text-faint); background-clip: padding-box; }
+  .irc-msg .irc-react-add { opacity: 0; }
+  .irc-msg:hover .irc-react-add { opacity: 1; }
+  @keyframes ircTypeBlink { 0%, 60%, 100% { transform: translateY(0); opacity: .35; } 30% { transform: translateY(-3px); opacity: 1; } }
+  input::placeholder { color: var(--text-faint); }
+</style>
+</helmet>
+<div ref="{{ setRoot }}" data-theme="{{ theme }}" data-terminal="{{ terminalAttr }}" style="display:flex;flex-direction:column;height:100vh;width:100%;font-family:var(--ui-font);background:var(--bg);color:var(--text);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;overflow:hidden">
+
+  <div style="display:flex;flex:1;min-height:0">
+
+    <!-- LEFT PANEL: networks + channels -->
+    <div style="width:{{ leftWidth }};flex:0 0 auto;overflow:hidden;transition:width .22s cubic-bezier(.4,0,.2,1);background:var(--panel);border-right:1px solid var(--border)">
+      <div style="width:256px;height:100%;display:flex;flex-direction:column">
+        <div style="height:53px;flex:0 0 auto;display:flex;align-items:center;gap:9px;padding:0 14px;border-bottom:1px solid var(--border)">
+          <div style="width:22px;height:22px;border-radius:6px;background:var(--accent);display:flex;align-items:center;justify-content:center;color:var(--accent-ink);font-family:var(--mono-font);font-weight:700;font-size:13px">λ</div>
+          <div style="font-weight:600;letter-spacing:-.01em">relay</div>
+          <div style="margin-left:auto;font-family:var(--mono-font);font-size:11px;color:var(--text-faint)">2 nets</div>
+        </div>
+        <div class="irc-scroll" style="flex:1;overflow-y:auto;padding:10px 8px">
+          <sc-for list="{{ networks }}" as="net" hint-placeholder-count="2">
+            <div style="margin-bottom:14px">
+              <div style="display:flex;align-items:center;gap:7px;padding:4px 8px 6px;font-family:var(--mono-font);font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim)">
+                <span style="width:6px;height:6px;border-radius:50%;background:{{ net.dotColor }}"></span>
+                <span>{{ net.name }}</span>
+              </div>
+              <sc-for list="{{ net.channels }}" as="ch" hint-placeholder-count="4">
+                <div onClick="{{ ch.onSelect }}" style="{{ ch.rowStyle }}">
+                  <span style="font-family:var(--mono-font);font-size:14px;color:{{ ch.hashColor }};width:12px;text-align:center">#</span>
+                  <span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:{{ ch.weight }}">{{ ch.name }}</span>
+                  <sc-if value="{{ ch.hasMention }}" hint-placeholder-val="{{ false }}">
+                    <span style="min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--accent);color:var(--accent-ink);font-family:var(--mono-font);font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center">{{ ch.badge }}</span>
+                  </sc-if>
+                  <sc-if value="{{ ch.hasUnreadOnly }}" hint-placeholder-val="{{ false }}">
+                    <span style="min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--elev);border:1px solid var(--border);color:var(--text-dim);font-family:var(--mono-font);font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center">{{ ch.badge }}</span>
+                  </sc-if>
+                </div>
+              </sc-for>
+            </div>
+          </sc-for>
+        </div>
+        <div style="flex:0 0 auto;border-top:1px solid var(--border);padding:10px 12px;display:flex;align-items:center;gap:10px">
+          <div style="position:relative">
+            <div style="width:30px;height:30px;border-radius:8px;background:{{ meColor }};display:flex;align-items:center;justify-content:center;color:#0e1015;font-family:var(--mono-font);font-weight:700;font-size:13px">{{ meInitial }}</div>
+            <span style="position:absolute;right:-2px;bottom:-2px;width:11px;height:11px;border-radius:50%;background:var(--online);border:2px solid var(--panel)"></span>
+          </div>
+          <div style="min-width:0">
+            <div style="font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ me }}</div>
+            <div style="font-family:var(--mono-font);font-size:11px;color:var(--text-dim)">online</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CENTER: topic / messages / input -->
+    <div style="flex:1;min-width:0;display:flex;flex-direction:column;background:var(--bg)">
+
+      <!-- Topic header -->
+      <div style="height:53px;flex:0 0 auto;display:flex;align-items:center;gap:12px;padding:0 14px;border-bottom:1px solid var(--border);background:var(--panel)">
+        <button onClick="{{ toggleLeft }}" title="Toggle channels" style="{{ leftBtnStyle }}">◧</button>
+        <div style="display:flex;align-items:baseline;gap:8px;min-width:0">
+          <span style="font-family:var(--mono-font);font-weight:600;font-size:16px;color:var(--text);white-space:nowrap"><span style="color:var(--text-faint)">#</span>{{ activeName }}</span>
+        </div>
+        <div style="width:1px;height:20px;background:var(--border);flex:0 0 auto"></div>
+        <div style="flex:1;min-width:0;color:var(--text-dim);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ activeTopic }}</div>
+        <button onClick="{{ toggleTheme }}" title="Toggle theme" style="{{ iconBtnStyle }}">{{ themeGlyph }}</button>
+        <button onClick="{{ toggleRight }}" title="Toggle members" style="{{ rightBtnStyle }}">◨</button>
+      </div>
+
+      <!-- Messages -->
+      <div ref="{{ setMsgEl }}" class="irc-scroll" style="flex:1;overflow-y:auto;padding:14px 4px 18px">
+        <sc-for list="{{ messages }}" as="m" hint-placeholder-count="10">
+          <sc-if value="{{ m.isSystem }}" hint-placeholder-val="{{ false }}">
+            <div style="display:flex;align-items:center;gap:9px;padding:3px 16px;color:var(--text-faint);font-size:12.5px">
+              <span style="font-family:var(--mono-font);font-size:11px;color:var(--text-faint);width:42px;flex:0 0 auto;text-align:right">{{ m.time }}</span>
+              <span style="color:{{ m.markColor }};font-family:var(--mono-font);flex:0 0 auto">{{ m.mark }}</span>
+              <span style="font-style:normal">{{ m.text }}</span>
+            </div>
+          </sc-if>
+          <sc-if value="{{ m.isMsg }}" hint-placeholder-val="{{ true }}">
+            <div class="irc-msg" style="{{ m.rowStyle }}">
+              <span style="font-family:var(--mono-font);font-size:11px;color:var(--text-faint);width:42px;flex:0 0 auto;text-align:right;padding-top:2px">{{ m.time }}</span>
+              <span style="font-family:var(--mono-font);font-size:13px;font-weight:600;color:{{ m.nickColor }};width:96px;flex:0 0 auto;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-top:1px">{{ m.nick }}</span>
+              <div style="flex:1;min-width:0">
+                <div style="word-wrap:break-word;overflow-wrap:anywhere">{{ m.body }}</div>
+                <sc-if value="{{ m.hasReactions }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:5px">
+                    <sc-for list="{{ m.reactions }}" as="r" hint-placeholder-count="2">
+                      <button onClick="{{ r.onToggle }}" style="{{ r.style }}"><span style="font-size:13px">{{ r.emoji }}</span><span style="font-family:var(--mono-font);font-size:11px;font-weight:600">{{ r.count }}</span></button>
+                    </sc-for>
+                  </div>
+                </sc-if>
+              </div>
+              <button class="irc-react-add" onClick="{{ m.onAddReaction }}" title="Add reaction" style="align-self:flex-start;flex:0 0 auto;width:24px;height:22px;border:1px solid var(--border);background:var(--panel);border-radius:6px;color:var(--text-dim);cursor:pointer;font-size:12px;line-height:1;transition:opacity .12s">☺</button>
+            </div>
+          </sc-if>
+        </sc-for>
+      </div>
+
+      <!-- Input -->
+      <div style="flex:0 0 auto;padding:0 16px 16px;position:relative">
+        <!-- typing indicator: upper-right of input box -->
+        <div style="position:absolute;top:-9px;right:26px;z-index:3;display:flex;align-items:center;gap:7px;height:22px;padding:0 10px;border-radius:11px;background:var(--elev);border:1px solid var(--border);box-shadow:0 4px 14px rgba(0,0,0,.18);transition:opacity .18s,transform .18s;opacity:{{ typingOpacity }};transform:translateY({{ typingShift }})">
+          <span style="display:inline-flex;gap:3px;align-items:flex-end;height:8px">
+            <span style="width:4px;height:4px;border-radius:50%;background:var(--text-dim);animation:ircTypeBlink 1.1s infinite;animation-delay:0s"></span>
+            <span style="width:4px;height:4px;border-radius:50%;background:var(--text-dim);animation:ircTypeBlink 1.1s infinite;animation-delay:.18s"></span>
+            <span style="width:4px;height:4px;border-radius:50%;background:var(--text-dim);animation:ircTypeBlink 1.1s infinite;animation-delay:.36s"></span>
+          </span>
+          <span style="font-size:11.5px;color:var(--text-dim);white-space:nowrap">{{ typingText }}</span>
+        </div>
+
+        <div style="display:flex;align-items:flex-end;gap:8px;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:7px 8px 7px 12px">
+          <span style="font-family:var(--mono-font);font-size:14px;color:var(--text-faint);padding:6px 0;align-self:flex-start">{{ mePrompt }}</span>
+          <input value="{{ draft }}" onInput="{{ onDraft }}" onKeyDown="{{ onKey }}" placeholder="Message #{{ activeName }}" style="flex:1;min-width:0;border:none;outline:none;background:transparent;color:var(--text);font-family:var(--ui-font);font-size:14px;padding:6px 0" />
+          <div style="position:relative;align-self:flex-start">
+            <button onClick="{{ toggleEmoji }}" title="Emoji" style="width:34px;height:34px;border:none;background:transparent;border-radius:7px;cursor:pointer;font-size:17px;line-height:1;color:var(--text-dim)" style-hover="background:var(--hover)">☺</button>
+            <sc-if value="{{ emojiOpen }}" hint-placeholder-val="{{ false }}">
+              <div style="position:absolute;bottom:44px;right:0;z-index:5;width:216px;padding:8px;background:var(--elev);border:1px solid var(--border);border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.3);display:grid;grid-template-columns:repeat(6,1fr);gap:2px">
+                <sc-for list="{{ emojis }}" as="e" hint-placeholder-count="12">
+                  <button onClick="{{ e.onPick }}" style="height:30px;border:none;background:transparent;border-radius:6px;cursor:pointer;font-size:18px;line-height:1" style-hover="background:var(--hover-2)">{{ e.ch }}</button>
+                </sc-for>
+              </div>
+            </sc-if>
+          </div>
+          <button onClick="{{ send }}" title="Send" style="{{ sendStyle }}">Send</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT PANEL: members -->
+    <div style="width:{{ rightWidth }};flex:0 0 auto;overflow:hidden;transition:width .22s cubic-bezier(.4,0,.2,1);background:var(--panel);border-left:1px solid var(--border)">
+      <div style="width:220px;height:100%;display:flex;flex-direction:column">
+        <div style="height:53px;flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:0 15px;border-bottom:1px solid var(--border)">
+          <div style="font-family:var(--mono-font);font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim)">Members</div>
+          <div style="margin-left:auto;font-family:var(--mono-font);font-size:12px;color:var(--text-faint)">{{ memberCount }}</div>
+        </div>
+        <div class="irc-scroll" style="flex:1;overflow-y:auto;padding:10px 8px">
+          <sc-for list="{{ memberGroups }}" as="g" hint-placeholder-count="3">
+            <div style="margin-bottom:14px">
+              <div style="padding:2px 8px 6px;font-family:var(--mono-font);font-size:10.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-faint)">{{ g.label }} — {{ g.count }}</div>
+              <sc-for list="{{ g.members }}" as="u" hint-placeholder-count="4">
+                <div style="display:flex;align-items:center;gap:9px;padding:5px 8px;border-radius:7px;cursor:default" style-hover="background:var(--hover)">
+                  <span style="position:relative;flex:0 0 auto">
+                    <span style="width:8px;height:8px;border-radius:50%;background:{{ u.statusColor }};display:block"></span>
+                  </span>
+                  <span style="font-family:var(--mono-font);font-size:12px;color:{{ u.roleColor }};width:12px;flex:0 0 auto">{{ u.roleGlyph }}</span>
+                  <span style="flex:1;font-size:13px;font-weight:500;color:{{ u.nickColor }};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:{{ u.opacity }}">{{ u.nick }}</span>
+                </div>
+              </sc-for>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:&quot;100%&quot;,&quot;height&quot;:&quot;100%&quot;},&quot;accent&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:&quot;#2A6FDB&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;},&quot;terminal&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Theme&quot;}}">
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this._me = 'ada';
+    this._emojiSet = ['😄','😅','🔥','👍','🎉','❤️','🚀','👀','😎','🙌','🤔','✨'];
+    const seed = this.buildSeed();
+    this.state = {
+      theme: 'dark',
+      leftOpen: true,
+      rightOpen: true,
+      emojiOpen: false,
+      draft: '',
+      activeKey: 'libera/#general',
+      networks: seed.networks,
+      msgs: seed.msgs,
+      members: seed.members,
+      typing: [],
+    };
+    this._pendingScroll = true;
+  }
+
+  // ---- color helpers ----
+  nickColor(nick) {
+    let h = 0; for (const c of nick) h = (h * 31 + c.charCodeAt(0)) % 360;
+    const L = this.state && this.state.theme === 'light' ? 0.5 : 0.74;
+    const C = this.state && this.state.theme === 'light' ? 0.15 : 0.13;
+    return `oklch(${L} ${C} ${h})`;
+  }
+
+  buildSeed() {
+    const networks = [
+      { name: 'Libera.Chat', dotColor: 'var(--online)', channels: [
+        { key: 'libera/#general', name: 'general', unread: 0, mentions: 0, topic: 'Welcome to #general — be excellent to each other · docs at relay.im/guide' },
+        { key: 'libera/#dev', name: 'dev', unread: 3, mentions: 0, topic: 'build tools & PRs · CI is green' },
+        { key: 'libera/#design', name: 'design', unread: 12, mentions: 2, topic: 'pixels, type, and taste' },
+        { key: 'libera/#random', name: 'random', unread: 0, mentions: 0, topic: 'off-topic zone' },
+        { key: 'libera/#music', name: 'music', unread: 0, mentions: 0, topic: 'now playing' },
+      ]},
+      { name: 'OFTC', dotColor: 'var(--away)', channels: [
+        { key: 'oftc/#tor', name: 'tor', unread: 0, mentions: 0, topic: 'onion routing discussion' },
+        { key: 'oftc/#debian', name: 'debian', unread: 1, mentions: 0, topic: 'stable is the new stable' },
+      ]},
+    ];
+
+    const M = (nick, text, opts = {}) => ({ id: 'm' + (Math.random().toString(36).slice(2)), nick, text, time: opts.time || this.now(), type: 'msg', reactions: opts.reactions || [] });
+    const S = (mark, text, opts = {}) => ({ id: 's' + (Math.random().toString(36).slice(2)), type: 'system', kind: opts.kind || 'join', mark, text, time: opts.time || this.now() });
+
+    const gen = [
+      S('→', 'nova (nova@user/nova) has joined', { kind: 'join', time: '13:58' }),
+      M('lex', 'morning everyone ☕ shipped the compositor patch overnight', { time: '14:02' }),
+      M('mira', 'nice — did that fix the flicker on resize?', { time: '14:03', reactions: [{ emoji: '👍', count: 3, by: ['tomb','sol','wren'] }] }),
+      M('lex', 'yep, no more repaint thrash. was a stale layout cache', { time: '14:03' }),
+      M('tomb', 'legend. i had a workaround with a debounce, can rip it out now', { time: '14:05' }),
+      S('→', 'kite has joined', { kind: 'join', time: '14:06' }),
+      M('nova', 'has anyone tried the new relay theme api? thinking of a solarized port', { time: '14:08' }),
+      M('sol', 'ada wrote most of it, she can probably point you at the tokens', { time: '14:09' }),
+      M('mira', 'ada: ^ solarized would look sick', { time: '14:10' }),
+      M('wren', 'seconded 🎨', { time: '14:11', reactions: [{ emoji: '🎨', count: 2, by: ['nova','kite'] }] }),
+      M('tomb', 'btw reactions render inline now, try it — hover a message', { time: '14:13' }),
+      S('←', 'byte has quit (Ping timeout: 246 seconds)', { kind: 'part', time: '14:14' }),
+      M('kite', 'left panel collapse feels so much snappier than the old client', { time: '14:16' }),
+      M('lex', 'the whole thing is like 40kb now. no framework, just vibes', { time: '14:17', reactions: [{ emoji: '🚀', count: 4, by: ['mira','tomb','sol','nova'] }] }),
+      M('sol', 'mobile layout when 👀', { time: '14:19' }),
+      M('mira', 'lol one thing at a time', { time: '14:20' }),
+    ];
+
+    const thin = (arr) => arr;
+    const msgs = {
+      'libera/#general': gen,
+      'libera/#dev': thin([
+        M('tomb', 'PR #482 is up — refactors the socket reconnect logic', { time: '13:40' }),
+        M('lex', 'looking now', { time: '13:44' }),
+        M('sol', 'approved, ship it', { time: '13:51', reactions: [{ emoji: '✅', count: 1, by: ['tomb'] }] }),
+      ]),
+      'libera/#design': thin([
+        M('wren', 'ada what do you think of tightening the message gutter to 40px?', { time: '12:10' }),
+        M('nova', 'ada: also need your take on the away-state opacity', { time: '12:22' }),
+        M('mira', 'the mono nicks column looks so clean 😍', { time: '12:30' }),
+      ]),
+      'libera/#random': thin([ M('kite', 'friday', { time: '11:00' }), M('sol', 'friday', { time: '11:01' }) ]),
+      'libera/#music': thin([ M('nova', '♫ now playing: aphex twin — avril 14th', { time: '10:15' }) ]),
+      'oftc/#tor': thin([ M('echo', 'consensus refreshed', { time: '09:30' }) ]),
+      'oftc/#debian': thin([ M('pip', 'point release this weekend', { time: '08:45' }) ]),
+    };
+
+    const mk = (nick, role, status) => ({ nick, role, status });
+    const members = {
+      'libera/#general': [
+        mk('lex','op','online'), mk('mira','op','online'),
+        mk('ada','voice','online'), mk('nova','voice','online'), mk('tomb','voice','away'),
+        mk('sol','user','online'), mk('wren','user','online'), mk('kite','user','online'),
+        mk('jax','user','away'), mk('echo','user','online'), mk('pip','user','away'),
+        mk('byte','user','offline'), mk('quill','user','online'), mk('rune','user','offline'),
+      ],
+      'libera/#dev': [ mk('tomb','op','online'), mk('lex','voice','online'), mk('sol','user','online'), mk('ada','user','online') ],
+      'libera/#design': [ mk('wren','op','online'), mk('ada','voice','online'), mk('nova','user','online'), mk('mira','user','online') ],
+      'libera/#random': [ mk('kite','user','online'), mk('sol','user','online'), mk('ada','user','online') ],
+      'libera/#music': [ mk('nova','op','online'), mk('ada','user','online') ],
+      'oftc/#tor': [ mk('echo','op','online'), mk('ada','user','online') ],
+      'oftc/#debian': [ mk('pip','op','online'), mk('ada','user','online') ],
+    };
+
+    return { networks, msgs, members };
+  }
+
+  now() {
+    const d = new Date();
+    return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+  }
+
+  componentDidMount() {
+    this.applyAccent();
+    this.scheduleTyping();
+  }
+  componentWillUnmount() { clearTimeout(this._typeT1); clearTimeout(this._typeT2); }
+  componentDidUpdate() {
+    this.applyAccent();
+    if (this._pendingScroll && this._msgEl) {
+      this._msgEl.scrollTop = this._msgEl.scrollHeight;
+      this._pendingScroll = false;
+    }
+  }
+  applyAccent() {
+    if (this._root && this.props.accent) this._root.style.setProperty('--accent', this.props.accent);
+  }
+
+  // ---- typing simulation for the active channel ----
+  scheduleTyping() {
+    const delay = 5000 + Math.random() * 6000;
+    this._typeT1 = setTimeout(() => {
+      const roster = (this.state.members[this.state.activeKey] || [])
+        .filter(m => m.nick !== this._me && m.status === 'online');
+      if (!roster.length) { this.scheduleTyping(); return; }
+      const who = roster[Math.floor(Math.random() * roster.length)].nick;
+      this.setState({ typing: [who] });
+      this._typeT2 = setTimeout(() => {
+        const pool = [
+          'good point, let me check the logs',
+          'pushing a fix in a sec',
+          'anyone else seeing that?',
+          'ok that makes sense now',
+          '+1, works on my box',
+          'brb, coffee refill',
+          'ada nice work on this btw',
+          'we should document that somewhere',
+        ];
+        const text = pool[Math.floor(Math.random() * pool.length)];
+        this.appendMsg(this.state.activeKey, { nick: who, text });
+        this.setState({ typing: [] });
+        this.scheduleTyping();
+      }, 2600);
+    }, delay);
+  }
+
+  appendMsg(key, m) {
+    this.setState(s => {
+      const msgs = { ...s.msgs };
+      const row = { id: 'm' + Math.random().toString(36).slice(2), nick: m.nick, text: m.text, time: this.now(), type: 'msg', reactions: m.reactions || [] };
+      msgs[key] = [...(msgs[key] || []), row];
+      let networks = s.networks;
+      if (key !== s.activeKey) {
+        networks = s.networks.map(n => ({ ...n, channels: n.channels.map(c => c.key === key ? { ...c, unread: c.unread + 1 } : c) }));
+      }
+      return { msgs, networks };
+    });
+    if (key === this.state.activeKey) this._pendingScroll = true;
+  }
+
+  // ---- handlers ----
+  selectChannel(key) {
+    clearTimeout(this._typeT1); clearTimeout(this._typeT2);
+    this.setState(s => ({
+      activeKey: key,
+      typing: [],
+      networks: s.networks.map(n => ({ ...n, channels: n.channels.map(c => c.key === key ? { ...c, unread: 0, mentions: 0 } : c) })),
+    }), () => this.scheduleTyping());
+    this._pendingScroll = true;
+  }
+  send() {
+    const text = this.state.draft.trim();
+    if (!text) return;
+    this.appendMsg(this.state.activeKey, { nick: this._me, text });
+    this.setState({ draft: '', emojiOpen: false });
+  }
+  onKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); this.send(); } }
+  toggleReaction(key, msgId, emoji) {
+    this.setState(s => {
+      const msgs = { ...s.msgs };
+      msgs[key] = (msgs[key] || []).map(m => {
+        if (m.id !== msgId) return m;
+        const reactions = m.reactions.slice();
+        const i = reactions.findIndex(r => r.emoji === emoji);
+        if (i === -1) { reactions.push({ emoji, count: 1, by: [this._me] }); }
+        else {
+          const r = reactions[i]; const mine = r.by.includes(this._me);
+          const by = mine ? r.by.filter(x => x !== this._me) : [...r.by, this._me];
+          if (by.length === 0) reactions.splice(i, 1);
+          else reactions[i] = { ...r, by, count: by.length };
+        }
+        return { ...m, reactions };
+      });
+      return { msgs };
+    });
+  }
+
+  activeChannel() {
+    for (const n of this.state.networks) for (const c of n.channels) if (c.key === this.state.activeKey) return c;
+    return this.state.networks[0].channels[0];
+  }
+
+  renderVals() {
+    const s = this.state;
+    const active = this.activeChannel();
+    const meRe = new RegExp('\\b' + this._me + '\\b', 'i');
+
+    const networks = s.networks.map(n => ({
+      name: n.name, dotColor: n.dotColor,
+      channels: n.channels.map(c => {
+        const isActive = c.key === s.activeKey;
+        const hasMention = c.mentions > 0;
+        const hasUnread = c.unread > 0;
+        return {
+          name: c.name, key: c.key,
+          onSelect: () => this.selectChannel(c.key),
+          hashColor: isActive ? 'var(--accent)' : 'var(--text-faint)',
+          weight: (hasUnread || isActive) ? 600 : 400,
+          hasMention,
+          hasUnreadOnly: hasUnread && !hasMention,
+          badge: hasMention ? String(c.mentions) : String(c.unread),
+          rowStyle: 'display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:7px;cursor:pointer;margin:1px 0;font-size:13.5px;'
+            + (isActive
+              ? 'background:var(--accent-soft);color:var(--text);box-shadow:inset 2px 0 0 var(--accent)'
+              : (hasUnread ? 'color:var(--text)' : 'color:var(--text-dim)')),
+        };
+      }),
+    }));
+
+    const rawMsgs = s.msgs[s.activeKey] || [];
+    const messages = rawMsgs.map(m => {
+      if (m.type === 'system') {
+        return { isSystem: true, isMsg: false, time: m.time, mark: m.mark,
+          markColor: m.kind === 'part' ? 'var(--away)' : 'var(--online)', text: m.text };
+      }
+      const isMe = m.nick === this._me;
+      const isMention = !isMe && meRe.test(m.text);
+      const reactions = (m.reactions || []).map(r => ({
+        emoji: r.emoji, count: r.count,
+        onToggle: () => this.toggleReaction(s.activeKey, m.id, r.emoji),
+        style: 'display:inline-flex;align-items:center;gap:4px;padding:1px 7px;height:22px;border-radius:11px;cursor:pointer;'
+          + (r.by && r.by.includes(this._me)
+            ? 'background:var(--accent-soft);border:1px solid var(--accent-line);color:var(--text)'
+            : 'background:var(--panel);border:1px solid var(--border);color:var(--text-dim)'),
+      }));
+      return {
+        isSystem: false, isMsg: true, time: m.time, nick: m.nick,
+        nickColor: isMe ? 'var(--accent)' : this.nickColor(m.nick),
+        body: m.text,
+        hasReactions: reactions.length > 0, reactions,
+        onAddReaction: () => this.toggleReaction(s.activeKey, m.id, '👍'),
+        rowStyle: 'display:flex;gap:10px;padding:3px 12px 3px 4px;position:relative;'
+          + (isMention ? 'background:var(--mention);box-shadow:inset 3px 0 0 var(--accent)' : ''),
+      };
+    });
+
+    const roster = s.members[s.activeKey] || [];
+    const mkMember = (u) => ({
+      nick: u.nick,
+      nickColor: u.status === 'offline' ? 'var(--text-faint)' : this.nickColor(u.nick),
+      statusColor: u.status === 'online' ? 'var(--online)' : u.status === 'away' ? 'var(--away)' : 'var(--offline)',
+      roleGlyph: u.role === 'op' ? '@' : u.role === 'voice' ? '+' : '',
+      roleColor: u.role === 'op' ? 'var(--accent)' : 'var(--online)',
+      opacity: u.status === 'offline' ? 0.5 : 1,
+    });
+    const groups = [
+      { label: 'Ops', role: 'op' },
+      { label: 'Voice', role: 'voice' },
+      { label: 'Online', role: 'user', online: true },
+      { label: 'Offline', role: 'user', online: false },
+    ];
+    const memberGroups = groups.map(g => {
+      let list;
+      if (g.role !== 'user') list = roster.filter(u => u.role === g.role);
+      else list = roster.filter(u => u.role === 'user' && (g.online ? u.status !== 'offline' : u.status === 'offline'));
+      return { label: g.label, count: list.length, members: list.map(mkMember) };
+    }).filter(g => g.count > 0);
+
+    const typers = s.typing;
+    let typingText = '';
+    if (typers.length === 1) typingText = typers[0] + ' is typing…';
+    else if (typers.length === 2) typingText = typers[0] + ' and ' + typers[1] + ' are typing…';
+    else if (typers.length > 2) typingText = 'several people are typing…';
+    const typingActive = typers.length > 0;
+
+    const btnBase = 'width:34px;height:34px;flex:0 0 auto;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);background:var(--panel-2);border-radius:8px;cursor:pointer;font-size:15px;line-height:1;transition:background .12s;';
+    const activeBtn = 'color:var(--accent);border-color:var(--accent-line);background:var(--accent-soft);';
+    const idleBtn = 'color:var(--text-dim);';
+
+    return {
+      theme: s.theme,
+      terminalAttr: this.props.terminal ? 'true' : 'false',
+      leftWidth: s.leftOpen ? '256px' : '0px',
+      rightWidth: s.rightOpen ? '220px' : '0px',
+      setRoot: (el) => { this._root = el; },
+      setMsgEl: (el) => { this._msgEl = el; },
+
+      networks,
+      messages,
+      memberGroups,
+      memberCount: roster.filter(u => u.status !== 'offline').length,
+
+      activeName: active.name,
+      activeTopic: active.topic,
+
+      me: this._me,
+      meInitial: this._me[0].toUpperCase(),
+      meColor: this.nickColor(this._me),
+      mePrompt: this._me + ' ›',
+
+      draft: s.draft,
+      onDraft: (e) => this.setState({ draft: e.target.value }),
+      onKey: (e) => this.onKey(e),
+      send: () => this.send(),
+
+      emojiOpen: s.emojiOpen,
+      toggleEmoji: () => this.setState(st => ({ emojiOpen: !st.emojiOpen })),
+      emojis: this._emojiSet.map(ch => ({ ch, onPick: () => this.setState(st => ({ draft: st.draft + ch, emojiOpen: false })) })),
+
+      toggleLeft: () => this.setState(st => ({ leftOpen: !st.leftOpen })),
+      toggleRight: () => this.setState(st => ({ rightOpen: !st.rightOpen })),
+      toggleTheme: () => this.setState(st => ({ theme: st.theme === 'dark' ? 'light' : 'dark' })),
+      themeGlyph: s.theme === 'dark' ? '☀' : '☾',
+
+      leftBtnStyle: btnBase + (s.leftOpen ? activeBtn : idleBtn),
+      rightBtnStyle: btnBase + (s.rightOpen ? activeBtn : idleBtn),
+      iconBtnStyle: btnBase + idleBtn,
+      sendStyle: 'flex:0 0 auto;height:34px;padding:0 16px;border:none;border-radius:var(--radius);background:var(--accent);color:var(--accent-ink);font-family:var(--ui-font);font-weight:600;font-size:13px;cursor:pointer;align-self:flex-start',
+
+      typingText,
+      typingOpacity: typingActive ? 1 : 0,
+      typingShift: typingActive ? '0' : '4px',
+    };
+  }
+}
+</script>
+</body>
+</html>

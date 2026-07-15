@@ -1,0 +1,14 @@
+# Built binary
+/bin/
+
+# SQLite databases
+*.db
+*.db-wal
+*.db-shm
+
+# Frontend build output (keep .gitkeep so go:embed works in a fresh checkout)
+web/dist/*
+!web/dist/.gitkeep
+
+# Node
+web/node_modules/

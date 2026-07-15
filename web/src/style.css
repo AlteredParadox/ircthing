@@ -1,0 +1,35 @@
+:root {
+	--bg: #16181d;
+	--fg: #d7dae0;
+	--fg-muted: #8b919c;
+}
+
+@media (prefers-color-scheme: light) {
+	:root {
+		--bg: #fafafa;
+		--fg: #1c1e22;
+		--fg-muted: #6b7078;
+	}
+}
+
+* {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	background: var(--bg);
+	color: var(--fg);
+	font: 14px/1.5 system-ui, sans-serif;
+}
+
+.placeholder {
+	display: grid;
+	place-content: center;
+	min-height: 100vh;
+	text-align: center;
+}
+
+.placeholder p {
+	color: var(--fg-muted);
+}
