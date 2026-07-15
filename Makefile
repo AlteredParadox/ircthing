@@ -33,7 +33,7 @@ build-debug: frontend
 
 frontend: web/node_modules
 	cd web && $(ESBUILD) $(ESBUILD_FLAGS) src/main.jsx --outfile=dist/app.js
-	cp web/index.html web/dist/index.html
+	cp web/index.html web/manifest.json web/icon.svg web/dist/
 
 web/node_modules: web/package.json web/package-lock.json
 	cd web && npm ci --no-fund --no-audit

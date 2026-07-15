@@ -114,6 +114,11 @@ body {
 	line-height: var(--lh);
 	-webkit-font-smoothing: antialiased;
 	overflow: hidden;
+	/* Mobile: no pull-to-refresh mid-scrollback, no double-tap zoom
+	   delay, no gray tap flash. */
+	overscroll-behavior: none;
+	touch-action: manipulation;
+	-webkit-tap-highlight-color: transparent;
 }
 
 #app {
@@ -156,9 +161,12 @@ input::placeholder {
 
 /* ---- app frame ---- */
 
+/* dvh tracks the real visible height on mobile (URL bar, keyboard);
+   the vh line is the fallback for browsers without it. */
 .app {
 	display: flex;
 	height: 100vh;
+	height: 100dvh;
 	width: 100%;
 	overflow: hidden;
 }
@@ -436,7 +444,7 @@ input::placeholder {
 .side-foot {
 	flex: 0 0 auto;
 	border-top: 1px solid var(--border);
-	padding: 10px 12px;
+	padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
 	display: flex;
 	align-items: center;
 	gap: 10px;
@@ -695,7 +703,7 @@ input::placeholder {
 .preview-card {
 	display: flex;
 	margin-top: 6px;
-	max-width: 460px;
+	max-width: min(460px, 100%);
 	border: 1px solid var(--border);
 	border-radius: var(--radius);
 	overflow: hidden;
@@ -756,7 +764,7 @@ input::placeholder {
 }
 
 .preview-thumb img {
-	max-width: 320px;
+	max-width: min(320px, 100%);
 	max-height: 240px;
 	border-radius: var(--radius);
 	border: 1px solid var(--border);
@@ -767,7 +775,7 @@ input::placeholder {
 
 .composer {
 	flex: 0 0 auto;
-	padding: 0 16px 16px;
+	padding: 0 16px calc(16px + env(safe-area-inset-bottom, 0px));
 	position: relative;
 }
 
@@ -1357,6 +1365,7 @@ input::placeholder {
 
 .login-wrap {
 	height: 100vh;
+	height: 100dvh;
 	display: grid;
 	place-items: center;
 	background: var(--bg);
@@ -1424,7 +1433,8 @@ input::placeholder {
 
 /* ---- responsive ---- */
 
-.side-scrim {
+.side-scrim,
+.right-scrim {
 	display: none;
 }
 
@@ -1434,6 +1444,14 @@ input::placeholder {
 		inset: 0 0 0 auto;
 		z-index: 20;
 		box-shadow: 0 0 40px rgba(0, 0, 0, 0.4);
+	}
+
+	.right-scrim {
+		display: block;
+		position: fixed;
+		inset: 0;
+		z-index: 15;
+		background: rgba(0, 0, 0, 0.35);
 	}
 }
 
@@ -1464,5 +1482,92 @@ input::placeholder {
 
 	.msg-time {
 		width: 2.5rem;
+	}
+}
+
+/* Very narrow (phones portrait): the topic gives way to the channel
+   name, and overlays use the full width. */
+@media (max-width: 559px) {
+	.topbar {
+		gap: 8px;
+		padding: 0 10px;
+	}
+
+	.topic-name {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.topic-sep,
+	.topic-text {
+		display: none;
+	}
+
+	/* The nick prompt eats a third of a phone-width composer. */
+	.prompt {
+		display: none;
+	}
+
+	.composer {
+		padding-left: 10px;
+		padding-right: 10px;
+	}
+
+	.search-scrim {
+		padding-top: 4vh;
+	}
+
+	.search-panel,
+	.settings-panel {
+		width: calc(100vw - 16px);
+		max-height: 86vh;
+		max-height: 86dvh;
+	}
+}
+
+/* Touch devices: hover-revealed controls must be visible, and rows need
+   finger-sized targets regardless of the density preference. */
+@media (hover: none) {
+	.msg-redact,
+	.monitor-remove {
+		opacity: 0.55;
+	}
+}
+
+@media (pointer: coarse) {
+	.chan-row,
+	.monitor-row,
+	.member-row,
+	.search-result {
+		padding-top: max(var(--pad-row), 9px);
+		padding-bottom: max(var(--pad-row), 9px);
+	}
+
+	.icon-btn {
+		width: 38px;
+		height: 38px;
+	}
+
+	.monitor-addbtn,
+	.foot-gear,
+	.msg-redact,
+	.monitor-remove,
+	.rule-remove {
+		min-width: 30px;
+		min-height: 30px;
+	}
+
+	/* iOS Safari zooms into any focused input under 16px; keep every
+	   text input at exactly 16px on touch screens. !important because
+	   the mono message-font override is more specific. */
+	.compose-input,
+	.search-input,
+	.login-input,
+	.monitor-input,
+	.rule-input,
+	.css-input {
+		font-size: 16px !important;
 	}
 }

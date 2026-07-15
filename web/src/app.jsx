@@ -625,6 +625,7 @@ export function App() {
 					<div class="empty-state">no buffers yet — waiting for traffic</div>
 				)}
 			</div>
+			{isChan && rightOpen && <div class="right-scrim" onClick={() => setRightOpen(false)} />}
 			{isChan && (
 				<div class={"rightbar" + (rightOpen ? " open" : "")}>
 					<Members info={chanInfo} theme={theme} />
