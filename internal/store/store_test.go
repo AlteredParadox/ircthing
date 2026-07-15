@@ -496,6 +496,44 @@ func TestMigrationsIdempotentAndRecorded(t *testing.T) {
 	}
 }
 
+func TestBuffers(t *testing.T) {
+	s, _ := openTest(t, 10)
+
+	// No buffers yet.
+	infos, err := s.Buffers(ctx)
+	if err != nil || len(infos) != 0 {
+		t.Fatalf("empty store: %v, %v", infos, err)
+	}
+
+	seed(t, s, "net", "#chan", 5) // ts 1000..5000
+	seed(t, s, "net", "#quiet", 2)
+	if err := s.SetReadMarker(ctx, "net", "#chan", time.UnixMilli(3000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetReadMarker(ctx, "net", "#quiet", time.UnixMilli(2000)); err != nil {
+		t.Fatal(err)
+	}
+	seed(t, s, "other", "#x", 1)
+
+	infos, err = s.Buffers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []BufferInfo{
+		{Network: "net", Target: "#chan", LastTS: 5000, Marker: 3000, Unread: 2},
+		{Network: "net", Target: "#quiet", LastTS: 2000, Marker: 2000, Unread: 0},
+		{Network: "other", Target: "#x", LastTS: 1000, Marker: 0, Unread: 1},
+	}
+	if len(infos) != len(want) {
+		t.Fatalf("got %d buffers: %+v", len(infos), infos)
+	}
+	for i, w := range want {
+		if infos[i] != w {
+			t.Fatalf("buffer %d = %+v, want %+v", i, infos[i], w)
+		}
+	}
+}
+
 func TestDefaultUserSeededAndScoped(t *testing.T) {
 	s, _ := openTest(t, 10)
 	var username string

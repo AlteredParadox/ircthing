@@ -288,6 +288,42 @@ func (s *Store) SetReadMarker(ctx context.Context, network, target string, t tim
 	return err
 }
 
+// BufferInfo summarizes one buffer for the client's sidebar.
+type BufferInfo struct {
+	Network string
+	Target  string
+	LastTS  int64 // unix ms of the newest message, 0 if none
+	Marker  int64 // unix ms read marker, 0 if unset
+	Unread  int64 // messages newer than the marker
+}
+
+// Buffers lists every buffer with its activity and read state, ordered by
+// network then target.
+func (s *Store) Buffers(ctx context.Context) ([]BufferInfo, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT n.name, b.name,
+			COALESCE((SELECT MAX(ts) FROM messages WHERE buffer_id = b.id), 0),
+			COALESCE((SELECT ts FROM read_markers WHERE buffer_id = b.id), 0),
+			(SELECT COUNT(*) FROM messages WHERE buffer_id = b.id
+				AND ts > COALESCE((SELECT ts FROM read_markers WHERE buffer_id = b.id), 0))
+		FROM buffers b
+		JOIN networks n ON n.id = b.network_id
+		ORDER BY n.name, b.name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BufferInfo
+	for rows.Next() {
+		var b BufferInfo
+		if err := rows.Scan(&b.Network, &b.Target, &b.LastTS, &b.Marker, &b.Unread); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
 // bufferID resolves (network, target) to a buffer row id, creating rows
 // when create is set. Returns 0 for an unknown buffer when create is not.
 // Caller holds s.mu.
