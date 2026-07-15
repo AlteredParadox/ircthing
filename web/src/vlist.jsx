@@ -1,0 +1,183 @@
+import { useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import { Geometry, prependedCount } from "./vmath.js";
+
+// VirtualList: windowed rendering for the message list. Only the rows
+// intersecting the viewport (plus `overscan` px each side) exist in the
+// DOM; spacer divs stand in for everything else, so 50k+ loaded messages
+// stay smooth.
+//
+// Variable heights: rows start at estimate(item) and are corrected by a
+// ResizeObserver as they render. When a row above the viewport changes
+// height (measurement or late wrap), scrollTop is compensated in the same
+// batch so visible content doesn't jump.
+//
+// Chat semantics: the list follows the bottom while pinned (user at the
+// bottom); scrolling near the top calls onNearTop() so the parent can
+// prepend an older page, and the prepend is anchored so the viewport
+// keeps showing the same messages.
+//
+// Callers should key the component by buffer so switching buffers
+// remounts with fresh state.
+export function VirtualList({
+	items,
+	renderItem,
+	estimate,
+	header,
+	onNearTop,
+	onPinned,
+	overscan = 600,
+	nearTopPx = 400,
+}) {
+	const scroller = useRef(null);
+	const headerEl = useRef(null);
+	const geo = useMemo(() => new Geometry(estimate), []);
+	const [, setTick] = useState(0);
+	const bump = () => setTick((t) => t + 1);
+
+	const pinned = useRef(true);
+	const prevFirstId = useRef(null);
+	const prevLastId = useRef(null);
+	const pendingPrepend = useRef(0);
+	const width = useRef(0);
+	const rowEls = useRef(new Map()); // id -> element
+
+	geo.setItems(items);
+
+	// Detect a prepend during render; the layout effect below compensates
+	// scrollTop after the new spacers apply.
+	const k = prependedCount(prevFirstId.current, items);
+	if (k > 0) pendingPrepend.current = k;
+	const appended = items.length > 0 && prevLastId.current !== items[items.length - 1].id;
+	prevFirstId.current = items.length ? items[0].id : null;
+	prevLastId.current = items.length ? items[items.length - 1].id : null;
+
+	// Current window from the last known scroll position.
+	const el = scroller.current;
+	const headerH = headerEl.current?.offsetHeight || 0;
+	const viewTop = el ? el.scrollTop - headerH : 0;
+	const viewH = el ? el.clientHeight : 800;
+	let { start, end } = geo.range(viewTop - overscan, viewTop + viewH + overscan);
+	if (pinned.current && items.length) {
+		// While pinned the tail must be in the window even before the
+		// scroll position catches up (first paint, buffer switch, append).
+		end = items.length;
+		start = Math.max(0, Math.min(start, end - 1));
+		const bottom = geo.total();
+		const r = geo.range(bottom - viewH - overscan, bottom);
+		start = Math.min(start, r.start);
+	}
+
+	const topPad = geo.offsetOf(start);
+	const bottomPad = geo.total() - geo.offsetOf(end);
+
+	// One ResizeObserver for every row: correct heights, keep the
+	// viewport still, then re-render with the fixed geometry.
+	const ro = useMemo(
+		() =>
+			new ResizeObserver((entries) => {
+				const sc = scroller.current;
+				if (!sc) return;
+				// Two passes so the offset table is rebuilt once, not per
+				// entry: classify rows against pre-measure geometry, then
+				// apply all measurements.
+				const batch = [];
+				const hh = headerEl.current?.offsetHeight || 0;
+				for (const e of entries) {
+					const id = idOf(e.target.dataset.vid);
+					if (id === null) continue;
+					const h = e.borderBoxSize?.[0]?.blockSize ?? e.target.offsetHeight;
+					if (h === 0) continue; // detached row
+					const i = geo.indexOf(id);
+					batch.push({ id, h, above: i !== -1 && geo.offsetOf(i) + hh < sc.scrollTop });
+				}
+				let above = 0;
+				let changed = false;
+				for (const b of batch) {
+					const d = geo.measure(b.id, b.h);
+					if (d !== 0) {
+						changed = true;
+						if (b.above) above += d;
+					}
+				}
+				if (!changed) return;
+				if (pinned.current) sc.scrollTop = sc.scrollHeight;
+				else if (above !== 0) sc.scrollTop += above;
+				bump();
+			}),
+		[],
+	);
+	useLayoutEffect(() => () => ro.disconnect(), []);
+
+	// Row ref callback: (un)observe and track elements by id.
+	function rowRef(id) {
+		return (node) => {
+			const old = rowEls.current.get(id);
+			if (old && old !== node) ro.unobserve(old);
+			if (node) {
+				rowEls.current.set(id, node);
+				ro.observe(node);
+			} else {
+				rowEls.current.delete(id);
+			}
+		};
+	}
+
+	const scrollScheduled = useRef(false);
+	function handleScroll() {
+		const sc = scroller.current;
+		if (!sc) return;
+		const nowPinned = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 40;
+		if (nowPinned !== pinned.current) {
+			pinned.current = nowPinned;
+			onPinned?.(nowPinned);
+		}
+		if (sc.scrollTop < nearTopPx) onNearTop?.();
+		// One re-render per frame, however many scroll events arrive.
+		if (scrollScheduled.current) return;
+		scrollScheduled.current = true;
+		requestAnimationFrame(() => {
+			scrollScheduled.current = false;
+			bump();
+		});
+	}
+
+	// After every commit: apply prepend anchoring, follow the bottom while
+	// pinned, and watch for width changes that invalidate measurements.
+	useLayoutEffect(() => {
+		const sc = scroller.current;
+		if (!sc) return;
+		if (pendingPrepend.current > 0) {
+			sc.scrollTop += geo.offsetOf(pendingPrepend.current);
+			pendingPrepend.current = 0;
+		}
+		if (pinned.current && appended) {
+			sc.scrollTop = sc.scrollHeight;
+		}
+		const w = sc.clientWidth;
+		if (w !== width.current) {
+			width.current = w;
+			geo.clearMeasured();
+			if (pinned.current) sc.scrollTop = sc.scrollHeight;
+			bump();
+		}
+	});
+
+	return (
+		<div class="msgs scroll" ref={scroller} onScroll={handleScroll}>
+			<div ref={headerEl}>{header}</div>
+			<div style={{ height: topPad }} />
+			{items.slice(start, end).map((item, j) => (
+				<div key={item.id} data-vid={item.id} ref={rowRef(item.id)}>
+					{renderItem(item, start + j)}
+				</div>
+			))}
+			<div style={{ height: bottomPad }} />
+		</div>
+	);
+}
+
+function idOf(s) {
+	if (s === undefined) return null;
+	const n = Number(s);
+	return Number.isNaN(n) ? s : n;
+}

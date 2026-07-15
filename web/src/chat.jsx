@@ -1,5 +1,7 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { fmtTime, linkify, mentionsMe, nickColor, renderable, sameGroup } from "./irc.js";
+import { VirtualList } from "./vlist.jsx";
+import { estimateMsgHeight } from "./vmath.js";
 
 function Body({ text }) {
 	return linkify(text).map((seg) =>
@@ -38,53 +40,31 @@ function Row({ ev, prev, selfNick, theme }) {
 	);
 }
 
-// Chat renders the active buffer: topic bar handled by the parent; this
-// is the scrollback plus composer. Scrollback stays pinned to the bottom
-// unless the user scrolls up; nearing the top loads an older page with
-// scroll anchoring.
+function estimate(ev) {
+	return estimateMsgHeight(ev.raw);
+}
+
+// Chat renders the active buffer: virtualized scrollback plus composer.
 export function Chat({ buf, msgs, selfNick, theme, connected, onSend, onLoadOlder, onRead }) {
-	const el = useRef(null);
-	const pinned = useRef(true);
-	const anchor = useRef(null); // scrollHeight before an older-page prepend
 	const [draft, setDraft] = useState("");
+	const pinned = useRef(true);
+	const loadingOlder = useRef(false);
 	const list = msgs?.list || [];
-	const first = list[0];
 	const last = list[list.length - 1];
 
-	function onScroll() {
-		const e = el.current;
-		if (!e) return;
-		pinned.current = e.scrollHeight - e.scrollTop - e.clientHeight < 40;
-		if (e.scrollTop < 80 && !msgs?.reachedTop && !anchor.current && list.length) {
-			anchor.current = e.scrollHeight - e.scrollTop;
-			onLoadOlder();
-		}
-		if (pinned.current) markRead();
+	function nearTop() {
+		if (loadingOlder.current || msgs?.reachedTop || !list.length) return;
+		loadingOlder.current = true;
+		Promise.resolve(onLoadOlder()).finally(() => {
+			loadingOlder.current = false;
+		});
 	}
 
-	// Keep the viewport stable: pinned follows new messages; a prepend
-	// keeps the previously visible message where it was.
-	useLayoutEffect(() => {
-		const e = el.current;
-		if (!e) return;
-		if (anchor.current !== null && first) {
-			e.scrollTop = e.scrollHeight - anchor.current;
-			anchor.current = null;
-		} else if (pinned.current) {
-			e.scrollTop = e.scrollHeight;
-		}
-	}, [first?.id, last?.id, buf?.key]);
-
-	useEffect(() => {
-		pinned.current = true;
-		anchor.current = null;
-	}, [buf?.key]);
-
 	const markRead = () => {
-		if (last && document.hasFocus()) onRead(last.time);
+		if (last && pinned.current && document.hasFocus()) onRead(last.time);
 	};
 	useEffect(() => {
-		if (pinned.current) markRead();
+		markRead();
 		window.addEventListener("focus", markRead);
 		return () => window.removeEventListener("focus", markRead);
 	}, [last?.id, buf?.key]);
@@ -97,17 +77,26 @@ export function Chat({ buf, msgs, selfNick, theme, connected, onSend, onLoadOlde
 		setDraft("");
 	}
 
+	const header = msgs?.loaded
+		? (msgs.reachedTop && list.length > 0 && <div class="top-note">beginning of history</div>)
+		: <div class="top-note">loading…</div>;
+
 	return (
 		<>
-			<div class="msgs scroll" ref={el} onScroll={onScroll}>
-				{msgs?.reachedTop && list.length > 0 && (
-					<div class="top-note">beginning of history</div>
+			<VirtualList
+				key={buf?.key}
+				items={list}
+				estimate={estimate}
+				header={header}
+				onNearTop={nearTop}
+				onPinned={(p) => {
+					pinned.current = p;
+					if (p) markRead();
+				}}
+				renderItem={(ev, i) => (
+					<Row ev={ev} prev={list[i - 1]} selfNick={selfNick} theme={theme} />
 				)}
-				{list.map((ev, i) => (
-					<Row key={ev.id} ev={ev} prev={list[i - 1]} selfNick={selfNick} theme={theme} />
-				))}
-				{!msgs?.loaded && <div class="top-note">loading…</div>}
-			</div>
+			/>
 			<div class="composer">
 				<form class="compose-box" onSubmit={submit}>
 					<span class="prompt">{selfNick || "…"} ›</span>

@@ -7,9 +7,10 @@ import { Socket } from "./ws.js";
 
 const PAGE = 100;
 // Memory bound per buffer: trim to TRIM_TO once past TRIM_AT. Older pages
-// are always refetchable, so trimming loses nothing durable.
-const TRIM_AT = 3000;
-const TRIM_TO = 1500;
+// are always refetchable, so trimming loses nothing durable. The list is
+// virtualized, so these bound JS memory, not DOM size.
+const TRIM_AT = 50000;
+const TRIM_TO = 25000;
 
 function wsURL() {
 	const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -183,9 +184,9 @@ export function App() {
 	function loadOlder() {
 		const buf = buffers[activeKey];
 		const cur = msgs[activeKey];
-		if (!buf || !cur?.list.length || cur.reachedTop) return;
+		if (!buf || !cur?.list.length || cur.reachedTop) return Promise.resolve();
 		const oldest = cur.list[0];
-		sock.current
+		return sock.current
 			.request("get_history", {
 				network: buf.network, buffer: buf.buffer,
 				before: { ts: oldest.time, id: oldest.id }, limit: PAGE,
