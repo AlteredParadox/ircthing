@@ -22,6 +22,7 @@ var wantedCaps = []string{
 	"cap-notify",
 	"chghost",
 	"draft/chathistory",
+	"draft/multiline",
 	"draft/event-playback",
 	"draft/message-redaction",
 	"draft/read-marker",

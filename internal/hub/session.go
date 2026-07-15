@@ -122,37 +122,66 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "unknown_network", "network is not connected"))
 		return
 	}
-	// With echo-message negotiated the server reflects our PRIVMSGs and
+	// With echo-message negotiated the server reflects our messages and
 	// the regular event path persists them (with server-time and msgid);
 	// otherwise persist and broadcast ourselves so every device sees
 	// what this one sent.
 	echo := conn.CapEnabled("echo-message")
-	for _, line := range strings.Split(strings.ReplaceAll(d.Text, "\r\n", "\n"), "\n") {
-		if line == "" {
-			continue
+	lines := nonEmptyLines(d.Text)
+
+	// A genuine multi-line message goes out as one draft/multiline batch
+	// (reconstructed into a single message on echo); the fallback splits
+	// into one PRIVMSG per line.
+	if len(lines) > 1 && conn.CapEnabled("draft/multiline") {
+		if err := conn.SendMultiline(d.Target, lines); err != nil {
+			s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
+			return
 		}
+		if !echo {
+			s.persistOwn(ctx, conn, d.Network, d.Target, strings.Join(lines, "\n"))
+		}
+		s.push(envelope("ok", env.Seq, nil))
+		return
+	}
+
+	for _, line := range lines {
 		msg := newPrivmsg(d.Target, line)
 		if err := conn.Send(msg); err != nil {
 			s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
 			return
 		}
-		if echo {
-			continue
+		if !echo {
+			s.persistOwn(ctx, conn, d.Network, d.Target, line)
 		}
-		stored, err := s.hub.store.Append(ctx, d.Network, d.Target, store.Message{
-			Time:    time.Now(),
-			Sender:  conn.Nick(),
-			Command: "PRIVMSG",
-			Raw:     msg.String(),
-			Text:    line,
-		})
-		if err != nil {
-			s.push(errEnvelope(env.Seq, "persist_failed", err.Error()))
-			return
-		}
-		s.hub.broadcast(envelope("event", 0, eventData(stored)))
 	}
 	s.push(envelope("ok", env.Seq, nil))
+}
+
+func nonEmptyLines(text string) []string {
+	var out []string
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// persistOwn stores and broadcasts one of our own sent messages, used
+// when echo-message is unavailable to reflect it.
+func (s *Session) persistOwn(ctx context.Context, conn Conn, network, target, text string) {
+	msg := &ircv4.Message{Command: "PRIVMSG", Params: []string{target, text}}
+	stored, err := s.hub.store.Append(ctx, network, target, store.Message{
+		Time:    time.Now(),
+		Sender:  conn.Nick(),
+		Command: "PRIVMSG",
+		Raw:     msg.String(),
+		Text:    text,
+	})
+	if err != nil {
+		return
+	}
+	s.hub.broadcast(envelope("event", 0, eventData(stored)))
 }
 
 // handleTyping relays our typing state as a TAGMSG with the +typing

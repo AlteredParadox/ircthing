@@ -5,11 +5,19 @@ import { VirtualList } from "./vlist.jsx";
 import { estimateMsgHeight } from "./vmath.js";
 
 function Body({ text }) {
-	return linkify(text).map((seg) =>
-		seg.link
-			? <a href={seg.text} target="_blank" rel="noopener noreferrer">{seg.text}</a>
-			: seg.text,
-	);
+	// draft/multiline messages carry embedded newlines; render each line
+	// on its own row, linkifying within each.
+	const lines = text.split("\n");
+	return lines.map((line, li) => (
+		<>
+			{li > 0 && <br />}
+			{linkify(line).map((seg) =>
+				seg.link
+					? <a href={seg.text} target="_blank" rel="noopener noreferrer">{seg.text}</a>
+					: seg.text,
+			)}
+		</>
+	));
 }
 
 function Row({ ev, prev, selfNick, theme, focused, isHighlight, onRedact }) {
@@ -139,10 +147,18 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 				{error && <div class="cmd-error">{error}</div>}
 				<form class="compose-box" onSubmit={submit}>
 					<span class="prompt">{selfNick || "…"} ›</span>
-					<input
+					<textarea
 						class="compose-input"
+						rows={draft.includes("\n") ? Math.min(draft.split("\n").length, 8) : 1}
 						value={draft}
 						onInput={(e) => draftChanged(e.currentTarget.value)}
+						onKeyDown={(e) => {
+							// Enter sends; Shift+Enter inserts a newline (multiline).
+							if (e.key === "Enter" && !e.shiftKey) {
+								e.preventDefault();
+								submit(e);
+							}
+						}}
 						placeholder={connected ? `Message ${buf?.buffer || ""}` : "disconnected — reconnecting…"}
 						disabled={!connected}
 					/>

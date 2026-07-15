@@ -75,6 +75,16 @@ test("renderable", () => {
 	}
 });
 
+test("renderable: multiline body preserves the joined text", () => {
+	// The reconstructed multiline message carries embedded newlines in
+	// its trailing parameter; renderable returns them intact for the
+	// Body component to split.
+	const ev = { sender: "a", command: "PRIVMSG", raw: ":a!u@h PRIVMSG #go :one\ntwo\nthree", time: 0 };
+	const r = renderable(ev);
+	is(r.kind, "msg");
+	is(r.text, "one\ntwo\nthree");
+});
+
 test("renderable: redacted messages become tombstones", () => {
 	const ev = { sender: "alice", command: "PRIVMSG", raw: ":alice!u@h PRIVMSG #go :secret", time: 0, redacted: true };
 	const r = renderable(ev);

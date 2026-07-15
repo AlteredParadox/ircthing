@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -116,11 +117,12 @@ type fakeConn struct {
 	chans map[string][]irc.Member
 	caps  map[string]bool
 
-	mu      sync.Mutex
-	sent    []*ircv4.Message
-	sendErr error
-	hist    []string // RequestChatHistory calls as "target@sinceMs"
-	names   []string // EnsureNames calls
+	mu        sync.Mutex
+	sent      []*ircv4.Message
+	sendErr   error
+	hist      []string // RequestChatHistory calls as "target@sinceMs"
+	names     []string // EnsureNames calls
+	multiline []string // SendMultiline calls
 }
 
 func (f *fakeConn) Events() <-chan irc.Event     { return f.ch }
@@ -173,6 +175,22 @@ func (f *fakeConn) namesReqs() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.names...)
+}
+
+func (f *fakeConn) SendMultiline(target string, lines []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sendErr != nil {
+		return f.sendErr
+	}
+	f.multiline = append(f.multiline, target+"|"+strings.Join(lines, "\\n"))
+	return nil
+}
+
+func (f *fakeConn) multilineSends() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.multiline...)
 }
 
 func TestHubPersistsEvents(t *testing.T) {

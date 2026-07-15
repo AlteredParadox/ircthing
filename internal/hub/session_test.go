@@ -512,6 +512,73 @@ func TestRedactionOutbound(t *testing.T) {
 	}
 }
 
+func TestMultilineSend(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{
+		ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox",
+		caps: map[string]bool{"draft/multiline": true},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	s := h.NewSession()
+	defer s.Close()
+
+	// Multi-line text with the cap goes out as one multiline batch and,
+	// without echo, persists as a single message with embedded newlines.
+	s.Handle(ctx, request(t, "send", 1, SendData{Network: "libera", Target: "#go", Text: "line one\nline two\nline three"}))
+	recv(t, s, "ok", "event")
+	if got := conn.multilineSends(); len(got) != 1 || got[0] != "#go|line one\\nline two\\nline three" {
+		t.Fatalf("multiline sends = %v", got)
+	}
+	msgs, _ := h.store.Latest(ctx, "libera", "#go", 10)
+	if len(msgs) != 1 || msgs[0].Text != "line one\nline two\nline three" {
+		t.Fatalf("stored = %+v", msgs)
+	}
+
+	// A single-line message uses a plain PRIVMSG, not a batch.
+	s.Handle(ctx, request(t, "send", 2, SendData{Network: "libera", Target: "#go", Text: "just one line"}))
+	recv(t, s, "ok", "event")
+	if len(conn.multilineSends()) != 1 {
+		t.Fatal("single line used a multiline batch")
+	}
+	if sent := conn.sentMsgs(); len(sent) == 0 || sent[len(sent)-1].Trailing() != "just one line" {
+		t.Fatalf("single-line PRIVMSG missing: %v", sent)
+	}
+}
+
+func TestMultilineSendFallbackWithoutCap(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox"} // no cap
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	s := h.NewSession()
+	defer s.Close()
+
+	// Without the cap, newlines fall back to one PRIVMSG per line.
+	s.Handle(ctx, request(t, "send", 1, SendData{Network: "libera", Target: "#go", Text: "a\nb"}))
+	recv(t, s, "ok", "event")
+	if len(conn.multilineSends()) != 0 {
+		t.Fatal("used multiline batch without the cap")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(conn.sentMsgs()) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("sent %d PRIVMSGs, want 2", len(conn.sentMsgs()))
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	sent := conn.sentMsgs()
+	if sent[0].Trailing() != "a" || sent[1].Trailing() != "b" {
+		t.Fatalf("fallback lines = %q, %q", sent[0].Trailing(), sent[1].Trailing())
+	}
+}
+
 func TestSessionCommand(t *testing.T) {
 	h := newTestHub(t)
 	conn := &fakeConn{ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox"}

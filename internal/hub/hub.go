@@ -36,6 +36,8 @@ type Conn interface {
 	// EnsureNames lazily fetches a channel's membership under
 	// draft/no-implicit-names; a no-op otherwise.
 	EnsureNames(channel string)
+	// SendMultiline sends the lines as one draft/multiline batch.
+	SendMultiline(target string, lines []string) error
 }
 
 type Hub struct {

@@ -79,6 +79,7 @@ type Manager struct {
 	registered atomic.Bool
 	nick       atomic.Value // string: current nick once registered
 	caps       atomic.Value // map[string]bool, copy-on-write: enabled capabilities
+	capVals    atomic.Value // map[string]string: values of enabled caps
 	isup       *isupport
 	roster     *roster
 	// joined is the set of channels to (re)join after registration:
@@ -92,6 +93,8 @@ type Manager struct {
 	// EnsureNames (hub goroutine) and reset on reconnect (run goroutine).
 	namesMu  sync.Mutex
 	namesReq map[string]bool
+
+	batchSeq atomic.Uint64 // outgoing multiline batch reference counter
 }
 
 // Name returns the configured network label.
@@ -171,6 +174,20 @@ func (m *Manager) resetNames() {
 	m.namesMu.Unlock()
 }
 
+// SendMultiline sends a multi-line message as a draft/multiline batch,
+// respecting the server's advertised limits. Callers should only use this
+// when draft/multiline is negotiated; otherwise send one PRIVMSG per line.
+func (m *Manager) SendMultiline(target string, lines []string) error {
+	ref := "ml" + strconv.FormatUint(m.batchSeq.Add(1), 10)
+	lim := parseMultilineLimits(m.CapValue("draft/multiline"))
+	for _, msg := range buildMultilineBatch(ref, target, lines, lim) {
+		if err := m.Send(msg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // RequestChatHistory asks the server for messages in target newer than
 // the given resume point — gap-free scrollback after reconnects
 // (draft/chathistory AFTER; https://ircv3.net/specs/extensions/
@@ -206,6 +223,13 @@ func (m *Manager) RequestChatHistory(target string, sinceMs int64, msgid string)
 func (m *Manager) CapEnabled(name string) bool {
 	caps, _ := m.caps.Load().(map[string]bool)
 	return caps[name]
+}
+
+// CapValue returns the advertised value of an enabled capability, or ""
+// (e.g. draft/multiline's "max-bytes=4096,max-lines=24").
+func (m *Manager) CapValue(name string) string {
+	vals, _ := m.capVals.Load().(map[string]string)
+	return vals[name]
 }
 
 func (m *Manager) setCaps(caps map[string]bool) {
@@ -380,17 +404,31 @@ drain:
 		}
 	}
 
-	m.registered.Store(true)
-	defer m.registered.Store(false)
+	// Reset per-connection state before signalling registration, so a
+	// consumer that sees "registered" never observes the previous
+	// connection's ISUPPORT, roster, or lazy-NAMES set. All three are
+	// repopulated by the 005/JOIN/353 replies that follow.
+	m.isup.reset()
+	m.roster.clear()
+	defer m.roster.clear()
+	m.resetNames()
+
 	m.nick.Store(hs.nick)
 	m.setCaps(hs.enabled)
+	// Retain the advertised values of enabled caps (e.g. multiline's
+	// max-bytes/max-lines).
+	vals := make(map[string]string, len(hs.enabled))
+	for name := range hs.enabled {
+		if v := hs.caps[name]; v != "" {
+			vals[name] = v
+		}
+	}
+	m.capVals.Store(vals)
+	m.registered.Store(true)
+	defer m.registered.Store(false)
 	bo.reset()
 	m.emit(ctx, Event{Kind: EventState, State: StateRegistered})
 
-	m.isup.reset()   // ISUPPORT is per-connection; 005 follows shortly
-	m.roster.clear() // membership is per-connection state
-	defer m.roster.clear()
-	m.resetNames() // lazy NAMES must be re-requested on the new connection
 	rejoin := make([]string, 0, len(m.joined))
 	for _, ch := range m.joined {
 		rejoin = append(rejoin, ch)
@@ -411,6 +449,8 @@ drain:
 	// (roster, nick, rejoin intent). Nested batches are not tracked —
 	// servers do not nest chathistory in practice.
 	histBatch := make(map[string]bool)
+	// draft/multiline reconstruction, per connection.
+	ml := newMultiline()
 	for {
 		idle := m.cfg.PingInterval
 		if pinged {
@@ -444,6 +484,15 @@ drain:
 					return err
 				}
 			}
+		}
+		// draft/multiline: buffer the batch's lines and emit the single
+		// reconstructed message on close; consumed lines are not processed
+		// further.
+		if emit, consumed := ml.feed(in); consumed {
+			if emit != nil {
+				m.emit(ctx, Event{Kind: EventMessage, Msg: emit})
+			}
+			continue
 		}
 		if in.Command == "BATCH" && len(in.Params) > 0 {
 			ref := in.Params[0]
