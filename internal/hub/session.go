@@ -89,6 +89,8 @@ func (s *Session) Handle(ctx context.Context, env Envelope) {
 		s.handleGetChannel(ctx, env)
 	case "get_buffers":
 		s.handleGetBuffers(ctx, env)
+	case "typing":
+		s.handleTyping(ctx, env)
 	case "get_history":
 		s.handleGetHistory(ctx, env)
 	case "get_read_marker":
@@ -146,6 +148,32 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 		s.hub.broadcast(envelope("event", 0, eventData(stored)))
 	}
 	s.push(envelope("ok", env.Seq, nil))
+}
+
+// handleTyping relays our typing state as a TAGMSG with the +typing
+// client tag (https://ircv3.net/specs/client-tags/typing, fetched
+// 2026-07-15). Best-effort: on a network without message-tags (the
+// transport requirement) it is a silent no-op. Acked only when the client
+// asked (Seq set) — typing is fire-and-forget.
+func (s *Session) handleTyping(ctx context.Context, env Envelope) {
+	var d TypingData
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		return
+	}
+	ok := d.Network != "" && d.Buffer != "" &&
+		(d.State == "active" || d.State == "paused" || d.State == "done")
+	if ok {
+		if conn := s.hub.network(d.Network); conn != nil && conn.CapEnabled("message-tags") {
+			_ = conn.Send(&ircv4.Message{
+				Tags:    ircv4.Tags{"+typing": d.State},
+				Command: "TAGMSG",
+				Params:  []string{d.Buffer},
+			})
+		}
+	}
+	if env.Seq != 0 {
+		s.push(envelope("ok", env.Seq, nil))
+	}
 }
 
 // commandSpec is the allowlist of client-issued IRC commands with their

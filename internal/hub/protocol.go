@@ -169,6 +169,17 @@ type MembersChangedData struct {
 	Buffer  string `json:"buffer"`
 }
 
+// TypingData carries draft/typing state ("typing", both directions).
+// Client -> server it sets our state for a buffer (Nick ignored, Seq may
+// be 0 for fire-and-forget); server -> client it reports someone else's.
+// Typing is ephemeral: never persisted, cleared by expiry or a message.
+type TypingData struct {
+	Network string `json:"network"`
+	Buffer  string `json:"buffer"`
+	Nick    string `json:"nick,omitempty"`
+	State   string `json:"state"` // "active", "paused" or "done"
+}
+
 // ErrorData is the "error" response.
 type ErrorData struct {
 	Code    string `json:"code"`

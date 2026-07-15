@@ -530,6 +530,97 @@ func TestHubBroadcastsMembersChanged(t *testing.T) {
 	}
 }
 
+func TestTypingOutbound(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{
+		ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox",
+		caps: map[string]bool{"message-tags": true},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	s := h.NewSession()
+	defer s.Close()
+
+	// Fire-and-forget (no seq): TAGMSG goes out, nothing comes back.
+	s.Handle(ctx, request(t, "typing", 0, TypingData{Network: "libera", Buffer: "#go", State: "active"}))
+	deadline := time.Now().Add(5 * time.Second)
+	for len(conn.sentMsgs()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("TAGMSG never sent")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := conn.sentMsgs()[0].String(); got != "@+typing=active TAGMSG #go" {
+		t.Fatalf("wire = %q", got)
+	}
+	expectSilence(t, s)
+
+	// With a seq, it is acked.
+	s.Handle(ctx, request(t, "typing", 9, TypingData{Network: "libera", Buffer: "#go", State: "done"}))
+	recv(t, s, "ok")
+
+	// Invalid state: dropped, not relayed.
+	before := len(conn.sentMsgs())
+	s.Handle(ctx, request(t, "typing", 0, TypingData{Network: "libera", Buffer: "#go", State: "typing!"}))
+	expectSilence(t, s)
+	if len(conn.sentMsgs()) != before {
+		t.Fatal("invalid state hit the wire")
+	}
+
+	// Without message-tags the notification is silently suppressed.
+	conn.mu.Lock()
+	conn.caps = nil
+	conn.mu.Unlock()
+	s.Handle(ctx, request(t, "typing", 10, TypingData{Network: "libera", Buffer: "#go", State: "active"}))
+	recv(t, s, "ok")
+	if len(conn.sentMsgs()) != before {
+		t.Fatal("TAGMSG sent without message-tags")
+	}
+}
+
+func TestTypingInbound(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+
+	// Channel typing is pushed with the channel buffer.
+	conn.ch <- ev("@+typing=active :alice!u@h TAGMSG #go")
+	got := decode[TypingData](t, recv(t, s, "typing"))
+	if got.Buffer != "#go" || got.Nick != "alice" || got.State != "active" {
+		t.Fatalf("typing = %+v", got)
+	}
+
+	// PM typing files under the sender's query buffer.
+	conn.ch <- ev("@+typing=paused :bob!u@h TAGMSG AlteredParadox")
+	got = decode[TypingData](t, recv(t, s, "typing"))
+	if got.Buffer != "bob" || got.State != "paused" {
+		t.Fatalf("pm typing = %+v", got)
+	}
+
+	// Our own echo, foreign-target TAGMSG, and tagless TAGMSG: silence.
+	conn.ch <- ev("@+typing=active :AlteredParadox!u@h TAGMSG #go")
+	conn.ch <- ev("@+typing=active :carol!u@h TAGMSG dave")
+	conn.ch <- ev("@example/other=1 :alice!u@h TAGMSG #go")
+	expectSilence(t, s)
+
+	// TAGMSG is never persisted.
+	if msgs, _ := h.store.Latest(ctx, "libera", "#go", 10); len(msgs) != 0 {
+		t.Fatalf("TAGMSG persisted: %v", msgs)
+	}
+}
+
 func TestSessionIgnoresUnknownInput(t *testing.T) {
 	h := newTestHub(t)
 	s := h.NewSession()

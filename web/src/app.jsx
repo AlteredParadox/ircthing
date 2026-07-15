@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
-import { bufKey, isChannelName, mentionsMe, parseHash, parseInput, renderable, toHash } from "./irc.js";
+import { bufKey, isChannelName, mentionsMe, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
 import { Login } from "./login.jsx";
 import { Members } from "./members.jsx";
 import { Sidebar } from "./sidebar.jsx";
@@ -34,6 +34,8 @@ export function App() {
 	const [chanInfo, setChanInfo] = useState(null);
 	const [chanTick, setChanTick] = useState(0);
 	const [cmdError, setCmdError] = useState("");
+	// typers: bufKey -> { nick: { state, at } }; ephemeral, never stored.
+	const [typers, setTypers] = useState({});
 	const sock = useRef(null);
 
 	useEffect(() => {
@@ -109,6 +111,13 @@ export function App() {
 				}
 				return { ...m, [key]: { ...(cur || {}), list, reachedTop } };
 			});
+			// A message from someone clears their typing indicator.
+			setTypers((t) => {
+				if (!t[key]?.[ev.sender]) return t;
+				const cur = { ...t[key] };
+				delete cur[ev.sender];
+				return { ...t, [key]: cur };
+			});
 			setBuffers((b) => {
 				const cur = b[key] || {
 					key, network: ev.network, buffer: ev.buffer,
@@ -127,6 +136,16 @@ export function App() {
 						mention: cur.mention || (isMsg && !mine && mentionsMe(r.text, nick)),
 					},
 				};
+			});
+		});
+
+		s.on("typing", (d) => {
+			const key = bufKey(d.network, d.buffer);
+			setTypers((t) => {
+				const cur = { ...(t[key] || {}) };
+				if (d.state === "done") delete cur[d.nick];
+				else cur[d.nick] = { state: d.state, at: Date.now() };
+				return { ...t, [key]: cur };
 			});
 		});
 
@@ -169,6 +188,28 @@ export function App() {
 	buffersRef.current = buffers;
 	const activeKeyRef = useRef(activeKey);
 	activeKeyRef.current = activeKey;
+
+	// Expire stale typing states (6s active / 30s paused per spec).
+	useEffect(() => {
+		const t = setInterval(() => {
+			setTypers((all) => {
+				const now = Date.now();
+				let changed = false;
+				const next = {};
+				for (const [key, nicks] of Object.entries(all)) {
+					const keep = {};
+					for (const [nick, v] of Object.entries(nicks)) {
+						if (typingExpired(v.state, v.at, now)) changed = true;
+						else keep[nick] = v;
+					}
+					if (Object.keys(keep).length) next[key] = keep;
+					else if (Object.keys(nicks).length) changed = true;
+				}
+				return changed ? next : all;
+			});
+		}, 1000);
+		return () => clearInterval(t);
+	}, []);
 
 	// Channel state (topic + members) for the active buffer. Debounced:
 	// members_changed hints arrive in bursts (NAMES floods, netsplits).
@@ -375,7 +416,12 @@ export function App() {
 						buf={activeBuf} msgs={msgs[activeKey]} selfNick={selfNick} theme={theme}
 						connected={connected && netState === "registered"}
 						error={cmdError}
+						typers={Object.keys(typers[activeKey] || {})}
 						onSend={sendInput} onLoadOlder={loadOlder} onRead={markRead}
+						onTyping={(state) =>
+							sock.current?.notify("typing", {
+								network: activeBuf.network, buffer: activeBuf.buffer, state,
+							})}
 					/>
 				) : (
 					<div class="empty-state">no buffers yet — waiting for traffic</div>

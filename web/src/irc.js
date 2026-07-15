@@ -209,6 +209,78 @@ export function groupMembers(members) {
 	return groups.filter((g) => g.members.length > 0);
 }
 
+// TypingSender implements the sending side of the draft/typing client
+// tag (https://ircv3.net/specs/client-tags/typing, fetched 2026-07-15):
+//   - "active" continuously while composing, throttled so no
+//     notification goes out within 3 seconds of another;
+//   - "paused" once when input rests non-empty (owner calls pause()
+//     from an idle timer);
+//   - "done" once when the field is cleared or composing is abandoned.
+// Slash commands never trigger notifications. Sending the message ends
+// the session silently — the message itself clears remote indicators.
+export class TypingSender {
+	constructor(send, now = () => Date.now()) {
+		this.send = send;
+		this.now = now;
+		this.lastSent = 0;
+		this.state = "none"; // none | active | paused
+	}
+
+	notify(state) {
+		this.lastSent = this.now();
+		this.send(state);
+	}
+
+	// input is called on every draft change. The 3s throttle applies to
+	// all notifications, so resuming right after a pause may briefly show
+	// as paused remotely — the spec mandates the throttle regardless.
+	input(text) {
+		if (!text || text.startsWith("/")) {
+			this.done();
+			return;
+		}
+		if (this.now() - this.lastSent >= 3000) {
+			this.state = "active";
+			this.notify("active");
+		}
+	}
+
+	// pause is called by the owner's idle timer while text remains.
+	pause(text) {
+		if (this.state === "active" && text && !text.startsWith("/")) {
+			this.state = "paused";
+			this.notify("paused");
+		}
+	}
+
+	// done is called when the input clears without sending.
+	done() {
+		if (this.state !== "none") {
+			this.state = "none";
+			this.notify("done");
+		}
+	}
+
+	// messageSent ends the session without a notification: the delivered
+	// message clears remote indicators by itself.
+	messageSent() {
+		this.state = "none";
+	}
+}
+
+// typingText renders the indicator wording for a set of typing nicks.
+export function typingText(nicks) {
+	if (nicks.length === 0) return "";
+	if (nicks.length === 1) return nicks[0] + " is typing…";
+	if (nicks.length === 2) return nicks[0] + " and " + nicks[1] + " are typing…";
+	return "several people are typing…";
+}
+
+// typing states expire per the spec: 6s after active, 30s after paused.
+export function typingExpired(state, at, now) {
+	return now - at > (state === "paused" ? 30000 : 6000);
+}
+
 export function bufKey(network, buffer) {
 	return network + "\n" + buffer;
 }

@@ -93,6 +93,10 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 						Network: ev.Network, Buffer: hint,
 					}))
 				}
+				if ev.Msg.Command == "TAGMSG" {
+					h.relayTyping(ev, c)
+					continue // TAGMSG is ephemeral, never persisted
+				}
 				target, ok := persistTarget(ev.Msg, c.Nick())
 				if !ok {
 					continue
@@ -135,6 +139,35 @@ func (h *Hub) broadcastExcept(except *Session, env Envelope) {
 			s.push(env)
 		}
 	}
+}
+
+// relayTyping turns an incoming TAGMSG carrying the +typing client tag
+// into a "typing" push. Our own echoed TAGMSGs are ignored — the local
+// client knows what it is typing.
+func (h *Hub) relayTyping(ev irc.Event, c Conn) {
+	state := ev.Msg.Tags["+typing"]
+	if state != "active" && state != "paused" && state != "done" {
+		return
+	}
+	sender := ""
+	if ev.Msg.Prefix != nil {
+		sender = ev.Msg.Prefix.Name
+	}
+	nick := c.Nick()
+	if sender == "" || nick == "" || strings.EqualFold(sender, nick) {
+		return
+	}
+	buffer := ev.Msg.Param(0)
+	if !isChannel(buffer) {
+		// A typing notice addressed to us belongs in the sender's query.
+		if !strings.EqualFold(buffer, nick) {
+			return
+		}
+		buffer = sender
+	}
+	h.broadcast(envelope("typing", 0, TypingData{
+		Network: ev.Network, Buffer: buffer, Nick: sender, State: state,
+	}))
 }
 
 // membersHint reports whether a message changes channel state clients may

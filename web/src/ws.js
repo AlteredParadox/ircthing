@@ -78,6 +78,15 @@ export class Socket {
 		});
 	}
 
+	// notify sends a fire-and-forget envelope (no seq, no response).
+	// Silently dropped while disconnected — fine for ephemeral state
+	// like typing.
+	notify(type, data) {
+		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+			this.ws.send(JSON.stringify({ v: V, type, data }));
+		}
+	}
+
 	close() {
 		this.closed = true;
 		this.ws?.close();

@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "preact/hooks";
-import { fmtTime, linkify, mentionsMe, nickColor, renderable, sameGroup } from "./irc.js";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { fmtTime, linkify, mentionsMe, nickColor, renderable, sameGroup, TypingSender, typingText } from "./irc.js";
 import { VirtualList } from "./vlist.jsx";
 import { estimateMsgHeight } from "./vmath.js";
 
@@ -45,12 +45,30 @@ function estimate(ev) {
 }
 
 // Chat renders the active buffer: virtualized scrollback plus composer.
-export function Chat({ buf, msgs, selfNick, theme, connected, error, onSend, onLoadOlder, onRead }) {
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, onSend, onLoadOlder, onRead, onTyping }) {
 	const [draft, setDraft] = useState("");
 	const pinned = useRef(true);
 	const loadingOlder = useRef(false);
 	const list = msgs?.list || [];
 	const last = list[list.length - 1];
+
+	// Typing notifications, one sender per buffer; the previous buffer's
+	// session ends with "done" when switching away mid-draft.
+	const typing = useMemo(() => new TypingSender((state) => onTypingRef.current(state)), [buf?.key]);
+	const onTypingRef = useRef(onTyping);
+	onTypingRef.current = onTyping;
+	const pauseTimer = useRef(null);
+	useEffect(() => () => {
+		clearTimeout(pauseTimer.current);
+		typing.done();
+	}, [typing]);
+
+	function draftChanged(text) {
+		setDraft(text);
+		typing.input(text);
+		clearTimeout(pauseTimer.current);
+		pauseTimer.current = setTimeout(() => typing.pause(text), 5000);
+	}
 
 	function nearTop() {
 		if (loadingOlder.current || msgs?.reachedTop || !list.length) return;
@@ -75,6 +93,8 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, onSend, onL
 		if (!text || !connected) return;
 		onSend(text);
 		setDraft("");
+		clearTimeout(pauseTimer.current);
+		typing.messageSent();
 	}
 
 	const header = msgs?.loaded
@@ -98,13 +118,21 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, onSend, onL
 				)}
 			/>
 			<div class="composer">
+				{typers?.length > 0 && (
+					<div class="typing-bubble">
+						<span class="typing-dots">
+							<span /><span /><span />
+						</span>
+						<span class="typing-label">{typingText(typers)}</span>
+					</div>
+				)}
 				{error && <div class="cmd-error">{error}</div>}
 				<form class="compose-box" onSubmit={submit}>
 					<span class="prompt">{selfNick || "…"} ›</span>
 					<input
 						class="compose-input"
 						value={draft}
-						onInput={(e) => setDraft(e.currentTarget.value)}
+						onInput={(e) => draftChanged(e.currentTarget.value)}
 						placeholder={connected ? `Message ${buf?.buffer || ""}` : "disconnected — reconnecting…"}
 						disabled={!connected}
 					/>
