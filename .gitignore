@@ -4,6 +4,9 @@
 # Local config (contains credentials); config.example.json is the template
 /config.json
 
+# Runtime logs
+*.log
+
 # SQLite databases
 *.db
 *.db-wal
