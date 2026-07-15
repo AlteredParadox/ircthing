@@ -1,6 +1,7 @@
 {
   "name": "ircthing-web",
   "private": true,
+  "type": "module",
   "dependencies": {
     "preact": "^10.26.9"
   },

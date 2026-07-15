@@ -39,8 +39,13 @@ web/node_modules: web/package.json web/package-lock.json
 	cd web && npm ci --no-fund --no-audit
 	touch web/node_modules
 
-check: vet staticcheck test build binary-size-gate bundle-size-gate
+check: vet staticcheck test frontend-test build binary-size-gate bundle-size-gate
 	@echo "check: OK"
+
+# Pure frontend logic (parsers, formatting) tested with node's built-in
+# runner — no extra test dependencies.
+frontend-test:
+	cd web && node --test test/
 
 vet:
 	$(GO) vet ./...
