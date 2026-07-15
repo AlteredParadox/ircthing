@@ -88,7 +88,7 @@ func TestSASL(t *testing.T) {
 	st, h := newStoreAndHub(t)
 	s := startStack(t, st, h, irc.Config{
 		Name: "ergo", Addr: addr, Nick: "sasluser",
-		SASL: &irc.SASLPlain{Login: "sasluser", Password: "sekrit-pw"},
+		SASL: &irc.SASLConfig{Login: "sasluser", Password: "sekrit-pw"},
 	})
 	s.waitRegistered()
 }
@@ -131,7 +131,7 @@ func TestReadMarkerMultiDevice(t *testing.T) {
 	})
 	reg.send("QUIT :done")
 
-	sasl := &irc.SASLPlain{Login: "shared", Password: "sekrit-pw"}
+	sasl := &irc.SASLConfig{Login: "shared", Password: "sekrit-pw"}
 	stA, hA := newStoreAndHub(t)
 	devA := startStack(t, stA, hA, irc.Config{
 		Name: "ergo", Addr: addr, Nick: "shared", SASL: sasl, Channels: []string{"#rm"},

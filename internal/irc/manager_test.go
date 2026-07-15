@@ -128,6 +128,25 @@ func (s *srvConn) registerCaps(nick, lsCaps string) {
 	}
 }
 
+// registerExternal plays the server side of a SASL EXTERNAL exchange.
+func (s *srvConn) registerExternal(nick string) {
+	s.t.Helper()
+	s.readCmd("USER")
+	s.send("CAP * LS :sasl=EXTERNAL")
+	req := s.readCmd("CAP") // CAP REQ :sasl
+	s.send("CAP " + nick + " ACK :" + req.Trailing())
+	if m := s.readCmd("AUTHENTICATE"); m.Param(0) != "EXTERNAL" {
+		s.t.Fatalf("AUTHENTICATE %q, want EXTERNAL", m.Param(0))
+	}
+	s.send("AUTHENTICATE +")
+	if m := s.readCmd("AUTHENTICATE"); m.Param(0) != "+" {
+		s.t.Fatalf("EXTERNAL response = %q, want + (empty)", m.Param(0))
+	}
+	s.send(":irc.test 903 " + nick + " :SASL successful")
+	s.readCmd("CAP") // CAP END
+	s.send(":irc.test 001 " + nick + " :Welcome " + nick)
+}
+
 // startManager runs the manager in the background for the whole test.
 func startManager(t *testing.T, cfg Config) *Manager {
 	t.Helper()
@@ -706,6 +725,54 @@ func TestManagerTLS(t *testing.T) {
 	waitState(t, m, StateRegistered)
 }
 
+// TestManagerPresentsClientCert verifies the SASL EXTERNAL prerequisite:
+// a configured TLS client certificate is presented to the server during
+// the handshake (the server then matches its fingerprint to an account).
+func TestManagerPresentsClientCert(t *testing.T) {
+	serverCert, pool := selfSignedCert(t)
+	clientCert, _ := selfSignedCert(t)
+
+	tcpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotCert := make(chan bool, 1)
+	ln := tls.NewListener(tcpLn, &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequestClientCert,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			select {
+			case gotCert <- len(cs.PeerCertificates) > 0:
+			default:
+			}
+			return nil
+		},
+	})
+	conns := listen(t, ln)
+
+	cfg := testCfg(tcpLn.Addr().String())
+	cfg.AllowPlaintext = false
+	cfg.TLS = true
+	cfg.TLSConfig = &tls.Config{RootCAs: pool, Certificates: []tls.Certificate{clientCert}}
+	cfg.SASL = &SASLConfig{Mechanism: "EXTERNAL"}
+	m := startManager(t, cfg)
+
+	s := accept(t, conns)
+	// Server offers EXTERNAL; the client authenticates with an empty
+	// response proven by the presented certificate.
+	s.registerExternal("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	select {
+	case ok := <-gotCert:
+		if !ok {
+			t.Fatal("server did not receive a client certificate")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("TLS never completed")
+	}
+}
+
 func TestNewManagerRejectsBadConfig(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -715,7 +782,7 @@ func TestNewManagerRejectsBadConfig(t *testing.T) {
 		{"missing addr", Config{Nick: "n", AllowPlaintext: true}, "Addr"},
 		{"missing nick", Config{Addr: "x:1", AllowPlaintext: true}, "Nick"},
 		{"plaintext without opt-in", Config{Addr: "x:1", Nick: "n"}, "AllowPlaintext"},
-		{"sasl without login", Config{Addr: "x:1", Nick: "n", TLS: true, SASL: &SASLPlain{Password: "p"}}, "login"},
+		{"sasl without login", Config{Addr: "x:1", Nick: "n", TLS: true, SASL: &SASLConfig{Password: "p"}}, "login"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

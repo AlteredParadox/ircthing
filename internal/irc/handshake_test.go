@@ -1,11 +1,13 @@
 package irc
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"reflect"
 	"strings"
 	"testing"
 
+	"golang.org/x/crypto/pbkdf2"
 	ircv4 "gopkg.in/irc.v4"
 )
 
@@ -40,7 +42,7 @@ func b64(login, pass string) string {
 func TestHandshake(t *testing.T) {
 	baseCfg := Config{Addr: "irc.test:6667", Nick: "AlteredParadox", AllowPlaintext: true}
 	saslCfg := baseCfg
-	saslCfg.SASL = &SASLPlain{Login: "AlteredParadox", Password: "sesame"}
+	saslCfg.SASL = &SASLConfig{Mechanism: "PLAIN", Login: "AlteredParadox", Password: "sesame"}
 	authLine := "AUTHENTICATE " + b64("AlteredParadox", "sesame")
 
 	type step struct {
@@ -100,6 +102,22 @@ func TestHandshake(t *testing.T) {
 				{in: "AUTHENTICATE +", want: []string{authLine}},
 				{in: ":irc.test 900 AlteredParadox AlteredParadox!u@h AlteredParadox :You are now logged in as AlteredParadox"},
 				{in: ":irc.test 903 AlteredParadox :SASL authentication successful", want: []string{"CAP END"}},
+				{in: ":irc.test 001 AlteredParadox :Welcome", done: true},
+			},
+		},
+		{
+			name: "SASL EXTERNAL sends an empty response",
+			cfg: func() Config {
+				c := baseCfg
+				c.SASL = &SASLConfig{Mechanism: "EXTERNAL"}
+				return c
+			}(),
+			steps: []step{
+				{in: "CAP * LS :sasl=EXTERNAL", want: []string{"CAP REQ sasl"}},
+				{in: "CAP * ACK :sasl", want: []string{"AUTHENTICATE EXTERNAL"}},
+				// EXTERNAL's authorization identity is empty -> "+".
+				{in: "AUTHENTICATE +", want: []string{"AUTHENTICATE +"}},
+				{in: ":irc.test 903 AlteredParadox :SASL successful", want: []string{"CAP END"}},
 				{in: ":irc.test 001 AlteredParadox :Welcome", done: true},
 			},
 		},
@@ -190,12 +208,14 @@ func TestHandshake(t *testing.T) {
 			},
 		},
 		{
-			name: "unexpected non-empty PLAIN challenge fails",
+			// PLAIN is single-round; any server challenge (even a spurious
+			// non-empty one) is answered with the credential payload.
+			name: "PLAIN ignores the challenge content",
 			cfg:  saslCfg,
 			steps: []step{
 				{in: "CAP * LS :sasl", want: []string{"CAP REQ sasl"}},
 				{in: "CAP * ACK :sasl", want: []string{"AUTHENTICATE PLAIN"}},
-				{in: "AUTHENTICATE c29tZWNoYWxsZW5nZQ==", errSub: "unexpected SASL challenge"},
+				{in: "AUTHENTICATE c29tZWNoYWxsZW5nZQ==", want: []string{authLine}},
 			},
 		},
 		{
@@ -314,6 +334,91 @@ func TestHandshake(t *testing.T) {
 		})
 	}
 }
+
+// TestHandshakeSCRAMFlow drives a full SCRAM-SHA-256 exchange through the
+// handshake, playing a cooperative server that computes a valid
+// server-first and server-final from the client's actual nonce.
+func TestHandshakeSCRAMFlow(t *testing.T) {
+	cfg := Config{
+		Addr: "irc.test:6697", Nick: "AlteredParadox", TLS: true,
+		SASL: &SASLConfig{Mechanism: "SCRAM-SHA-256", Login: "AlteredParadox", Password: "pencil"},
+	}
+	hs := newHandshake(&cfg)
+	hs.start()
+
+	// respond feeds a line and returns the single AUTHENTICATE argument
+	// the client sends back (decoded from base64).
+	respond := func(line string) []byte {
+		t.Helper()
+		out, _, err := hs.handle(ircv4.MustParseMessage(line))
+		if err != nil {
+			t.Fatalf("handle %q: %v", line, err)
+		}
+		if len(out) != 1 || out[0].Command != "AUTHENTICATE" {
+			t.Fatalf("handle %q -> %v", line, wire(out))
+		}
+		arg := out[0].Param(0)
+		if arg == "+" {
+			return nil
+		}
+		b, err := base64.StdEncoding.DecodeString(arg)
+		if err != nil {
+			t.Fatalf("client sent non-base64 %q", arg)
+		}
+		return b
+	}
+
+	// CAP negotiation up to the AUTHENTICATE SCRAM-SHA-256.
+	if _, _, err := hs.handle(ircv4.MustParseMessage("CAP * LS :sasl=SCRAM-SHA-256")); err != nil {
+		t.Fatal(err)
+	}
+	out, _, _ := hs.handle(ircv4.MustParseMessage("CAP AlteredParadox ACK :sasl"))
+	if len(out) != 1 || out[0].String() != "AUTHENTICATE SCRAM-SHA-256" {
+		t.Fatalf("ack -> %v", wire(out))
+	}
+
+	// Client-first.
+	clientFirst := string(respond("AUTHENTICATE +"))
+	bare := strings.TrimPrefix(clientFirst, "n,,")
+	attrs, _ := parseScramAttrs(bare)
+	cnonce := attrs["r"]
+	if cnonce == "" || attrs["n"] != "AlteredParadox" {
+		t.Fatalf("client-first = %q", clientFirst)
+	}
+
+	// Server-first: extend the nonce, pick a salt and iteration count.
+	snonce := cnonce + "serverpart"
+	salt := []byte("0123456789abcdef")
+	iters := 4096
+	serverFirst := "r=" + snonce + ",s=" + base64.StdEncoding.EncodeToString(salt) + ",i=4096"
+
+	clientFinal := string(respond("AUTHENTICATE " + base64Encode(serverFirst)))
+	// clientFinal is "c=biws,r=<snonce>,p=<proof>".
+	if !strings.HasPrefix(clientFinal, "c=biws,r="+snonce+",p=") {
+		t.Fatalf("client-final = %q", clientFinal)
+	}
+
+	// Compute the expected server signature and complete the exchange.
+	saltedPassword := pbkdf2.Key([]byte("pencil"), salt, iters, sha256.Size, sha256.New)
+	serverKey := scramHMAC(saltedPassword, []byte("Server Key"))
+	clientFinalNoProof := "c=biws,r=" + snonce
+	authMessage := bare + "," + serverFirst + "," + clientFinalNoProof
+	serverSig := scramHMAC(serverKey, []byte(authMessage))
+	serverFinal := "v=" + base64.StdEncoding.EncodeToString(serverSig)
+
+	ack := respond("AUTHENTICATE " + base64Encode(serverFinal))
+	if len(ack) != 0 {
+		t.Fatalf("final client ack = %q, want empty", ack)
+	}
+
+	// 903 completes SASL; the handshake sends CAP END.
+	end, _, _ := hs.handle(ircv4.MustParseMessage(":irc.test 903 AlteredParadox :ok"))
+	if len(end) != 1 || end[0].String() != "CAP END" {
+		t.Fatalf("after 903 -> %v", wire(end))
+	}
+}
+
+func base64Encode(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
 func TestHandshakeRecordsEnabledCaps(t *testing.T) {
 	cfg := Config{Addr: "irc.test:6667", Nick: "AlteredParadox", AllowPlaintext: true}

@@ -68,7 +68,11 @@ func run(cfg *config) error {
 	// consumer for its events.
 	var wg sync.WaitGroup
 	for _, nc := range cfg.Networks {
-		m, err := irc.NewManager(nc.ircConfig())
+		icfg, err := nc.ircConfig()
+		if err != nil {
+			return err
+		}
+		m, err := irc.NewManager(icfg)
 		if err != nil {
 			return fmt.Errorf("network %q: %w", nc.effectiveName(), err)
 		}

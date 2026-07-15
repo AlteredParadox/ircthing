@@ -86,6 +86,7 @@ type handshake struct {
 	saslDone   bool
 	nakRetried bool // one sasl-only retry after a NAK of the full set
 	lastReq    []string
+	mech       saslMech // chosen SASL mechanism, built at CAP LS
 }
 
 func newHandshake(cfg *Config) *handshake {
@@ -225,11 +226,14 @@ func (h *handshake) handleCAP(m *ircv4.Message) ([]*ircv4.Message, bool, error) 
 			if !offered {
 				return nil, false, errors.New("SASL configured but the server does not offer the sasl capability")
 			}
-			// With CAP 302 the sasl value lists mechanisms; an empty
-			// value means the server didn't say, so try PLAIN anyway.
-			if mechs != "" && !mechListed(mechs, "PLAIN") {
-				return nil, false, fmt.Errorf("SASL PLAIN not offered (server mechanisms: %s)", mechs)
+			// Choose and build the mechanism now so an unsupported choice
+			// fails before we CAP REQ. (mechs is empty when the server
+			// didn't advertise its list under CAP 302.)
+			mech, err := newMech(h.cfg.SASL, mechs)
+			if err != nil {
+				return nil, false, err
 			}
+			h.mech = mech
 		}
 		reqs := h.capsToRequest()
 		if len(reqs) == 0 {
@@ -251,9 +255,9 @@ func (h *handshake) handleCAP(m *ircv4.Message) ([]*ircv4.Message, bool, error) 
 				h.enabled[tok] = true
 			}
 		}
-		if h.cfg.SASL != nil && h.enabled["sasl"] && !h.saslDone {
+		if h.mech != nil && h.enabled["sasl"] && !h.saslDone {
 			h.phase = hsAuthChallenge
-			return []*ircv4.Message{newMsg("AUTHENTICATE", "PLAIN")}, false, nil
+			return []*ircv4.Message{newMsg("AUTHENTICATE", h.mech.Name())}, false, nil
 		}
 		h.phase = hsAwaitWelcome
 		return []*ircv4.Message{newMsg("CAP", "END")}, false, nil
@@ -282,21 +286,38 @@ func (h *handshake) handleCAP(m *ircv4.Message) ([]*ircv4.Message, bool, error) 
 }
 
 func (h *handshake) handleAuthenticate(m *ircv4.Message) ([]*ircv4.Message, bool, error) {
-	if h.phase != hsAuthChallenge {
+	if h.phase != hsAuthChallenge || h.mech == nil {
 		return nil, false, nil
 	}
-	// PLAIN is a single-round mechanism: the only valid server challenge
-	// is the empty one ("+").
-	if m.Param(0) != "+" {
-		return nil, false, fmt.Errorf("unexpected SASL challenge %q for PLAIN", m.Param(0))
+	// A server AUTHENTICATE carries the base64 challenge, or "+" for an
+	// empty one. Multi-round mechanisms (SCRAM) reassemble across it.
+	challenge, err := decodeChallenge(m.Param(0))
+	if err != nil {
+		return nil, false, err
 	}
-	blob := saslPlain("", h.cfg.SASL.Login, h.cfg.SASL.Password)
+	resp, err := h.mech.respond(challenge)
+	if err != nil {
+		// Abort the exchange; the connection attempt then fails and retries.
+		return []*ircv4.Message{newMsg("AUTHENTICATE", "*")}, false, fmt.Errorf("SASL %s: %w", h.mech.Name(), err)
+	}
 	var out []*ircv4.Message
-	for _, chunk := range chunkAuthenticate(base64.StdEncoding.EncodeToString(blob)) {
+	for _, chunk := range chunkAuthenticate(base64.StdEncoding.EncodeToString(resp)) {
 		out = append(out, newMsg("AUTHENTICATE", chunk))
 	}
-	h.phase = hsAuthResult
 	return out, false, nil
+}
+
+// decodeChallenge base64-decodes a server AUTHENTICATE argument; "+"
+// means an empty challenge.
+func decodeChallenge(arg string) ([]byte, error) {
+	if arg == "+" || arg == "" {
+		return nil, nil
+	}
+	b, err := base64.StdEncoding.DecodeString(arg)
+	if err != nil {
+		return nil, fmt.Errorf("SASL: undecodable server challenge: %w", err)
+	}
+	return b, nil
 }
 
 // capsToRequest is the sorted intersection of what we want and what the

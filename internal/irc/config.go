@@ -3,6 +3,7 @@ package irc
 import (
 	"crypto/tls"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -29,11 +30,11 @@ type Config struct {
 	// Pass is the server password (PASS), sent only if non-empty.
 	Pass string
 
-	// SASL enables SASL PLAIN authentication during registration.
-	// If the server does not offer it, the connection attempt fails
-	// (and is retried with backoff) rather than proceeding
+	// SASL enables SASL authentication during registration. If the server
+	// does not offer SASL (or the chosen mechanism), the connection
+	// attempt fails (and is retried with backoff) rather than proceeding
 	// unauthenticated.
-	SASL *SASLPlain
+	SASL *SASLConfig
 
 	// Channels are joined after every successful registration, so they
 	// come back automatically on reconnect.
@@ -60,10 +61,16 @@ type Config struct {
 	SendInterval time.Duration
 }
 
-// SASLPlain holds credentials for the SASL PLAIN mechanism (RFC 4616).
-type SASLPlain struct {
-	Login    string
-	Password string
+// SASLConfig holds SASL authentication settings. Mechanism is one of
+// "PLAIN", "EXTERNAL", "SCRAM-SHA-256", or "" to choose automatically
+// (EXTERNAL when no password is set, else SCRAM-SHA-256 if the server
+// offers it, else PLAIN). EXTERNAL authenticates via the TLS client
+// certificate (Config.TLSConfig must carry one) and needs no password.
+type SASLConfig struct {
+	Mechanism string
+	Login     string // authcid (account name); empty allowed for EXTERNAL
+	Password  string // PLAIN / SCRAM-SHA-256
+	Authzid   string // optional authorization identity, usually empty
 }
 
 func (c *Config) validate() error {
@@ -76,8 +83,14 @@ func (c *Config) validate() error {
 	if !c.TLS && !c.AllowPlaintext {
 		return errors.New("irc: config: plaintext connection requires the explicit AllowPlaintext opt-in")
 	}
-	if c.SASL != nil && c.SASL.Login == "" {
-		return errors.New("irc: config: SASL requires a login")
+	if c.SASL != nil {
+		mech := strings.ToUpper(c.SASL.Mechanism)
+		if mech != "EXTERNAL" && c.SASL.Login == "" {
+			return errors.New("irc: config: SASL requires a login (except EXTERNAL)")
+		}
+		if mech == "EXTERNAL" && !c.TLS {
+			return errors.New("irc: config: SASL EXTERNAL requires a TLS connection with a client certificate")
+		}
 	}
 	return nil
 }

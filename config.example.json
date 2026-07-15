@@ -13,6 +13,7 @@
       "nick": "mynick",
       "realname": "My Name",
       "sasl": {
+        "mechanism": "",
         "login": "mynick",
         "password": "my-nickserv-password"
       },

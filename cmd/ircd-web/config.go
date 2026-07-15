@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,8 +52,15 @@ type netConfig struct {
 }
 
 type saslConfig struct {
-	Login    string `json:"login"`
-	Password string `json:"password"`
+	// Mechanism is "PLAIN", "EXTERNAL", "SCRAM-SHA-256", or "" to choose
+	// automatically (EXTERNAL when no password, else SCRAM-SHA-256 if
+	// offered, else PLAIN).
+	Mechanism string `json:"mechanism"`
+	Login     string `json:"login"`
+	Password  string `json:"password"`
+	// CertFile/KeyFile provide the TLS client certificate for EXTERNAL.
+	CertFile string `json:"cert_file"`
+	KeyFile  string `json:"key_file"`
 }
 
 func loadConfig(path string) (*config, error) {
@@ -107,7 +115,7 @@ func (n *netConfig) effectiveName() string {
 	return n.Addr
 }
 
-func (n *netConfig) ircConfig() irc.Config {
+func (n *netConfig) ircConfig() (irc.Config, error) {
 	cfg := irc.Config{
 		Name:           n.Name,
 		Addr:           n.Addr,
@@ -120,9 +128,22 @@ func (n *netConfig) ircConfig() irc.Config {
 		Channels:       n.Channels,
 	}
 	if n.SASL != nil {
-		cfg.SASL = &irc.SASLPlain{Login: n.SASL.Login, Password: n.SASL.Password}
+		cfg.SASL = &irc.SASLConfig{
+			Mechanism: n.SASL.Mechanism,
+			Login:     n.SASL.Login,
+			Password:  n.SASL.Password,
+		}
+		// A client certificate (SASL EXTERNAL) is presented during the
+		// TLS handshake.
+		if n.SASL.CertFile != "" {
+			cert, err := tls.LoadX509KeyPair(n.SASL.CertFile, n.SASL.KeyFile)
+			if err != nil {
+				return irc.Config{}, fmt.Errorf("network %q: loading client certificate: %w", n.effectiveName(), err)
+			}
+			cfg.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+		}
 	}
-	return cfg
+	return cfg, nil
 }
 
 func (c *config) sessionTTL() time.Duration {
