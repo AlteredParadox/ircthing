@@ -1,0 +1,55 @@
+# Minimal Ergo config for the integration suite. {{PORT}} and {{DIR}} are
+# substituted by the test harness. History is enabled so chathistory
+# backfill can be exercised; account registration is open (no email) so
+# the SASL test can create an account at runtime.
+network:
+  name: ircthing-test
+server:
+  name: test.example
+  listeners:
+    "127.0.0.1:{{PORT}}": {}
+  casemapping: ascii
+  enforce-utf8: true
+  lookup-hostnames: false
+  ip-cloaking:
+    enabled: false
+  max-sendq: 96k
+  connection-limits:
+    enabled: false
+  connection-throttling:
+    enabled: false
+datastore:
+  path: "{{DIR}}/ircd.db"
+accounts:
+  authentication-enabled: true
+  registration:
+    enabled: true
+    allow-before-connect: true
+    throttling:
+      enabled: false
+    email-verification:
+      enabled: false
+  multiclient:
+    enabled: true
+    allowed-by-default: true
+    always-on: opt-in
+channels:
+  default-modes: +nt
+  registration:
+    enabled: true
+history:
+  enabled: true
+  channel-length: 2048
+  client-length: 256
+  autoresize-window: 1h
+  chathistory-maxmessages: 100
+  restrictions:
+    expire-time: 1h
+    query-cutoff: none
+limits:
+  nicklen: 32
+  identlen: 20
+  channellen: 64
+  awaylen: 200
+  kicklen: 300
+  topiclen: 300

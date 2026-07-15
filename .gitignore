@@ -7,6 +7,9 @@
 # Runtime logs
 *.log
 
+# Tool cache (ergo build for make integration)
+/.cache/
+
 # SQLite databases
 *.db
 *.db-wal

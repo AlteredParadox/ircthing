@@ -29,9 +29,10 @@ type Conn interface {
 	CapEnabled(name string) bool
 	IsChannel(target string) bool // per the network's ISUPPORT CHANTYPES
 	ChanTypes() string
-	// RequestChatHistory backfills target with messages newer than
-	// sinceMs; a no-op on networks without draft/chathistory.
-	RequestChatHistory(target string, sinceMs int64)
+	// RequestChatHistory backfills target with messages newer than the
+	// resume point (msgid preferred over sinceMs when non-empty); a
+	// no-op on networks without draft/chathistory.
+	RequestChatHistory(target string, sinceMs int64, msgid string)
 }
 
 type Hub struct {
@@ -101,6 +102,9 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					h.backfill(ctx, c)
 				}
 			case irc.EventMessage:
+				if ev.Msg.Command == "FAIL" { // standard-replies
+					log.Printf("irc[%s]: server failure: %s", ev.Network, ev.Msg.String())
+				}
 				if ev.Msg.Command == "BATCH" {
 					h.trackHistoryBatch(ev, histBatch)
 					continue
@@ -111,6 +115,16 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 						h.broadcast(envelope("members_changed", 0, MembersChangedData{
 							Network: ev.Network, Buffer: hint,
 						}))
+					}
+					// Our own JOIN is the moment to backfill that channel:
+					// requesting at registration would race the JOIN, and
+					// servers may refuse history for channels we are not
+					// in yet.
+					if ev.Msg.Command == "JOIN" && ev.Msg.Prefix != nil &&
+						c.Nick() != "" && strings.EqualFold(ev.Msg.Prefix.Name, c.Nick()) {
+						if ts, msgid := h.lastStored(ctx, ev.Network, ev.Msg.Param(0)); ts > 0 {
+							c.RequestChatHistory(ev.Msg.Param(0), ts, msgid)
+						}
 					}
 				}
 				if ev.Msg.Command == "TAGMSG" {
@@ -142,10 +156,10 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 	}
 }
 
-// backfill requests missed history for every known buffer of the network
-// after (re)registration; the store's newest timestamp per buffer is the
-// resume point. Buffers with no stored history yet have nothing to resume
-// from and are skipped.
+// backfill requests missed history for the network's non-channel (query)
+// buffers after (re)registration; channels backfill on their own JOIN
+// echo instead. The store's newest timestamp per buffer is the resume
+// point; buffers with no stored history have nothing to resume from.
 func (h *Hub) backfill(ctx context.Context, c Conn) {
 	infos, err := h.store.Buffers(ctx)
 	if err != nil {
@@ -153,10 +167,21 @@ func (h *Hub) backfill(ctx context.Context, c Conn) {
 		return
 	}
 	for _, b := range infos {
-		if b.Network == c.Name() && b.LastTS > 0 {
-			c.RequestChatHistory(b.Target, b.LastTS)
+		if b.Network == c.Name() && b.LastTS > 0 && !c.IsChannel(b.Target) {
+			_, msgid := h.lastStored(ctx, b.Network, b.Target)
+			c.RequestChatHistory(b.Target, b.LastTS, msgid)
 		}
 	}
+}
+
+// lastStored returns the newest stored message's timestamp (unix ms) and
+// msgid for one buffer; (0, "") when the buffer has no history.
+func (h *Hub) lastStored(ctx context.Context, network, target string) (int64, string) {
+	msgs, err := h.store.Latest(ctx, network, target, 1)
+	if err != nil || len(msgs) == 0 {
+		return 0, ""
+	}
+	return msgs[0].Time.UnixMilli(), msgs[0].MsgID
 }
 
 // trackHistoryBatch follows BATCH open/close for chathistory replays and

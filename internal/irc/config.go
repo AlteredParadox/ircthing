@@ -50,8 +50,12 @@ type Config struct {
 	PingTimeout      time.Duration // wait for traffic after our PING, default 30s
 
 	// Outbound flood protection (token bucket): SendBurst messages may go
-	// out back-to-back, then one message per SendInterval. Defaults: 4
-	// messages, 2s (the classic RFC 1459 client penalty model).
+	// out back-to-back, then one message per SendInterval. Defaults: 16
+	// messages, 2s. The burst must comfortably cover registration (CAP
+	// LS/REQ/END, NICK, USER, SASL) plus a handful of rejoins, or every
+	// reconnect crawls at one line per interval; 16 keeps sustained
+	// output at the classic RFC 1459 rate while letting handshakes run
+	// at full speed.
 	SendBurst    int
 	SendInterval time.Duration
 }
@@ -95,7 +99,7 @@ func (c *Config) applyDefaults() {
 		c.PingTimeout = 30 * time.Second
 	}
 	if c.SendBurst <= 0 {
-		c.SendBurst = 4
+		c.SendBurst = 16
 	}
 	if c.SendInterval <= 0 {
 		c.SendInterval = 2 * time.Second

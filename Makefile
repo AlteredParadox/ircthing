@@ -78,9 +78,22 @@ bundle-size-gate: frontend
 		exit 1; \
 	fi
 
-# Spins up a local Ergo IRCd in a container and runs end-to-end tests.
-integration:
-	@echo "integration: not implemented yet (stub)"; exit 1
+# End-to-end tests against a real Ergo IRCd (connect, SASL, join,
+# chathistory, reconnect-replay). Ergo is a pure-Go binary, so it runs
+# directly — no container runtime needed; ERGO_BIN overrides the cached
+# build.
+ERGO_REF := v2.19.0-rc1
+
+integration: .cache/bin/ergo
+	go test -tags integration -count=1 -v -timeout 300s ./integration/
+
+ergo: .cache/bin/ergo
+
+.cache/bin/ergo:
+	@echo "building ergo ($(ERGO_REF)) into .cache/bin ..."
+	rm -rf .cache/ergo-src
+	git clone --depth 1 --branch $(ERGO_REF) https://github.com/ergochat/ergo.git .cache/ergo-src
+	cd .cache/ergo-src && GOTOOLCHAIN=auto $(GO) build -o ../bin/ergo .
 
 # RSS scenario: 5 networks / 50 channels / 10k hot messages under
 # GOMEMLIMIT=64MiB, verified against the 72 MB target.

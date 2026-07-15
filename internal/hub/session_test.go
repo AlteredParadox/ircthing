@@ -630,6 +630,13 @@ func TestChatHistoryBackfillFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A query buffer backfills at registration; the channel on JOIN.
+	if _, err := h.store.Append(context.Background(), "libera", "bob", store.Message{
+		Time: time.UnixMilli(4000), MsgID: "pm", Sender: "bob", Command: "PRIVMSG", Raw: "pm msg",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
 	conn := &fakeConn{ch: make(chan irc.Event, 16), name: "libera", nick: "AlteredParadox"}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -638,19 +645,35 @@ func TestChatHistoryBackfillFlow(t *testing.T) {
 	s := h.NewSession()
 	defer s.Close()
 
-	// Registration triggers a backfill request from the newest stored ts.
+	// Registration backfills the query buffer only.
 	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered}
 	recv(t, s, "state")
 	deadline := time.Now().Add(5 * time.Second)
 	for len(conn.histReqs()) == 0 {
 		if time.Now().After(deadline) {
-			t.Fatal("backfill never requested")
+			t.Fatal("query backfill never requested")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	if got := conn.histReqs()[0]; got != "#go@5000" {
-		t.Fatalf("backfill request = %q", got)
+	if got := conn.histReqs(); len(got) != 1 || got[0] != "bob@4000@pm" {
+		t.Fatalf("registration backfill = %v", got)
 	}
+
+	// Our JOIN echo triggers the channel backfill.
+	conn.ch <- irc.Event{
+		Network: "libera", Kind: irc.EventMessage,
+		Msg: ircv4.MustParseMessage(":AlteredParadox!u@h JOIN #go"), Time: time.Now(),
+	}
+	for len(conn.histReqs()) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("channel backfill never requested")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := conn.histReqs()[1]; got != "#go@5000@seed" {
+		t.Fatalf("channel backfill request = %q", got)
+	}
+	recv(t, s, "members_changed", "event") // JOIN side effects
 
 	// The replay batch: persisted, but no live event/members pushes; a
 	// history_changed hint follows the batch close.
@@ -661,7 +684,7 @@ func TestChatHistoryBackfillFlow(t *testing.T) {
 	conn.ch <- ev("@batch=r1;msgid=h1;time=2026-07-15T00:00:06.000Z :bob!u@h PRIVMSG #go :missed one")
 	conn.ch <- ev("@batch=r1;msgid=h2;time=2026-07-15T00:00:07.000Z :bob!u@h JOIN #go")
 	conn.ch <- ev(":srv BATCH -r1")
-	hint := decode[HistoryChangedData](t, recv(t, s, "history_changed"))
+	hint := decode[HistoryChangedData](t, recv(t, s, "history_changed", "event", "members_changed"))
 	if hint.Network != "libera" || hint.Buffer != "#go" {
 		t.Fatalf("hint = %+v", hint)
 	}
@@ -670,7 +693,7 @@ func TestChatHistoryBackfillFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(msgs) != 3 || msgs[1].Raw == "" || msgs[1].MsgID != "h1" {
+	if len(msgs) != 4 || msgs[1].Raw == "" || msgs[1].MsgID != "h1" {
 		t.Fatalf("persisted: %+v", msgs)
 	}
 	if !msgs[1].Time.Equal(time.Date(2026, 7, 15, 0, 0, 6, 0, time.UTC)) {
@@ -681,7 +704,7 @@ func TestChatHistoryBackfillFlow(t *testing.T) {
 	// dropped silently, even outside a batch.
 	conn.ch <- ev("@msgid=h1;time=2026-07-15T00:00:06.000Z :bob!u@h PRIVMSG #go :missed one")
 	expectSilence(t, s)
-	if msgs, _ := h.store.Latest(ctx, "libera", "#go", 10); len(msgs) != 3 {
+	if msgs, _ := h.store.Latest(ctx, "libera", "#go", 10); len(msgs) != 4 {
 		t.Fatalf("duplicate persisted: %d rows", len(msgs))
 	}
 
@@ -691,11 +714,9 @@ func TestChatHistoryBackfillFlow(t *testing.T) {
 		t.Fatalf("live event = %+v", got)
 	}
 
-	// Buffers with no stored history are not backfilled.
-	for _, r := range conn.histReqs() {
-		if r != "#go@5000" {
-			t.Fatalf("unexpected backfill %q", r)
-		}
+	// No further backfills beyond the query and joined channel.
+	if got := conn.histReqs(); len(got) != 2 {
+		t.Fatalf("backfill requests = %v", got)
 	}
 }
 

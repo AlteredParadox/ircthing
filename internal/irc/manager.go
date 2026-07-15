@@ -5,7 +5,9 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"log"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -134,13 +136,16 @@ func (m *Manager) Channel(name string) (topic string, members []Member, ok bool)
 }
 
 // RequestChatHistory asks the server for messages in target newer than
-// sinceMs (unix ms) — gap-free scrollback after reconnects
+// the given resume point — gap-free scrollback after reconnects
 // (draft/chathistory AFTER; https://ircv3.net/specs/extensions/
 // chathistory, fetched 2026-07-15). No-op unless the server offers the
-// cap. Single page, clamped to the CHATHISTORY ISUPPORT limit: if more
-// messages than that were missed, the older remainder is not fetched
-// (paginated backfill is a later refinement).
-func (m *Manager) RequestChatHistory(target string, sinceMs int64) {
+// cap. The msgid selector is preferred when the newest stored message
+// has one and MSGREFTYPES allows it: AFTER excludes equal timestamps, so
+// two messages in the same millisecond would lose the second one under a
+// timestamp selector. Single page, clamped to the CHATHISTORY ISUPPORT
+// limit: if more messages than that were missed, the older remainder is
+// not fetched (paginated backfill is a later refinement).
+func (m *Manager) RequestChatHistory(target string, sinceMs int64, msgid string) {
 	if !m.CapEnabled("draft/chathistory") {
 		return
 	}
@@ -150,9 +155,14 @@ func (m *Manager) RequestChatHistory(target string, sinceMs int64) {
 			limit = n
 		}
 	}
-	ts := time.UnixMilli(sinceMs).UTC().Format("2006-01-02T15:04:05.000Z")
+	sel := "timestamp=" + time.UnixMilli(sinceMs).UTC().Format("2006-01-02T15:04:05.000Z")
+	if msgid != "" {
+		if refs, ok := m.isup.Raw("MSGREFTYPES"); ok && mechListed(refs, "msgid") {
+			sel = "msgid=" + msgid
+		}
+	}
 	// Best-effort: a full queue just means no backfill this round.
-	_ = m.Send(newMsg("CHATHISTORY", "AFTER", target, "timestamp="+ts, strconv.Itoa(limit)))
+	_ = m.Send(newMsg("CHATHISTORY", "AFTER", target, sel, strconv.Itoa(limit)))
 }
 
 // CapEnabled reports whether an IRCv3 capability was negotiated on the
@@ -286,6 +296,14 @@ drain:
 
 	r := ircv4.NewReader(conn)
 	w := ircv4.NewWriter(conn)
+	if os.Getenv("IRCTHING_DEBUG_RAW") != "" {
+		r.DebugCallback = func(line string) {
+			log.Printf("irc[%s] << %s", m.cfg.Name, strings.TrimRight(line, "\r\n"))
+		}
+		w.DebugCallback = func(line string) {
+			log.Printf("irc[%s] >> %s", m.cfg.Name, strings.TrimRight(line, "\r\n"))
+		}
+	}
 	internal := make(chan *ircv4.Message, 16)
 	go m.writeLoop(cctx, cancel, conn, w, internal)
 

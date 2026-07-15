@@ -435,7 +435,7 @@ func TestManagerRequestsChatHistory(t *testing.T) {
 	s := accept(t, conns)
 	s.registerCaps("AlteredParadox", "batch server-time message-tags draft/chathistory draft/event-playback")
 	waitState(t, m, StateRegistered)
-	s.send(":irc.test 005 AlteredParadox CHATHISTORY=50 :are supported by this server")
+	s.send(":irc.test 005 AlteredParadox CHATHISTORY=50 MSGREFTYPES=msgid,timestamp :are supported by this server")
 
 	// The limit clamps to the server's advertised maximum once 005 lands.
 	deadline := time.Now().Add(5 * time.Second)
@@ -449,11 +449,21 @@ func TestManagerRequestsChatHistory(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	since := int64(1752570000000)
-	m.RequestChatHistory("#go", since)
+
+	// With a msgid and MSGREFTYPES support, the precise selector wins
+	// (a timestamp selector loses same-millisecond messages).
+	m.RequestChatHistory("#go", since, "abc123")
 	got := s.readCmd("CHATHISTORY")
-	wantTS := time.UnixMilli(since).UTC().Format("2006-01-02T15:04:05.000Z")
 	if got.Param(0) != "AFTER" || got.Param(1) != "#go" ||
-		got.Param(2) != "timestamp="+wantTS || got.Param(3) != "50" {
+		got.Param(2) != "msgid=abc123" || got.Param(3) != "50" {
+		t.Fatalf("wire = %q", got.String())
+	}
+
+	// Without a msgid the timestamp selector is used.
+	m.RequestChatHistory("#go", since, "")
+	got = s.readCmd("CHATHISTORY")
+	wantTS := time.UnixMilli(since).UTC().Format("2006-01-02T15:04:05.000Z")
+	if got.Param(2) != "timestamp="+wantTS {
 		t.Fatalf("wire = %q", got.String())
 	}
 }
@@ -469,7 +479,7 @@ func TestManagerChatHistoryWithoutCapIsNoop(t *testing.T) {
 	s.register("AlteredParadox") // no chathistory in LS
 	waitState(t, m, StateRegistered)
 
-	m.RequestChatHistory("#go", 1000)
+	m.RequestChatHistory("#go", 1000, "x")
 	// A marker message must be the next thing on the wire.
 	if err := m.Send(newMsg("PRIVMSG", "#go", "marker")); err != nil {
 		t.Fatal(err)

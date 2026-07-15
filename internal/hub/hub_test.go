@@ -150,10 +150,10 @@ func (f *fakeConn) sentMsgs() []*ircv4.Message {
 	return append([]*ircv4.Message(nil), f.sent...)
 }
 
-func (f *fakeConn) RequestChatHistory(target string, sinceMs int64) {
+func (f *fakeConn) RequestChatHistory(target string, sinceMs int64, msgid string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.hist = append(f.hist, fmt.Sprintf("%s@%d", target, sinceMs))
+	f.hist = append(f.hist, fmt.Sprintf("%s@%d@%s", target, sinceMs, msgid))
 }
 
 func (f *fakeConn) histReqs() []string {
