@@ -419,6 +419,62 @@ func TestManagerCapsAndNotify(t *testing.T) {
 	}
 }
 
+func TestManagerAppliesISupport(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	// Defaults before 005.
+	if !m.IsChannel("&local") || m.ChanTypes() != "#&" {
+		t.Fatal("defaults wrong before 005")
+	}
+	s.send(":irc.test 005 AlteredParadox CHANTYPES=# PREFIX=(qaohv)~&@%+ CASEMAPPING=ascii :are supported by this server")
+	deadline := time.Now().Add(5 * time.Second)
+	for m.IsChannel("&local") {
+		if time.Now().After(deadline) {
+			t.Fatal("005 CHANTYPES never applied")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if m.ChanTypes() != "#" {
+		t.Fatalf("ChanTypes = %q", m.ChanTypes())
+	}
+
+	// The roster consumes the advertised PREFIX for NAMES parsing.
+	s.send(":AlteredParadox!u@h JOIN #x")
+	s.send(":srv 353 AlteredParadox = #x :~boss AlteredParadox")
+	s.send(":srv 366 AlteredParadox #x :end")
+	for {
+		if _, members, ok := m.Channel("#x"); ok && len(members) == 2 {
+			if members[1].Nick != "boss" || members[1].Prefix != "~" {
+				t.Fatalf("members = %v", members)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("roster never applied 005 PREFIX")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// A reconnect resets ISUPPORT to defaults until the new 005.
+	s.c.Close()
+	waitState(t, m, StateDisconnected)
+	s2 := accept(t, conns)
+	s2.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+	if !m.IsChannel("&local") {
+		t.Fatal("ISUPPORT not reset on reconnect")
+	}
+}
+
 func TestManagerTracksNick(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

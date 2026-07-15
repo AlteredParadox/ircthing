@@ -12,15 +12,16 @@ import (
 //
 // Sources: NAMES on join (353 accumulated until 366), then live
 // JOIN/PART/KICK/QUIT/NICK/MODE/TOPIC/332/331/AWAY. Status prefixes are
-// kept as display characters ("~&@%+"), all of them ordered highest
-// first when multi-prefix (https://ircv3.net/specs/extensions/
-// multi-prefix, fetched 2026-07-15) is negotiated — without it only the
-// highest is known. NAMES entries may be full nick!user@host hostmasks
-// under userhost-in-names (spec fetched 2026-07-15). Away state comes
-// from away-notify AWAY lines (spec fetched 2026-07-15). Casemapping is
-// ASCII lowering and MODE parsing assumes the RFC 1459 defaults
-// (PREFIX=(qaohv)~&@%+ superset, CHANMODES=b,k,l,imnpst) until ISUPPORT
-// parsing lands.
+// kept as display characters, all of them ordered highest first when
+// multi-prefix (https://ircv3.net/specs/extensions/multi-prefix, fetched
+// 2026-07-15) is negotiated — without it only the highest is known.
+// NAMES entries may be full nick!user@host hostmasks under
+// userhost-in-names (spec fetched 2026-07-15). Away state comes from
+// away-notify AWAY lines (spec fetched 2026-07-15).
+//
+// Prefix ranks, MODE argument consumption and name casemapping all come
+// from the connection's RPL_ISUPPORT values (PREFIX, CHANMODES,
+// CASEMAPPING), falling back to the RFC 1459 defaults until 005 arrives.
 
 // Member is one channel occupant.
 type Member struct {
@@ -32,19 +33,21 @@ type Member struct {
 type channelState struct {
 	name    string // original casing
 	topic   string
-	members map[string]Member // lower(nick) -> member
+	members map[string]Member // folded nick -> member
 	pending map[string]Member // NAMES accumulation until 366
 }
 
 // roster is written by the connection's read loop and snapshotted by hub
 // sessions, so a mutex guards the maps.
 type roster struct {
+	isup *isupport
+
 	mu    sync.Mutex
-	chans map[string]*channelState // lower(channel) -> state
+	chans map[string]*channelState // folded channel -> state
 }
 
-func newRoster() *roster {
-	return &roster{chans: make(map[string]*channelState)}
+func newRoster(isup *isupport) *roster {
+	return &roster{isup: isup, chans: make(map[string]*channelState)}
 }
 
 // clear drops all state; the manager calls it when a connection ends,
@@ -59,7 +62,7 @@ func (r *roster) clear() {
 func (r *roster) channel(name string) (topic string, members []Member, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	st := r.chans[lower(name)]
+	st := r.chans[r.isup.Fold(name)]
 	if st == nil {
 		return "", nil, false
 	}
@@ -68,7 +71,7 @@ func (r *roster) channel(name string) (topic string, members []Member, ok bool) 
 		members = append(members, m)
 	}
 	sort.Slice(members, func(i, j int) bool {
-		return lower(members[i].Nick) < lower(members[j].Nick)
+		return r.isup.Fold(members[i].Nick) < r.isup.Fold(members[j].Nick)
 	})
 	return st.topic, members, true
 }
@@ -79,15 +82,16 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	fold := r.isup.Fold
 	sender := ""
 	if m.Prefix != nil {
 		sender = m.Prefix.Name
 	}
-	us := func(nick string) bool { return lower(nick) == lower(ourNick) && ourNick != "" }
+	us := func(nick string) bool { return ourNick != "" && r.isup.FoldEqual(nick, ourNick) }
 
 	switch m.Command {
 	case "353": // RPL_NAMREPLY: <me> <symbol> <channel> :<prefixed nicks>
-		st := r.chans[lower(m.Param(2))]
+		st := r.chans[fold(m.Param(2))]
 		if st == nil {
 			return
 		}
@@ -95,82 +99,82 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 			st.pending = make(map[string]Member)
 		}
 		for _, raw := range strings.Fields(m.Param(3)) {
-			prefix, nick := splitNamesPrefix(raw)
-			st.pending[lower(nick)] = Member{Nick: nick, Prefix: prefix}
+			prefix, nick := splitNamesPrefix(r.isup.PrefixSymbols(), raw)
+			st.pending[fold(nick)] = Member{Nick: nick, Prefix: prefix}
 		}
 
 	case "366": // RPL_ENDOFNAMES: <me> <channel> — pending replaces live
-		if st := r.chans[lower(m.Param(1))]; st != nil && st.pending != nil {
+		if st := r.chans[fold(m.Param(1))]; st != nil && st.pending != nil {
 			st.members = st.pending
 			st.pending = nil
 		}
 
 	case "332": // RPL_TOPIC: <me> <channel> :<topic>
-		if st := r.chans[lower(m.Param(1))]; st != nil {
+		if st := r.chans[fold(m.Param(1))]; st != nil {
 			st.topic = m.Param(2)
 		}
 
 	case "331": // RPL_NOTOPIC
-		if st := r.chans[lower(m.Param(1))]; st != nil {
+		if st := r.chans[fold(m.Param(1))]; st != nil {
 			st.topic = ""
 		}
 
 	case "TOPIC":
-		if st := r.chans[lower(m.Param(0))]; st != nil {
+		if st := r.chans[fold(m.Param(0))]; st != nil {
 			st.topic = m.Trailing()
 		}
 
 	case "JOIN":
 		ch := m.Param(0)
 		if us(sender) {
-			r.chans[lower(ch)] = &channelState{name: ch, members: make(map[string]Member)}
+			r.chans[fold(ch)] = &channelState{name: ch, members: make(map[string]Member)}
 		}
-		if st := r.chans[lower(ch)]; st != nil {
-			st.members[lower(sender)] = Member{Nick: sender}
+		if st := r.chans[fold(ch)]; st != nil {
+			st.members[fold(sender)] = Member{Nick: sender}
 		}
 
 	case "PART":
 		if us(sender) {
-			delete(r.chans, lower(m.Param(0)))
-		} else if st := r.chans[lower(m.Param(0))]; st != nil {
-			delete(st.members, lower(sender))
+			delete(r.chans, fold(m.Param(0)))
+		} else if st := r.chans[fold(m.Param(0))]; st != nil {
+			delete(st.members, fold(sender))
 		}
 
 	case "KICK": // <channel> <victim>
 		victim := m.Param(1)
 		if us(victim) {
-			delete(r.chans, lower(m.Param(0)))
-		} else if st := r.chans[lower(m.Param(0))]; st != nil {
-			delete(st.members, lower(victim))
+			delete(r.chans, fold(m.Param(0)))
+		} else if st := r.chans[fold(m.Param(0))]; st != nil {
+			delete(st.members, fold(victim))
 		}
 
 	case "QUIT":
 		for _, st := range r.chans {
-			delete(st.members, lower(sender))
+			delete(st.members, fold(sender))
 		}
 
 	case "NICK":
 		to := m.Param(0)
 		for _, st := range r.chans {
-			if mem, ok := st.members[lower(sender)]; ok {
-				delete(st.members, lower(sender))
+			if mem, ok := st.members[fold(sender)]; ok {
+				delete(st.members, fold(sender))
 				mem.Nick = to
-				st.members[lower(to)] = mem
+				st.members[fold(to)] = mem
 			}
 		}
 
 	case "AWAY": // away-notify: a parameter means away, none means back
 		away := len(m.Params) > 0
 		for _, st := range r.chans {
-			if mem, ok := st.members[lower(sender)]; ok {
+			if mem, ok := st.members[fold(sender)]; ok {
 				mem.Away = away
-				st.members[lower(sender)] = mem
+				st.members[fold(sender)] = mem
 			}
 		}
 
 	case "MODE":
-		if st := r.chans[lower(m.Param(0))]; st != nil {
-			applyChannelMode(st, m.Params)
+		if st := r.chans[fold(m.Param(0))]; st != nil {
+			r.applyChannelMode(st, m.Params)
 		}
 	}
 }
@@ -179,9 +183,9 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 // userhost-in-names, "@+nick!user@host" into its status prefixes and the
 // bare nick. multi-prefix sends all prefixes "in order of 'rank', from
 // highest to lowest" — keep them as-is.
-func splitNamesPrefix(raw string) (prefixes, nick string) {
+func splitNamesPrefix(symbols, raw string) (prefixes, nick string) {
 	i := 0
-	for i < len(raw) && strings.IndexByte(prefixRank, raw[i]) != -1 {
+	for i < len(raw) && strings.IndexByte(symbols, raw[i]) != -1 {
 		i++
 	}
 	prefixes, nick = raw[:i], raw[i:]
@@ -191,18 +195,12 @@ func splitNamesPrefix(raw string) (prefixes, nick string) {
 	return prefixes, nick
 }
 
-// prefixForMode maps a PREFIX mode letter to its display char.
-var prefixForMode = map[byte]string{'q': "~", 'a': "&", 'o': "@", 'h': "%", 'v': "+"}
-
-// prefixRank orders status prefixes, highest first.
-const prefixRank = "~&@%+"
-
 // applyChannelMode parses a channel MODE change (params: channel,
 // modestring, args...) and updates member status prefixes. Argument
-// consumption follows the RFC 1459 default CHANMODES: type A ("b") and
-// type B ("k") always take an argument, type C ("l") only when setting,
-// type D never; status modes (qaohv) always do.
-func applyChannelMode(st *channelState, params []string) {
+// consumption follows the ISUPPORT CHANMODES classification; status
+// (PREFIX) modes always take a nick argument. Unknown mode letters are
+// assumed argument-less. Caller holds r.mu.
+func (r *roster) applyChannelMode(st *channelState, params []string) {
 	if len(params) < 2 {
 		return
 	}
@@ -223,46 +221,46 @@ func applyChannelMode(st *channelState, params []string) {
 			adding = true
 		case '-':
 			adding = false
-		case 'q', 'a', 'o', 'h', 'v':
-			nick := takeArg()
-			mem, ok := st.members[lower(nick)]
-			if !ok {
-				continue
-			}
-			if adding {
-				mem.Prefix = addPrefix(mem.Prefix, prefixForMode[c])
-			} else {
-				mem.Prefix = strings.ReplaceAll(mem.Prefix, prefixForMode[c], "")
-			}
-			st.members[lower(nick)] = mem
-		case 'b', 'k': // always take an argument
-			takeArg()
-		case 'l': // argument only when setting
-			if adding {
+		default:
+			switch r.isup.ChanModeType(c) {
+			case 'P': // status mode
+				nick := takeArg()
+				mem, ok := st.members[r.isup.Fold(nick)]
+				if !ok {
+					continue
+				}
+				sym := r.isup.SymbolForMode(c)
+				if adding {
+					mem.Prefix = addPrefix(r.isup.PrefixSymbols(), mem.Prefix, sym)
+				} else {
+					mem.Prefix = strings.ReplaceAll(mem.Prefix, sym, "")
+				}
+				st.members[r.isup.Fold(nick)] = mem
+			case 'A', 'B': // always take an argument
 				takeArg()
+			case 'C': // argument only when setting
+				if adding {
+					takeArg()
+				}
+				// 'D' and unknown: no argument
 			}
-			// type D (imnpst...) and unknown modes: no argument
 		}
 	}
 }
 
-// addPrefix inserts a status prefix keeping rank order (highest first).
-// With multi-prefix negotiated the stored set is exact; without it NAMES
-// only reveals the highest, so lower statuses may be missing until a
-// MODE grants them again.
-func addPrefix(current, changed string) string {
-	if strings.Contains(current, changed) {
+// addPrefix inserts a status prefix keeping rank order (highest first,
+// per the ISUPPORT PREFIX ordering). With multi-prefix negotiated the
+// stored set is exact; without it NAMES only reveals the highest, so
+// lower statuses may be missing until a MODE grants them again.
+func addPrefix(rank, current, changed string) string {
+	if changed == "" || strings.Contains(current, changed) {
 		return current
 	}
-	rank := strings.Index(prefixRank, changed)
+	pos := strings.Index(rank, changed)
 	for i := 0; i < len(current); i++ {
-		if strings.IndexByte(prefixRank, current[i]) > rank {
+		if strings.IndexByte(rank, current[i]) > pos {
 			return current[:i] + changed + current[i:]
 		}
 	}
 	return current + changed
-}
-
-func lower(s string) string {
-	return strings.ToLower(s)
 }

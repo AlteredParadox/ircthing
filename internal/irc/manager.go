@@ -75,6 +75,7 @@ type Manager struct {
 	registered atomic.Bool
 	nick       atomic.Value // string: current nick once registered
 	caps       atomic.Value // map[string]bool, copy-on-write: enabled capabilities
+	isup       *isupport
 	roster     *roster
 	// joined is the set of channels to (re)join after registration:
 	// the configured ones plus runtime JOINs, minus runtime PARTs (a KICK
@@ -99,17 +100,30 @@ func NewManager(cfg Config) (*Manager, error) {
 		return nil, err
 	}
 	cfg.applyDefaults()
+	isup := newISupport()
 	m := &Manager{
 		cfg:    cfg,
 		events: make(chan Event, 256),
 		out:    make(chan *ircv4.Message, 64),
-		roster: newRoster(),
+		isup:   isup,
+		roster: newRoster(isup),
 		joined: make(map[string]string),
 	}
 	for _, ch := range cfg.Channels {
-		m.joined[lower(ch)] = ch
+		m.joined[isup.Fold(ch)] = ch
 	}
 	return m, nil
+}
+
+// IsChannel reports whether target names a channel per the server's
+// ISUPPORT CHANTYPES.
+func (m *Manager) IsChannel(target string) bool {
+	return m.isup.IsChannel(target)
+}
+
+// ChanTypes returns the server's channel prefix characters.
+func (m *Manager) ChanTypes() string {
+	return m.isup.ChanTypes()
 }
 
 // Channel returns the topic and member snapshot of a joined channel;
@@ -296,6 +310,7 @@ drain:
 	bo.reset()
 	m.emit(ctx, Event{Kind: EventState, State: StateRegistered})
 
+	m.isup.reset()   // ISUPPORT is per-connection; 005 follows shortly
 	m.roster.clear() // membership is per-connection state
 	defer m.roster.clear()
 	rejoin := make([]string, 0, len(m.joined))
@@ -347,13 +362,14 @@ drain:
 				}
 			}
 		}
-		// Track our own nick changes. ASCII folding stands in for proper
-		// ISUPPORT casemapping until that lands.
-		if in.Command == "NICK" && in.Prefix != nil && strings.EqualFold(in.Prefix.Name, m.Nick()) {
+		// Track our own nick changes, compared under the server's
+		// casemapping.
+		if in.Command == "NICK" && in.Prefix != nil && m.isup.FoldEqual(in.Prefix.Name, m.Nick()) {
 			if n := in.Param(0); n != "" {
 				m.nick.Store(n)
 			}
 		}
+		m.isup.handle(in) // 005, ignored otherwise
 		m.roster.handle(m.Nick(), in)
 		m.trackJoinIntent(in)
 		m.emit(ctx, Event{Kind: EventMessage, Msg: in})
@@ -364,16 +380,16 @@ drain:
 // PARTs. Runs on the read-loop goroutine, which is the only writer of
 // m.joined after construction.
 func (m *Manager) trackJoinIntent(in *ircv4.Message) {
-	if in.Prefix == nil || !strings.EqualFold(in.Prefix.Name, m.Nick()) {
+	if in.Prefix == nil || !m.isup.FoldEqual(in.Prefix.Name, m.Nick()) {
 		return
 	}
 	switch in.Command {
 	case "JOIN":
 		if ch := in.Param(0); ch != "" {
-			m.joined[lower(ch)] = ch
+			m.joined[m.isup.Fold(ch)] = ch
 		}
 	case "PART":
-		delete(m.joined, lower(in.Param(0)))
+		delete(m.joined, m.isup.Fold(in.Param(0)))
 	}
 }
 

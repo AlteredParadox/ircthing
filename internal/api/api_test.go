@@ -161,6 +161,12 @@ func (f *fakeConn) Channel(string) (string, []irc.Member, bool) {
 
 func (f *fakeConn) CapEnabled(string) bool { return false }
 
+func (f *fakeConn) IsChannel(t string) bool {
+	return t != "" && (t[0] == '#' || t[0] == '&')
+}
+
+func (f *fakeConn) ChanTypes() string { return "#&" }
+
 func (f *fakeConn) privmsg(line string) irc.Event {
 	return irc.Event{
 		Network: f.name,

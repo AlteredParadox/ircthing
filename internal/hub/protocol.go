@@ -99,9 +99,10 @@ type MarkerData struct {
 
 // NetworkInfo describes one configured network connection ("buffers").
 type NetworkInfo struct {
-	Name  string `json:"name"`
-	State string `json:"state"`
-	Nick  string `json:"nick"`
+	Name      string `json:"name"`
+	State     string `json:"state"`
+	Nick      string `json:"nick"`
+	ChanTypes string `json:"chantypes,omitempty"` // ISUPPORT CHANTYPES
 }
 
 // BufferInfo describes one buffer for the sidebar ("buffers").

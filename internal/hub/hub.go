@@ -27,6 +27,8 @@ type Conn interface {
 	Send(*ircv4.Message) error
 	Channel(name string) (topic string, members []irc.Member, ok bool)
 	CapEnabled(name string) bool
+	IsChannel(target string) bool // per the network's ISUPPORT CHANTYPES
+	ChanTypes() string
 }
 
 type Hub struct {
@@ -97,7 +99,7 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					h.relayTyping(ev, c)
 					continue // TAGMSG is ephemeral, never persisted
 				}
-				target, ok := persistTarget(ev.Msg, c.Nick())
+				target, ok := persistTarget(ev.Msg, c.Nick(), c.IsChannel)
 				if !ok {
 					continue
 				}
@@ -158,7 +160,7 @@ func (h *Hub) relayTyping(ev irc.Event, c Conn) {
 		return
 	}
 	buffer := ev.Msg.Param(0)
-	if !isChannel(buffer) {
+	if !c.IsChannel(buffer) {
 		// A typing notice addressed to us belongs in the sender's query.
 		if !strings.EqualFold(buffer, nick) {
 			return
@@ -203,13 +205,12 @@ func eventData(m store.Message) EventData {
 }
 
 // persistTarget decides which buffer a message lands in, or none.
-// Channel detection uses the default CHANTYPES "#&" until ISUPPORT
-// parsing lands.
-func persistTarget(m *ircv4.Message, ourNick string) (string, bool) {
+// isChan is the network's ISUPPORT-driven channel detection.
+func persistTarget(m *ircv4.Message, ourNick string, isChan func(string) bool) (string, bool) {
 	switch m.Command {
 	case "PRIVMSG", "NOTICE":
 		t := m.Param(0)
-		if isChannel(t) {
+		if isChan(t) {
 			return t, true
 		}
 		if m.Prefix == nil || m.Prefix.Name == "" || ourNick == "" {
@@ -227,7 +228,7 @@ func persistTarget(m *ircv4.Message, ourNick string) (string, bool) {
 		}
 		return "", false
 	case "JOIN", "PART", "TOPIC", "KICK", "MODE":
-		if t := m.Param(0); isChannel(t) {
+		if t := m.Param(0); isChan(t) {
 			return t, true
 		}
 		return "", false
@@ -235,7 +236,8 @@ func persistTarget(m *ircv4.Message, ourNick string) (string, bool) {
 	return "", false
 }
 
-func isChannel(target string) bool {
+// defaultIsChannel is the RFC 1459 CHANTYPES fallback, used by tests.
+func defaultIsChannel(target string) bool {
 	return target != "" && (target[0] == '#' || target[0] == '&')
 }
 

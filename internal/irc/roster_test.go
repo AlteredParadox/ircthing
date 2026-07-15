@@ -7,12 +7,19 @@ import (
 	ircv4 "gopkg.in/irc.v4"
 )
 
-// feed parses and applies lines as the user "AlteredParadox".
+// feed parses and applies lines as the user "AlteredParadox", routing 005 through
+// the isupport tracker the same way the manager's read loop does.
 func feed(t *testing.T, r *roster, lines ...string) {
 	t.Helper()
 	for _, l := range lines {
-		r.handle("AlteredParadox", ircv4.MustParseMessage(l))
+		m := ircv4.MustParseMessage(l)
+		r.isup.handle(m)
+		r.handle("AlteredParadox", m)
 	}
+}
+
+func testRoster() *roster {
+	return newRoster(newISupport())
 }
 
 func members(t *testing.T, r *roster, ch string) []Member {
@@ -48,6 +55,8 @@ func TestRoster(t *testing.T) {
 		{
 			name: "multi-prefix NAMES keeps all prefixes ordered",
 			lines: []string{
+				// Extended prefixes exist only when 005 advertises them.
+				":srv 005 AlteredParadox PREFIX=(qaohv)~&@%+ :are supported by this server",
 				joinGo,
 				":srv 353 AlteredParadox = #go :~owner &admin %half @+multi",
 				":srv 366 AlteredParadox #go :end",
@@ -254,6 +263,71 @@ func TestRoster(t *testing.T) {
 			},
 		},
 		{
+			name: "ISUPPORT-driven mode consumption with custom CHANMODES",
+			lines: []string{
+				// libera-style: q is a list mode (quiet), f takes an arg
+				// only when set, j likewise.
+				":srv 005 AlteredParadox CHANMODES=eIbq,k,flj,CPcgimnprstuz :are supported by this server",
+				joinGo,
+				":srv 353 AlteredParadox = #go :alice AlteredParadox",
+				":srv 366 AlteredParadox #go :end",
+				// +q consumes the mask (list mode, NOT owner status here),
+				// +f consumes, then +o grants alice.
+				":op!u@h MODE #go +qfo *!*@spam 30:5 alice",
+			},
+			check: func(t *testing.T, r *roster) {
+				want := []Member{{Nick: "alice", Prefix: "@"}, {Nick: "AlteredParadox"}}
+				if got := members(t, r, "#go"); !reflect.DeepEqual(got, want) {
+					t.Fatalf("members = %v, want %v", got, want)
+				}
+			},
+		},
+		{
+			name: "unsetting a C-type mode consumes no argument",
+			lines: []string{
+				":srv 005 AlteredParadox CHANMODES=b,k,fl,imnpst :are supported by this server",
+				joinGo,
+				":srv 353 AlteredParadox = #go :alice AlteredParadox",
+				":srv 366 AlteredParadox #go :end",
+				// -f takes no arg when unsetting, so alice is +o's target.
+				":op!u@h MODE #go -f+o alice",
+			},
+			check: func(t *testing.T, r *roster) {
+				if got := members(t, r, "#go"); got[0].Prefix != "@" {
+					t.Fatalf("members = %v", got)
+				}
+			},
+		},
+		{
+			name: "ascii casemapping distinguishes bracket nicks",
+			lines: []string{
+				":srv 005 AlteredParadox CASEMAPPING=ascii :are supported by this server",
+				joinGo,
+				":alice[]!u@h JOIN #go",
+				// Under ascii, alice{} is a DIFFERENT user; this PART must
+				// not remove alice[].
+				":alice{}!u@h PART #go",
+			},
+			check: func(t *testing.T, r *roster) {
+				if got := members(t, r, "#go"); len(got) != 2 {
+					t.Fatalf("ascii casemapping folded brackets: %v", got)
+				}
+			},
+		},
+		{
+			name: "rfc1459 casemapping folds bracket nicks",
+			lines: []string{
+				joinGo,
+				":alice[]!u@h JOIN #go",
+				":alice{}!u@h PART #go", // same user under rfc1459
+			},
+			check: func(t *testing.T, r *roster) {
+				if got := members(t, r, "#go"); len(got) != 1 {
+					t.Fatalf("rfc1459 casemapping missed brackets: %v", got)
+				}
+			},
+		},
+		{
 			name:  "unknown channel messages are ignored",
 			lines: []string{":srv 353 AlteredParadox = #ghost :@op", ":srv 366 AlteredParadox #ghost :end", ":alice!u@h JOIN #ghost"},
 			check: func(t *testing.T, r *roster) {
@@ -266,7 +340,7 @@ func TestRoster(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := newRoster()
+			r := testRoster()
 			feed(t, r, tc.lines...)
 			tc.check(t, r)
 		})
@@ -274,7 +348,7 @@ func TestRoster(t *testing.T) {
 }
 
 func TestRosterClear(t *testing.T) {
-	r := newRoster()
+	r := testRoster()
 	feed(t, r, joinGo, ":alice!u@h JOIN #go")
 	r.clear()
 	if _, _, ok := r.channel("#go"); ok {

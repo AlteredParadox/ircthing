@@ -272,6 +272,7 @@ func (s *Session) handleGetBuffers(ctx context.Context, env Envelope) {
 		info := NetworkInfo{Name: name, State: s.hub.states[name]}
 		if c := s.hub.networks[name]; c != nil {
 			info.Nick = c.Nick()
+			info.ChanTypes = c.ChanTypes()
 		}
 		data.Networks = append(data.Networks, info)
 	}

@@ -50,7 +50,7 @@ func TestPersistTarget(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse %q: %v", tc.line, err)
 			}
-			got, ok := persistTarget(m, tc.ourNick)
+			got, ok := persistTarget(m, tc.ourNick, defaultIsChannel)
 			if got != tc.want || ok != tc.ok {
 				t.Fatalf("persistTarget = (%q, %v), want (%q, %v)", got, ok, tc.want, tc.ok)
 			}
@@ -120,10 +120,12 @@ type fakeConn struct {
 	sendErr error
 }
 
-func (f *fakeConn) Events() <-chan irc.Event    { return f.ch }
-func (f *fakeConn) Name() string                { return f.name }
-func (f *fakeConn) Nick() string                { return f.nick }
-func (f *fakeConn) CapEnabled(name string) bool { return f.caps[name] }
+func (f *fakeConn) Events() <-chan irc.Event     { return f.ch }
+func (f *fakeConn) Name() string                 { return f.name }
+func (f *fakeConn) Nick() string                 { return f.nick }
+func (f *fakeConn) CapEnabled(name string) bool  { return f.caps[name] }
+func (f *fakeConn) IsChannel(target string) bool { return defaultIsChannel(target) }
+func (f *fakeConn) ChanTypes() string            { return "#&" }
 
 func (f *fakeConn) Channel(name string) (string, []irc.Member, bool) {
 	ms, ok := f.chans[name]
