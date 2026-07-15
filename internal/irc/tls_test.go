@@ -79,7 +79,7 @@ func TestDialTrustedFingerprint(t *testing.T) {
 		pretty = append(pretty, strings.ToUpper(fp[i:i+2]))
 	}
 	m := fpManager(t, addr, []string{strings.Join(pretty, ":")})
-	conn, err := m.dial(context.Background())
+	conn, err := m.dial(context.Background(), m.cfg.Addr, true)
 	if err != nil {
 		t.Fatalf("dial with matching fingerprint: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestDialUntrustedFingerprint(t *testing.T) {
 	addr, _ := selfSignedServer(t)
 	wrong := strings.Repeat("ab", 32)
 	m := fpManager(t, addr, []string{wrong})
-	if conn, err := m.dial(context.Background()); err == nil {
+	if conn, err := m.dial(context.Background(), m.cfg.Addr, true); err == nil {
 		conn.Close()
 		t.Fatal("dial accepted a certificate with an untrusted fingerprint")
 	} else if !strings.Contains(err.Error(), "fingerprint") {
@@ -102,7 +102,7 @@ func TestDialSelfSignedWithoutFingerprintFails(t *testing.T) {
 	// No pins configured: standard CA verification must still apply.
 	addr, _ := selfSignedServer(t)
 	m := fpManager(t, addr, nil)
-	if conn, err := m.dial(context.Background()); err == nil {
+	if conn, err := m.dial(context.Background(), m.cfg.Addr, true); err == nil {
 		conn.Close()
 		t.Fatal("dial accepted a self-signed certificate without a trusted fingerprint")
 	}

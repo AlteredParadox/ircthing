@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	ircv4 "gopkg.in/irc.v4"
 )
@@ -89,6 +90,12 @@ type handshake struct {
 	lastReq    []string
 	mech       saslMech // chosen SASL mechanism, built at CAP LS
 	mechErr    error    // mechanism unavailable; abort after CAP ACK
+
+	// secure is whether this connection runs over TLS; it gates STS
+	// handling (see sts.go). stsDuration is set when a secure CAP LS
+	// carries a duration policy, for the manager to persist.
+	secure      bool
+	stsDuration *time.Duration
 }
 
 func newHandshake(cfg *Config) *handshake {
@@ -222,6 +229,20 @@ func (h *handshake) handleCAP(m *ircv4.Message) ([]*ircv4.Message, bool, error) 
 		parseCapList(m.Params[len(m.Params)-1], h.caps)
 		if more {
 			return nil, false, nil
+		}
+		// STS (sts.go): on an insecure connection a valid port upgrades
+		// the connection (abort, secure redial); on a secure one the
+		// duration policy is recorded for the manager to persist. Never
+		// requested with CAP REQ.
+		if val, ok := h.caps["sts"]; ok {
+			v := parseSTS(val)
+			if !h.secure && v.port > 0 {
+				return nil, false, errSTSUpgrade{port: v.port}
+			}
+			if h.secure && v.hasDuration {
+				d := v.duration
+				h.stsDuration = &d
+			}
 		}
 		if h.cfg.SASL != nil {
 			mechs, offered := h.caps["sasl"]

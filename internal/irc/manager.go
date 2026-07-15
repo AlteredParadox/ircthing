@@ -97,6 +97,15 @@ type Manager struct {
 	namesMu  sync.Mutex
 	namesReq map[string]bool
 
+	// stsMu guards the active STS policy (sts.go): connect to stsPort
+	// with TLS until stsUntil (zero stsUntil with a port = session-only
+	// upgrade). stsLastDur is the most recently advertised duration, used
+	// to reschedule the expiry when a connection closes.
+	stsMu      sync.Mutex
+	stsPort    int
+	stsUntil   time.Time
+	stsLastDur time.Duration
+
 	batchSeq atomic.Uint64 // outgoing multiline batch reference counter
 }
 
@@ -363,6 +372,7 @@ func (m *Manager) Send(msg *ircv4.Message) error {
 
 // Run connects and reconnects until ctx is canceled.
 func (m *Manager) Run(ctx context.Context) error {
+	m.loadSTS(ctx)
 	bo := newBackoff(m.cfg.Backoff)
 	for {
 		m.emit(ctx, Event{Kind: EventState, State: StateConnecting})
@@ -370,12 +380,114 @@ func (m *Manager) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		// An STS upgrade is a policy-driven redial, not a failure: adopt
+		// a session policy and reconnect securely right away.
+		var up errSTSUpgrade
+		if errors.As(err, &up) {
+			m.stsMu.Lock()
+			m.stsPort, m.stsUntil = up.port, time.Time{}
+			m.stsMu.Unlock()
+			continue
+		}
 		m.emit(ctx, Event{Kind: EventState, State: StateDisconnected, Err: err})
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(bo.next()):
 		}
+	}
+}
+
+// loadSTS seeds the in-memory STS policy from the persistent store.
+func (m *Manager) loadSTS(ctx context.Context) {
+	if m.cfg.STS == nil {
+		return
+	}
+	host, _, err := net.SplitHostPort(m.cfg.Addr)
+	if err != nil {
+		return
+	}
+	port, until, ok, err := m.cfg.STS.STSPolicy(ctx, host)
+	if err != nil || !ok || !time.Now().Before(until) {
+		return
+	}
+	m.stsMu.Lock()
+	m.stsPort, m.stsUntil = port, until
+	m.stsMu.Unlock()
+}
+
+// effectiveAddr resolves where and how to connect: the configured
+// address, unless an unexpired STS policy upgrades a plaintext config to
+// TLS on the policy port.
+func (m *Manager) effectiveAddr() (addr string, secure bool) {
+	if m.cfg.TLS {
+		return m.cfg.Addr, true
+	}
+	host, _, err := net.SplitHostPort(m.cfg.Addr)
+	if err != nil {
+		return m.cfg.Addr, false
+	}
+	m.stsMu.Lock()
+	port, until := m.stsPort, m.stsUntil
+	m.stsMu.Unlock()
+	if port > 0 && (until.IsZero() || time.Now().Before(until)) {
+		return net.JoinHostPort(host, strconv.Itoa(port)), true
+	}
+	return m.cfg.Addr, false
+}
+
+// applySTS handles a duration policy received on a secure connection:
+// remember it (and its port — the one we are connected to), persist it,
+// and keep the duration for close-time rescheduling. duration=0 clears
+// the policy.
+func (m *Manager) applySTS(ctx context.Context, connAddr string, d time.Duration) {
+	host, _, err := net.SplitHostPort(m.cfg.Addr)
+	if err != nil {
+		return
+	}
+	_, portStr, err := net.SplitHostPort(connAddr)
+	if err != nil {
+		return
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return
+	}
+	until := time.Now().Add(d)
+	m.stsMu.Lock()
+	if d == 0 {
+		m.stsPort, m.stsUntil, m.stsLastDur = 0, time.Time{}, 0
+	} else {
+		m.stsPort, m.stsUntil, m.stsLastDur = port, until, d
+	}
+	m.stsMu.Unlock()
+	if m.cfg.STS == nil {
+		return
+	}
+	if d == 0 {
+		_ = m.cfg.STS.ClearSTSPolicy(ctx, host)
+		return
+	}
+	_ = m.cfg.STS.SetSTSPolicy(ctx, host, port, until)
+}
+
+// rescheduleSTS pushes the policy expiry to now + the last advertised
+// duration, as the spec requires when a connection closes.
+func (m *Manager) rescheduleSTS(ctx context.Context) {
+	m.stsMu.Lock()
+	d, port := m.stsLastDur, m.stsPort
+	if d <= 0 || port == 0 {
+		m.stsMu.Unlock()
+		return
+	}
+	until := time.Now().Add(d)
+	m.stsUntil = until
+	m.stsMu.Unlock()
+	if m.cfg.STS == nil {
+		return
+	}
+	if host, _, err := net.SplitHostPort(m.cfg.Addr); err == nil {
+		_ = m.cfg.STS.SetSTSPolicy(context.WithoutCancel(ctx), host, port, until)
 	}
 }
 
@@ -402,9 +514,15 @@ drain:
 		}
 	}
 
-	conn, err := m.dial(ctx)
+	addr, secure := m.effectiveAddr()
+	conn, err := m.dial(ctx, addr, secure)
 	if err != nil {
 		return err
+	}
+	// STS: whenever a secure connection closes, its policy expiry is
+	// pushed to close-time + duration (a no-op without a policy).
+	if secure {
+		defer m.rescheduleSTS(ctx)
 	}
 	// Everything below is scoped to this connection: canceling cctx
 	// closes the socket, which unblocks both loops.
@@ -442,6 +560,7 @@ drain:
 	// Registration. The whole exchange must finish within
 	// HandshakeTimeout.
 	hs := newHandshake(&m.cfg)
+	hs.secure = secure
 	if err := send(hs.start()); err != nil {
 		return err
 	}
@@ -453,6 +572,11 @@ drain:
 			return fmt.Errorf("registration: %w", connError(cctx, err))
 		}
 		out, done, err := hs.handle(in)
+		// A secure CAP LS carried an STS duration policy: persist it.
+		if hs.stsDuration != nil {
+			m.applySTS(ctx, addr, *hs.stsDuration)
+			hs.stsDuration = nil
+		}
 		// A failing handshake can still have parting words (SASL abort
 		// "AUTHENTICATE *", QUIT) — flush them before the deferred cancel
 		// tears down the socket.
@@ -557,6 +681,17 @@ drain:
 					return err
 				}
 			}
+			// A CAP NEW on a secure connection may carry/refresh the STS
+			// policy (CAP DEL never disables it, per spec).
+			if secure && len(in.Params) >= 3 && strings.ToUpper(in.Params[1]) == "NEW" {
+				for _, tok := range strings.Fields(in.Params[len(in.Params)-1]) {
+					if name, val, _ := strings.Cut(tok, "="); name == "sts" {
+						if v := parseSTS(val); v.hasDuration {
+							m.applySTS(ctx, addr, v.duration)
+						}
+					}
+				}
+			}
 		}
 		// draft/multiline: buffer the batch's lines and emit the single
 		// reconstructed message on close; consumed lines are not processed
@@ -645,13 +780,15 @@ func connError(cctx context.Context, readErr error) error {
 	return readErr
 }
 
-func (m *Manager) dial(ctx context.Context) (net.Conn, error) {
+// dial connects to addr, with TLS when secure — usually the configured
+// address/mode, unless an STS policy upgraded them (see effectiveAddr).
+func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn, error) {
 	d := &net.Dialer{Timeout: m.cfg.DialTimeout}
-	conn, err := d.DialContext(ctx, "tcp", m.cfg.Addr)
+	conn, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	if !m.cfg.TLS {
+	if !secure {
 		return conn, nil
 	}
 	tcfg := m.cfg.TLSConfig.Clone() // Clone on nil returns nil
@@ -659,10 +796,10 @@ func (m *Manager) dial(ctx context.Context) (net.Conn, error) {
 		tcfg = &tls.Config{}
 	}
 	if tcfg.ServerName == "" {
-		host, _, err := net.SplitHostPort(m.cfg.Addr)
+		host, _, err := net.SplitHostPort(addr)
 		if err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("irc: cannot derive TLS server name from %q: %w", m.cfg.Addr, err)
+			return nil, fmt.Errorf("irc: cannot derive TLS server name from %q: %w", addr, err)
 		}
 		tcfg.ServerName = host
 	}

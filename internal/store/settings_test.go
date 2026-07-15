@@ -1,6 +1,9 @@
 package store
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestSettings(t *testing.T) {
 	s, _ := openTest(t, 10)
@@ -52,5 +55,32 @@ func TestSettingsSurviveReopen(t *testing.T) {
 	}
 	if v != `{"accent":"rose"}` {
 		t.Fatalf("after reopen got %q", v)
+	}
+}
+
+func TestSTSPolicyRoundTrip(t *testing.T) {
+	s, path := openTest(t, 10)
+
+	if _, _, ok, err := s.STSPolicy(ctx, "irc.example"); err != nil || ok {
+		t.Fatalf("empty: ok=%v err=%v", ok, err)
+	}
+
+	until := time.Now().Add(time.Hour).Truncate(time.Millisecond)
+	if err := s.SetSTSPolicy(ctx, "irc.example", 6697, until); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s2 := reopen(t, path, 10)
+	port, got, ok, err := s2.STSPolicy(ctx, "irc.example")
+	if err != nil || !ok || port != 6697 || !got.Equal(until) {
+		t.Fatalf("after reopen: port=%d until=%v ok=%v err=%v", port, got, ok, err)
+	}
+
+	if err := s2.ClearSTSPolicy(ctx, "irc.example"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, _ := s2.STSPolicy(ctx, "irc.example"); ok {
+		t.Fatal("policy survived clear")
 	}
 }

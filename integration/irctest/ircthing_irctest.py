@@ -25,7 +25,7 @@ PASSWORD_HASH = "$2a$10$/vXcvxwnd0BAE188Vf9aSOFQFZeGKQsf1817JpdYiDhibk6nh7QQ."
 class IrcthingController(BaseClientController, DirectoryBasedController):
     software_name = "ircthing"
     supported_sasl_mechanisms = {"PLAIN", "SCRAM-SHA-256", "EXTERNAL"}
-    supports_sts = False
+    supports_sts = True
 
     def run(
         self,

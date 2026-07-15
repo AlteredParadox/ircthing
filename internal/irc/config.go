@@ -44,6 +44,11 @@ type Config struct {
 	// unauthenticated.
 	SASL *SASLConfig
 
+	// STS optionally persists IRCv3 STS policies (see sts.go) so a
+	// server's upgrade-to-TLS policy survives restarts. Nil keeps
+	// policies for the process lifetime only.
+	STS STSStore
+
 	// Channels are joined after every successful registration, so they
 	// come back automatically on reconnect.
 	Channels []string

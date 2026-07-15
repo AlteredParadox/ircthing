@@ -72,6 +72,9 @@ func run(cfg *config) error {
 		if err != nil {
 			return err
 		}
+		// STS policies persist in the store so upgrade-to-TLS survives
+		// restarts.
+		icfg.STS = st
 		m, err := irc.NewManager(icfg)
 		if err != nil {
 			return fmt.Errorf("network %q: %w", nc.effectiveName(), err)

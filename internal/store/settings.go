@@ -31,3 +31,12 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 		key, value)
 	return err
 }
+
+// DeleteSetting removes key; deleting an absent key is not an error.
+func (s *Store) DeleteSetting(ctx context.Context, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, key)
+	return err
+}
