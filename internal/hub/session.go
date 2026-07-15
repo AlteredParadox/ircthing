@@ -107,6 +107,10 @@ func (s *Session) Handle(ctx context.Context, env Envelope) {
 		s.handleGetMarker(ctx, env)
 	case "set_read_marker":
 		s.handleSetMarker(ctx, env)
+	case "get_prefs":
+		s.handleGetPrefs(ctx, env)
+	case "set_prefs":
+		s.handleSetPrefs(ctx, env)
 	default:
 		// Unknown message types are ignored, not errored (protocol
 		// forward-compatibility rule).
@@ -544,6 +548,48 @@ func (s *Session) handleSetMarker(ctx context.Context, env Envelope) {
 			Params:  []string{d.Buffer, "timestamp=" + t.UTC().Format(markreadTimeLayout)},
 		})
 	}
+}
+
+// maxPrefsBytes caps the stored prefs blob; it carries the user's custom
+// CSS, so it is generous, but not an unbounded write path into SQLite.
+const maxPrefsBytes = 64 * 1024
+
+// prefsKey is the settings-table key for the client preferences blob.
+const prefsKey = "prefs"
+
+func (s *Session) handleGetPrefs(ctx context.Context, env Envelope) {
+	v, err := s.hub.store.Setting(ctx, prefsKey)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "prefs query failed"))
+		return
+	}
+	var d PrefsData
+	// Only ever written via set_prefs, but never trust stored bytes to be
+	// JSON — a bad blob here would silently corrupt the envelope.
+	if v != "" && json.Valid([]byte(v)) {
+		d.Prefs = json.RawMessage(v)
+	}
+	s.push(envelope("prefs", env.Seq, d))
+}
+
+// handleSetPrefs stores the preferences blob and pushes it to the user's
+// other connected sessions, so appearance changes apply everywhere live.
+func (s *Session) handleSetPrefs(ctx context.Context, env Envelope) {
+	var d PrefsData
+	if err := json.Unmarshal(env.Data, &d); err != nil || len(d.Prefs) == 0 {
+		s.push(errEnvelope(env.Seq, "bad_request", "set_prefs needs a prefs value"))
+		return
+	}
+	if len(d.Prefs) > maxPrefsBytes {
+		s.push(errEnvelope(env.Seq, "bad_request", "prefs too large"))
+		return
+	}
+	if err := s.hub.store.SetSetting(ctx, prefsKey, string(d.Prefs)); err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "storing prefs failed"))
+		return
+	}
+	s.push(envelope("ok", env.Seq, nil))
+	s.hub.broadcastExcept(s, envelope("prefs", 0, d))
 }
 
 // markreadTimeLayout is the server-time format used by MARKREAD

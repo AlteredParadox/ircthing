@@ -1,6 +1,9 @@
 // Appearance preferences: theme, accent color, text size, density,
-// message font, and a raw user-CSS override. Stored per browser in
-// localStorage and applied as data attributes / CSS custom properties on
+// message font, and a raw user-CSS override. The server's settings table
+// is the source of truth (prefs sync across devices via get_prefs /
+// set_prefs / "prefs" pushes — see app.jsx); localStorage is a
+// write-through cache so the first paint has the right theme before the
+// socket connects. Applied as data attributes / CSS custom properties on
 // <html> — the stylesheet keys everything off those (see style.css).
 
 export const THEMES = ["system", "dark", "light"];

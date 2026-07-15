@@ -1227,3 +1227,53 @@ func TestHubBroadcastsStateAndEvents(t *testing.T) {
 		t.Fatalf("event = %+v", ev)
 	}
 }
+
+func TestPrefsFlow(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	a := h.NewSession()
+	defer a.Close()
+	b := h.NewSession()
+	defer b.Close()
+
+	// Nothing stored yet: prefs is null/absent.
+	a.Handle(ctx, request(t, "get_prefs", 1, nil))
+	if d := decode[PrefsData](t, recv(t, a, "prefs")); len(d.Prefs) != 0 {
+		t.Fatalf("initial prefs = %s", d.Prefs)
+	}
+
+	// Setting from session A acks A and pushes the blob to B, not A.
+	blob := `{"theme":"dark","accent":"rose"}`
+	a.Handle(ctx, request(t, "set_prefs", 2, PrefsData{Prefs: json.RawMessage(blob)}))
+	recv(t, a, "ok")
+	if d := decode[PrefsData](t, recv(t, b, "prefs")); string(d.Prefs) != blob {
+		t.Fatalf("pushed prefs = %s", d.Prefs)
+	}
+
+	// get_prefs returns the stored blob.
+	b.Handle(ctx, request(t, "get_prefs", 3, nil))
+	if d := decode[PrefsData](t, recv(t, b, "prefs")); string(d.Prefs) != blob {
+		t.Fatalf("stored prefs = %s", d.Prefs)
+	}
+
+	// Empty and oversized blobs are rejected.
+	a.Handle(ctx, request(t, "set_prefs", 4, PrefsData{}))
+	if e := decode[ErrorData](t, recv(t, a, "error")); e.Code != "bad_request" {
+		t.Fatalf("empty set_prefs error = %+v", e)
+	}
+	big := make([]byte, maxPrefsBytes+16)
+	for i := range big {
+		big[i] = 'x'
+	}
+	big[0], big[len(big)-1] = '"', '"'
+	a.Handle(ctx, request(t, "set_prefs", 5, PrefsData{Prefs: big}))
+	if e := decode[ErrorData](t, recv(t, a, "error")); e.Code != "bad_request" {
+		t.Fatalf("oversized set_prefs error = %+v", e)
+	}
+
+	// The rejected writes did not clobber the stored value.
+	a.Handle(ctx, request(t, "get_prefs", 6, nil))
+	if d := decode[PrefsData](t, recv(t, a, "prefs")); string(d.Prefs) != blob {
+		t.Fatalf("prefs after rejected writes = %s", d.Prefs)
+	}
+}

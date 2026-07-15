@@ -3,7 +3,7 @@ import { Chat } from "./chat.jsx";
 import { bufKey, isChannelName, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
 import { Login } from "./login.jsx";
-import { applyPrefs, loadPrefs, resolveTheme, savePrefs } from "./prefs.js";
+import { applyPrefs, loadPrefs, normalizePrefs, resolveTheme, savePrefs } from "./prefs.js";
 import { Members } from "./members.jsx";
 import { SearchOverlay } from "./search.jsx";
 import { Settings } from "./settings.jsx";
@@ -56,10 +56,25 @@ export function App() {
 	const [typers, setTypers] = useState({});
 	const sock = useRef(null);
 
+	// The server is the source of truth for prefs; localStorage is a
+	// write-through cache so the first paint has the right theme. This
+	// effect applies + caches; pushing to the server happens only in
+	// updatePrefs (explicit local changes), never when adopting a server
+	// value — that would echo forever between devices.
 	useEffect(() => {
 		applyPrefs(prefs, theme);
 		savePrefs(prefs);
 	}, [prefs, theme]);
+
+	const prefsPush = useRef(null);
+	function updatePrefs(next) {
+		setPrefs(next);
+		// Debounced: the custom-CSS textarea changes on every keystroke.
+		clearTimeout(prefsPush.current);
+		prefsPush.current = setTimeout(() => {
+			sock.current?.request("set_prefs", { prefs: next }).catch(() => {});
+		}, 400);
+	}
 
 	// Track the OS theme so the "system" preference follows it live.
 	useEffect(() => {
@@ -132,6 +147,14 @@ export function App() {
 
 		s.on("_open", async () => {
 			setConnected(true);
+			// Adopt the server's prefs; a server with none stored yet (fresh
+			// install, pre-sync upgrade) is seeded from this browser's cache.
+			s.request("get_prefs", null)
+				.then((d) => {
+					if (d.prefs) setPrefs(normalizePrefs(d.prefs));
+					else s.request("set_prefs", { prefs: prefsRef.current }).catch(() => {});
+				})
+				.catch(() => {});
 			try {
 				applyBuffers(await s.request("get_buffers", null));
 				// History may have advanced while we were away; refetch the
@@ -229,6 +252,11 @@ export function App() {
 			}
 		});
 
+		// Another device changed prefs; adopt without echoing back.
+		s.on("prefs", (d) => {
+			if (d.prefs) setPrefs(normalizePrefs(d.prefs));
+		});
+
 		s.on("presence", (d) => {
 			setMonitors((all) => {
 				const list = all[d.network] || [];
@@ -298,6 +326,8 @@ export function App() {
 
 	// Refs mirror state so long-lived socket handlers read current values
 	// without re-registering on every change.
+	const prefsRef = useRef(prefs);
+	prefsRef.current = prefs;
 	const networksRef = useRef(networks);
 	networksRef.current = networks;
 	const buffersRef = useRef(buffers);
@@ -592,7 +622,7 @@ export function App() {
 					>⌕</button>
 					<button
 						class="icon-btn" title="Toggle theme"
-						onClick={() => setPrefs({ ...prefs, theme: theme === "dark" ? "light" : "dark" })}
+						onClick={() => updatePrefs({ ...prefs, theme: theme === "dark" ? "light" : "dark" })}
 					>{theme === "dark" ? "☀" : "☾"}</button>
 					{isChan && (
 						<button
@@ -637,7 +667,7 @@ export function App() {
 			{settingsOpen && (
 				<Settings
 					networks={networks} rules={rules} onRules={updateRules}
-					prefs={prefs} onPrefs={setPrefs}
+					prefs={prefs} onPrefs={updatePrefs}
 					notifier={notifier.current} onClose={() => setSettingsOpen(false)}
 				/>
 			)}

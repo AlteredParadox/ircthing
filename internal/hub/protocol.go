@@ -256,6 +256,15 @@ type TypingData struct {
 	State   string `json:"state"` // "active", "paused" or "done"
 }
 
+// PrefsData carries the client preferences blob ("prefs" pushes and
+// responses, and the "set_prefs" request). The server stores it opaquely
+// (clients validate their own settings shape); it exists server-side so
+// appearance follows the user across devices. Null/absent means nothing
+// stored yet.
+type PrefsData struct {
+	Prefs json.RawMessage `json:"prefs,omitempty"`
+}
+
 // ErrorData is the "error" response.
 type ErrorData struct {
 	Code    string `json:"code"`
