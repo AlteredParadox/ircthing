@@ -133,6 +133,10 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					}
 					continue // TAGMSG is ephemeral, never persisted
 				}
+				if ev.Msg.Command == "MARKREAD" {
+					h.applyUpstreamMarker(ctx, ev)
+					continue // marker state, never persisted
+				}
 				target, ok := persistTarget(ev.Msg, c.Nick(), c.IsChannel)
 				if !ok {
 					continue
@@ -166,10 +170,19 @@ func (h *Hub) backfill(ctx context.Context, c Conn) {
 		log.Printf("irc[%s]: backfill: %v", c.Name(), err)
 		return
 	}
+	markers := c.CapEnabled("draft/read-marker")
 	for _, b := range infos {
-		if b.Network == c.Name() && b.LastTS > 0 && !c.IsChannel(b.Target) {
+		if b.Network != c.Name() || c.IsChannel(b.Target) {
+			continue // channels resume on their own JOIN echo (+ MARKREAD from the server)
+		}
+		if b.LastTS > 0 {
 			_, msgid := h.lastStored(ctx, b.Network, b.Target)
 			c.RequestChatHistory(b.Target, b.LastTS, msgid)
+		}
+		if markers {
+			// Fetch the account's read position for the query buffer;
+			// the reply flows back through applyUpstreamMarker.
+			_ = c.Send(&ircv4.Message{Command: "MARKREAD", Params: []string{b.Target}})
 		}
 	}
 }
@@ -182,6 +195,34 @@ func (h *Hub) lastStored(ctx context.Context, network, target string) (int64, st
 		return 0, ""
 	}
 	return msgs[0].Time.UnixMilli(), msgs[0].MsgID
+}
+
+// applyUpstreamMarker folds a draft/read-marker MARKREAD line (another
+// client of our account read something, or a reply to our get/set) into
+// the store and tells sessions. The store clamps regressions, so the
+// pushed value is always the newest known position.
+func (h *Hub) applyUpstreamMarker(ctx context.Context, ev irc.Event) {
+	target := ev.Msg.Param(0)
+	sel := ev.Msg.Param(1)
+	v, ok := strings.CutPrefix(sel, "timestamp=")
+	if target == "" || !ok { // includes the "*" no-marker reply
+		return
+	}
+	t, err := time.Parse(time.RFC3339Nano, v)
+	if err != nil {
+		return
+	}
+	if err := h.store.SetReadMarker(ctx, ev.Network, target, t); err != nil {
+		log.Printf("irc[%s]: upstream read marker for %q: %v", ev.Network, target, err)
+		return
+	}
+	authoritative, err := h.store.ReadMarker(ctx, ev.Network, target)
+	if err != nil {
+		return
+	}
+	h.broadcast(envelope("read_marker", 0, MarkerData{
+		Network: ev.Network, Buffer: target, Time: authoritative.UnixMilli(),
+	}))
 }
 
 // trackHistoryBatch follows BATCH open/close for chathistory replays and

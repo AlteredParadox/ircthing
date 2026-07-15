@@ -720,6 +720,124 @@ func TestChatHistoryBackfillFlow(t *testing.T) {
 	}
 }
 
+func TestReadMarkerBridgeOutbound(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{
+		ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox",
+		caps: map[string]bool{"draft/read-marker": true},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	s := h.NewSession()
+	defer s.Close()
+
+	s.Handle(ctx, request(t, "set_read_marker", 2, SetMarkerData{Network: "libera", Buffer: "#go", Time: 1752570000000}))
+	recv(t, s, "read_marker")
+	deadline := time.Now().Add(5 * time.Second)
+	for len(conn.sentMsgs()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("MARKREAD never sent upstream")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := conn.sentMsgs()[0].String(); got != "MARKREAD #go timestamp=2025-07-15T09:00:00.000Z" {
+		t.Fatalf("wire = %q", got)
+	}
+
+	// A regressing set sends the authoritative (newer) value upstream,
+	// never the regression.
+	s.Handle(ctx, request(t, "set_read_marker", 3, SetMarkerData{Network: "libera", Buffer: "#go", Time: 1000}))
+	recv(t, s, "read_marker")
+	for len(conn.sentMsgs()) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("second MARKREAD never sent")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := conn.sentMsgs()[1].String(); got != "MARKREAD #go timestamp=2025-07-15T09:00:00.000Z" {
+		t.Fatalf("regression leaked upstream: %q", got)
+	}
+}
+
+func TestReadMarkerBridgeInbound(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+
+	// Another device of ours read #go: store updates and sessions learn.
+	conn.ch <- ev(":irc.test MARKREAD #go timestamp=2025-07-15T09:00:00.000Z")
+	got := decode[MarkerData](t, recv(t, s, "read_marker"))
+	if got.Buffer != "#go" || got.Time != 1752570000000 {
+		t.Fatalf("marker push = %+v", got)
+	}
+	stored, err := h.store.ReadMarker(ctx, "libera", "#go")
+	if err != nil || stored.UnixMilli() != 1752570000000 {
+		t.Fatalf("stored = %v, %v", stored, err)
+	}
+
+	// An older upstream value never regresses the marker; the push
+	// carries the authoritative newer one.
+	conn.ch <- ev(":irc.test MARKREAD #go timestamp=2020-01-01T00:00:00.000Z")
+	got = decode[MarkerData](t, recv(t, s, "read_marker"))
+	if got.Time != 1752570000000 {
+		t.Fatalf("regressed to %d", got.Time)
+	}
+
+	// The "*" no-marker reply and garbage are ignored, not persisted.
+	conn.ch <- ev(":irc.test MARKREAD alice *")
+	conn.ch <- ev(":irc.test MARKREAD alice timestamp=yesterday")
+	expectSilence(t, s)
+	if m, _ := h.store.ReadMarker(ctx, "libera", "alice"); !m.IsZero() {
+		t.Fatalf("garbage set a marker: %v", m)
+	}
+}
+
+func TestReadMarkerFetchedForQueriesOnRegistration(t *testing.T) {
+	h := newTestHub(t)
+	if _, err := h.store.Append(context.Background(), "libera", "bob", store.Message{
+		Time: time.UnixMilli(4000), Sender: "bob", Command: "PRIVMSG", Raw: "pm",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	conn := &fakeConn{
+		ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox",
+		caps: map[string]bool{"draft/read-marker": true},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var get bool
+		for _, m := range conn.sentMsgs() {
+			if m.String() == "MARKREAD bob" {
+				get = true
+			}
+		}
+		if get {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("MARKREAD get never sent; sent: %v", conn.sentMsgs())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 func TestSessionIgnoresUnknownInput(t *testing.T) {
 	h := newTestHub(t)
 	s := h.NewSession()

@@ -23,6 +23,7 @@ var wantedCaps = []string{
 	"chghost",
 	"draft/chathistory",
 	"draft/event-playback",
+	"draft/read-marker",
 	"echo-message",
 	"extended-join",
 	"invite-notify",

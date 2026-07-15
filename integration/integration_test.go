@@ -26,6 +26,7 @@ func TestConnectJoinMessage(t *testing.T) {
 		Name: "ergo", Addr: addr, Nick: "webuser", Channels: []string{"#it"},
 	})
 	s.waitRegistered()
+	s.waitJoined("webuser", "#it")
 
 	buddy := dialRaw(t, addr, "buddy")
 	buddy.send("JOIN #it")
@@ -92,6 +93,59 @@ func TestSASL(t *testing.T) {
 	s.waitRegistered()
 }
 
+// TestReadMarkerMultiDevice: two ircthing instances ("devices") logged
+// into the same account; reading on one device moves the marker on the
+// other via draft/read-marker.
+func TestReadMarkerMultiDevice(t *testing.T) {
+	addr := startErgo(t)
+
+	reg := dialRaw(t, addr, "shared")
+	reg.send("PRIVMSG NickServ :REGISTER sekrit-pw")
+	reg.waitFor(func(m *ircv4.Message) bool {
+		return m.Command == "NOTICE" && strings.Contains(strings.ToLower(m.Trailing()), "created")
+	})
+	reg.send("QUIT :done")
+
+	sasl := &irc.SASLPlain{Login: "shared", Password: "sekrit-pw"}
+	stA, hA := newStoreAndHub(t)
+	devA := startStack(t, stA, hA, irc.Config{
+		Name: "ergo", Addr: addr, Nick: "shared", SASL: sasl, Channels: []string{"#rm"},
+	})
+	devA.waitRegistered()
+	stB, hB := newStoreAndHub(t)
+	devB := startStack(t, stB, hB, irc.Config{
+		Name: "ergo", Addr: addr, Nick: "shared", SASL: sasl, Channels: []string{"#rm"},
+	})
+	devB.waitRegistered()
+
+	// Device A marks #rm read; device B's session learns the position.
+	markTime := time.Now().Add(-time.Minute).Truncate(time.Millisecond)
+	devA.sess.Handle(context.Background(), envelope(t, "set_read_marker", 1, hub.SetMarkerData{
+		Network: "ergo", Buffer: "#rm", Time: markTime.UnixMilli(),
+	}))
+	got := devB.waitEnvelope("read_marker", func(d json.RawMessage) bool {
+		var md hub.MarkerData
+		return json.Unmarshal(d, &md) == nil && md.Buffer == "#rm" && md.Time == markTime.UnixMilli()
+	})
+	_ = got
+
+	// And device B's own store agrees.
+	deadline := time.Now().Add(testTimeout)
+	for {
+		m, err := stB.ReadMarker(context.Background(), "ergo", "#rm")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.UnixMilli() == markTime.UnixMilli() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("device B marker = %v, want %v", m, markTime)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // TestChathistoryReconnectReplay: the CLAUDE.md "chathistory,
 // reconnect-replay" scenario — messages sent while we are offline are
 // backfilled into the store on reconnect, without duplicating what we
@@ -104,6 +158,7 @@ func TestChathistoryReconnectReplay(t *testing.T) {
 		Name: "ergo", Addr: addr, Nick: "webuser", Channels: []string{"#hist"},
 	})
 	s1.waitRegistered()
+	s1.waitJoined("webuser", "#hist")
 
 	buddy := dialRaw(t, addr, "buddy")
 	buddy.send("JOIN #hist")

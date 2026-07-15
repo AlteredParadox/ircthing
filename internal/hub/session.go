@@ -374,7 +374,20 @@ func (s *Session) handleSetMarker(ctx context.Context, env Envelope) {
 	data := MarkerData{Network: d.Network, Buffer: d.Buffer, Time: markerMillis(t)}
 	s.push(envelope("read_marker", env.Seq, data))
 	s.hub.broadcastExcept(s, envelope("read_marker", 0, data))
+	// Bridge to draft/read-marker: other clients of this account (e.g.
+	// on a bouncer) learn our read position. The authoritative value is
+	// sent, never a regression.
+	if conn := s.hub.network(d.Network); conn != nil && conn.CapEnabled("draft/read-marker") && !t.IsZero() {
+		_ = conn.Send(&ircv4.Message{
+			Command: "MARKREAD",
+			Params:  []string{d.Buffer, "timestamp=" + t.UTC().Format(markreadTimeLayout)},
+		})
+	}
 }
+
+// markreadTimeLayout is the server-time format used by MARKREAD
+// (https://ircv3.net/specs/extensions/read-marker, fetched 2026-07-15).
+const markreadTimeLayout = "2006-01-02T15:04:05.000Z"
 
 // markerMillis maps the zero time (marker unset) to protocol 0.
 func markerMillis(t time.Time) int64 {

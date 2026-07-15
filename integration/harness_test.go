@@ -216,6 +216,18 @@ func (s *stack) waitRegistered() {
 	})
 }
 
+// waitJoined waits until the server has processed nick's join to channel
+// (its JOIN echo came back). Tests must sequence on this before other
+// clients act, or the join order races.
+func (s *stack) waitJoined(nick, channel string) {
+	s.t.Helper()
+	s.waitEnvelope("event", func(d json.RawMessage) bool {
+		var ev hub.EventData
+		return json.Unmarshal(d, &ev) == nil &&
+			ev.Command == "JOIN" && ev.Sender == nick && ev.Buffer == channel
+	})
+}
+
 // waitStored polls the store until pred over the buffer's latest page
 // holds.
 func (s *stack) waitStored(network, target string, pred func([]store.Message) bool) []store.Message {
