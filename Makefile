@@ -5,8 +5,9 @@ GO            ?= go
 BIN           := bin/ircd-web
 GOFLAGS       := -trimpath -ldflags="-s -w"
 # staticcheck is run via `go run` (pinned) so it needs no global install
-# and stays out of go.mod.
-STATICCHECK   := $(GO) run honnef.co/go/tools/cmd/staticcheck@2025.1.1
+# and stays out of go.mod. GOTOOLCHAIN pins its build to the same Go
+# version the module resolves, or it refuses to analyze the module.
+STATICCHECK   := GOTOOLCHAIN=$(shell $(GO) env GOVERSION) $(GO) run honnef.co/go/tools/cmd/staticcheck@v0.7.0
 
 # Size gates. Budgets are hard rules from CLAUDE.md — fix the size,
 # never raise these numbers.
@@ -20,10 +21,15 @@ ESBUILD_FLAGS := --bundle --minify --format=esm \
 	--jsx=automatic --jsx-import-source=preact \
 	--target=es2020
 
-.PHONY: build frontend check vet staticcheck test binary-size-gate bundle-size-gate integration memcheck clean
+.PHONY: build build-debug frontend check vet staticcheck test binary-size-gate bundle-size-gate integration memcheck clean
 
 build: frontend
 	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN) ./cmd/ircd-web
+
+# Unstripped, race-enabled binary for debugging with delve. Never
+# size-gated; the release gate measures the stripped build above.
+build-debug: frontend
+	$(GO) build -race -o bin/ircd-web-debug ./cmd/ircd-web
 
 frontend: web/node_modules
 	cd web && $(ESBUILD) $(ESBUILD_FLAGS) src/main.jsx --outfile=dist/app.js

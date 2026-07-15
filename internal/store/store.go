@@ -1,4 +1,421 @@
-// Package store provides SQLite persistence (WAL mode): messages, networks,
-// channels, read markers, and FTS5 search. Schema changes go through
-// migrations/ — never mutate schema in place.
+// Package store provides SQLite persistence (WAL mode): messages,
+// networks, buffers, and read markers, with a bounded in-memory hot
+// scrollback ring per buffer in front of the database. Schema changes go
+// through migrations/ — never mutate schema in place.
 package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"math"
+	"sync"
+	"time"
+
+	_ "modernc.org/sqlite" // pure-Go SQLite driver (approved; CGO-free)
+)
+
+const (
+	// DefaultRingSize is the per-buffer hot scrollback bound: with the
+	// 50-channel scenario from the memory target this keeps hot history
+	// around 10k messages total.
+	DefaultRingSize = 200
+	DefaultPageSize = 100
+	MaxPageSize     = 500
+)
+
+// Message is one stored IRC message. ID and Network/Target are assigned
+// by the store on append.
+type Message struct {
+	ID      int64
+	Network string
+	Target  string
+	Time    time.Time
+	MsgID   string // IRCv3 msgid tag, "" when absent
+	Sender  string // prefix name (nick or server)
+	Command string
+	Raw     string // full IRC line including tags
+}
+
+// Cursor is a position in a buffer's history: unix-millisecond timestamp
+// plus row id as the tiebreaker. Pagination is exclusive of the cursor in
+// both directions (matching chathistory BEFORE/AFTER semantics). For a
+// pure-timestamp cursor use CursorAtTime.
+type Cursor struct {
+	TS int64
+	ID int64
+}
+
+func (m Message) Cursor() Cursor {
+	return Cursor{TS: m.Time.UnixMilli(), ID: m.ID}
+}
+
+// CursorAtTime positions before the first message at t: Before(c) returns
+// only strictly older messages, After(c) includes messages stamped exactly t.
+func CursorAtTime(t time.Time) Cursor {
+	return Cursor{TS: t.UnixMilli()}
+}
+
+var maxCursor = Cursor{TS: math.MaxInt64, ID: math.MaxInt64}
+
+// defaultUserID is the user seeded by the initial migration. The schema
+// is fully user-scoped (users own networks; everything below follows),
+// but the application runs single-user until auth lands in internal/api,
+// so the store pins this id rather than threading a user through the API.
+const defaultUserID = 1
+
+var ErrMsgIDNotFound = errors.New("store: msgid not found")
+
+type Options struct {
+	// RingSize bounds the per-buffer in-memory scrollback.
+	// 0 means DefaultRingSize.
+	RingSize int
+}
+
+// Store is safe for concurrent use. One coarse mutex guards the rings and
+// caches; at IRC message rates lock contention is a non-issue and this
+// keeps the invariants easy to reason about.
+type Store struct {
+	db       *sql.DB
+	ringSize int
+
+	mu       sync.Mutex
+	networks map[string]int64
+	buffers  map[bufKey]int64
+	rings    map[int64]*ring
+	stats    struct{ ringPages, dbPages int } // observability for tests
+}
+
+type bufKey struct{ network, target string }
+
+// Open opens (creating if needed) the database at path and applies any
+// pending migrations. WAL mode per the architecture; NORMAL synchronous is
+// the documented safe pairing with WAL.
+func Open(path string, opts Options) (*Store, error) {
+	if opts.RingSize <= 0 {
+		opts.RingSize = DefaultRingSize
+	}
+	dsn := "file:" + path +
+		"?_pragma=journal_mode(WAL)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=busy_timeout(5000)" +
+		"&_pragma=foreign_keys(1)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	// Single-connection limitation: this serializes ALL database access —
+	// writes and any reads that miss the rings. Deliberate for now: it
+	// sidesteps SQLITE_BUSY handling entirely, and at IRC message rates
+	// the connection is idle almost always. If bulk reads (search, large
+	// history fetches) ever contend with the write path, the successor is
+	// a split pool: keep this connection as the sole writer and add a
+	// small read-only pool (2–4 connections, PRAGMA query_only) — WAL
+	// already lets those readers run concurrently with the writer.
+	db.SetMaxOpenConns(1)
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &Store{
+		db:       db,
+		ringSize: opts.RingSize,
+		networks: make(map[string]int64),
+		buffers:  make(map[bufKey]int64),
+		rings:    make(map[int64]*ring),
+	}, nil
+}
+
+func (s *Store) Close() error {
+	return s.db.Close()
+}
+
+// Append persists m to the (network, target) buffer, creating network and
+// buffer rows as needed, and returns the message with its assigned ID.
+// A zero Time is stamped with the current time.
+func (s *Store) Append(ctx context.Context, network, target string, m Message) (Message, error) {
+	if network == "" || target == "" {
+		return Message{}, errors.New("store: network and target must be non-empty")
+	}
+	if m.Time.IsZero() {
+		m.Time = time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bufID, r, err := s.bufferAndRing(ctx, network, target, true)
+	if err != nil {
+		return Message{}, err
+	}
+	var msgid any
+	if m.MsgID != "" {
+		msgid = m.MsgID
+	}
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO messages (buffer_id, ts, msgid, sender, command, raw) VALUES (?, ?, ?, ?, ?, ?)`,
+		bufID, m.Time.UnixMilli(), msgid, m.Sender, m.Command, m.Raw)
+	if err != nil {
+		return Message{}, fmt.Errorf("store: append: %w", err)
+	}
+	m.ID, err = res.LastInsertId()
+	if err != nil {
+		return Message{}, err
+	}
+	m.Network, m.Target = network, target
+	r.insert(m)
+	return m, nil
+}
+
+// Latest returns the newest messages of a buffer, ascending.
+func (s *Store) Latest(ctx context.Context, network, target string, limit int) ([]Message, error) {
+	return s.Before(ctx, network, target, maxCursor, limit)
+}
+
+// Before returns up to limit messages strictly older than c, ascending.
+// An unknown buffer yields an empty page, not an error.
+func (s *Store) Before(ctx context.Context, network, target string, c Cursor, limit int) ([]Message, error) {
+	limit = clampLimit(limit)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bufID, r, err := s.bufferAndRing(ctx, network, target, false)
+	if err != nil || r == nil {
+		return nil, err
+	}
+	if out, ok := r.pageBefore(c, limit); ok {
+		s.stats.ringPages++
+		return out, nil
+	}
+	s.stats.dbPages++
+	msgs, err := s.queryPage(ctx, network, target,
+		`SELECT id, ts, msgid, sender, command, raw FROM messages
+		 WHERE buffer_id = ? AND (ts < ? OR (ts = ? AND id < ?))
+		 ORDER BY ts DESC, id DESC LIMIT ?`,
+		bufID, c.TS, c.TS, c.ID, limit)
+	if err != nil {
+		return nil, err
+	}
+	reverse(msgs)
+	return msgs, nil
+}
+
+// After returns up to limit messages strictly newer than c, ascending.
+// An unknown buffer yields an empty page, not an error.
+func (s *Store) After(ctx context.Context, network, target string, c Cursor, limit int) ([]Message, error) {
+	limit = clampLimit(limit)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bufID, r, err := s.bufferAndRing(ctx, network, target, false)
+	if err != nil || r == nil {
+		return nil, err
+	}
+	if out, ok := r.pageAfter(c, limit); ok {
+		s.stats.ringPages++
+		return out, nil
+	}
+	s.stats.dbPages++
+	return s.queryPage(ctx, network, target,
+		`SELECT id, ts, msgid, sender, command, raw FROM messages
+		 WHERE buffer_id = ? AND (ts > ? OR (ts = ? AND id > ?))
+		 ORDER BY ts ASC, id ASC LIMIT ?`,
+		bufID, c.TS, c.TS, c.ID, limit)
+}
+
+// CursorForMsgID resolves an IRCv3 msgid to its position in the buffer,
+// for msgid-anchored history paging.
+func (s *Store) CursorForMsgID(ctx context.Context, network, target, msgid string) (Cursor, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bufID, r, err := s.bufferAndRing(ctx, network, target, false)
+	if err != nil {
+		return Cursor{}, err
+	}
+	if r == nil {
+		return Cursor{}, ErrMsgIDNotFound
+	}
+	var c Cursor
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id, ts FROM messages WHERE buffer_id = ? AND msgid = ? LIMIT 1`,
+		bufID, msgid).Scan(&c.ID, &c.TS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Cursor{}, ErrMsgIDNotFound
+	}
+	if err != nil {
+		return Cursor{}, err
+	}
+	return c, nil
+}
+
+// ReadMarker returns the buffer's read marker, or the zero time when none
+// has been set.
+func (s *Store) ReadMarker(ctx context.Context, network, target string) (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bufID, err := s.bufferID(ctx, network, target, false)
+	if err != nil || bufID == 0 {
+		return time.Time{}, err
+	}
+	var ts int64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT ts FROM read_markers WHERE buffer_id = ?`, bufID).Scan(&ts)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.UnixMilli(ts), nil
+}
+
+// SetReadMarker advances the buffer's read marker to t. Markers only move
+// forward: with several devices syncing, the newest read position wins.
+func (s *Store) SetReadMarker(ctx context.Context, network, target string, t time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bufID, err := s.bufferID(ctx, network, target, true)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO read_markers (buffer_id, ts) VALUES (?, ?)
+		 ON CONFLICT (buffer_id) DO UPDATE SET ts = max(ts, excluded.ts)`,
+		bufID, t.UnixMilli())
+	return err
+}
+
+// bufferID resolves (network, target) to a buffer row id, creating rows
+// when create is set. Returns 0 for an unknown buffer when create is not.
+// Caller holds s.mu.
+func (s *Store) bufferID(ctx context.Context, network, target string, create bool) (int64, error) {
+	key := bufKey{network, target}
+	if id, ok := s.buffers[key]; ok {
+		return id, nil
+	}
+	netID, ok := s.networks[network]
+	if !ok {
+		err := s.db.QueryRowContext(ctx,
+			`SELECT id FROM networks WHERE user_id = ? AND name = ?`,
+			defaultUserID, network).Scan(&netID)
+		if errors.Is(err, sql.ErrNoRows) {
+			if !create {
+				return 0, nil
+			}
+			res, err := s.db.ExecContext(ctx,
+				`INSERT INTO networks (user_id, name) VALUES (?, ?)`,
+				defaultUserID, network)
+			if err != nil {
+				return 0, err
+			}
+			if netID, err = res.LastInsertId(); err != nil {
+				return 0, err
+			}
+		} else if err != nil {
+			return 0, err
+		}
+		s.networks[network] = netID
+	}
+
+	var bufID int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM buffers WHERE network_id = ? AND name = ?`, netID, target).Scan(&bufID)
+	if errors.Is(err, sql.ErrNoRows) {
+		if !create {
+			return 0, nil
+		}
+		res, err := s.db.ExecContext(ctx,
+			`INSERT INTO buffers (network_id, name) VALUES (?, ?)`, netID, target)
+		if err != nil {
+			return 0, err
+		}
+		if bufID, err = res.LastInsertId(); err != nil {
+			return 0, err
+		}
+		// Brand-new buffer: an empty ring IS its entire history.
+		s.rings[bufID] = newRing(s.ringSize)
+		s.rings[bufID].complete = true
+	} else if err != nil {
+		return 0, err
+	}
+	s.buffers[key] = bufID
+	return bufID, nil
+}
+
+// bufferAndRing resolves the buffer and returns its ring, warming the ring
+// from disk on first touch after startup. A nil ring means the buffer does
+// not exist (and create was false). Caller holds s.mu.
+func (s *Store) bufferAndRing(ctx context.Context, network, target string, create bool) (int64, *ring, error) {
+	bufID, err := s.bufferID(ctx, network, target, create)
+	if err != nil || bufID == 0 {
+		return 0, nil, err
+	}
+	if r, ok := s.rings[bufID]; ok {
+		return bufID, r, nil
+	}
+	// Warm with the newest ringSize+1 rows: getting fewer proves the ring
+	// now holds the buffer's entire history.
+	msgs, err := s.queryPage(ctx, network, target,
+		`SELECT id, ts, msgid, sender, command, raw FROM messages
+		 WHERE buffer_id = ? ORDER BY ts DESC, id DESC LIMIT ?`,
+		bufID, s.ringSize+1)
+	if err != nil {
+		return 0, nil, err
+	}
+	reverse(msgs)
+	r := newRing(s.ringSize)
+	if len(msgs) <= s.ringSize {
+		r.complete = true
+	} else {
+		msgs = msgs[1:]
+	}
+	for _, m := range msgs {
+		r.insert(m)
+	}
+	s.rings[bufID] = r
+	return bufID, r, nil
+}
+
+func (s *Store) queryPage(ctx context.Context, network, target, query string, args ...any) ([]Message, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Message
+	for rows.Next() {
+		var (
+			m     Message
+			ts    int64
+			msgid sql.NullString
+		)
+		if err := rows.Scan(&m.ID, &ts, &msgid, &m.Sender, &m.Command, &m.Raw); err != nil {
+			return nil, err
+		}
+		m.Time = time.UnixMilli(ts)
+		m.MsgID = msgid.String
+		m.Network, m.Target = network, target
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func clampLimit(limit int) int {
+	switch {
+	case limit <= 0:
+		return DefaultPageSize
+	case limit > MaxPageSize:
+		return MaxPageSize
+	default:
+		return limit
+	}
+}
+
+func reverse(msgs []Message) {
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+}
