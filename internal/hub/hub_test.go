@@ -106,9 +106,11 @@ func TestStoreMessage(t *testing.T) {
 }
 
 type fakeConn struct {
-	ch   chan irc.Event
-	name string
-	nick string
+	ch    chan irc.Event
+	name  string
+	nick  string
+	topic string
+	chans map[string][]irc.Member
 
 	mu      sync.Mutex
 	sent    []*ircv4.Message
@@ -118,6 +120,11 @@ type fakeConn struct {
 func (f *fakeConn) Events() <-chan irc.Event { return f.ch }
 func (f *fakeConn) Name() string             { return f.name }
 func (f *fakeConn) Nick() string             { return f.nick }
+
+func (f *fakeConn) Channel(name string) (string, []irc.Member, bool) {
+	ms, ok := f.chans[name]
+	return f.topic, ms, ok
+}
 
 func (f *fakeConn) Send(m *ircv4.Message) error {
 	f.mu.Lock()

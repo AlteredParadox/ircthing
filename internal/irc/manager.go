@@ -73,6 +73,12 @@ type Manager struct {
 	out        chan *ircv4.Message
 	registered atomic.Bool
 	nick       atomic.Value // string: current nick once registered
+	roster     *roster
+	// joined is the set of channels to (re)join after registration:
+	// the configured ones plus runtime JOINs, minus runtime PARTs (a KICK
+	// deliberately does not remove the intent — bouncers rejoin). Only
+	// the run goroutine touches it.
+	joined map[string]string // lower(channel) -> original casing
 }
 
 // Name returns the configured network label.
@@ -91,11 +97,23 @@ func NewManager(cfg Config) (*Manager, error) {
 		return nil, err
 	}
 	cfg.applyDefaults()
-	return &Manager{
+	m := &Manager{
 		cfg:    cfg,
 		events: make(chan Event, 256),
 		out:    make(chan *ircv4.Message, 64),
-	}, nil
+		roster: newRoster(),
+		joined: make(map[string]string),
+	}
+	for _, ch := range cfg.Channels {
+		m.joined[lower(ch)] = ch
+	}
+	return m, nil
+}
+
+// Channel returns the topic and member snapshot of a joined channel;
+// ok is false for channels we are not in (or before registration).
+func (m *Manager) Channel(name string) (topic string, members []Member, ok bool) {
+	return m.roster.channel(name)
 }
 
 // Events delivers server messages and state changes. The channel is
@@ -221,7 +239,9 @@ drain:
 	bo.reset()
 	m.emit(ctx, Event{Kind: EventState, State: StateRegistered})
 
-	for _, ch := range m.cfg.Channels {
+	m.roster.clear() // membership is per-connection state
+	defer m.roster.clear()
+	for _, ch := range m.joined {
 		if err := send([]*ircv4.Message{newMsg("JOIN", ch)}); err != nil {
 			return err
 		}
@@ -265,7 +285,26 @@ drain:
 				m.nick.Store(n)
 			}
 		}
+		m.roster.handle(m.Nick(), in)
+		m.trackJoinIntent(in)
 		m.emit(ctx, Event{Kind: EventMessage, Msg: in})
+	}
+}
+
+// trackJoinIntent keeps the rejoin set in step with our own JOINs and
+// PARTs. Runs on the read-loop goroutine, which is the only writer of
+// m.joined after construction.
+func (m *Manager) trackJoinIntent(in *ircv4.Message) {
+	if in.Prefix == nil || !strings.EqualFold(in.Prefix.Name, m.Nick()) {
+		return
+	}
+	switch in.Command {
+	case "JOIN":
+		if ch := in.Param(0); ch != "" {
+			m.joined[lower(ch)] = ch
+		}
+	case "PART":
+		delete(m.joined, lower(in.Param(0)))
 	}
 }
 

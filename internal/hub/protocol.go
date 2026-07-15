@@ -128,6 +128,46 @@ type SendData struct {
 	Text    string `json:"text"`
 }
 
+// CommandData submits a structured IRC command ("command"). The server
+// accepts only an allowlist (JOIN, PART, NICK, TOPIC) and validates
+// params; everything else is rejected rather than passed through.
+type CommandData struct {
+	Network string   `json:"network"`
+	Command string   `json:"command"`
+	Params  []string `json:"params"`
+}
+
+// ChannelReq asks for a channel's live state ("get_channel").
+type ChannelReq struct {
+	Network string `json:"network"`
+	Buffer  string `json:"buffer"`
+}
+
+// MemberData is one channel occupant.
+type MemberData struct {
+	Nick   string `json:"nick"`
+	Prefix string `json:"prefix,omitempty"` // "~", "&", "@", "%", "+" or ""
+}
+
+// ChannelData answers "get_channel": topic and membership as currently
+// known. Joined is false for channels we are not in (PM buffers,
+// disconnected networks) — members and topic are then empty.
+type ChannelData struct {
+	Network string       `json:"network"`
+	Buffer  string       `json:"buffer"`
+	Joined  bool         `json:"joined"`
+	Topic   string       `json:"topic"`
+	Members []MemberData `json:"members"`
+}
+
+// MembersChangedData is a server push hinting that channel state changed
+// and interested clients should refetch ("members_changed"). An empty
+// Buffer means anywhere on the network (QUIT/NICK span channels).
+type MembersChangedData struct {
+	Network string `json:"network"`
+	Buffer  string `json:"buffer"`
+}
+
 // ErrorData is the "error" response.
 type ErrorData struct {
 	Code    string `json:"code"`

@@ -127,6 +127,86 @@ export function linkify(text) {
 	return out;
 }
 
+export function isChannelName(s) {
+	return !!s && (s[0] === "#" || s[0] === "&");
+}
+
+// parseInput interprets composer input: plain text, a "//"-escaped
+// literal slash, or a command. `buffer` is the active buffer (default
+// target for /part and /topic). Returns one of:
+//   { type: "text", text }                    — send to the active buffer
+//   { type: "msg", target, text }             — /msg (caller switches)
+//   { type: "cmd", command, params, switchTo? }
+//   { type: "error", message }
+export function parseInput(input, buffer) {
+	if (!input.startsWith("/")) return { type: "text", text: input };
+	if (input.startsWith("//")) return { type: "text", text: input.slice(1) };
+	const m = /^\/(\S+)\s*([^]*)$/.exec(input);
+	const cmd = m[1].toLowerCase();
+	const rest = m[2].trim();
+	const err = (message) => ({ type: "error", message });
+
+	switch (cmd) {
+		case "me":
+			if (!rest) return err("usage: /me <action>");
+			return { type: "text", text: "\x01ACTION " + rest + "\x01" };
+
+		case "msg":
+		case "query": {
+			const sp = rest.indexOf(" ");
+			if (sp === -1 || !rest.slice(sp + 1).trim()) return err("usage: /msg <target> <text>");
+			return { type: "msg", target: rest.slice(0, sp), text: rest.slice(sp + 1).trim() };
+		}
+
+		case "join": {
+			if (!rest) return err("usage: /join <channel> [key]");
+			const [chan, key] = rest.split(/\s+/);
+			if (!isChannelName(chan)) return err("/join: " + chan + " is not a channel");
+			return { type: "cmd", command: "JOIN", params: key ? [chan, key] : [chan], switchTo: chan };
+		}
+
+		case "part": {
+			let chan = buffer;
+			let reason = rest;
+			if (isChannelName(rest.split(/\s+/)[0] || "")) {
+				const sp = rest.indexOf(" ");
+				chan = sp === -1 ? rest : rest.slice(0, sp);
+				reason = sp === -1 ? "" : rest.slice(sp + 1).trim();
+			}
+			if (!isChannelName(chan)) return err("/part: not in a channel");
+			return { type: "cmd", command: "PART", params: reason ? [chan, reason] : [chan] };
+		}
+
+		case "nick":
+			if (!rest || /\s/.test(rest)) return err("usage: /nick <newnick>");
+			return { type: "cmd", command: "NICK", params: [rest] };
+
+		case "topic":
+			if (!isChannelName(buffer)) return err("/topic: not in a channel");
+			if (!rest) return err("usage: /topic <text>");
+			return { type: "cmd", command: "TOPIC", params: [buffer, rest] };
+
+		default:
+			return err("unknown command /" + cmd);
+	}
+}
+
+// groupMembers buckets a channel roster for the members panel:
+// Ops (~ & @), Voice (% +), Members. Empty groups are dropped.
+export function groupMembers(members) {
+	const groups = [
+		{ label: "Ops", members: [] },
+		{ label: "Voice", members: [] },
+		{ label: "Members", members: [] },
+	];
+	for (const m of members) {
+		if ("~&@".includes(m.prefix || "\x00")) groups[0].members.push(m);
+		else if ("%+".includes(m.prefix || "\x00")) groups[1].members.push(m);
+		else groups[2].members.push(m);
+	}
+	return groups.filter((g) => g.members.length > 0);
+}
+
 export function bufKey(network, buffer) {
 	return network + "\n" + buffer;
 }

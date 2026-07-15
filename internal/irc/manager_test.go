@@ -318,6 +318,60 @@ func TestManagerAutojoinsAfterRegistration(t *testing.T) {
 	}
 }
 
+func TestManagerRejoinsRuntimeChannels(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	cfg := testCfg(ln.Addr().String())
+	cfg.Channels = []string{"#cfg"}
+	m := startManager(t, cfg)
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+	if got := s.readCmd("JOIN").Param(0); got != "#cfg" {
+		t.Fatalf("configured join = %q", got)
+	}
+
+	// Server echoes our runtime JOIN and a later PART of the configured
+	// channel; NAMES fills the roster.
+	s.send(":AlteredParadox!u@h JOIN #dyn")
+	s.send(":srv 353 AlteredParadox = #dyn :@AlteredParadox alice")
+	s.send(":srv 366 AlteredParadox #dyn :end")
+	s.send(":AlteredParadox!u@h PART #cfg")
+
+	// Roster reflects membership.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, members, ok := m.Channel("#dyn"); ok && len(members) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("roster never saw #dyn members")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Reconnect: the runtime join persists, the parted channel does not,
+	// and stale roster state is gone.
+	s.c.Close()
+	waitState(t, m, StateDisconnected)
+	if _, _, ok := m.Channel("#dyn"); ok {
+		t.Fatal("roster kept state across disconnect")
+	}
+	s2 := accept(t, conns)
+	s2.register("AlteredParadox")
+	if got := s2.readCmd("JOIN").Param(0); got != "#dyn" {
+		t.Fatalf("rejoin = %q, want #dyn", got)
+	}
+	s2.c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if msg, err := s2.r.ReadMessage(); err == nil && msg.Command == "JOIN" {
+		t.Fatalf("unexpected second join: %s", msg.String())
+	}
+}
+
 func TestManagerTracksNick(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

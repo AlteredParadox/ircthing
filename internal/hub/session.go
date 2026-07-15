@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"ircthing/internal/store"
+
+	ircv4 "gopkg.in/irc.v4"
 )
 
 // sessionBuffer is the per-session outbound queue depth. A session that
@@ -81,6 +83,10 @@ func (s *Session) Handle(ctx context.Context, env Envelope) {
 	switch env.Type {
 	case "send":
 		s.handleSend(ctx, env)
+	case "command":
+		s.handleCommand(ctx, env)
+	case "get_channel":
+		s.handleGetChannel(ctx, env)
 	case "get_buffers":
 		s.handleGetBuffers(ctx, env)
 	case "get_history":
@@ -135,6 +141,76 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 		s.hub.broadcast(envelope("event", 0, eventData(stored)))
 	}
 	s.push(envelope("ok", env.Seq, nil))
+}
+
+// commandSpec is the allowlist of client-issued IRC commands with their
+// permitted parameter counts. Everything else is rejected — the client
+// does not get raw connection access.
+var commandSpec = map[string]struct{ min, max int }{
+	"JOIN":  {1, 2}, // channel [key]
+	"PART":  {1, 2}, // channel [reason]
+	"NICK":  {1, 1},
+	"TOPIC": {1, 2}, // channel [new topic]
+}
+
+func (s *Session) handleCommand(ctx context.Context, env Envelope) {
+	var d CommandData
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", "malformed command data"))
+		return
+	}
+	cmd := strings.ToUpper(d.Command)
+	spec, allowed := commandSpec[cmd]
+	if !allowed {
+		s.push(errEnvelope(env.Seq, "bad_request", "command not allowed: "+d.Command))
+		return
+	}
+	if len(d.Params) < spec.min || len(d.Params) > spec.max {
+		s.push(errEnvelope(env.Seq, "bad_request", "wrong number of parameters"))
+		return
+	}
+	for i, p := range d.Params {
+		if p == "" || strings.ContainsAny(p, "\r\n\x00") {
+			s.push(errEnvelope(env.Seq, "bad_request", "invalid parameter"))
+			return
+		}
+		// Only the final parameter may contain spaces or lead with ':'
+		// (it is sent as the trailing parameter).
+		if i < len(d.Params)-1 && (strings.Contains(p, " ") || strings.HasPrefix(p, ":")) {
+			s.push(errEnvelope(env.Seq, "bad_request", "invalid parameter"))
+			return
+		}
+	}
+	conn := s.hub.network(d.Network)
+	if conn == nil {
+		s.push(errEnvelope(env.Seq, "unknown_network", "network is not connected"))
+		return
+	}
+	if err := conn.Send(&ircv4.Message{Command: cmd, Params: d.Params}); err != nil {
+		s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
+		return
+	}
+	s.push(envelope("ok", env.Seq, nil))
+}
+
+func (s *Session) handleGetChannel(ctx context.Context, env Envelope) {
+	var d ChannelReq
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", "malformed get_channel data"))
+		return
+	}
+	data := ChannelData{Network: d.Network, Buffer: d.Buffer, Members: []MemberData{}}
+	if conn := s.hub.network(d.Network); conn != nil {
+		topic, members, ok := conn.Channel(d.Buffer)
+		if ok {
+			data.Joined = true
+			data.Topic = topic
+			for _, m := range members {
+				data.Members = append(data.Members, MemberData{Nick: m.Nick, Prefix: m.Prefix})
+			}
+		}
+	}
+	s.push(envelope("channel", env.Seq, data))
 }
 
 func (s *Session) handleGetBuffers(ctx context.Context, env Envelope) {

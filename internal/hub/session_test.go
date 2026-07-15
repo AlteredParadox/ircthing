@@ -317,6 +317,179 @@ func TestSessionGetBuffers(t *testing.T) {
 	}
 }
 
+func TestSessionCommand(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	s := h.NewSession()
+	defer s.Close()
+
+	cases := []struct {
+		name    string
+		data    CommandData
+		wantErr string // "" = ok expected
+		sent    string // expected wire form when ok
+	}{
+		{
+			name: "join",
+			data: CommandData{Network: "libera", Command: "join", Params: []string{"#go"}},
+			sent: "JOIN #go",
+		},
+		{
+			name: "join with key",
+			data: CommandData{Network: "libera", Command: "JOIN", Params: []string{"#priv", "sekrit"}},
+			sent: "JOIN #priv sekrit",
+		},
+		{
+			name: "part with reason",
+			data: CommandData{Network: "libera", Command: "PART", Params: []string{"#go", "later folks"}},
+			sent: "PART #go :later folks",
+		},
+		{
+			name: "topic",
+			data: CommandData{Network: "libera", Command: "TOPIC", Params: []string{"#go", "new topic here"}},
+			sent: "TOPIC #go :new topic here",
+		},
+		{
+			name: "nick",
+			data: CommandData{Network: "libera", Command: "NICK", Params: []string{"AlteredParadox2"}},
+			sent: "NICK AlteredParadox2",
+		},
+		{
+			name:    "disallowed command",
+			data:    CommandData{Network: "libera", Command: "OPER", Params: []string{"x", "y"}},
+			wantErr: "bad_request",
+		},
+		{
+			name:    "too many params",
+			data:    CommandData{Network: "libera", Command: "NICK", Params: []string{"a", "b"}},
+			wantErr: "bad_request",
+		},
+		{
+			name:    "missing params",
+			data:    CommandData{Network: "libera", Command: "JOIN"},
+			wantErr: "bad_request",
+		},
+		{
+			name:    "crlf injection rejected",
+			data:    CommandData{Network: "libera", Command: "JOIN", Params: []string{"#go\r\nQUIT"}},
+			wantErr: "bad_request",
+		},
+		{
+			name:    "space in non-final param rejected",
+			data:    CommandData{Network: "libera", Command: "JOIN", Params: []string{"#a #b", "key"}},
+			wantErr: "bad_request",
+		},
+		{
+			name:    "unknown network",
+			data:    CommandData{Network: "ghost", Command: "JOIN", Params: []string{"#go"}},
+			wantErr: "unknown_network",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := len(conn.sentMsgs())
+			s.Handle(ctx, request(t, "command", 4, tc.data))
+			if tc.wantErr != "" {
+				if got := decode[ErrorData](t, recv(t, s, "error")); got.Code != tc.wantErr {
+					t.Fatalf("error code = %q, want %q", got.Code, tc.wantErr)
+				}
+				if len(conn.sentMsgs()) != before {
+					t.Fatal("rejected command still hit the wire")
+				}
+				return
+			}
+			recv(t, s, "ok")
+			sent := conn.sentMsgs()
+			if got := sent[len(sent)-1].String(); got != tc.sent {
+				t.Fatalf("wire = %q, want %q", got, tc.sent)
+			}
+		})
+	}
+}
+
+func TestSessionGetChannel(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{
+		ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox",
+		topic: "welcome",
+		chans: map[string][]irc.Member{
+			"#go": {{Nick: "alice", Prefix: "@"}, {Nick: "AlteredParadox"}, {Nick: "bob", Prefix: "+"}},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	s := h.NewSession()
+	defer s.Close()
+
+	s.Handle(ctx, request(t, "get_channel", 5, ChannelReq{Network: "libera", Buffer: "#go"}))
+	got := decode[ChannelData](t, recv(t, s, "channel"))
+	if !got.Joined || got.Topic != "welcome" || len(got.Members) != 3 {
+		t.Fatalf("channel = %+v", got)
+	}
+	if got.Members[0].Nick != "alice" || got.Members[0].Prefix != "@" {
+		t.Fatalf("members = %+v", got.Members)
+	}
+
+	// Unjoined buffer (a PM) answers joined=false, not an error.
+	s.Handle(ctx, request(t, "get_channel", 6, ChannelReq{Network: "libera", Buffer: "alice"}))
+	if got := decode[ChannelData](t, recv(t, s, "channel")); got.Joined || len(got.Members) != 0 {
+		t.Fatalf("pm channel = %+v", got)
+	}
+	// Unknown network likewise.
+	s.Handle(ctx, request(t, "get_channel", 7, ChannelReq{Network: "ghost", Buffer: "#go"}))
+	if got := decode[ChannelData](t, recv(t, s, "channel")); got.Joined {
+		t.Fatalf("ghost network = %+v", got)
+	}
+}
+
+func TestHubBroadcastsMembersChanged(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+
+	// JOIN: hint names the channel (and the JOIN also persists as event).
+	conn.ch <- ev(":alice!u@h JOIN #go")
+	if got := decode[MembersChangedData](t, recv(t, s, "members_changed")); got.Buffer != "#go" {
+		t.Fatalf("hint = %+v", got)
+	}
+	recv(t, s, "event")
+
+	// QUIT is not persisted but still hints, network-wide.
+	conn.ch <- ev(":alice!u@h QUIT :bye")
+	if got := decode[MembersChangedData](t, recv(t, s, "members_changed")); got.Buffer != "" {
+		t.Fatalf("quit hint = %+v", got)
+	}
+
+	// End of NAMES hints its channel.
+	conn.ch <- ev(":srv 366 AlteredParadox #go :End of /NAMES list")
+	if got := decode[MembersChangedData](t, recv(t, s, "members_changed")); got.Buffer != "#go" {
+		t.Fatalf("366 hint = %+v", got)
+	}
+
+	// Ordinary PRIVMSG does not hint.
+	conn.ch <- ev(":alice!u@h PRIVMSG #go :hi")
+	if env := recv(t, s, "event"); env.Type != "event" {
+		t.Fatalf("got %+v", env)
+	}
+}
+
 func TestSessionIgnoresUnknownInput(t *testing.T) {
 	h := newTestHub(t)
 	s := h.NewSession()

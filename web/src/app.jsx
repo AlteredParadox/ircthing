@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
-import { bufKey, mentionsMe, parseHash, renderable, toHash } from "./irc.js";
+import { bufKey, isChannelName, mentionsMe, parseHash, parseInput, renderable, toHash } from "./irc.js";
 import { Login } from "./login.jsx";
+import { Members } from "./members.jsx";
 import { Sidebar } from "./sidebar.jsx";
 import { Socket } from "./ws.js";
 
@@ -29,6 +30,10 @@ export function App() {
 	});
 	const [theme, setTheme] = useState(() => localStorage.getItem("theme") || "dark");
 	const [sideOpen, setSideOpen] = useState(() => window.innerWidth >= 760);
+	const [rightOpen, setRightOpen] = useState(() => window.innerWidth >= 1000);
+	const [chanInfo, setChanInfo] = useState(null);
+	const [chanTick, setChanTick] = useState(0);
+	const [cmdError, setCmdError] = useState("");
 	const sock = useRef(null);
 
 	useEffect(() => {
@@ -92,13 +97,17 @@ export function App() {
 		s.on("event", (ev) => {
 			const key = bufKey(ev.network, ev.buffer);
 			setMsgs((m) => {
+				// Accumulate even before history is loaded — the fetch
+				// response merges and dedupes, so events racing an
+				// in-flight history request are never lost.
 				const cur = m[key];
-				if (!cur?.loaded) return m; // not fetched yet: history covers it
-				let list = [...cur.list, ev];
+				let list = [...(cur?.list || []), ev];
+				let reachedTop = cur?.reachedTop;
 				if (list.length > TRIM_AT) {
 					list = list.slice(list.length - TRIM_TO);
+					reachedTop = false;
 				}
-				return { ...m, [key]: { ...cur, list, reachedTop: list.length <= TRIM_AT && cur.reachedTop } };
+				return { ...m, [key]: { ...(cur || {}), list, reachedTop } };
 			});
 			setBuffers((b) => {
 				const cur = b[key] || {
@@ -119,6 +128,16 @@ export function App() {
 					},
 				};
 			});
+		});
+
+		s.on("members_changed", (d) => {
+			const buf = buffersRef.current[activeKeyRef.current];
+			if (
+				buf && d.network === buf.network &&
+				(!d.buffer || d.buffer.toLowerCase() === buf.buffer.toLowerCase())
+			) {
+				setChanTick((t) => t + 1);
+			}
 		});
 
 		s.on("read_marker", (d) => {
@@ -142,10 +161,37 @@ export function App() {
 		return () => s.close();
 	}, [phase]);
 
-	// networksRef lets the event handler read the current nick without
-	// re-registering socket handlers on every state change.
+	// Refs mirror state so long-lived socket handlers read current values
+	// without re-registering on every change.
 	const networksRef = useRef(networks);
 	networksRef.current = networks;
+	const buffersRef = useRef(buffers);
+	buffersRef.current = buffers;
+	const activeKeyRef = useRef(activeKey);
+	activeKeyRef.current = activeKey;
+
+	// Channel state (topic + members) for the active buffer. Debounced:
+	// members_changed hints arrive in bursts (NAMES floods, netsplits).
+	useEffect(() => {
+		const buf = activeKey ? buffers[activeKey] : null;
+		if (!buf || !connected || !isChannelName(buf.buffer)) {
+			setChanInfo(null);
+			return;
+		}
+		let alive = true;
+		const t = setTimeout(() => {
+			sock.current
+				.request("get_channel", { network: buf.network, buffer: buf.buffer })
+				.then((d) => {
+					if (alive) setChanInfo(d);
+				})
+				.catch(() => {});
+		}, 150);
+		return () => {
+			alive = false;
+			clearTimeout(t);
+		};
+	}, [activeKey, connected, chanTick]);
 
 	// Load history when a buffer becomes active and has none.
 	useEffect(() => {
@@ -155,14 +201,21 @@ export function App() {
 		sock.current
 			.request("get_history", { network: buf.network, buffer: buf.buffer, limit: PAGE })
 			.then((page) => {
-				setMsgs((m) => ({
-					...m,
-					[activeKey]: {
-						list: page.messages || [],
-						loaded: true,
-						reachedTop: (page.messages || []).length < PAGE,
-					},
-				}));
+				setMsgs((m) => {
+					// Keep events that streamed in while the fetch was in
+					// flight; the page is authoritative for what it covers.
+					const pageMsgs = page.messages || [];
+					const seen = new Set(pageMsgs.map((e) => e.id));
+					const streamed = (m[activeKey]?.list || []).filter((e) => !seen.has(e.id));
+					return {
+						...m,
+						[activeKey]: {
+							list: [...pageMsgs, ...streamed],
+							loaded: true,
+							reachedTop: pageMsgs.length < PAGE,
+						},
+					};
+				});
 			})
 			.catch(() => {});
 	}, [activeKey, connected, buffers, msgs]);
@@ -176,8 +229,17 @@ export function App() {
 	}, [buffers, activeKey]);
 
 	function select(network, buffer) {
+		const key = bufKey(network, buffer);
+		// A buffer may not exist yet (/join, /msg to a fresh target):
+		// create a placeholder so the view renders while events arrive.
+		setBuffers((b) =>
+			b[key] ? b : {
+				...b,
+				[key]: { key, network, buffer, lastTime: 0, marker: 0, unread: 0, mention: false },
+			});
 		location.hash = toHash(network, buffer);
-		setActiveKey(bufKey(network, buffer));
+		setActiveKey(key);
+		setCmdError("");
 		if (window.innerWidth < 760) setSideOpen(false);
 	}
 
@@ -205,10 +267,36 @@ export function App() {
 			.catch(() => {});
 	}
 
-	function sendMsg(text) {
+	function sendInput(text) {
 		const buf = buffers[activeKey];
 		if (!buf) return;
-		sock.current.request("send", { network: buf.network, target: buf.buffer, text }).catch(() => {});
+		setCmdError("");
+		const p = parseInput(text, buf.buffer);
+		const oops = (e) => setCmdError(e.message || "failed");
+		switch (p.type) {
+			case "error":
+				setCmdError(p.message);
+				break;
+			case "text":
+				sock.current
+					.request("send", { network: buf.network, target: buf.buffer, text: p.text })
+					.catch(oops);
+				break;
+			case "msg":
+				sock.current
+					.request("send", { network: buf.network, target: p.target, text: p.text })
+					.then(() => select(buf.network, p.target))
+					.catch(oops);
+				break;
+			case "cmd":
+				sock.current
+					.request("command", { network: buf.network, command: p.command, params: p.params })
+					.then(() => {
+						if (p.switchTo) select(buf.network, p.switchTo);
+					})
+					.catch(oops);
+				break;
+		}
 	}
 
 	const readSent = useRef(0);
@@ -239,6 +327,11 @@ export function App() {
 	const activeBuf = activeKey ? buffers[activeKey] : null;
 	const selfNick = activeBuf ? networks[activeBuf.network]?.nick : "";
 	const netState = activeBuf ? networks[activeBuf.network]?.state : "";
+	const isChan = activeBuf && isChannelName(activeBuf.buffer);
+	const topicText =
+		netState && netState !== "registered"
+			? `${activeBuf?.network}: ${netState}…`
+			: chanInfo?.topic || "";
 
 	return (
 		<div class="app">
@@ -258,30 +351,41 @@ export function App() {
 					>◧</button>
 					{activeBuf && (
 						<span class="topic-name">
-							<span class="hash">{activeBuf.buffer.startsWith("#") || activeBuf.buffer.startsWith("&") ? activeBuf.buffer[0] : "@"}</span>
+							<span class="hash">{isChan ? activeBuf.buffer[0] : "@"}</span>
 							{activeBuf.buffer.replace(/^[#&]/, "")}
 						</span>
 					)}
 					<div class="topic-sep" />
-					<div class="topic-text">
-						{netState && netState !== "registered" ? `${activeBuf?.network}: ${netState}…` : ""}
-					</div>
+					<div class="topic-text" title={topicText}>{topicText}</div>
 					<button
 						class="icon-btn" title="Toggle theme"
 						onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
 					>{theme === "dark" ? "☀" : "☾"}</button>
+					{isChan && (
+						<button
+							class={"icon-btn" + (rightOpen ? " active" : "")}
+							title="Toggle members"
+							onClick={() => setRightOpen(!rightOpen)}
+						>◨</button>
+					)}
 				</div>
 				{!connected && <div class="conn-banner">connection lost — reconnecting…</div>}
 				{activeBuf ? (
 					<Chat
 						buf={activeBuf} msgs={msgs[activeKey]} selfNick={selfNick} theme={theme}
 						connected={connected && netState === "registered"}
-						onSend={sendMsg} onLoadOlder={loadOlder} onRead={markRead}
+						error={cmdError}
+						onSend={sendInput} onLoadOlder={loadOlder} onRead={markRead}
 					/>
 				) : (
 					<div class="empty-state">no buffers yet — waiting for traffic</div>
 				)}
 			</div>
+			{isChan && (
+				<div class={"rightbar" + (rightOpen ? " open" : "")}>
+					<Members info={chanInfo} theme={theme} />
+				</div>
+			)}
 		</div>
 	);
 }

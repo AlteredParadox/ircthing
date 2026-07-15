@@ -25,6 +25,7 @@ type Conn interface {
 	Nick() string
 	Events() <-chan irc.Event
 	Send(*ircv4.Message) error
+	Channel(name string) (topic string, members []irc.Member, ok bool)
 }
 
 type Hub struct {
@@ -86,6 +87,11 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					Error:   errStr,
 				}))
 			case irc.EventMessage:
+				if hint, affected := membersHint(ev.Msg); affected {
+					h.broadcast(envelope("members_changed", 0, MembersChangedData{
+						Network: ev.Network, Buffer: hint,
+					}))
+				}
 				target, ok := persistTarget(ev.Msg, c.Nick())
 				if !ok {
 					continue
@@ -128,6 +134,21 @@ func (h *Hub) broadcastExcept(except *Session, env Envelope) {
 			s.push(env)
 		}
 	}
+}
+
+// membersHint reports whether a message changes channel state clients may
+// be displaying, and which buffer it affects ("" = anywhere on the
+// network: QUIT and NICK span channels the hub doesn't track).
+func membersHint(m *ircv4.Message) (buffer string, affected bool) {
+	switch m.Command {
+	case "JOIN", "PART", "KICK", "TOPIC", "MODE":
+		return m.Param(0), true
+	case "366": // end of NAMES: <me> <channel>
+		return m.Param(1), true
+	case "QUIT", "NICK":
+		return "", true
+	}
+	return "", false
 }
 
 func newPrivmsg(target, text string) *ircv4.Message {

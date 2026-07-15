@@ -45,7 +45,7 @@ function estimate(ev) {
 }
 
 // Chat renders the active buffer: virtualized scrollback plus composer.
-export function Chat({ buf, msgs, selfNick, theme, connected, onSend, onLoadOlder, onRead }) {
+export function Chat({ buf, msgs, selfNick, theme, connected, error, onSend, onLoadOlder, onRead }) {
 	const [draft, setDraft] = useState("");
 	const pinned = useRef(true);
 	const loadingOlder = useRef(false);
@@ -98,6 +98,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, onSend, onLoadOlde
 				)}
 			/>
 			<div class="composer">
+				{error && <div class="cmd-error">{error}</div>}
 				<form class="compose-box" onSubmit={submit}>
 					<span class="prompt">{selfNick || "…"} ›</span>
 					<input
