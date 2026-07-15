@@ -75,6 +75,9 @@ type Manager struct {
 	nick       atomic.Value // string: current nick once registered
 }
 
+// Name returns the configured network label.
+func (m *Manager) Name() string { return m.cfg.Name }
+
 // Nick returns the nick the server currently knows us by: empty before
 // the first registration, then kept current across nick changes and
 // reconnects.
@@ -217,6 +220,12 @@ drain:
 	m.nick.Store(hs.nick)
 	bo.reset()
 	m.emit(ctx, Event{Kind: EventState, State: StateRegistered})
+
+	for _, ch := range m.cfg.Channels {
+		if err := send([]*ircv4.Message{newMsg("JOIN", ch)}); err != nil {
+			return err
+		}
+	}
 
 	// Steady state. The read deadline doubles as the keepalive timer:
 	// after PingInterval of silence we PING, and if the server stays

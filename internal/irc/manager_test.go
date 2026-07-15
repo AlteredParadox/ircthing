@@ -290,6 +290,34 @@ func TestManagerKeepaliveAnswered(t *testing.T) {
 	}
 }
 
+func TestManagerAutojoinsAfterRegistration(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	cfg := testCfg(ln.Addr().String())
+	cfg.Channels = []string{"#go", "#linux"}
+	m := startManager(t, cfg)
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+	for _, want := range cfg.Channels {
+		if got := s.readCmd("JOIN").Param(0); got != want {
+			t.Fatalf("JOIN %q, want %q", got, want)
+		}
+	}
+
+	// Channels are re-joined after a reconnect.
+	s.c.Close()
+	s2 := accept(t, conns)
+	s2.register("AlteredParadox")
+	if got := s2.readCmd("JOIN").Param(0); got != "#go" {
+		t.Fatalf("JOIN after reconnect = %q, want #go", got)
+	}
+}
+
 func TestManagerTracksNick(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -35,6 +35,10 @@ type Config struct {
 	// unauthenticated.
 	SASL *SASLPlain
 
+	// Channels are joined after every successful registration, so they
+	// come back automatically on reconnect.
+	Channels []string
+
 	// Backoff controls reconnect delays; zero values pick defaults.
 	Backoff BackoffConfig
 
