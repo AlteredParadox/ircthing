@@ -228,6 +228,37 @@ func (s *stack) waitJoined(nick, channel string) {
 	})
 }
 
+// channelMembers requests a channel's roster from a session and returns
+// the member nicks, retrying until non-empty or timeout.
+func (s *stack) channelMembers(network, buffer string) []string {
+	s.t.Helper()
+	deadline := time.Now().Add(testTimeout)
+	seq := int64(1000)
+	for {
+		seq++
+		s.sess.Handle(context.Background(), envelope(s.t, "get_channel", seq, hub.ChannelReq{
+			Network: network, Buffer: buffer,
+		}))
+		env := s.waitEnvelope("channel", func(d json.RawMessage) bool {
+			var cd hub.ChannelData
+			return json.Unmarshal(d, &cd) == nil && cd.Buffer == buffer
+		})
+		var cd hub.ChannelData
+		json.Unmarshal(env.Data, &cd)
+		if len(cd.Members) > 0 {
+			out := make([]string, len(cd.Members))
+			for i, m := range cd.Members {
+				out[i] = m.Nick
+			}
+			return out
+		}
+		if time.Now().After(deadline) {
+			s.t.Fatalf("channel %s never populated members", buffer)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // waitStored polls the store until pred over the buffer's latest page
 // holds.
 func (s *stack) waitStored(network, target string, pred func([]store.Message) bool) []store.Message {

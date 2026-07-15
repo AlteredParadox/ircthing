@@ -198,6 +198,8 @@ func (f *fakeConn) ChanTypes() string { return "#&" }
 
 func (f *fakeConn) RequestChatHistory(string, int64, string) {}
 
+func (f *fakeConn) EnsureNames(string) {}
+
 func (f *fakeConn) privmsg(line string) irc.Event {
 	return irc.Event{
 		Network: f.name,

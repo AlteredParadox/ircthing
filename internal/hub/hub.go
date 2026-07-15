@@ -33,6 +33,9 @@ type Conn interface {
 	// resume point (msgid preferred over sinceMs when non-empty); a
 	// no-op on networks without draft/chathistory.
 	RequestChatHistory(target string, sinceMs int64, msgid string)
+	// EnsureNames lazily fetches a channel's membership under
+	// draft/no-implicit-names; a no-op otherwise.
+	EnsureNames(channel string)
 }
 
 type Hub struct {

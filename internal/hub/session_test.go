@@ -545,6 +545,10 @@ func TestSessionGetChannel(t *testing.T) {
 	if !got.Joined || got.Topic != "welcome" || len(got.Members) != 3 {
 		t.Fatalf("channel = %+v", got)
 	}
+	// get_channel lazily requests membership (no-implicit-names path).
+	if names := conn.namesReqs(); len(names) == 0 || names[len(names)-1] != "#go" {
+		t.Fatalf("EnsureNames not called: %v", names)
+	}
 	if got.Members[0].Nick != "alice" || got.Members[0].Prefix != "@+" {
 		t.Fatalf("members = %+v", got.Members)
 	}

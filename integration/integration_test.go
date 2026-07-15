@@ -93,6 +93,31 @@ func TestSASL(t *testing.T) {
 	s.waitRegistered()
 }
 
+// TestNoImplicitNames: Ergo advertises no-implicit-names, so it sends no
+// membership on JOIN. Our lazy fetch must still populate the members
+// panel when a channel is viewed.
+func TestNoImplicitNames(t *testing.T) {
+	addr := startErgo(t)
+	st, h := newStoreAndHub(t)
+	s := startStack(t, st, h, irc.Config{
+		Name: "ergo", Addr: addr, Nick: "webuser", Channels: []string{"#nin"},
+	})
+	s.waitRegistered()
+	s.waitJoined("webuser", "#nin")
+
+	// A second user joins so the roster has someone besides us.
+	buddy := dialRaw(t, addr, "buddy")
+	buddy.send("JOIN #nin")
+	s.waitJoined("buddy", "#nin")
+
+	// get_channel triggers the lazy NAMES; membership then populates.
+	members := s.channelMembers("ergo", "#nin")
+	have := strings.Join(members, ",")
+	if !strings.Contains(have, "webuser") || !strings.Contains(have, "buddy") {
+		t.Fatalf("members = %v, want webuser and buddy", members)
+	}
+}
+
 // TestReadMarkerMultiDevice: two ircthing instances ("devices") logged
 // into the same account; reading on one device moves the marker on the
 // other via draft/read-marker.

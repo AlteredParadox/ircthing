@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -85,6 +86,12 @@ type Manager struct {
 	// deliberately does not remove the intent — bouncers rejoin). Only
 	// the run goroutine touches it.
 	joined map[string]string // lower(channel) -> original casing
+
+	// namesMu guards namesReq: channels for which we have already sent an
+	// explicit NAMES this connection (draft/no-implicit-names). Touched by
+	// EnsureNames (hub goroutine) and reset on reconnect (run goroutine).
+	namesMu  sync.Mutex
+	namesReq map[string]bool
 }
 
 // Name returns the configured network label.
@@ -105,12 +112,13 @@ func NewManager(cfg Config) (*Manager, error) {
 	cfg.applyDefaults()
 	isup := newISupport()
 	m := &Manager{
-		cfg:    cfg,
-		events: make(chan Event, 256),
-		out:    make(chan *ircv4.Message, 64),
-		isup:   isup,
-		roster: newRoster(isup),
-		joined: make(map[string]string),
+		cfg:      cfg,
+		events:   make(chan Event, 256),
+		out:      make(chan *ircv4.Message, 64),
+		isup:     isup,
+		roster:   newRoster(isup),
+		joined:   make(map[string]string),
+		namesReq: make(map[string]bool),
 	}
 	for _, ch := range cfg.Channels {
 		m.joined[isup.Fold(ch)] = ch
@@ -133,6 +141,34 @@ func (m *Manager) ChanTypes() string {
 // ok is false for channels we are not in (or before registration).
 func (m *Manager) Channel(name string) (topic string, members []Member, ok bool) {
 	return m.roster.channel(name)
+}
+
+// EnsureNames requests the membership of a channel we have not fetched
+// this connection. Under draft/no-implicit-names
+// (https://ircv3.net/specs/extensions/no-implicit-names, fetched
+// 2026-07-15) the server sends no NAMES on JOIN, so member lists are
+// fetched lazily — only for channels the user actually looks at — which
+// is the point of the capability. Without the cap this is a no-op: the
+// implicit NAMES already populated the roster. The reply (353/366)
+// populates the roster and raises a members_changed hint as usual.
+func (m *Manager) EnsureNames(channel string) {
+	if !m.CapEnabled("no-implicit-names") || !m.registered.Load() {
+		return
+	}
+	key := m.isup.Fold(channel)
+	m.namesMu.Lock()
+	already := m.namesReq[key]
+	m.namesReq[key] = true
+	m.namesMu.Unlock()
+	if !already {
+		_ = m.Send(newMsg("NAMES", channel))
+	}
+}
+
+func (m *Manager) resetNames() {
+	m.namesMu.Lock()
+	m.namesReq = make(map[string]bool)
+	m.namesMu.Unlock()
 }
 
 // RequestChatHistory asks the server for messages in target newer than
@@ -354,6 +390,7 @@ drain:
 	m.isup.reset()   // ISUPPORT is per-connection; 005 follows shortly
 	m.roster.clear() // membership is per-connection state
 	defer m.roster.clear()
+	m.resetNames() // lazy NAMES must be re-requested on the new connection
 	rejoin := make([]string, 0, len(m.joined))
 	for _, ch := range m.joined {
 		rejoin = append(rejoin, ch)

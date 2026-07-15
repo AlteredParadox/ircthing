@@ -30,6 +30,7 @@ var wantedCaps = []string{
 	"labeled-response",
 	"message-tags",
 	"multi-prefix",
+	"no-implicit-names",
 	"server-time",
 	"setname",
 	"standard-replies",

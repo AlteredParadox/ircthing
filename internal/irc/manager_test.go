@@ -424,6 +424,62 @@ func TestManagerCapsAndNotify(t *testing.T) {
 	}
 }
 
+func TestManagerLazyNames(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+
+	s := accept(t, conns)
+	s.registerCaps("AlteredParadox", "no-implicit-names")
+	waitState(t, m, StateRegistered)
+
+	// First request for a channel sends NAMES; a repeat is deduped.
+	m.EnsureNames("#go")
+	if got := s.readCmd("NAMES").Param(0); got != "#go" {
+		t.Fatalf("NAMES target = %q", got)
+	}
+	m.EnsureNames("#go")
+	m.EnsureNames("#other")
+	if got := s.readCmd("NAMES").Param(0); got != "#other" {
+		t.Fatalf("second NAMES = %q (dedup failed?)", got)
+	}
+
+	// A reconnect clears the requested set, so NAMES is re-sent.
+	s.c.Close()
+	waitState(t, m, StateDisconnected)
+	s2 := accept(t, conns)
+	s2.registerCaps("AlteredParadox", "no-implicit-names")
+	waitState(t, m, StateRegistered)
+	m.EnsureNames("#go")
+	if got := s2.readCmd("NAMES").Param(0); got != "#go" {
+		t.Fatalf("NAMES after reconnect = %q", got)
+	}
+}
+
+func TestManagerEnsureNamesNoopWithoutCap(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+	s := accept(t, conns)
+	s.register("AlteredParadox") // does not offer no-implicit-names
+	waitState(t, m, StateRegistered)
+
+	m.EnsureNames("#go")
+	// A marker must be next on the wire — no NAMES was sent.
+	if err := m.Send(newMsg("PRIVMSG", "#go", "marker")); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.read(); got.Command != "PRIVMSG" {
+		t.Fatalf("expected marker, got %q", got.String())
+	}
+}
+
 func TestManagerRequestsChatHistory(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

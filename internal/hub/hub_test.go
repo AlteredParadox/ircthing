@@ -120,6 +120,7 @@ type fakeConn struct {
 	sent    []*ircv4.Message
 	sendErr error
 	hist    []string // RequestChatHistory calls as "target@sinceMs"
+	names   []string // EnsureNames calls
 }
 
 func (f *fakeConn) Events() <-chan irc.Event     { return f.ch }
@@ -160,6 +161,18 @@ func (f *fakeConn) histReqs() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.hist...)
+}
+
+func (f *fakeConn) EnsureNames(channel string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.names = append(f.names, channel)
+}
+
+func (f *fakeConn) namesReqs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.names...)
 }
 
 func TestHubPersistsEvents(t *testing.T) {

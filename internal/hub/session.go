@@ -237,6 +237,10 @@ func (s *Session) handleGetChannel(ctx context.Context, env Envelope) {
 	}
 	data := ChannelData{Network: d.Network, Buffer: d.Buffer, Members: []MemberData{}}
 	if conn := s.hub.network(d.Network); conn != nil {
+		// Under no-implicit-names the roster is empty until we ask; this
+		// fetches lazily the first time a channel is viewed. The 366 reply
+		// raises members_changed and the client refetches.
+		conn.EnsureNames(d.Buffer)
 		topic, members, ok := conn.Channel(d.Buffer)
 		if ok {
 			data.Joined = true
