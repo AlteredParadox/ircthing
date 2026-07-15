@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -106,11 +107,33 @@ func TestStoreMessage(t *testing.T) {
 
 type fakeConn struct {
 	ch   chan irc.Event
+	name string
 	nick string
+
+	mu      sync.Mutex
+	sent    []*ircv4.Message
+	sendErr error
 }
 
 func (f *fakeConn) Events() <-chan irc.Event { return f.ch }
+func (f *fakeConn) Name() string             { return f.name }
 func (f *fakeConn) Nick() string             { return f.nick }
+
+func (f *fakeConn) Send(m *ircv4.Message) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sendErr != nil {
+		return f.sendErr
+	}
+	f.sent = append(f.sent, m)
+	return nil
+}
+
+func (f *fakeConn) sentMsgs() []*ircv4.Message {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*ircv4.Message(nil), f.sent...)
+}
 
 func TestHubPersistsEvents(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"), store.Options{})
@@ -119,7 +142,7 @@ func TestHubPersistsEvents(t *testing.T) {
 	}
 	defer st.Close()
 
-	conn := &fakeConn{ch: make(chan irc.Event, 16), nick: "AlteredParadox"}
+	conn := &fakeConn{ch: make(chan irc.Event, 16), name: "libera", nick: "AlteredParadox"}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {

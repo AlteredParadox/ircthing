@@ -1,13 +1,16 @@
-// Package hub owns fan-out from IRC events to connected WebSocket
-// sessions. For now it implements the persistence half: consuming a
-// connection manager's events and appending message traffic to the store.
-// WebSocket sessions attach here in a later phase.
+// Package hub owns fan-out: IRC events flow in from the per-network
+// connection managers, get persisted to the store, and are broadcast to
+// every connected WebSocket session. Sessions send client requests
+// (history pages, read markers, outgoing messages) back through it.
+// The hub is transport-agnostic: internal/api owns the actual WebSocket
+// connections and moves Envelopes in and out of Sessions.
 package hub
 
 import (
 	"context"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"ircthing/internal/irc"
@@ -16,24 +19,50 @@ import (
 	ircv4 "gopkg.in/irc.v4"
 )
 
+// Conn is the slice of *irc.Manager the hub consumes.
+type Conn interface {
+	Name() string
+	Nick() string
+	Events() <-chan irc.Event
+	Send(*ircv4.Message) error
+}
+
 type Hub struct {
 	store *store.Store
+
+	mu       sync.Mutex
+	networks map[string]Conn
+	states   map[string]string // last known connection state per network
+	sessions map[*Session]struct{}
 }
 
 func New(st *store.Store) *Hub {
-	return &Hub{store: st}
+	return &Hub{
+		store:    st,
+		networks: make(map[string]Conn),
+		states:   make(map[string]string),
+		sessions: make(map[*Session]struct{}),
+	}
 }
 
-// Conn is the slice of *irc.Manager the hub consumes.
-type Conn interface {
-	Events() <-chan irc.Event
-	Nick() string
-}
-
-// Run consumes one network's events and persists message traffic until
-// ctx is canceled. A failed append is logged, not fatal: losing one line
-// of scrollback beats dropping the connection's event stream.
+// Run consumes one network's events until ctx is canceled: message
+// traffic is persisted and broadcast, state changes are broadcast. A
+// failed append is logged, not fatal: losing one line of scrollback beats
+// dropping the connection's event stream.
 func (h *Hub) Run(ctx context.Context, c Conn) error {
+	name := c.Name()
+	h.mu.Lock()
+	h.networks[name] = c
+	if _, ok := h.states[name]; !ok {
+		h.states[name] = irc.StateDisconnected.String()
+	}
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		delete(h.networks, name)
+		h.mu.Unlock()
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -41,24 +70,80 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 		case ev := <-c.Events():
 			switch ev.Kind {
 			case irc.EventState:
+				h.mu.Lock()
+				h.states[ev.Network] = ev.State.String()
+				h.mu.Unlock()
+				errStr := ""
 				if ev.Err != nil {
+					errStr = ev.Err.Error()
 					log.Printf("irc[%s]: %s: %v", ev.Network, ev.State, ev.Err)
 				} else {
 					log.Printf("irc[%s]: %s", ev.Network, ev.State)
 				}
+				h.broadcast(envelope("state", 0, StateData{
+					Network: ev.Network,
+					State:   ev.State.String(),
+					Error:   errStr,
+				}))
 			case irc.EventMessage:
 				target, ok := persistTarget(ev.Msg, c.Nick())
 				if !ok {
 					continue
 				}
-				if _, err := h.store.Append(ctx, ev.Network, target, storeMessage(ev)); err != nil {
+				stored, err := h.store.Append(ctx, ev.Network, target, storeMessage(ev))
+				if err != nil {
 					if ctx.Err() != nil {
 						return ctx.Err()
 					}
 					log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
+					continue
 				}
+				h.broadcast(envelope("event", 0, eventData(stored)))
 			}
 		}
+	}
+}
+
+func (h *Hub) network(name string) Conn {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.networks[name]
+}
+
+func (h *Hub) broadcast(env Envelope) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for s := range h.sessions {
+		s.push(env)
+	}
+}
+
+// broadcastExcept sends to every session but the originator, which gets
+// its own seq-tagged response instead.
+func (h *Hub) broadcastExcept(except *Session, env Envelope) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for s := range h.sessions {
+		if s != except {
+			s.push(env)
+		}
+	}
+}
+
+func newPrivmsg(target, text string) *ircv4.Message {
+	return &ircv4.Message{Command: "PRIVMSG", Params: []string{target, text}}
+}
+
+func eventData(m store.Message) EventData {
+	return EventData{
+		Network: m.Network,
+		Buffer:  m.Target,
+		ID:      m.ID,
+		Time:    m.Time.UnixMilli(),
+		MsgID:   m.MsgID,
+		Sender:  m.Sender,
+		Command: m.Command,
+		Raw:     m.Raw,
 	}
 }
 

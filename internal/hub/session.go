@@ -1,0 +1,275 @@
+package hub
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"ircthing/internal/store"
+)
+
+// sessionBuffer is the per-session outbound queue depth. A session that
+// falls this far behind is disconnected (see push).
+var sessionBuffer = 64
+
+// Session is one connected client (one browser tab / device). The
+// transport (internal/api) feeds client envelopes to Handle and writes
+// everything from Outbound to the wire; when Done closes, the transport
+// must drop the connection.
+type Session struct {
+	hub  *Hub
+	out  chan Envelope
+	done chan struct{}
+	once sync.Once
+}
+
+func (h *Hub) NewSession() *Session {
+	s := &Session{
+		hub:  h,
+		out:  make(chan Envelope, sessionBuffer),
+		done: make(chan struct{}),
+	}
+	h.mu.Lock()
+	h.sessions[s] = struct{}{}
+	h.mu.Unlock()
+	return s
+}
+
+// Close unregisters the session; the transport calls it exactly once when
+// the connection ends.
+func (s *Session) Close() {
+	s.hub.mu.Lock()
+	delete(s.hub.sessions, s)
+	s.hub.mu.Unlock()
+	s.disconnect()
+}
+
+func (s *Session) Outbound() <-chan Envelope { return s.out }
+
+// Done closes when the session has been evicted (or Closed); the
+// transport must stop writing and drop the connection.
+func (s *Session) Done() <-chan struct{} { return s.done }
+
+// push enqueues without blocking. A session too slow to drain its buffer
+// is disconnected rather than stalling the hub or silently dropping
+// events mid-stream — after a reconnect the client refetches history and
+// misses nothing.
+func (s *Session) push(env Envelope) {
+	select {
+	case <-s.done:
+	case s.out <- env:
+	default:
+		s.disconnect()
+	}
+}
+
+func (s *Session) disconnect() {
+	s.once.Do(func() { close(s.done) })
+}
+
+// Handle processes one client envelope. Responses and errors are pushed
+// to this session's Outbound, tagged with the request's Seq; side effects
+// other sessions must see are broadcast.
+func (s *Session) Handle(ctx context.Context, env Envelope) {
+	if env.V != ProtocolVersion {
+		return // unknown protocol version: ignore
+	}
+	switch env.Type {
+	case "send":
+		s.handleSend(ctx, env)
+	case "get_buffers":
+		s.handleGetBuffers(ctx, env)
+	case "get_history":
+		s.handleGetHistory(ctx, env)
+	case "get_read_marker":
+		s.handleGetMarker(ctx, env)
+	case "set_read_marker":
+		s.handleSetMarker(ctx, env)
+	default:
+		// Unknown message types are ignored, not errored (protocol
+		// forward-compatibility rule).
+	}
+}
+
+func (s *Session) handleSend(ctx context.Context, env Envelope) {
+	var d SendData
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", "malformed send data"))
+		return
+	}
+	if d.Network == "" || d.Target == "" || strings.TrimSpace(d.Text) == "" {
+		s.push(errEnvelope(env.Seq, "bad_request", "send needs network, target and text"))
+		return
+	}
+	conn := s.hub.network(d.Network)
+	if conn == nil {
+		s.push(errEnvelope(env.Seq, "unknown_network", "network is not connected"))
+		return
+	}
+	for _, line := range strings.Split(strings.ReplaceAll(d.Text, "\r\n", "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		msg := newPrivmsg(d.Target, line)
+		if err := conn.Send(msg); err != nil {
+			s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
+			return
+		}
+		// Without echo-message the server never reflects our own PRIVMSG,
+		// so persist and broadcast it ourselves — every device sees what
+		// this one sent.
+		stored, err := s.hub.store.Append(ctx, d.Network, d.Target, store.Message{
+			Time:    time.Now(),
+			Sender:  conn.Nick(),
+			Command: "PRIVMSG",
+			Raw:     msg.String(),
+		})
+		if err != nil {
+			s.push(errEnvelope(env.Seq, "persist_failed", err.Error()))
+			return
+		}
+		s.hub.broadcast(envelope("event", 0, eventData(stored)))
+	}
+	s.push(envelope("ok", env.Seq, nil))
+}
+
+func (s *Session) handleGetBuffers(ctx context.Context, env Envelope) {
+	infos, err := s.hub.store.Buffers(ctx)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "buffer list query failed"))
+		return
+	}
+	data := BuffersData{
+		Networks: make([]NetworkInfo, 0, 4),
+		Buffers:  make([]BufferInfo, 0, len(infos)),
+	}
+	for _, b := range infos {
+		data.Buffers = append(data.Buffers, BufferInfo{
+			Network: b.Network, Buffer: b.Target,
+			LastTime: b.LastTS, Marker: b.Marker, Unread: b.Unread,
+		})
+	}
+	s.hub.mu.Lock()
+	names := make([]string, 0, len(s.hub.states))
+	for name := range s.hub.states {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		info := NetworkInfo{Name: name, State: s.hub.states[name]}
+		if c := s.hub.networks[name]; c != nil {
+			info.Nick = c.Nick()
+		}
+		data.Networks = append(data.Networks, info)
+	}
+	s.hub.mu.Unlock()
+	s.push(envelope("buffers", env.Seq, data))
+}
+
+func (s *Session) handleGetHistory(ctx context.Context, env Envelope) {
+	var d HistoryReq
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", "malformed get_history data"))
+		return
+	}
+	if d.Network == "" || d.Buffer == "" {
+		s.push(errEnvelope(env.Seq, "bad_request", "get_history needs network and buffer"))
+		return
+	}
+
+	var (
+		msgs []store.Message
+		err  error
+	)
+	switch {
+	case d.Before != nil:
+		msgs, err = s.hub.store.Before(ctx, d.Network, d.Buffer, store.Cursor(*d.Before), d.Limit)
+	case d.After != nil:
+		msgs, err = s.hub.store.After(ctx, d.Network, d.Buffer, store.Cursor(*d.After), d.Limit)
+	case d.BeforeMsgID != "":
+		var c store.Cursor
+		if c, err = s.hub.store.CursorForMsgID(ctx, d.Network, d.Buffer, d.BeforeMsgID); err == nil {
+			msgs, err = s.hub.store.Before(ctx, d.Network, d.Buffer, c, d.Limit)
+		}
+	case d.AfterMsgID != "":
+		var c store.Cursor
+		if c, err = s.hub.store.CursorForMsgID(ctx, d.Network, d.Buffer, d.AfterMsgID); err == nil {
+			msgs, err = s.hub.store.After(ctx, d.Network, d.Buffer, c, d.Limit)
+		}
+	default:
+		msgs, err = s.hub.store.Latest(ctx, d.Network, d.Buffer, d.Limit)
+	}
+	if errors.Is(err, store.ErrMsgIDNotFound) {
+		s.push(errEnvelope(env.Seq, "unknown_msgid", "no message with that msgid"))
+		return
+	}
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "history query failed"))
+		return
+	}
+
+	page := HistoryData{
+		Network:  d.Network,
+		Buffer:   d.Buffer,
+		Messages: make([]EventData, 0, len(msgs)),
+	}
+	for _, m := range msgs {
+		page.Messages = append(page.Messages, eventData(m))
+	}
+	s.push(envelope("history", env.Seq, page))
+}
+
+func (s *Session) handleGetMarker(ctx context.Context, env Envelope) {
+	var d MarkerRef
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", "malformed get_read_marker data"))
+		return
+	}
+	t, err := s.hub.store.ReadMarker(ctx, d.Network, d.Buffer)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "read marker query failed"))
+		return
+	}
+	s.push(envelope("read_marker", env.Seq, MarkerData{
+		Network: d.Network, Buffer: d.Buffer, Time: markerMillis(t),
+	}))
+}
+
+func (s *Session) handleSetMarker(ctx context.Context, env Envelope) {
+	var d SetMarkerData
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", "malformed set_read_marker data"))
+		return
+	}
+	if d.Network == "" || d.Buffer == "" || d.Time <= 0 {
+		s.push(errEnvelope(env.Seq, "bad_request", "set_read_marker needs network, buffer and time"))
+		return
+	}
+	if err := s.hub.store.SetReadMarker(ctx, d.Network, d.Buffer, time.UnixMilli(d.Time)); err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "setting read marker failed"))
+		return
+	}
+	// Read back: markers never move backwards, so the stored value is the
+	// authoritative one for every device, including a requester that
+	// tried to regress it.
+	t, err := s.hub.store.ReadMarker(ctx, d.Network, d.Buffer)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "read marker query failed"))
+		return
+	}
+	data := MarkerData{Network: d.Network, Buffer: d.Buffer, Time: markerMillis(t)}
+	s.push(envelope("read_marker", env.Seq, data))
+	s.hub.broadcastExcept(s, envelope("read_marker", 0, data))
+}
+
+// markerMillis maps the zero time (marker unset) to protocol 0.
+func markerMillis(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixMilli()
+}
