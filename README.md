@@ -71,7 +71,7 @@ loudly. See `config.example.json` for a complete example.
 | Field | Meaning |
 |---|---|
 | `listen` | HTTP listen address. Default `127.0.0.1:8067` (loopback only — see Deployment). |
-| `database` | SQLite path, created on first run. Default `ircthing.db`. |
+| `database` | SQLite path, created on first run. Default `ircthing.db`. Created mode 0600 (it holds plaintext network credentials and message history); an existing group/world-readable file is tightened to 0600 on start. |
 | `user.username`, `user.password_hash` | Web login. Generate the bcrypt hash with `ircd-web -hash-password`. |
 | `session_ttl_days` | Login cookie lifetime. Default 30. |
 | `ring_size` | Hot scrollback kept in memory per buffer. Default 200; older history is read from SQLite. |

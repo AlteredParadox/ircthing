@@ -2,8 +2,11 @@ package store
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -261,5 +264,62 @@ func TestAppendFoldedConcurrent(t *testing.T) {
 			names[i] = b.Target
 		}
 		t.Fatalf("concurrent case-variant appends made %d buffers: %v", len(bufs), names)
+	}
+}
+
+// The database holds plaintext credentials, so a freshly created file
+// must be 0600 regardless of umask, and an existing loose file is
+// tightened on open.
+func TestDatabasePermissions(t *testing.T) {
+	old := syscall.Umask(0o022) // the common umask that would yield 0644
+	defer syscall.Umask(old)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "perm.db")
+
+	s, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMode := func(p string, want os.FileMode) {
+		fi, err := os.Stat(p)
+		if err != nil {
+			return // sidecar may not exist; only assert when present
+		}
+		if got := fi.Mode().Perm(); got != want {
+			t.Fatalf("%s mode = %#o, want %#o", p, got, want)
+		}
+	}
+	// Force the WAL sidecars into existence, then check everything.
+	ctx := context.Background()
+	if _, err := s.Append(ctx, "n", "#c", Message{Time: time.Now(), Sender: "a", Command: "PRIVMSG", Raw: ":a PRIVMSG #c :hi"}); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Fatalf("new db mode = %#o, want 0600", got)
+	}
+	assertMode(path+"-wal", 0o600)
+	assertMode(path+"-shm", 0o600)
+	s.Close()
+
+	// An existing world/group-readable db is tightened on open.
+	loose := filepath.Join(dir, "loose.db")
+	if f, err := os.OpenFile(loose, os.O_CREATE|os.O_WRONLY, 0o644); err != nil {
+		t.Fatal(err)
+	} else {
+		f.Close()
+	}
+	s2, err := Open(loose, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	fi, _ = os.Stat(loose)
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Fatalf("existing loose db mode after open = %#o, want 0600", got)
 	}
 }

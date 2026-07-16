@@ -9,7 +9,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"math"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -95,6 +98,36 @@ type Store struct {
 	stats    struct{ ringPages, dbPages int } // observability for tests
 }
 
+// secureDBFile ensures the database file exists with 0600 permissions,
+// creating it if absent (O_EXCL so we set the mode ourselves, not the
+// umask) and tightening it — with a logged warning — if an existing file
+// is group- or world-accessible. In-memory databases have no file and
+// are skipped.
+func secureDBFile(path string) error {
+	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file::memory:") {
+		return nil
+	}
+	fi, err := os.Stat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return fmt.Errorf("store: creating database %s: %w", path, err)
+		}
+		return f.Close()
+	case err != nil:
+		return fmt.Errorf("store: stat database %s: %w", path, err)
+	default:
+		if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+			if err := os.Chmod(path, 0o600); err != nil {
+				return fmt.Errorf("store: database %s is group/world-accessible (%#o) and could not be tightened: %w", path, perm, err)
+			}
+			log.Printf("store: tightened database permissions on %s from %#o to 0600", path, perm)
+		}
+		return nil
+	}
+}
+
 type bufKey struct{ network, target string }
 
 // Open opens (creating if needed) the database at path and applies any
@@ -103,6 +136,15 @@ type bufKey struct{ network, target string }
 func Open(path string, opts Options) (*Store, error) {
 	if opts.RingSize <= 0 {
 		opts.RingSize = DefaultRingSize
+	}
+	// The database holds plaintext network credentials (server, proxy,
+	// SASL passwords) and private message history, so it must never be
+	// group- or world-readable. Pre-create it 0600 before SQLite touches
+	// it — independent of the process umask, which at the common 022
+	// would otherwise leave a new file at 0644 — and tighten an existing
+	// loose file.
+	if err := secureDBFile(path); err != nil {
+		return nil, err
 	}
 	dsn := "file:" + path +
 		"?_pragma=journal_mode(WAL)" +
@@ -125,6 +167,14 @@ func Open(path string, opts Options) (*Store, error) {
 	if err := migrate(db); err != nil {
 		db.Close()
 		return nil, err
+	}
+	// The WAL/SHM sidecars, created during migration's first write,
+	// inherit the db file's mode on unix; tighten them explicitly in
+	// case a platform or a pre-existing sidecar differs.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if fi, err := os.Stat(path + suffix); err == nil && fi.Mode().Perm()&0o077 != 0 {
+			_ = os.Chmod(path+suffix, 0o600)
+		}
 	}
 	return &Store{
 		db:       db,
