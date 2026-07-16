@@ -241,3 +241,34 @@ func TestSendChecksLineLength(t *testing.T) {
 		t.Fatalf("send within LINELEN=1024: %v", err)
 	}
 }
+
+// Framing bytes in any client-supplied field are rejected centrally, so
+// a crafted parameter cannot inject extra IRC protocol lines regardless
+// of handler-level checks.
+func TestSendRejectsFramingBytes(t *testing.T) {
+	m, err := NewManager(Config{Addr: "x:1", Nick: "n", AllowPlaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.registered.Store(true)
+
+	cases := []*ircv4.Message{
+		{Command: "PRIVMSG", Params: []string{"#chan\r\nOPER name pass", "hi"}},
+		{Command: "PRIVMSG", Params: []string{"#chan", "line one\r\nPRIVMSG #x :two"}},
+		{Command: "PRIVMSG", Params: []string{"#chan", "bare\rcr"}},
+		{Command: "PRIVMSG", Params: []string{"#chan", "nul\x00byte"}},
+		{Command: "PRIVMSG", Tags: ircv4.Tags{"k": "v\r\nx"}, Params: []string{"#chan", "hi"}},
+	}
+	for i, msg := range cases {
+		if err := m.Send(msg); err != ErrUnsafeFraming {
+			t.Fatalf("case %d: err = %v, want ErrUnsafeFraming", i, err)
+		}
+	}
+	if len(m.out) != 0 {
+		t.Fatalf("an unsafe message was queued")
+	}
+	// A clean message still goes through.
+	if err := m.Send(&ircv4.Message{Command: "PRIVMSG", Params: []string{"#chan", "hello"}}); err != nil {
+		t.Fatal(err)
+	}
+}

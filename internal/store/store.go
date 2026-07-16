@@ -147,7 +147,7 @@ func (s *Store) Close() error {
 // and the zero Message (ID 0) is returned — callers use that to skip
 // broadcasting.
 func (s *Store) Append(ctx context.Context, network, target string, m Message) (Message, error) {
-	return s.append(ctx, network, target, m, true)
+	return s.append(ctx, network, target, m, true, nil)
 }
 
 // AppendExisting is Append minus buffer creation: the message is
@@ -156,10 +156,19 @@ func (s *Store) Append(ctx context.Context, network, target string, m Message) (
 // close_buffer delete and the PART echo race, and both orders must end
 // with the buffer gone.
 func (s *Store) AppendExisting(ctx context.Context, network, target string, m Message) (Message, error) {
-	return s.append(ctx, network, target, m, false)
+	return s.append(ctx, network, target, m, false, nil)
 }
 
-func (s *Store) append(ctx context.Context, network, target string, m Message, create bool) (Message, error) {
+// AppendFolded resolves target to its canonical stored spelling under
+// fold and appends in one locked operation, so two concurrent first
+// messages for case-equivalent targets (a browser send and an incoming
+// IRC event run on independent goroutines) cannot each decide no buffer
+// exists and create separate rows. m.Target is set to the resolved name.
+func (s *Store) AppendFolded(ctx context.Context, network, target string, fold func(string) string, m Message) (Message, error) {
+	return s.append(ctx, network, target, m, true, fold)
+}
+
+func (s *Store) append(ctx context.Context, network, target string, m Message, create bool, fold func(string) string) (Message, error) {
 	if network == "" || target == "" {
 		return Message{}, errors.New("store: network and target must be non-empty")
 	}
@@ -169,6 +178,9 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if fold != nil {
+		target, _ = s.canonicalLocked(ctx, network, target, fold)
+	}
 	bufID, r, err := s.bufferAndRing(ctx, network, target, create)
 	if err != nil {
 		return Message{}, err
@@ -533,17 +545,45 @@ func reverse(msgs []Message) {
 // pairs) — echoed messages can arrive with client-supplied casing.
 // Returns target unchanged when no buffer exists yet; the fast path
 // (exact spelling already cached) costs one map lookup.
+//
+// This is advisory (the resolve and a later Append are separate): use
+// AppendFolded when the append must not race a case-variant create.
 func (s *Store) CanonicalBuffer(ctx context.Context, network, target string, fold func(string) string) string {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	name, _ := s.canonicalLocked(ctx, network, target, fold)
+	return name
+}
+
+// canonicalLocked resolves target to an existing buffer's stored
+// spelling under fold, returning (name, true) on a match or
+// (target, false) when none exists. Caller holds s.mu.
+func (s *Store) canonicalLocked(ctx context.Context, network, target string, fold func(string) string) (string, bool) {
 	if _, ok := s.buffers[bufKey{network: network, target: target}]; ok {
-		s.mu.Unlock()
-		return target
+		return target, true // exact spelling already known
 	}
-	s.mu.Unlock()
-	if name, ok, err := s.FindBuffer(ctx, network, target, fold); err == nil && ok {
-		return name
+	if fold == nil {
+		return target, false
 	}
-	return target
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT b.name FROM buffers b
+		JOIN networks n ON n.id = b.network_id
+		WHERE n.user_id = ? AND n.name = ?`, defaultUserID, network)
+	if err != nil {
+		return target, false
+	}
+	defer rows.Close()
+	want := fold(target)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return target, false
+		}
+		if fold(name) == want {
+			return name, true
+		}
+	}
+	return target, false
 }
 
 // FindBuffer returns the stored buffer whose name matches target under

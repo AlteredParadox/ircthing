@@ -153,17 +153,25 @@ func TestBufferCanonicalization(t *testing.T) {
 	conn.ch <- ev(":bob[x]!u@h PRIVMSG AlteredParadox :query")
 	conn.ch <- ev(":bob{x}!u@h PRIVMSG AlteredParadox :query again") // rfc1459-equal sender
 
+	// Wait for the LAST event (the rfc1459-equal query sender) to be
+	// consumed before asserting counts — the event consumer works
+	// through the buffered channel asynchronously, so gating on #go
+	// alone would race the query buffer's creation.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		msgs, err := h.store.Latest(ctxb, "libera", "#go", 10)
+		gm, err := h.store.Latest(ctxb, "libera", "#go", 10)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(msgs) == 2 {
+		qm, err := h.store.Latest(ctxb, "libera", "bob[x]", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(gm) == 2 && len(qm) == 2 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("#go has %d messages, want both casings merged", len(msgs))
+			t.Fatalf("waiting for merged messages: #go=%d bob[x]=%d, want 2 and 2", len(gm), len(qm))
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

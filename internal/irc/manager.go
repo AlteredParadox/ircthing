@@ -189,6 +189,40 @@ func checkLineLen(msg *ircv4.Message, limit int) error {
 	return nil
 }
 
+// ErrUnsafeFraming reports a message carrying CR, LF, or NUL — the
+// characters that frame IRC lines. Enforced centrally on every outbound
+// message so a client-supplied parameter can never inject extra protocol
+// lines, independent of any handler-level checks.
+var ErrUnsafeFraming = errors.New("irc: message contains CR, LF, or NUL")
+
+func hasFramingBytes(s string) bool {
+	return strings.ContainsAny(s, "\r\n\x00")
+}
+
+// checkFraming rejects a message whose command, parameters, prefix, or
+// tags contain framing bytes.
+func checkFraming(msg *ircv4.Message) error {
+	if hasFramingBytes(msg.Command) {
+		return ErrUnsafeFraming
+	}
+	for _, p := range msg.Params {
+		if hasFramingBytes(p) {
+			return ErrUnsafeFraming
+		}
+	}
+	if msg.Prefix != nil {
+		if hasFramingBytes(msg.Prefix.Name) || hasFramingBytes(msg.Prefix.User) || hasFramingBytes(msg.Prefix.Host) {
+			return ErrUnsafeFraming
+		}
+	}
+	for k, v := range msg.Tags {
+		if hasFramingBytes(k) || hasFramingBytes(string(v)) {
+			return ErrUnsafeFraming
+		}
+	}
+	return nil
+}
+
 func (m *Manager) ChanTypes() string {
 	return m.isup.ChanTypes()
 }
@@ -449,6 +483,9 @@ func (m *Manager) Send(msg *ircv4.Message) error {
 func (m *Manager) sendAll(msgs []*ircv4.Message) error {
 	limit := m.lineLen()
 	for _, msg := range msgs {
+		if err := checkFraming(msg); err != nil {
+			return err
+		}
 		if err := checkLineLen(msg, limit); err != nil {
 			return err
 		}
@@ -645,7 +682,8 @@ drain:
 		conn.Close()
 	}()
 
-	r := ircv4.NewReader(&boundedLineReader{r: conn, max: maxIncomingLine})
+	blr := newBoundedLineReader(conn)
+	r := ircv4.NewReader(blr)
 	w := ircv4.NewWriter(conn)
 	if os.Getenv("IRCTHING_DEBUG_RAW") != "" {
 		r.DebugCallback = func(line string) {
@@ -668,7 +706,7 @@ drain:
 		}
 		return nil
 	}
-	lc := &liveConn{conn: conn, cctx: cctx, r: r, send: send, internal: internal, addr: addr, secure: secure}
+	lc := &liveConn{conn: conn, cctx: cctx, r: r, blr: blr, send: send, internal: internal, addr: addr, secure: secure}
 
 	hs, err := m.register(ctx, lc)
 	if err != nil {
@@ -722,6 +760,7 @@ type liveConn struct {
 	conn     net.Conn
 	cctx     context.Context
 	r        *ircv4.Reader
+	blr      *boundedLineReader
 	send     func([]*ircv4.Message) error
 	internal chan *ircv4.Message
 	addr     string
@@ -806,6 +845,12 @@ func (m *Manager) serveLoop(ctx context.Context, lc *liveConn) error {
 		trackChathistoryBatch(in, histBatch)
 		playback := in.Tags["batch"] != "" && histBatch[in.Tags["batch"]]
 		m.isup.handle(in) // 005, ignored otherwise
+		if in.Command == "005" {
+			// A negotiated LINELEN may legally exceed the default cap;
+			// raise the reader's limit (bounded by the hard ceiling) so
+			// long-but-legal lines are not cut off.
+			lc.blr.setLimit(m.lineLen())
+		}
 		var affected []string
 		if !playback {
 			if affected, err = m.onLiveLine(in, lc.send); err != nil {

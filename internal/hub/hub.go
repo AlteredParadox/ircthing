@@ -283,18 +283,20 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	if !ok {
 		return nil
 	}
-	// Resolve to the stored spelling: an echoed message can carry
-	// client-supplied casing, and #Go/#go must not split into two
-	// buffers.
-	target = h.store.CanonicalBuffer(ctx, ev.Network, target, c.Fold)
 	// Our own PART must not create a buffer: the UI's "Leave channel"
 	// deletes the stored buffer (close_buffer) while our PART echo is
 	// still in flight, and either arrival order must leave it closed.
-	append := h.store.Append
+	// Every other line resolves to the canonical stored spelling and
+	// appends atomically (AppendFolded): an echoed message can carry
+	// client-supplied casing, and #Go/#go must not split into two
+	// buffers even under a concurrent browser send.
+	var stored store.Message
+	var err error
 	if ev.Msg.Command == "PART" && ev.Msg.Prefix != nil && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick()) {
-		append = h.store.AppendExisting
+		stored, err = h.store.AppendExisting(ctx, ev.Network, target, storeMessage(ev))
+	} else {
+		stored, err = h.store.AppendFolded(ctx, ev.Network, target, c.Fold, storeMessage(ev))
 	}
-	stored, err := append(ctx, ev.Network, target, storeMessage(ev))
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()

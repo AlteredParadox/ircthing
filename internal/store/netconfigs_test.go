@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -227,5 +228,38 @@ func TestFindBufferFolds(t *testing.T) {
 	}
 	if _, ok, _ := s.FindBuffer(ctx, "net", "unrelated", fold); ok {
 		t.Fatal("unrelated name matched")
+	}
+}
+
+// AppendFolded resolves case-variant targets to one buffer even under
+// concurrent first messages — the fold+create+append is one locked op.
+func TestAppendFoldedConcurrent(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+	fold := func(x string) string { return strings.ToLower(x) }
+
+	var wg sync.WaitGroup
+	for _, target := range []string{"#Go", "#go", "#GO", "#gO"} {
+		wg.Add(1)
+		go func(tg string) {
+			defer wg.Done()
+			_, _ = s.AppendFolded(ctx, "net", tg, fold, Message{
+				Time: time.Now(), Sender: "a", Command: "PRIVMSG", Raw: ":a PRIVMSG " + tg + " :hi",
+			})
+		}(target)
+	}
+	wg.Wait()
+
+	bufs, err := s.Buffers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bufs) != 1 {
+		names := make([]string, len(bufs))
+		for i, b := range bufs {
+			names[i] = b.Target
+		}
+		t.Fatalf("concurrent case-variant appends made %d buffers: %v", len(bufs), names)
 	}
 }
