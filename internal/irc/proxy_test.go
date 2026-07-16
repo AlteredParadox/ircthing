@@ -2,7 +2,9 @@ package irc
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"strconv"
@@ -339,5 +341,42 @@ func TestManagerViaSOCKS5(t *testing.T) {
 
 	if got := f.requested(); len(got) != 1 || !strings.HasPrefix(got[0], "localhost:") {
 		t.Fatalf("proxy saw %v, want a localhost:6667 tunnel", got)
+	}
+}
+
+// A cancelled context must abort a stalled proxy handshake immediately,
+// not block until the deadline.
+func TestDialProxyCtxCancel(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() { // accept and say nothing: the handshake stalls
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+
+	u, _ := parseProxyURL("socks5://" + ln.Addr().String())
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	_, err = dialProxy(ctx, u, "irc.test:6667", 30*time.Second)
+	if err == nil {
+		t.Fatal("stalled handshake succeeded")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("cancellation took %v — blocked until the deadline?", d)
 	}
 }

@@ -53,6 +53,10 @@ func dialProxy(ctx context.Context, proxy *url.URL, target string, timeout time.
 		return nil, fmt.Errorf("proxy %s: %w", proxy.Host, err)
 	}
 	conn.SetDeadline(time.Now().Add(timeout))
+	// Honor ctx during the handshake too (shutdown must not block until
+	// the deadline): cancellation closes the socket, failing the reads.
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
 	switch proxy.Scheme {
 	case "socks5", "socks5h":
 		err = socks5Connect(conn, proxy.User, target)
@@ -61,6 +65,9 @@ func dialProxy(ctx context.Context, proxy *url.URL, target string, timeout time.
 	}
 	if err != nil {
 		conn.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("proxy %s: %w", proxy.Host, err)
 	}
 	conn.SetDeadline(time.Time{})
@@ -71,8 +78,8 @@ func dialProxy(ctx context.Context, proxy *url.URL, target string, timeout time.
 // proxy connection. Reads are exact-size (io.ReadFull), so no stream
 // bytes beyond the handshake are consumed.
 func socks5Connect(conn net.Conn, user *url.Userinfo, target string) error {
-	// Method negotiation: no-auth, plus username/password when
-	// credentials are configured.
+	// Method negotiation (RFC 1928 §3): no-auth, plus username/password
+	// when credentials are configured.
 	methods := []byte{0x00}
 	if user != nil {
 		methods = append(methods, 0x02)
@@ -89,7 +96,7 @@ func socks5Connect(conn net.Conn, user *url.Userinfo, target string) error {
 	}
 	switch sel[1] {
 	case 0x00: // no auth
-	case 0x02: // RFC 1929 username/password
+	case 0x02: // username/password subnegotiation (RFC 1929 §2)
 		if user == nil {
 			return errors.New("socks5: proxy requires authentication but none is configured")
 		}
@@ -122,9 +129,9 @@ func socks5Connect(conn net.Conn, user *url.Userinfo, target string) error {
 	if err != nil || port < 1 || port > 65535 {
 		return fmt.Errorf("socks5: bad target port %q", portStr)
 	}
-	req := []byte{0x05, 0x01, 0x00} // CONNECT
+	req := []byte{0x05, 0x01, 0x00} // CONNECT request (RFC 1928 §4)
 	switch ip := net.ParseIP(host); {
-	case ip == nil: // hostname: resolved by the proxy (ATYP domain)
+	case ip == nil: // hostname: resolved by the proxy (ATYP 0x03, domain)
 		if len(host) > 255 {
 			return errors.New("socks5: hostname too long")
 		}
@@ -139,7 +146,7 @@ func socks5Connect(conn net.Conn, user *url.Userinfo, target string) error {
 		return err
 	}
 
-	var head [4]byte // VER REP RSV ATYP
+	var head [4]byte // reply VER REP RSV ATYP (RFC 1928 §6)
 	if _, err := io.ReadFull(conn, head[:]); err != nil {
 		return fmt.Errorf("socks5 reply: %w", err)
 	}
