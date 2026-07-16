@@ -7,7 +7,7 @@
 // <html> — the stylesheet keys everything off those (see style.css).
 
 export const THEMES = ["system", "dark", "light"];
-export const ACCENTS = ["blue", "violet", "teal", "green", "amber", "rose"];
+export const ACCENTS = ["blue", "violet", "teal", "green", "amber", "rose", "slate", "gray"];
 export const TEXT_SIZES = ["sm", "md", "lg", "xl"];
 export const DENSITIES = ["compact", "cozy", "comfortable"];
 export const MSG_FONTS = ["sans", "mono"];
@@ -21,6 +21,8 @@ export const ACCENT_RGB = {
 	green: "47 158 89",
 	amber: "200 121 20",
 	rose: "219 72 120",
+	slate: "100 116 139",
+	gray: "115 115 118",
 };
 
 export const DEFAULTS = {

@@ -70,6 +70,8 @@
 :root[data-accent="green"] { --accent-rgb: 47 158 89; }
 :root[data-accent="amber"] { --accent-rgb: 200 121 20; }
 :root[data-accent="rose"] { --accent-rgb: 219 72 120; }
+:root[data-accent="slate"] { --accent-rgb: 100 116 139; }
+:root[data-accent="gray"] { --accent-rgb: 115 115 118; }
 
 /* Text size: 1rem tracks this, so every font scales together. */
 html { font-size: 14px; }
