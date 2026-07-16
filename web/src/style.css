@@ -202,7 +202,7 @@ input::placeholder {
 }
 
 .side-head {
-	height: 53px;
+	height: 42px;
 	flex: 0 0 auto;
 	display: flex;
 	align-items: center;
@@ -502,7 +502,7 @@ input::placeholder {
 /* ---- topbar ---- */
 
 .topbar {
-	height: 53px;
+	height: 42px;
 	flex: 0 0 auto;
 	display: flex;
 	align-items: center;
@@ -513,8 +513,8 @@ input::placeholder {
 }
 
 .icon-btn {
-	width: 34px;
-	height: 34px;
+	width: 30px;
+	height: 30px;
 	flex: 0 0 auto;
 	display: flex;
 	align-items: center;
@@ -523,7 +523,7 @@ input::placeholder {
 	background: var(--panel-2);
 	border-radius: 8px;
 	cursor: pointer;
-	font-size: 1.071rem;
+	font-size: 1rem;
 	line-height: 1;
 	color: var(--text-dim);
 	transition: background 0.12s;
@@ -542,7 +542,7 @@ input::placeholder {
 .topic-name {
 	font-family: var(--mono-font);
 	font-weight: 600;
-	font-size: 1.143rem;
+	font-size: 1.071rem;
 	color: var(--text);
 	white-space: nowrap;
 }
@@ -774,7 +774,7 @@ input::placeholder {
 
 .composer {
 	flex: 0 0 auto;
-	padding: 0 16px calc(16px + env(safe-area-inset-bottom, 0px));
+	padding: 0 8px calc(8px + env(safe-area-inset-bottom, 0px));
 	position: relative;
 }
 
@@ -832,14 +832,14 @@ input::placeholder {
 	background: var(--panel);
 	border: 1px solid var(--border);
 	border-radius: var(--radius);
-	padding: 7px 8px 7px 12px;
+	padding: 4px 5px 4px 12px;
 }
 
 .prompt {
 	font-family: var(--mono-font);
 	font-size: 1rem;
 	color: var(--text-faint);
-	padding: 6px 0;
+	padding: 5px 0;
 	align-self: flex-start;
 	white-space: nowrap;
 }
@@ -854,15 +854,15 @@ input::placeholder {
 	font-family: var(--msg-font);
 	font-size: 1rem;
 	line-height: 1.4;
-	padding: 6px 0;
+	padding: 5px 0;
 	resize: none;
 	max-height: 30vh;
 }
 
 .btn-accent {
 	flex: 0 0 auto;
-	height: 34px;
-	padding: 0 16px;
+	height: 28px;
+	padding: 0 13px;
 	border: none;
 	border-radius: var(--radius);
 	background: var(--accent);
@@ -912,7 +912,7 @@ input::placeholder {
 }
 
 .right-head {
-	height: 53px;
+	height: 42px;
 	flex: 0 0 auto;
 	display: flex;
 	align-items: center;
@@ -1751,11 +1751,6 @@ input::placeholder {
 	/* The nick prompt eats a third of a phone-width composer. */
 	.prompt {
 		display: none;
-	}
-
-	.composer {
-		padding-left: 10px;
-		padding-right: 10px;
 	}
 
 	.search-scrim {
