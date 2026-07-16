@@ -226,3 +226,14 @@ test("renderable: bot-mode message tag", () => {
 	is(action.bot, true);
 	is(action.kind, "action");
 });
+
+test("renderable: QUIT and NICK system lines", () => {
+	const quit = renderable({ command: "QUIT", sender: "alice", raw: ":alice!u@h QUIT :gone fishing" });
+	is(quit.kind, "system");
+	is(quit.text, "alice has quit (gone fishing)");
+	const bare = renderable({ command: "QUIT", sender: "alice", raw: ":alice!u@h QUIT" });
+	is(bare.text, "alice has quit");
+	const nick = renderable({ command: "NICK", sender: "alice", raw: ":alice!u@h NICK alicia" });
+	is(nick.kind, "system");
+	is(nick.text, "alice is now known as alicia");
+});

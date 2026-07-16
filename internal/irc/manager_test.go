@@ -985,3 +985,45 @@ func TestManagerUTF8Only(t *testing.T) {
 		t.Fatalf("post-UTF8ONLY trailing = %q, want caf� two", got.Trailing())
 	}
 }
+
+func TestManagerQuitNickAffected(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	s.send(":AlteredParadox!u@h JOIN #a")
+	s.send(":srv 353 AlteredParadox = #a :alice AlteredParadox")
+	s.send(":srv 366 AlteredParadox #a :x")
+	s.send(":AlteredParadox!u@h JOIN #b")
+	s.send(":srv 353 AlteredParadox = #b :alice bob AlteredParadox")
+	s.send(":srv 366 AlteredParadox #b :x")
+	s.send(":alice!u@h QUIT :gone fishing")
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case ev := <-m.Events():
+			if ev.Kind == EventMessage && ev.Msg.Command == "QUIT" {
+				if len(ev.Affected) != 2 || ev.Affected[0] != "#a" || ev.Affected[1] != "#b" {
+					t.Fatalf("QUIT Affected = %v, want [#a #b]", ev.Affected)
+				}
+				// The roster processed it after the capture.
+				if _, ms, _ := m.Channel("#b"); len(ms) != 2 {
+					t.Fatalf("#b members after quit = %v", ms)
+				}
+				return
+			}
+			if ev.Kind == EventMessage && ev.Msg.Command != "QUIT" && len(ev.Affected) != 0 {
+				t.Fatalf("%s carries Affected %v", ev.Msg.Command, ev.Affected)
+			}
+		case <-time.After(time.Until(deadline)):
+			t.Fatal("QUIT event never arrived")
+		}
+	}
+}

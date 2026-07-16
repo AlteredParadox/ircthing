@@ -70,6 +70,16 @@ export function renderable(ev) {
 				text: `${line.params[1] || "?"} was kicked by ${ev.sender}` +
 					(line.params.length > 2 ? ` (${last})` : ""),
 			};
+		case "QUIT":
+			return {
+				kind: "system", mark: "←", markClass: "part",
+				text: `${ev.sender} has quit` + (line.params.length > 0 && last ? ` (${last})` : ""),
+			};
+		case "NICK":
+			return {
+				kind: "system", mark: "•", markClass: "mode",
+				text: `${ev.sender} is now known as ${line.params[0] || "?"}`,
+			};
 		case "MODE":
 			return {
 				kind: "system", mark: "•", markClass: "mode",

@@ -404,3 +404,39 @@ func TestBotModeDiscovery(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+// TestQuitNickInScrollback: membership churn lands in channel history —
+// QUIT and NICK carry no channel, so the manager+hub fan them out to the
+// shared channels.
+func TestQuitNickInScrollback(t *testing.T) {
+	addr := startErgo(t)
+	st, h := newStoreAndHub(t)
+	s := startStack(t, st, h, irc.Config{
+		Name: "ergo", Addr: addr, Nick: "webuser", Channels: []string{"#churn"},
+	})
+	s.waitRegistered()
+	s.waitJoined("webuser", "#churn")
+
+	pal := dialRaw(t, addr, "churnpal")
+	pal.send("JOIN #churn")
+	s.waitJoined("churnpal", "#churn")
+
+	pal.send("NICK churnpal2")
+	s.waitStored("ergo", "#churn", func(m []store.Message) bool {
+		return countContaining(m, "NICK churnpal2") == 1
+	})
+
+	pal.send("QUIT :off to lunch")
+	msgs := s.waitStored("ergo", "#churn", func(m []store.Message) bool {
+		return countContaining(m, "QUIT") == 1
+	})
+	if countContaining(msgs, "off to lunch") != 1 {
+		t.Fatalf("quit reason missing: %v", rawsOf(msgs))
+	}
+	// The rename came from the new nick's prefix.
+	for _, m := range msgs {
+		if strings.Contains(m.Raw, "QUIT") && !strings.Contains(m.Raw, "churnpal2") {
+			t.Fatalf("QUIT from unexpected prefix: %q", m.Raw)
+		}
+	}
+}

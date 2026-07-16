@@ -229,6 +229,10 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					h.applyRedaction(ctx, ev, c, replay)
 					continue // redaction updates an existing row, not a new one
 				}
+				if ev.Msg.Command == "QUIT" || ev.Msg.Command == "NICK" {
+					h.persistMembership(ctx, ev, replay, batch)
+					continue
+				}
 				target, ok := persistTarget(ev.Msg, c.Nick(), c.IsChannel)
 				if !ok {
 					continue
@@ -608,6 +612,41 @@ func eventData(m store.Message) EventData {
 		Raw:          m.Raw,
 		Redacted:     m.Redacted,
 		RedactReason: m.RedactReason,
+	}
+}
+
+// persistMembership writes QUIT/NICK system lines into scrollback.
+// Neither message names a channel: a live event carries the sender's
+// shared channels (Event.Affected, captured by the manager before its
+// roster forgot them) plus any open query buffer with that nick; a
+// replayed one belongs to its chathistory batch's target. The per-buffer
+// msgid dedup makes the fan-out idempotent under overlapping backfill.
+func (h *Hub) persistMembership(ctx context.Context, ev irc.Event, replay bool, batch *histBatch) {
+	var targets []string
+	if replay {
+		if batch != nil && batch.target != "" {
+			targets = []string{batch.target}
+		}
+	} else {
+		targets = ev.Affected
+		if ev.Msg.Prefix != nil {
+			if name, ok, err := h.store.FindBuffer(ctx, ev.Network, ev.Msg.Prefix.Name); err == nil && ok {
+				targets = append(targets, name)
+			}
+		}
+	}
+	for _, target := range targets {
+		stored, err := h.store.Append(ctx, ev.Network, target, storeMessage(ev))
+		if err != nil {
+			log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
+			continue
+		}
+		if stored.ID == 0 {
+			continue // duplicate msgid: already stored and announced
+		}
+		if !replay {
+			h.broadcast(envelope("event", 0, eventData(stored)))
+		}
 	}
 }
 

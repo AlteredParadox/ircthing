@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1493,4 +1494,73 @@ func TestStandardRepliesSurfaced(t *testing.T) {
 	if info := decode[ServerInfoData](t, recv(t, s, "server_info")); info.Text != "warn: * INVALID_UTF8 Message dropped" {
 		t.Fatalf("WARN = %+v", info)
 	}
+}
+
+func TestQuitNickScrollback(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string, affected ...string) irc.Event {
+		return irc.Event{
+			Network: "libera", Kind: irc.EventMessage,
+			Msg: ircv4.MustParseMessage(line), Affected: affected, Time: time.Now(),
+		}
+	}
+
+	// A PM from alice opens a query buffer under her nick's casing.
+	conn.ch <- ev(":Alice!u@h PRIVMSG AlteredParadox :psst")
+	recv(t, s, "event")
+
+	// Live QUIT: a line lands in each shared channel AND the open query
+	// (found case-insensitively), each pushed live.
+	conn.ch <- ev(":alice!u@h QUIT :gone fishing", "#go", "#rust")
+	seen := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		got := decode[EventData](t, recv(t, s, "event", "members_changed"))
+		if got.Command != "QUIT" {
+			t.Fatalf("push %d = %+v", i, got)
+		}
+		seen[got.Buffer] = true
+	}
+	if !seen["#go"] || !seen["#rust"] || !seen["Alice"] {
+		t.Fatalf("QUIT buffers = %v", seen)
+	}
+	if msgs, _ := h.store.Latest(ctx, "libera", "#go", 5); countRaw(msgs, "QUIT") != 1 {
+		t.Fatalf("#go store: %+v", msgs)
+	}
+
+	// Live NICK renders per channel too.
+	conn.ch <- ev(":bob!u@h NICK bobby", "#go")
+	if got := decode[EventData](t, recv(t, s, "event", "members_changed")); got.Command != "NICK" || got.Buffer != "#go" {
+		t.Fatalf("NICK push = %+v", got)
+	}
+
+	// Replayed QUIT (chathistory + event-playback): persisted to the
+	// batch's target only, no live push, deduplicated by msgid.
+	conn.ch <- ev(":srv BATCH +r1 chathistory #go")
+	conn.ch <- ev("@batch=r1;msgid=q1;time=2026-07-16T00:00:01.000Z :carol!u@h QUIT :netsplit")
+	conn.ch <- ev("@batch=r1;msgid=q1;time=2026-07-16T00:00:01.000Z :carol!u@h QUIT :netsplit") // overlap
+	conn.ch <- ev(":srv BATCH -r1")
+	recv(t, s, "history_changed", "event", "members_changed")
+	msgs, _ := h.store.Latest(ctx, "libera", "#go", 10)
+	if countRaw(msgs, "carol") != 1 {
+		t.Fatalf("replayed QUIT rows = %d, want 1 (deduped): %+v", countRaw(msgs, "carol"), msgs)
+	}
+	expectSilence(t, s)
+}
+
+func countRaw(msgs []store.Message, sub string) int {
+	n := 0
+	for _, m := range msgs {
+		if strings.Contains(m.Raw, sub) {
+			n++
+		}
+	}
+	return n
 }

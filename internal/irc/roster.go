@@ -65,6 +65,21 @@ func (r *roster) clear() {
 	r.chans = make(map[string]*channelState)
 }
 
+// channelsWith returns the (sorted) channels nick is currently in.
+func (r *roster) channelsWith(nick string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := r.isup.Fold(nick)
+	var out []string
+	for _, st := range r.chans {
+		if _, ok := st.members[key]; ok {
+			out = append(out, st.name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // channel returns the topic and a nick-sorted member snapshot.
 func (r *roster) channel(name string) (topic string, members []Member, ok bool) {
 	r.mu.Lock()

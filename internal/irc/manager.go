@@ -58,6 +58,10 @@ type Event struct {
 	// Msg is set for EventMessage: one server message, including those
 	// received during registration.
 	Msg *ircv4.Message
+	// Affected lists the channels a live QUIT/NICK touches — the
+	// sender's shared channels, captured before the roster processed the
+	// message and forgot them. Empty for every other message.
+	Affected []string
 	// State is set for EventState; Err carries the disconnect reason when
 	// State is StateDisconnected.
 	State State
@@ -727,7 +731,14 @@ drain:
 		}
 		playback := in.Tags["batch"] != "" && histBatch[in.Tags["batch"]]
 		m.isup.handle(in) // 005, ignored otherwise
+		var affected []string
 		if !playback {
+			// QUIT/NICK name no channel; capture the sender's shared
+			// channels before the roster processes the message and
+			// forgets them, so the hub can persist a line per buffer.
+			if (in.Command == "QUIT" || in.Command == "NICK") && in.Prefix != nil {
+				affected = m.roster.channelsWith(in.Prefix.Name)
+			}
 			// CTCP queries addressed directly to us get their auto-reply
 			// (VERSION/PING/TIME/CLIENTINFO — see ctcp.go). Replays are
 			// excluded above: old queries must not be re-answered.
@@ -757,7 +768,7 @@ drain:
 				}
 			}
 		}
-		m.emit(ctx, Event{Kind: EventMessage, Msg: in})
+		m.emit(ctx, Event{Kind: EventMessage, Msg: in, Affected: affected})
 	}
 }
 

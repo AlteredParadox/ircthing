@@ -512,3 +512,26 @@ func reverse(msgs []Message) {
 		msgs[i], msgs[j] = msgs[j], msgs[i]
 	}
 }
+
+// FindBuffer returns the stored buffer whose name matches target
+// case-insensitively (SQLite NOCASE is ASCII-only, which covers nicks in
+// practice), preserving its stored casing. ok is false when no such
+// buffer exists. The hub uses it to route QUIT/NICK lines into an open
+// query buffer.
+func (s *Store) FindBuffer(ctx context.Context, network, target string) (name string, ok bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	err = s.db.QueryRowContext(ctx, `
+		SELECT b.name FROM buffers b
+		JOIN networks n ON n.id = b.network_id
+		WHERE n.user_id = ? AND n.name = ? AND b.name = ? COLLATE NOCASE
+		LIMIT 1`, defaultUserID, network, target).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return name, true, nil
+}

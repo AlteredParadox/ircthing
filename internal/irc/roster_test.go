@@ -488,3 +488,24 @@ func TestRosterBotFlag(t *testing.T) {
 		t.Fatalf("bot flagged without ISUPPORT BOT: %+v", got[1])
 	}
 }
+
+func TestChannelsWith(t *testing.T) {
+	r := testRoster()
+	feed(t, r,
+		joinGo,
+		":srv 353 AlteredParadox = #go :alice AlteredParadox",
+		":srv 366 AlteredParadox #go :x",
+		":AlteredParadox!u@h JOIN #rust",
+		":srv 353 AlteredParadox = #rust :Alice bob AlteredParadox",
+		":srv 366 AlteredParadox #rust :x",
+	)
+	if got := r.channelsWith("ALICE"); !reflect.DeepEqual(got, []string{"#go", "#rust"}) {
+		t.Fatalf("channelsWith(ALICE) = %v (casemapped lookup)", got)
+	}
+	if got := r.channelsWith("bob"); !reflect.DeepEqual(got, []string{"#rust"}) {
+		t.Fatalf("channelsWith(bob) = %v", got)
+	}
+	if got := r.channelsWith("ghost"); got != nil {
+		t.Fatalf("channelsWith(ghost) = %v", got)
+	}
+}

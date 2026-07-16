@@ -41,8 +41,10 @@ func TestPersistTarget(t *testing.T) {
 		{"kick", ":op!u@h KICK #go alice :out", "AlteredParadox", "#go", true},
 		{"channel mode", ":op!u@h MODE #go +o alice", "AlteredParadox", "#go", true},
 		{"user mode dropped", ":AlteredParadox MODE AlteredParadox :+i", "AlteredParadox", "", false},
-		{"quit dropped for now", ":alice!u@h QUIT :bye", "AlteredParadox", "", false},
-		{"nick change dropped for now", ":alice!u@h NICK alicia", "AlteredParadox", "", false},
+		// QUIT/NICK never resolve to a single target here — the hub's
+		// persistMembership fans them out per shared channel instead.
+		{"quit has no single target", ":alice!u@h QUIT :bye", "AlteredParadox", "", false},
+		{"nick change has no single target", ":alice!u@h NICK alicia", "AlteredParadox", "", false},
 		{"numeric dropped", ":irc.test 001 AlteredParadox :Welcome", "AlteredParadox", "", false},
 		{"ping dropped", "PING :x", "AlteredParadox", "", false},
 		{"ctcp query dropped", ":alice!u@h PRIVMSG AlteredParadox :\x01VERSION\x01", "AlteredParadox", "", false},
