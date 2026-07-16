@@ -117,32 +117,17 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 	case "366": // RPL_ENDOFNAMES
 		r.namesEnd(m)
 	case "332": // RPL_TOPIC: <me> <channel> :<topic>
-		if st := r.chans[fold(m.Param(1))]; st != nil {
-			st.topic = m.Param(2)
-		}
+		r.setTopic(m.Param(1), m.Param(2))
 	case "331": // RPL_NOTOPIC
-		if st := r.chans[fold(m.Param(1))]; st != nil {
-			st.topic = ""
-		}
+		r.setTopic(m.Param(1), "")
 	case "TOPIC":
-		if st := r.chans[fold(m.Param(0))]; st != nil {
-			st.topic = m.Trailing()
-		}
+		r.setTopic(m.Param(0), m.Trailing())
 	case "JOIN":
 		r.memberJoin(m, sender, us(sender))
 	case "PART":
-		if us(sender) {
-			delete(r.chans, fold(m.Param(0)))
-		} else if st := r.chans[fold(m.Param(0))]; st != nil {
-			delete(st.members, fold(sender))
-		}
+		r.memberLeft(m.Param(0), sender, us(sender))
 	case "KICK": // <channel> <victim>
-		victim := m.Param(1)
-		if us(victim) {
-			delete(r.chans, fold(m.Param(0)))
-		} else if st := r.chans[fold(m.Param(0))]; st != nil {
-			delete(st.members, fold(victim))
-		}
+		r.memberLeft(m.Param(0), m.Param(1), us(m.Param(1)))
 	case "QUIT":
 		for _, st := range r.chans {
 			delete(st.members, fold(sender))
@@ -170,6 +155,25 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 		if st := r.chans[fold(m.Param(0))]; st != nil {
 			r.applyChannelMode(st, m.Params)
 		}
+	}
+}
+
+// setTopic updates a known channel's topic. Caller holds r.mu.
+func (r *roster) setTopic(channel, topic string) {
+	if st := r.chans[r.isup.Fold(channel)]; st != nil {
+		st.topic = topic
+	}
+}
+
+// memberLeft removes nick from channel (PART/KICK); when the departure
+// is ours the whole channel state goes. Caller holds r.mu.
+func (r *roster) memberLeft(channel, nick string, ours bool) {
+	if ours {
+		delete(r.chans, r.isup.Fold(channel))
+		return
+	}
+	if st := r.chans[r.isup.Fold(channel)]; st != nil {
+		delete(st.members, r.isup.Fold(nick))
 	}
 }
 

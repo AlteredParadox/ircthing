@@ -39,8 +39,9 @@ function nickOptions(nicks, q, atStart) {
 	const seen = new Set();
 	const options = [];
 	for (const n of nicks) {
-		if (n && n.toLowerCase().startsWith(q) && !seen.has(n.toLowerCase())) {
-			seen.add(n.toLowerCase());
+		const low = n?.toLowerCase();
+		if (low?.startsWith(q) && !seen.has(low)) {
+			seen.add(low);
 			options.push(n + (atStart ? ": " : " "));
 		}
 	}

@@ -125,7 +125,7 @@ export function sameGroup(prev, cur) {
 const NICK_CHARS = String.raw`A-Za-z0-9_\-\[\]\\` + "`^{}|";
 export function mentionsMe(text, nick) {
 	if (!nick) return false;
-	const esc = nick.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const esc = nick.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
 	return new RegExp(`(^|[^${NICK_CHARS}])${esc}($|[^${NICK_CHARS}])`, "i").test(text);
 }
 
@@ -154,13 +154,6 @@ export function linkify(text) {
 export function isChannelName(s, chantypes) {
 	return !!s && (chantypes || "#&").includes(s[0]);
 }
-
-// COMMANDS lists every slash command parseInput understands, for
-// composer tab-completion. Keep in sync with the switch below.
-export const COMMANDS = [
-	"away", "invite", "join", "kick", "list", "me", "mode", "motd", "msg",
-	"nick", "notice", "part", "query", "topic", "who", "whois", "whowas",
-];
 
 // bufferOrder returns buffer keys in sidebar order (network, then name),
 // for keyboard prev/next navigation.
@@ -204,77 +197,73 @@ export function parseInput(input, buffer, chantypes) {
 	const cmd = m[1].toLowerCase();
 	const rest = m[2].trim();
 	const err = (message) => ({ type: "error", message });
-
-	switch (cmd) {
-		case "me":
-			if (!rest) return err("usage: /me <action>");
-			return { type: "text", text: "\x01ACTION " + rest + "\x01" };
-
-		case "msg":
-		case "query":
-			return parseMsgCmd(rest, err);
-
-		case "join":
-			return parseJoinCmd(rest, chantypes, err);
-
-		case "part":
-			return parsePartCmd(rest, buffer, chantypes, err);
-
-		case "nick":
-			if (!rest || /\s/.test(rest)) return err("usage: /nick <newnick>");
-			return { type: "cmd", command: "NICK", params: [rest] };
-
-		case "topic":
-			if (!isChannelName(buffer, chantypes)) return err("/topic: not in a channel");
-			if (!rest) return err("usage: /topic <text>");
-			return { type: "cmd", command: "TOPIC", params: [buffer, rest] };
-
-		case "whois":
-		case "whowas":
-		case "who": {
-			if (!rest || /\s/.test(rest)) return err(`usage: /${cmd} <nick>`);
-			return { type: "cmd", command: cmd.toUpperCase(), params: [rest] };
-		}
-
-		case "list":
-			if (/\s/.test(rest)) return err("usage: /list [pattern]");
-			return { type: "cmd", command: "LIST", params: rest ? [rest] : [] };
-
-		case "motd":
-			if (rest) return err("usage: /motd");
-			return { type: "cmd", command: "MOTD", params: [] };
-
-		case "away":
-			// A message marks us away; none marks us back.
-			return { type: "cmd", command: "AWAY", params: rest ? [rest] : [] };
-
-		case "notice": {
-			const sp = rest.indexOf(" ");
-			if (sp === -1 || !rest.slice(sp + 1).trim()) return err("usage: /notice <target> <text>");
-			return { type: "cmd", command: "NOTICE", params: [rest.slice(0, sp), rest.slice(sp + 1).trim()] };
-		}
-
-		case "mode":
-			return parseModeCmd(rest, buffer, err);
-
-		case "kick":
-			return parseKickCmd(rest, buffer, chantypes, err);
-
-		case "invite":
-			return parseInviteCmd(rest, buffer, chantypes, err);
-
-		default:
-			return err("unknown command /" + cmd);
-	}
+	const parse = CMD_PARSERS[cmd];
+	return parse ? parse(rest, buffer, chantypes, err) : err("unknown command /" + cmd);
 }
 
-function parseMsgCmd(rest, err) {
+// One parser per command, uniform (rest, buffer, chantypes, err)
+// signature; the table doubles as the COMMANDS completion source.
+const CMD_PARSERS = {
+	me: (rest, _buffer, _ct, err) =>
+		rest ? { type: "text", text: "\x01ACTION " + rest + "\x01" } : err("usage: /me <action>"),
+	msg: parseMsgCmd,
+	query: parseMsgCmd,
+	join: parseJoinCmd,
+	part: parsePartCmd,
+	nick: (rest, _buffer, _ct, err) =>
+		!rest || /\s/.test(rest)
+			? err("usage: /nick <newnick>")
+			: { type: "cmd", command: "NICK", params: [rest] },
+	topic: parseTopicCmd,
+	whois: nickArgCmd("WHOIS"),
+	whowas: nickArgCmd("WHOWAS"),
+	who: nickArgCmd("WHO"),
+	list: (rest, _buffer, _ct, err) =>
+		/\s/.test(rest)
+			? err("usage: /list [pattern]")
+			: { type: "cmd", command: "LIST", params: rest ? [rest] : [] },
+	motd: (rest, _buffer, _ct, err) =>
+		rest ? err("usage: /motd") : { type: "cmd", command: "MOTD", params: [] },
+	// A message marks us away; none marks us back.
+	away: (rest) => ({ type: "cmd", command: "AWAY", params: rest ? [rest] : [] }),
+	notice: parseNoticeCmd,
+	mode: parseModeCmd,
+	kick: parseKickCmd,
+	invite: parseInviteCmd,
+};
+
+// COMMANDS lists every slash command parseInput understands, for
+// composer tab-completion — derived from the parser table so the two
+// cannot drift.
+export const COMMANDS = Object.keys(CMD_PARSERS).sort((a, b) => a.localeCompare(b));
+
+// nickArgCmd builds a parser for commands taking exactly one nick/mask.
+function nickArgCmd(command) {
+	return (rest, _buffer, _ct, err) =>
+		!rest || /\s/.test(rest)
+			? err(`usage: /${command.toLowerCase()} <nick>`)
+			: { type: "cmd", command, params: [rest] };
+}
+
+function parseTopicCmd(rest, buffer, chantypes, err) {
+	if (!isChannelName(buffer, chantypes)) return err("/topic: not in a channel");
+	if (!rest) return err("usage: /topic <text>");
+	return { type: "cmd", command: "TOPIC", params: [buffer, rest] };
+}
+
+function parseNoticeCmd(rest, _buffer, _ct, err) {
+	const sp = rest.indexOf(" ");
+	if (sp === -1 || !rest.slice(sp + 1).trim()) return err("usage: /notice <target> <text>");
+	return { type: "cmd", command: "NOTICE", params: [rest.slice(0, sp), rest.slice(sp + 1).trim()] };
+}
+
+function parseMsgCmd(rest, _buffer, _ct, err) {
 	const sp = rest.indexOf(" ");
 	if (sp === -1 || !rest.slice(sp + 1).trim()) return err("usage: /msg <target> <text>");
 	return { type: "msg", target: rest.slice(0, sp), text: rest.slice(sp + 1).trim() };
 }
 
-function parseJoinCmd(rest, chantypes, err) {
+function parseJoinCmd(rest, _buffer, chantypes, err) {
 	if (!rest) return err("usage: /join <channel> [key]");
 	const [chan, key] = rest.split(/\s+/);
 	if (!isChannelName(chan, chantypes)) return err("/join: " + chan + " is not a channel");
@@ -297,7 +286,7 @@ function parsePartCmd(rest, buffer, chantypes, err) {
 
 // parseModeCmd: /mode queries the current buffer; /mode +m sets modes
 // on it; /mode <target> ... names one explicitly.
-function parseModeCmd(rest, buffer, err) {
+function parseModeCmd(rest, buffer, _ct, err) {
 	const parts = rest ? rest.split(/\s+/) : [];
 	let target = buffer;
 	if (parts.length && !/^[+-]/.test(parts[0])) target = parts.shift();

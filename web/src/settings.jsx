@@ -70,8 +70,8 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	const removeRule = (i) => onRules(rules.filter((_, j) => j !== i));
 
 	return (
-		<div class="search-scrim" role="presentation" onClick={onClose}>
-			<div class="settings-panel" role="presentation" onClick={(e) => e.stopPropagation()}>
+		<div class="search-scrim" aria-hidden="true" onClick={(e) => e.target === e.currentTarget && onClose()}>
+			<div class="settings-panel">
 				<div class="settings-head">
 					<div class="settings-title">Settings</div>
 					<button class="search-close" onClick={onClose} title="Close (Esc)">✕</button>

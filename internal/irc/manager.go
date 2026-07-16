@@ -695,7 +695,6 @@ func (m *Manager) register(ctx context.Context, lc *liveConn) (*handshake, error
 // and if the server stays silent for PingTimeout more, the connection is
 // dead.
 func (m *Manager) serveLoop(ctx context.Context, lc *liveConn) error {
-	pinged := false
 	// Open chathistory batches: messages tagged with these refs are
 	// replayed history, not live traffic, and must not touch live state
 	// (roster, nick, rejoin intent). Nested batches are not tracked —
@@ -703,39 +702,12 @@ func (m *Manager) serveLoop(ctx context.Context, lc *liveConn) error {
 	histBatch := make(map[string]bool)
 	ml := newMultiline() // draft/multiline reconstruction, per connection
 	for {
-		idle := m.cfg.PingInterval
-		if pinged {
-			idle = m.cfg.PingTimeout
-		}
-		lc.conn.SetReadDeadline(time.Now().Add(idle))
-		in, err := lc.r.ReadMessage()
+		in, err := m.readMessage(lc)
 		if err != nil {
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				if !pinged {
-					pinged = true
-					if err := lc.send([]*ircv4.Message{newMsg("PING", "keepalive")}); err != nil {
-						return err
-					}
-					continue
-				}
-				return fmt.Errorf("ping timeout: no traffic for %s after keepalive PING", m.cfg.PingTimeout)
-			}
-			return connError(lc.cctx, err)
+			return err
 		}
-		pinged = false
-		if in.Command == "PING" {
-			if err := lc.send([]*ircv4.Message{newMsg("PONG", in.Params...)}); err != nil {
-				return err
-			}
-		}
-		if in.Command == "CAP" { // cap-notify: NEW/DEL after registration
-			if out := m.handleCapNotify(in); len(out) > 0 {
-				if err := lc.send(out); err != nil {
-					return err
-				}
-			}
-			m.capNotifySTS(ctx, lc, in)
+		if err := m.serviceLine(ctx, lc, in); err != nil {
+			return err
 		}
 		// draft/multiline: buffer the batch's lines and emit the single
 		// reconstructed message on close; consumed lines are not
@@ -746,15 +718,7 @@ func (m *Manager) serveLoop(ctx context.Context, lc *liveConn) error {
 			}
 			continue
 		}
-		if in.Command == "BATCH" && len(in.Params) > 0 {
-			ref := in.Params[0]
-			switch {
-			case strings.HasPrefix(ref, "+") && strings.Contains(in.Param(1), "chathistory"):
-				histBatch[ref[1:]] = true
-			case strings.HasPrefix(ref, "-"):
-				delete(histBatch, ref[1:])
-			}
-		}
+		trackChathistoryBatch(in, histBatch)
 		playback := in.Tags["batch"] != "" && histBatch[in.Tags["batch"]]
 		m.isup.handle(in) // 005, ignored otherwise
 		var affected []string
@@ -764,6 +728,68 @@ func (m *Manager) serveLoop(ctx context.Context, lc *liveConn) error {
 			}
 		}
 		m.emit(ctx, Event{Kind: EventMessage, Msg: in, Affected: affected})
+	}
+}
+
+// readMessage reads the next server line. The read deadline doubles as
+// the keepalive timer: after PingInterval of silence we PING, and if the
+// server stays silent for PingTimeout more, the connection is dead.
+func (m *Manager) readMessage(lc *liveConn) (*ircv4.Message, error) {
+	pinged := false
+	for {
+		idle := m.cfg.PingInterval
+		if pinged {
+			idle = m.cfg.PingTimeout
+		}
+		lc.conn.SetReadDeadline(time.Now().Add(idle))
+		in, err := lc.r.ReadMessage()
+		if err == nil {
+			return in, nil
+		}
+		var ne net.Error
+		if !errors.As(err, &ne) || !ne.Timeout() {
+			return nil, connError(lc.cctx, err)
+		}
+		if pinged {
+			return nil, fmt.Errorf("ping timeout: no traffic for %s after keepalive PING", m.cfg.PingTimeout)
+		}
+		pinged = true
+		if err := lc.send([]*ircv4.Message{newMsg("PING", "keepalive")}); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// serviceLine answers protocol housekeeping on a line: server PINGs and
+// post-registration cap-notify (including its STS refresh).
+func (m *Manager) serviceLine(ctx context.Context, lc *liveConn, in *ircv4.Message) error {
+	if in.Command == "PING" {
+		if err := lc.send([]*ircv4.Message{newMsg("PONG", in.Params...)}); err != nil {
+			return err
+		}
+	}
+	if in.Command == "CAP" { // cap-notify: NEW/DEL after registration
+		if out := m.handleCapNotify(in); len(out) > 0 {
+			if err := lc.send(out); err != nil {
+				return err
+			}
+		}
+		m.capNotifySTS(ctx, lc, in)
+	}
+	return nil
+}
+
+// trackChathistoryBatch follows chathistory BATCH open/close markers.
+func trackChathistoryBatch(in *ircv4.Message, histBatch map[string]bool) {
+	if in.Command != "BATCH" || len(in.Params) == 0 {
+		return
+	}
+	ref := in.Params[0]
+	switch {
+	case strings.HasPrefix(ref, "+") && strings.Contains(in.Param(1), "chathistory"):
+		histBatch[ref[1:]] = true
+	case strings.HasPrefix(ref, "-"):
+		delete(histBatch, ref[1:])
 	}
 }
 
@@ -794,15 +820,8 @@ func (m *Manager) onLiveLine(in *ircv4.Message, send func([]*ircv4.Message) erro
 	if (in.Command == "QUIT" || in.Command == "NICK") && in.Prefix != nil {
 		affected = m.roster.channelsWith(in.Prefix.Name)
 	}
-	// CTCP queries addressed directly to us get their auto-reply
-	// (VERSION/PING/TIME/CLIENTINFO — see ctcp.go); the caller excludes
-	// replays, so old queries are never re-answered.
-	if in.Command == "PRIVMSG" && m.isup.FoldEqual(in.Param(0), m.Nick()) {
-		if reply := ctcpReply(in); reply != nil {
-			if err := send([]*ircv4.Message{reply}); err != nil {
-				return nil, err
-			}
-		}
+	if err := m.autoReply(in, send); err != nil {
+		return nil, err
 	}
 	// Track our own nick changes, compared under the server's
 	// casemapping.
@@ -813,16 +832,29 @@ func (m *Manager) onLiveLine(in *ircv4.Message, send func([]*ircv4.Message) erro
 	}
 	m.roster.handle(m.Nick(), in)
 	m.trackJoinIntent(in)
-	// End of NAMES: the roster knows who is here but not their
-	// away/account state — WHOX fills that in (see maybeWHOX).
-	if in.Command == "366" {
-		if out := m.maybeWHOX(in.Param(1)); out != nil {
-			if err := send([]*ircv4.Message{out}); err != nil {
-				return nil, err
+	return affected, nil
+}
+
+// autoReply sends the responses a live line can solicit: CTCP replies
+// to queries addressed directly to us (VERSION/PING/TIME/CLIENTINFO —
+// see ctcp.go; the caller excludes replays, so old queries are never
+// re-answered), and the WHOX query after a channel's end-of-NAMES (the
+// roster knows who is here but not their away/account state; see
+// maybeWHOX).
+func (m *Manager) autoReply(in *ircv4.Message, send func([]*ircv4.Message) error) error {
+	if in.Command == "PRIVMSG" && m.isup.FoldEqual(in.Param(0), m.Nick()) {
+		if reply := ctcpReply(in); reply != nil {
+			if err := send([]*ircv4.Message{reply}); err != nil {
+				return err
 			}
 		}
 	}
-	return affected, nil
+	if in.Command == "366" {
+		if out := m.maybeWHOX(in.Param(1)); out != nil {
+			return send([]*ircv4.Message{out})
+		}
+	}
+	return nil
 }
 
 // whoxToken correlates our WHOX replies (354) with the roster; the spec

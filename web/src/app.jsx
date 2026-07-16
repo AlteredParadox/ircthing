@@ -23,6 +23,44 @@ function wsURL() {
 	return `${proto}//${location.host}/api/ws`;
 }
 
+// topicFor: connection state trumps the topic while (re)connecting.
+function topicFor(activeBuf, netState, chanInfo) {
+	if (netState && netState !== "registered") return `${activeBuf?.network}: ${netState}…`;
+	return chanInfo?.topic || "";
+}
+
+// TopBar: buffer name, topic, and the panel/search/theme buttons.
+function TopBar({ activeBuf, isChan, topicText, sideOpen, rightOpen, theme, onSide, onRight, onSearch, onTheme }) {
+	return (
+		<div class="topbar">
+			<button
+				class={"icon-btn" + (sideOpen ? " active" : "")}
+				title="Toggle channels"
+				onClick={onSide}
+			>◧</button>
+			{activeBuf && (
+				<span class="topic-name">
+					<span class="hash">{isChan ? activeBuf.buffer[0] : "@"}</span>
+					{activeBuf.buffer.replace(/^[#&]/, "")}
+				</span>
+			)}
+			<div class="topic-sep" />
+			<div class="topic-text" title={topicText}>{topicText}</div>
+			<button class="icon-btn" title="Search (Ctrl+Shift+F)" onClick={onSearch}>⌕</button>
+			<button class="icon-btn" title="Toggle theme" onClick={onTheme}>
+				{theme === "dark" ? "☀" : "☾"}
+			</button>
+			{isChan && (
+				<button
+					class={"icon-btn" + (rightOpen ? " active" : "")}
+					title="Toggle members"
+					onClick={onRight}
+				>◨</button>
+			)}
+		</div>
+	);
+}
+
 function makeBuffer(network, buffer) {
 	return { key: bufKey(network, buffer), network, buffer, lastTime: 0, marker: 0, unread: 0, mention: false };
 }
@@ -254,50 +292,62 @@ export function App() {
 		return () => globalThis.removeEventListener("keydown", onKey);
 	}, []);
 
+	// Socket helpers, at component scope so handler nesting stays
+	// shallow. All of them read sock.current, which the effect below
+	// sets before any handler can fire.
+
+	// loadMonitors fetches one network's MONITOR buddy list with presence.
+	function loadMonitors(name) {
+		sock.current.request("get_monitors", { network: name })
+			.then((md) => setMonitors((all) => ({ ...all, [name]: md.monitors || [] })))
+			.catch(() => {});
+	}
+
+	// applyBuffers installs a get_buffers response: network states and
+	// the sidebar buffer list (the mention flag is client-side; keep it).
+	function applyBuffers(data) {
+		const nets = {};
+		for (const n of data.networks || []) {
+			nets[n.name] = { state: n.state, nick: n.nick, chantypes: n.chantypes || "#&" };
+		}
+		setNetworks(nets);
+		for (const name of Object.keys(nets)) loadMonitors(name);
+		setBuffers((prev) => {
+			const bufs = {};
+			for (const b of data.buffers || []) {
+				const key = bufKey(b.network, b.buffer);
+				bufs[key] = {
+					key, network: b.network, buffer: b.buffer,
+					lastTime: b.last_time, marker: b.marker,
+					unread: b.unread,
+					mention: prev[key]?.mention || false,
+				};
+			}
+			return bufs;
+		});
+	}
+
+	function refreshBuffers() {
+		sock.current.request("get_buffers", null).then(applyBuffers).catch(() => {});
+	}
+
+	// adoptPrefs applies the server's prefs; a server with none stored
+	// yet (fresh install, pre-sync upgrade) is seeded from this
+	// browser's cache.
+	function adoptPrefs(d) {
+		if (d.prefs) setPrefs(normalizePrefs(d.prefs));
+		else sock.current.request("set_prefs", { prefs: prefsRef.current }).catch(() => {});
+	}
+
 	// Socket lifecycle, once authed.
 	useEffect(() => {
 		if (phase !== "app") return;
 		const s = new Socket(wsURL());
 		sock.current = s;
 
-		const applyBuffers = (data) => {
-			const nets = {};
-			for (const n of data.networks || []) {
-				nets[n.name] = { state: n.state, nick: n.nick, chantypes: n.chantypes || "#&" };
-			}
-			setNetworks(nets);
-			// Load each network's MONITOR buddy list with current presence.
-			for (const name of Object.keys(nets)) {
-				s.request("get_monitors", { network: name })
-					.then((md) => setMonitors((all) => ({ ...all, [name]: md.monitors || [] })))
-					.catch(() => {});
-			}
-			setBuffers((prev) => {
-				const bufs = {};
-				for (const b of data.buffers || []) {
-					const key = bufKey(b.network, b.buffer);
-					bufs[key] = {
-						key, network: b.network, buffer: b.buffer,
-						lastTime: b.last_time, marker: b.marker,
-						unread: b.unread,
-						// The mention flag is client-side state; keep it.
-						mention: prev[key]?.mention || false,
-					};
-				}
-				return bufs;
-			});
-		};
-
 		s.on("_open", async () => {
 			setConnected(true);
-			// Adopt the server's prefs; a server with none stored yet (fresh
-			// install, pre-sync upgrade) is seeded from this browser's cache.
-			s.request("get_prefs", null)
-				.then((d) => {
-					if (d.prefs) setPrefs(normalizePrefs(d.prefs));
-					else s.request("set_prefs", { prefs: prefsRef.current }).catch(() => {});
-				})
-				.catch(() => {});
+			s.request("get_prefs", null).then(adoptPrefs).catch(() => {});
 			try {
 				applyBuffers(await s.request("get_buffers", null));
 				// History may have advanced while we were away; refetch the
@@ -317,20 +367,16 @@ export function App() {
 			const key = bufKey(d.network, d.buffer);
 			setMsgs((m) => dropBufferMsgs(m, key));
 			clearTimeout(bufRefresh);
-			bufRefresh = setTimeout(() => {
-				s.request("get_buffers", null).then(applyBuffers).catch(() => {});
-			}, 300);
+			bufRefresh = setTimeout(refreshBuffers, 300);
 		});
 
 		s.on("state", (d) => {
-			setNetworks((n) => ({ ...n, [d.network]: { ...(n[d.network] || {}), state: d.state } }));
+			setNetworks((n) => ({ ...n, [d.network]: { ...n[d.network], state: d.state } }));
 			// A (re)registered network's ISUPPORT (chantypes, nick) lands
 			// just after 001; refresh the buffer list once it settles.
 			if (d.state === "registered") {
 				clearTimeout(bufRefresh);
-				bufRefresh = setTimeout(() => {
-					s.request("get_buffers", null).then(applyBuffers).catch(() => {});
-				}, 1500);
+				bufRefresh = setTimeout(refreshBuffers, 1500);
 			}
 		});
 
@@ -646,10 +692,7 @@ export function App() {
 	const selfNick = activeBuf ? networks[activeBuf.network]?.nick : "";
 	const netState = activeBuf ? networks[activeBuf.network]?.state : "";
 	const isChan = activeBuf && isChannelName(activeBuf.buffer, networks[activeBuf.network]?.chantypes);
-	const topicText =
-		netState && netState !== "registered"
-			? `${activeBuf?.network}: ${netState}…`
-			: chanInfo?.topic || "";
+	const topicText = topicFor(activeBuf, netState, chanInfo);
 
 	return (
 		<div class="app">
@@ -661,38 +704,16 @@ export function App() {
 					onAddMonitor={addMonitor} onRemoveMonitor={removeMonitor}
 				/>
 			</div>
-			{sideOpen && <div class="side-scrim" role="presentation" onClick={() => setSideOpen(false)} />}
+			{sideOpen && <div class="side-scrim" aria-hidden="true" onClick={() => setSideOpen(false)} />}
 			<div class="main">
-				<div class="topbar">
-					<button
-						class={"icon-btn" + (sideOpen ? " active" : "")}
-						title="Toggle channels"
-						onClick={() => setSideOpen(!sideOpen)}
-					>◧</button>
-					{activeBuf && (
-						<span class="topic-name">
-							<span class="hash">{isChan ? activeBuf.buffer[0] : "@"}</span>
-							{activeBuf.buffer.replace(/^[#&]/, "")}
-						</span>
-					)}
-					<div class="topic-sep" />
-					<div class="topic-text" title={topicText}>{topicText}</div>
-					<button
-						class="icon-btn" title="Search (Ctrl+Shift+F)"
-						onClick={() => setSearchOpen(true)}
-					>⌕</button>
-					<button
-						class="icon-btn" title="Toggle theme"
-						onClick={() => updatePrefs({ ...prefs, theme: theme === "dark" ? "light" : "dark" })}
-					>{theme === "dark" ? "☀" : "☾"}</button>
-					{isChan && (
-						<button
-							class={"icon-btn" + (rightOpen ? " active" : "")}
-							title="Toggle members"
-							onClick={() => setRightOpen(!rightOpen)}
-						>◨</button>
-					)}
-				</div>
+				<TopBar
+					activeBuf={activeBuf} isChan={isChan} topicText={topicText}
+					sideOpen={sideOpen} rightOpen={rightOpen} theme={theme}
+					onSide={() => setSideOpen(!sideOpen)}
+					onRight={() => setRightOpen(!rightOpen)}
+					onSearch={() => setSearchOpen(true)}
+					onTheme={() => updatePrefs({ ...prefs, theme: theme === "dark" ? "light" : "dark" })}
+				/>
 				{!connected && <div class="conn-banner">connection lost — reconnecting…</div>}
 				{activeBuf ? (
 					<Chat
@@ -719,7 +740,7 @@ export function App() {
 					<div class="empty-state">no buffers yet — waiting for traffic</div>
 				)}
 			</div>
-			{isChan && rightOpen && <div class="right-scrim" role="presentation" onClick={() => setRightOpen(false)} />}
+			{isChan && rightOpen && <div class="right-scrim" aria-hidden="true" onClick={() => setRightOpen(false)} />}
 			{isChan && (
 				<div class={"rightbar" + (rightOpen ? " open" : "")}>
 					<Members info={chanInfo} theme={theme} />

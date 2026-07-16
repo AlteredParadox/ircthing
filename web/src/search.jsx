@@ -44,8 +44,8 @@ export function SearchOverlay({ sock, onJump, onClose }) {
 	}, [query]);
 
 	return (
-		<div class="search-scrim" role="presentation" onClick={onClose}>
-			<div class="search-panel" role="presentation" onClick={(e) => e.stopPropagation()}>
+		<div class="search-scrim" aria-hidden="true" onClick={(e) => e.target === e.currentTarget && onClose()}>
+			<div class="search-panel">
 				<div class="search-head">
 					<span class="search-icon">⌕</span>
 					<input
