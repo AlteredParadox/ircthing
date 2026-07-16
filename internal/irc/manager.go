@@ -347,23 +347,28 @@ func (m *Manager) handleCapNotify(in *ircv4.Message) []*ircv4.Message {
 		sort.Strings(req)
 		return []*ircv4.Message{newMsg("CAP", "REQ", strings.Join(req, " "))}
 	case "ACK", "DEL":
-		enable := strings.ToUpper(in.Params[1]) == "ACK"
-		old, _ := m.caps.Load().(map[string]bool)
-		caps := make(map[string]bool, len(old))
-		for k, v := range old {
-			caps[k] = v
-		}
-		for _, tok := range strings.Fields(list) {
-			name, removed := strings.CutPrefix(tok, "-")
-			if enable && !removed {
-				caps[name] = true
-			} else {
-				delete(caps, name)
-			}
-		}
-		m.setCaps(caps)
+		m.applyCapChange(strings.ToUpper(in.Params[1]) == "ACK", list)
 	}
 	return nil
+}
+
+// applyCapChange updates the enabled-capability set (copy-on-write) from
+// a post-registration CAP ACK or DEL list.
+func (m *Manager) applyCapChange(enable bool, list string) {
+	old, _ := m.caps.Load().(map[string]bool)
+	caps := make(map[string]bool, len(old))
+	for k, v := range old {
+		caps[k] = v
+	}
+	for _, tok := range strings.Fields(list) {
+		name, removed := strings.CutPrefix(tok, "-")
+		if enable && !removed {
+			caps[name] = true
+		} else {
+			delete(caps, name)
+		}
+	}
+	m.setCaps(caps)
 }
 
 // Events delivers server messages and state changes. The channel is
@@ -573,49 +578,11 @@ drain:
 		}
 		return nil
 	}
+	lc := &liveConn{conn: conn, cctx: cctx, r: r, send: send, internal: internal, addr: addr, secure: secure}
 
-	// Registration. The whole exchange must finish within
-	// HandshakeTimeout.
-	hs := newHandshake(&m.cfg)
-	hs.secure = secure
-	if err := send(hs.start()); err != nil {
+	hs, err := m.register(ctx, lc)
+	if err != nil {
 		return err
-	}
-	deadline := time.Now().Add(m.cfg.HandshakeTimeout)
-	for {
-		conn.SetReadDeadline(deadline)
-		in, err := r.ReadMessage()
-		if err != nil {
-			return fmt.Errorf("registration: %w", connError(cctx, err))
-		}
-		out, done, err := hs.handle(in)
-		// A secure CAP LS carried an STS duration policy: persist it.
-		if hs.stsDuration != nil {
-			m.applySTS(ctx, addr, *hs.stsDuration)
-			hs.stsDuration = nil
-		}
-		// A failing handshake can still have parting words (SASL abort
-		// "AUTHENTICATE *", QUIT) — flush them before the deferred cancel
-		// tears down the socket.
-		if sendErr := send(out); sendErr != nil {
-			return sendErr
-		}
-		if err != nil {
-			if len(out) > 0 {
-				flushDeadline := time.Now().Add(500 * time.Millisecond)
-				for len(internal) > 0 && time.Now().Before(flushDeadline) {
-					time.Sleep(5 * time.Millisecond)
-				}
-				// One more beat for a message the writer has dequeued but
-				// not yet written.
-				time.Sleep(20 * time.Millisecond)
-			}
-			return fmt.Errorf("registration: %w", err)
-		}
-		m.emit(ctx, Event{Kind: EventMessage, Msg: in})
-		if done {
-			break
-		}
 	}
 
 	// Reset per-connection state before signalling registration, so a
@@ -655,65 +622,124 @@ drain:
 		}
 	}
 
-	// Steady state. The read deadline doubles as the keepalive timer:
-	// after PingInterval of silence we PING, and if the server stays
-	// silent for PingTimeout more, the connection is dead.
+	return m.serveLoop(ctx, lc)
+}
+
+// liveConn bundles one established connection's plumbing for the
+// registration and steady-state loops.
+type liveConn struct {
+	conn     net.Conn
+	cctx     context.Context
+	r        *ircv4.Reader
+	send     func([]*ircv4.Message) error
+	internal chan *ircv4.Message
+	addr     string
+	secure   bool
+}
+
+// flushParting waits (briefly) for queued messages to reach the wire
+// before the socket is torn down.
+func (lc *liveConn) flushParting() {
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for len(lc.internal) > 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	// One more beat for a message the writer has dequeued but not yet
+	// written.
+	time.Sleep(20 * time.Millisecond)
+}
+
+// register drives the CAP/SASL/NICK/USER exchange to 001. The whole
+// exchange must finish within HandshakeTimeout.
+func (m *Manager) register(ctx context.Context, lc *liveConn) (*handshake, error) {
+	hs := newHandshake(&m.cfg)
+	hs.secure = lc.secure
+	if err := lc.send(hs.start()); err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(m.cfg.HandshakeTimeout)
+	for {
+		lc.conn.SetReadDeadline(deadline)
+		in, err := lc.r.ReadMessage()
+		if err != nil {
+			return nil, fmt.Errorf("registration: %w", connError(lc.cctx, err))
+		}
+		out, done, err := hs.handle(in)
+		// A secure CAP LS carried an STS duration policy: persist it.
+		if hs.stsDuration != nil {
+			m.applySTS(ctx, lc.addr, *hs.stsDuration)
+			hs.stsDuration = nil
+		}
+		// A failing handshake can still have parting words (SASL abort
+		// "AUTHENTICATE *", QUIT) — flush them before the deferred cancel
+		// tears down the socket.
+		if sendErr := lc.send(out); sendErr != nil {
+			return nil, sendErr
+		}
+		if err != nil {
+			if len(out) > 0 {
+				lc.flushParting()
+			}
+			return nil, fmt.Errorf("registration: %w", err)
+		}
+		m.emit(ctx, Event{Kind: EventMessage, Msg: in})
+		if done {
+			return hs, nil
+		}
+	}
+}
+
+// serveLoop is the steady state: answer PINGs, keep ISUPPORT and the
+// roster current, and emit every line to the hub. The read deadline
+// doubles as the keepalive timer: after PingInterval of silence we PING,
+// and if the server stays silent for PingTimeout more, the connection is
+// dead.
+func (m *Manager) serveLoop(ctx context.Context, lc *liveConn) error {
 	pinged := false
 	// Open chathistory batches: messages tagged with these refs are
 	// replayed history, not live traffic, and must not touch live state
 	// (roster, nick, rejoin intent). Nested batches are not tracked —
 	// servers do not nest chathistory in practice.
 	histBatch := make(map[string]bool)
-	// draft/multiline reconstruction, per connection.
-	ml := newMultiline()
+	ml := newMultiline() // draft/multiline reconstruction, per connection
 	for {
 		idle := m.cfg.PingInterval
 		if pinged {
 			idle = m.cfg.PingTimeout
 		}
-		conn.SetReadDeadline(time.Now().Add(idle))
-		in, err := r.ReadMessage()
+		lc.conn.SetReadDeadline(time.Now().Add(idle))
+		in, err := lc.r.ReadMessage()
 		if err != nil {
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
 				if !pinged {
 					pinged = true
-					if err := send([]*ircv4.Message{newMsg("PING", "keepalive")}); err != nil {
+					if err := lc.send([]*ircv4.Message{newMsg("PING", "keepalive")}); err != nil {
 						return err
 					}
 					continue
 				}
 				return fmt.Errorf("ping timeout: no traffic for %s after keepalive PING", m.cfg.PingTimeout)
 			}
-			return connError(cctx, err)
+			return connError(lc.cctx, err)
 		}
 		pinged = false
 		if in.Command == "PING" {
-			if err := send([]*ircv4.Message{newMsg("PONG", in.Params...)}); err != nil {
+			if err := lc.send([]*ircv4.Message{newMsg("PONG", in.Params...)}); err != nil {
 				return err
 			}
 		}
 		if in.Command == "CAP" { // cap-notify: NEW/DEL after registration
 			if out := m.handleCapNotify(in); len(out) > 0 {
-				if err := send(out); err != nil {
+				if err := lc.send(out); err != nil {
 					return err
 				}
 			}
-			// A CAP NEW on a secure connection may carry/refresh the STS
-			// policy (CAP DEL never disables it, per spec).
-			if secure && len(in.Params) >= 3 && strings.ToUpper(in.Params[1]) == "NEW" {
-				for _, tok := range strings.Fields(in.Params[len(in.Params)-1]) {
-					if name, val, _ := strings.Cut(tok, "="); name == "sts" {
-						if v := parseSTS(val); v.hasDuration {
-							m.applySTS(ctx, addr, v.duration)
-						}
-					}
-				}
-			}
+			m.capNotifySTS(ctx, lc, in)
 		}
 		// draft/multiline: buffer the batch's lines and emit the single
-		// reconstructed message on close; consumed lines are not processed
-		// further.
+		// reconstructed message on close; consumed lines are not
+		// processed further.
 		if emit, consumed := ml.feed(in); consumed {
 			if emit != nil {
 				m.emit(ctx, Event{Kind: EventMessage, Msg: emit})
@@ -733,43 +759,70 @@ drain:
 		m.isup.handle(in) // 005, ignored otherwise
 		var affected []string
 		if !playback {
-			// QUIT/NICK name no channel; capture the sender's shared
-			// channels before the roster processes the message and
-			// forgets them, so the hub can persist a line per buffer.
-			if (in.Command == "QUIT" || in.Command == "NICK") && in.Prefix != nil {
-				affected = m.roster.channelsWith(in.Prefix.Name)
-			}
-			// CTCP queries addressed directly to us get their auto-reply
-			// (VERSION/PING/TIME/CLIENTINFO — see ctcp.go). Replays are
-			// excluded above: old queries must not be re-answered.
-			if in.Command == "PRIVMSG" && m.isup.FoldEqual(in.Param(0), m.Nick()) {
-				if reply := ctcpReply(in); reply != nil {
-					if err := send([]*ircv4.Message{reply}); err != nil {
-						return err
-					}
-				}
-			}
-			// Track our own nick changes, compared under the server's
-			// casemapping.
-			if in.Command == "NICK" && in.Prefix != nil && m.isup.FoldEqual(in.Prefix.Name, m.Nick()) {
-				if n := in.Param(0); n != "" {
-					m.nick.Store(n)
-				}
-			}
-			m.roster.handle(m.Nick(), in)
-			m.trackJoinIntent(in)
-			// End of NAMES: the roster knows who is here but not their
-			// away/account state — WHOX fills that in (see maybeWHOX).
-			if in.Command == "366" {
-				if out := m.maybeWHOX(in.Param(1)); out != nil {
-					if err := send([]*ircv4.Message{out}); err != nil {
-						return err
-					}
-				}
+			if affected, err = m.onLiveLine(in, lc.send); err != nil {
+				return err
 			}
 		}
 		m.emit(ctx, Event{Kind: EventMessage, Msg: in, Affected: affected})
 	}
+}
+
+// capNotifySTS stores/refreshes the STS policy a CAP NEW on a secure
+// connection may carry (CAP DEL never disables it, per spec).
+func (m *Manager) capNotifySTS(ctx context.Context, lc *liveConn, in *ircv4.Message) {
+	if !lc.secure || len(in.Params) < 3 || strings.ToUpper(in.Params[1]) != "NEW" {
+		return
+	}
+	for _, tok := range strings.Fields(in.Params[len(in.Params)-1]) {
+		if name, val, _ := strings.Cut(tok, "="); name == "sts" {
+			if v := parseSTS(val); v.hasDuration {
+				m.applySTS(ctx, lc.addr, v.duration)
+			}
+		}
+	}
+}
+
+// onLiveLine applies a live (non-replayed) line's side effects: CTCP
+// auto-replies, own-nick tracking, roster and rejoin-intent bookkeeping,
+// and the WHOX query after NAMES. It returns the channels a QUIT/NICK
+// affects, captured before the roster forgets the sender.
+func (m *Manager) onLiveLine(in *ircv4.Message, send func([]*ircv4.Message) error) ([]string, error) {
+	var affected []string
+	// QUIT/NICK name no channel; capture the sender's shared channels
+	// before the roster processes the message and forgets them, so the
+	// hub can persist a line per buffer.
+	if (in.Command == "QUIT" || in.Command == "NICK") && in.Prefix != nil {
+		affected = m.roster.channelsWith(in.Prefix.Name)
+	}
+	// CTCP queries addressed directly to us get their auto-reply
+	// (VERSION/PING/TIME/CLIENTINFO — see ctcp.go); the caller excludes
+	// replays, so old queries are never re-answered.
+	if in.Command == "PRIVMSG" && m.isup.FoldEqual(in.Param(0), m.Nick()) {
+		if reply := ctcpReply(in); reply != nil {
+			if err := send([]*ircv4.Message{reply}); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// Track our own nick changes, compared under the server's
+	// casemapping.
+	if in.Command == "NICK" && in.Prefix != nil && m.isup.FoldEqual(in.Prefix.Name, m.Nick()) {
+		if n := in.Param(0); n != "" {
+			m.nick.Store(n)
+		}
+	}
+	m.roster.handle(m.Nick(), in)
+	m.trackJoinIntent(in)
+	// End of NAMES: the roster knows who is here but not their
+	// away/account state — WHOX fills that in (see maybeWHOX).
+	if in.Command == "366" {
+		if out := m.maybeWHOX(in.Param(1)); out != nil {
+			if err := send([]*ircv4.Message{out}); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return affected, nil
 }
 
 // whoxToken correlates our WHOX replies (354) with the roster; the spec
@@ -931,22 +984,30 @@ func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn,
 		return nil, fmt.Errorf("tls handshake: %w", err)
 	}
 	if fps != nil {
-		certs := tconn.ConnectionState().PeerCertificates
-		if len(certs) == 0 {
-			conn.Close()
-			return nil, errors.New("tls: server presented no certificate")
-		}
-		sum := sha256.Sum256(certs[0].Raw)
-		if !fps[hex.EncodeToString(sum[:])] {
-			// Absorb post-handshake messages (TLS 1.3 session tickets)
-			// briefly, then close with close_notify — the server sees a
-			// clean EOF instead of a reset.
-			tconn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			_, _ = io.Copy(io.Discard, tconn)
-			tconn.Close()
-			return nil, fmt.Errorf("tls: server certificate SHA-256 %s does not match any trusted fingerprint",
-				hex.EncodeToString(sum[:]))
+		if err := verifyPinned(tconn, fps); err != nil {
+			return nil, err
 		}
 	}
 	return tconn, nil
+}
+
+// verifyPinned checks the leaf certificate's SHA-256 against the trusted
+// set, closing the connection on mismatch. The close absorbs
+// post-handshake messages (TLS 1.3 session tickets) briefly and sends
+// close_notify, so the server sees a clean EOF instead of a reset.
+func verifyPinned(tconn *tls.Conn, fps map[string]bool) error {
+	certs := tconn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		tconn.Close()
+		return errors.New("tls: server presented no certificate")
+	}
+	sum := sha256.Sum256(certs[0].Raw)
+	if fps[hex.EncodeToString(sum[:])] {
+		return nil
+	}
+	tconn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	_, _ = io.Copy(io.Discard, tconn)
+	tconn.Close()
+	return fmt.Errorf("tls: server certificate SHA-256 %s does not match any trusted fingerprint",
+		hex.EncodeToString(sum[:]))
 }

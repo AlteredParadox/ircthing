@@ -106,154 +106,177 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 		case ev := <-c.Events():
 			switch ev.Kind {
 			case irc.EventState:
-				h.mu.Lock()
-				h.states[ev.Network] = ev.State.String()
-				h.mu.Unlock()
-				errStr := ""
-				if ev.Err != nil {
-					errStr = ev.Err.Error()
-					log.Printf("irc[%s]: %s: %v", ev.Network, ev.State, ev.Err)
-				} else {
-					log.Printf("irc[%s]: %s", ev.Network, ev.State)
-				}
-				h.broadcast(envelope("state", 0, StateData{
-					Network: ev.Network,
-					State:   ev.State.String(),
-					Error:   errStr,
-				}))
 				if ev.State == irc.StateRegistered {
-					// Fresh connection: stale batch refs are gone and every
-					// target gets a full pagination budget again.
+					// Fresh connection: stale batch refs are gone and
+					// every target gets a full pagination budget again.
 					histBatches = make(map[string]*histBatch)
 					backfillPages = make(map[string]int)
-					h.backfill(ctx, c)
-					h.startMonitor(ctx, c)
 				}
-				if ev.State == irc.StateDisconnected {
-					h.clearPresence(ev.Network)
-				}
+				h.onState(ctx, c, ev)
 			case irc.EventMessage:
-				// standard-replies: machine-readable server feedback the
-				// user should see ("FAIL * INVALID_UTF8 :..."). FAILs are
-				// also logged.
-				switch ev.Msg.Command {
-				case "FAIL", "WARN", "NOTE":
-					if ev.Msg.Command == "FAIL" {
-						log.Printf("irc[%s]: server failure: %s", ev.Network, ev.Msg.String())
-					}
-					if txt := strings.TrimSpace(strings.Join(ev.Msg.Params, " ")); txt != "" {
-						h.broadcast(envelope("server_info", 0, ServerInfoData{
-							Network: ev.Network,
-							Text:    strings.ToLower(ev.Msg.Command) + ": " + txt,
-						}))
-					}
-					continue
-				}
-				switch ev.Msg.Command {
-				case "730": // RPL_MONONLINE
-					h.updatePresence(ev.Network, ev.Msg, true)
-					continue
-				case "731": // RPL_MONOFFLINE
-					h.updatePresence(ev.Network, ev.Msg, false)
-					continue
-				case "734": // ERR_MONLISTFULL
-					log.Printf("irc[%s]: MONITOR list full: %s", ev.Network, ev.Msg.Trailing())
-					continue
-				case "732", "733": // RPL_MONLIST / end — the store is our source of truth
-					continue
-				}
-				// Command replies (WHOIS/WHO/LIST/AWAY/...) and error
-				// numerics are pushed as ephemeral "server_info" lines.
-				if txt, ok := h.serverInfo(ev); ok {
-					h.broadcast(envelope("server_info", 0, ServerInfoData{Network: ev.Network, Text: txt}))
-					continue
-				}
-				if ev.Msg.Command == "BATCH" {
-					h.trackHistoryBatch(ev, c, histBatches, backfillPages)
-					continue
-				}
-				batch := histBatches[ev.Msg.Tags["batch"]]
-				replay := batch != nil
-				if replay {
-					// Track the batch's own newest message as the anchor
-					// for the next page: live traffic may already have
-					// stored rows newer than the gap, so the store's
-					// latest row would skip past it.
-					batch.count++
-					if t := messageTime(ev); !t.IsZero() {
-						batch.lastTS = t.UnixMilli()
-					}
-					batch.lastID = ev.Msg.Tags["msgid"]
-				}
-				if !replay {
-					if hint, affected := membersHint(ev.Msg); affected {
-						h.broadcast(envelope("members_changed", 0, MembersChangedData{
-							Network: ev.Network, Buffer: hint,
-						}))
-					}
-					// An INVITE has no reply numeric to forward — surface
-					// it directly (both direct invites and invite-notify's
-					// third-party ones).
-					if ev.Msg.Command == "INVITE" && ev.Msg.Prefix != nil && len(ev.Msg.Params) >= 2 {
-						who := ev.Msg.Param(0)
-						if strings.EqualFold(who, c.Nick()) {
-							who = "you"
-						}
-						h.broadcast(envelope("server_info", 0, ServerInfoData{
-							Network: ev.Network,
-							Text:    ev.Msg.Prefix.Name + " invited " + who + " to " + ev.Msg.Param(1),
-						}))
-					}
-					// Our own JOIN is the moment to backfill that channel:
-					// requesting at registration would race the JOIN, and
-					// servers may refuse history for channels we are not
-					// in yet.
-					if ev.Msg.Command == "JOIN" && ev.Msg.Prefix != nil &&
-						c.Nick() != "" && strings.EqualFold(ev.Msg.Prefix.Name, c.Nick()) {
-						if ts, msgid := h.lastStored(ctx, ev.Network, ev.Msg.Param(0)); ts > 0 {
-							c.RequestChatHistory(ev.Msg.Param(0), ts, msgid)
-						}
-					}
-				}
-				if ev.Msg.Command == "TAGMSG" {
-					if !replay {
-						h.relayTyping(ev, c)
-					}
-					continue // TAGMSG is ephemeral, never persisted
-				}
-				if ev.Msg.Command == "MARKREAD" {
-					h.applyUpstreamMarker(ctx, ev)
-					continue // marker state, never persisted
-				}
-				if ev.Msg.Command == "REDACT" {
-					h.applyRedaction(ctx, ev, c, replay)
-					continue // redaction updates an existing row, not a new one
-				}
-				if ev.Msg.Command == "QUIT" || ev.Msg.Command == "NICK" {
-					h.persistMembership(ctx, ev, replay, batch)
-					continue
-				}
-				target, ok := persistTarget(ev.Msg, c.Nick(), c.IsChannel)
-				if !ok {
-					continue
-				}
-				stored, err := h.store.Append(ctx, ev.Network, target, storeMessage(ev))
-				if err != nil {
-					if ctx.Err() != nil {
-						return ctx.Err()
-					}
-					log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
-					continue
-				}
-				if stored.ID == 0 {
-					continue // duplicate msgid: already stored and announced
-				}
-				if !replay {
-					h.broadcast(envelope("event", 0, eventData(stored)))
+				if err := h.onMessage(ctx, c, ev, histBatches, backfillPages); err != nil {
+					return err
 				}
 			}
 		}
 	}
+}
+
+// onState records and broadcasts a connection state change, kicking off
+// backfill and MONITOR re-establishment on registration.
+func (h *Hub) onState(ctx context.Context, c Conn, ev irc.Event) {
+	h.mu.Lock()
+	h.states[ev.Network] = ev.State.String()
+	h.mu.Unlock()
+	errStr := ""
+	if ev.Err != nil {
+		errStr = ev.Err.Error()
+		log.Printf("irc[%s]: %s: %v", ev.Network, ev.State, ev.Err)
+	} else {
+		log.Printf("irc[%s]: %s", ev.Network, ev.State)
+	}
+	h.broadcast(envelope("state", 0, StateData{
+		Network: ev.Network,
+		State:   ev.State.String(),
+		Error:   errStr,
+	}))
+	if ev.State == irc.StateRegistered {
+		h.backfill(ctx, c)
+		h.startMonitor(ctx, c)
+	}
+	if ev.State == irc.StateDisconnected {
+		h.clearPresence(ev.Network)
+	}
+}
+
+// onMessage routes one server message: protocol-internal traffic is
+// consumed, ephemeral kinds are relayed, everything else persists (and,
+// when live rather than replayed, broadcasts). The only error is a
+// canceled context surfacing through a failed persist.
+func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches map[string]*histBatch, backfillPages map[string]int) error {
+	// standard-replies: machine-readable server feedback the user should
+	// see ("FAIL * INVALID_UTF8 :..."). FAILs are also logged.
+	switch ev.Msg.Command {
+	case "FAIL", "WARN", "NOTE":
+		if ev.Msg.Command == "FAIL" {
+			log.Printf("irc[%s]: server failure: %s", ev.Network, ev.Msg.String())
+		}
+		if txt := strings.TrimSpace(strings.Join(ev.Msg.Params, " ")); txt != "" {
+			h.broadcast(envelope("server_info", 0, ServerInfoData{
+				Network: ev.Network,
+				Text:    strings.ToLower(ev.Msg.Command) + ": " + txt,
+			}))
+		}
+		return nil
+	case "730": // RPL_MONONLINE
+		h.updatePresence(ev.Network, ev.Msg, true)
+		return nil
+	case "731": // RPL_MONOFFLINE
+		h.updatePresence(ev.Network, ev.Msg, false)
+		return nil
+	case "734": // ERR_MONLISTFULL
+		log.Printf("irc[%s]: MONITOR list full: %s", ev.Network, ev.Msg.Trailing())
+		return nil
+	case "732", "733": // RPL_MONLIST / end — the store is our source of truth
+		return nil
+	}
+	// Command replies (WHOIS/WHO/LIST/AWAY/...) and error numerics are
+	// pushed as ephemeral "server_info" lines.
+	if txt, ok := h.serverInfo(ev); ok {
+		h.broadcast(envelope("server_info", 0, ServerInfoData{Network: ev.Network, Text: txt}))
+		return nil
+	}
+	if ev.Msg.Command == "BATCH" {
+		h.trackHistoryBatch(ev, c, histBatches, backfillPages)
+		return nil
+	}
+	batch := histBatches[ev.Msg.Tags["batch"]]
+	replay := batch != nil
+	if replay {
+		// Track the batch's own newest message as the anchor for the
+		// next page: live traffic may already have stored rows newer
+		// than the gap, so the store's latest row would skip past it.
+		batch.count++
+		if t := messageTime(ev); !t.IsZero() {
+			batch.lastTS = t.UnixMilli()
+		}
+		batch.lastID = ev.Msg.Tags["msgid"]
+	} else {
+		h.liveHints(ctx, c, ev)
+	}
+	switch ev.Msg.Command {
+	case "TAGMSG": // ephemeral, never persisted
+		if !replay {
+			h.relayTyping(ev, c)
+		}
+		return nil
+	case "MARKREAD": // marker state, never persisted
+		h.applyUpstreamMarker(ctx, ev)
+		return nil
+	case "REDACT": // updates an existing row, not a new one
+		h.applyRedaction(ctx, ev, c, replay)
+		return nil
+	case "QUIT", "NICK": // fan out per shared channel
+		h.persistMembership(ctx, ev, replay, batch)
+		return nil
+	}
+	return h.persistEvent(ctx, c, ev, replay)
+}
+
+// liveHints handles the side effects only live (non-replayed) messages
+// have: members_changed refetch hints, surfacing INVITEs, and the
+// backfill request our own JOIN triggers.
+func (h *Hub) liveHints(ctx context.Context, c Conn, ev irc.Event) {
+	if hint, affected := membersHint(ev.Msg); affected {
+		h.broadcast(envelope("members_changed", 0, MembersChangedData{
+			Network: ev.Network, Buffer: hint,
+		}))
+	}
+	// An INVITE has no reply numeric to forward — surface it directly
+	// (both direct invites and invite-notify's third-party ones).
+	if ev.Msg.Command == "INVITE" && ev.Msg.Prefix != nil && len(ev.Msg.Params) >= 2 {
+		who := ev.Msg.Param(0)
+		if strings.EqualFold(who, c.Nick()) {
+			who = "you"
+		}
+		h.broadcast(envelope("server_info", 0, ServerInfoData{
+			Network: ev.Network,
+			Text:    ev.Msg.Prefix.Name + " invited " + who + " to " + ev.Msg.Param(1),
+		}))
+	}
+	// Our own JOIN is the moment to backfill that channel: requesting at
+	// registration would race the JOIN, and servers may refuse history
+	// for channels we are not in yet.
+	if ev.Msg.Command == "JOIN" && ev.Msg.Prefix != nil &&
+		c.Nick() != "" && strings.EqualFold(ev.Msg.Prefix.Name, c.Nick()) {
+		if ts, msgid := h.lastStored(ctx, ev.Network, ev.Msg.Param(0)); ts > 0 {
+			c.RequestChatHistory(ev.Msg.Param(0), ts, msgid)
+		}
+	}
+}
+
+// persistEvent stores a message in its buffer and, when live, broadcasts
+// it. Duplicate msgids (overlapping backfill) are silently dropped.
+func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay bool) error {
+	target, ok := persistTarget(ev.Msg, c.Nick(), c.IsChannel)
+	if !ok {
+		return nil
+	}
+	stored, err := h.store.Append(ctx, ev.Network, target, storeMessage(ev))
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
+		return nil
+	}
+	if stored.ID == 0 {
+		return nil // duplicate msgid: already stored and announced
+	}
+	if !replay {
+		h.broadcast(envelope("event", 0, eventData(stored)))
+	}
+	return nil
 }
 
 // backfill requests missed history for the network's non-channel (query)
@@ -622,20 +645,7 @@ func eventData(m store.Message) EventData {
 // replayed one belongs to its chathistory batch's target. The per-buffer
 // msgid dedup makes the fan-out idempotent under overlapping backfill.
 func (h *Hub) persistMembership(ctx context.Context, ev irc.Event, replay bool, batch *histBatch) {
-	var targets []string
-	if replay {
-		if batch != nil && batch.target != "" {
-			targets = []string{batch.target}
-		}
-	} else {
-		targets = ev.Affected
-		if ev.Msg.Prefix != nil {
-			if name, ok, err := h.store.FindBuffer(ctx, ev.Network, ev.Msg.Prefix.Name); err == nil && ok {
-				targets = append(targets, name)
-			}
-		}
-	}
-	for _, target := range targets {
+	for _, target := range h.membershipTargets(ctx, ev, replay, batch) {
 		stored, err := h.store.Append(ctx, ev.Network, target, storeMessage(ev))
 		if err != nil {
 			log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
@@ -650,41 +660,65 @@ func (h *Hub) persistMembership(ctx context.Context, ev irc.Event, replay bool, 
 	}
 }
 
+// membershipTargets collects the buffers a QUIT/NICK line lands in: the
+// replay batch's channel, or — live — the shared channels the manager
+// captured plus any open query buffer with that nick.
+func (h *Hub) membershipTargets(ctx context.Context, ev irc.Event, replay bool, batch *histBatch) []string {
+	if replay {
+		if batch != nil && batch.target != "" {
+			return []string{batch.target}
+		}
+		return nil
+	}
+	targets := ev.Affected
+	if ev.Msg.Prefix != nil {
+		if name, ok, err := h.store.FindBuffer(ctx, ev.Network, ev.Msg.Prefix.Name); err == nil && ok {
+			targets = append(targets, name)
+		}
+	}
+	return targets
+}
+
 // persistTarget decides which buffer a message lands in, or none.
 // isChan is the network's ISUPPORT-driven channel detection.
 func persistTarget(m *ircv4.Message, ourNick string, isChan func(string) bool) (string, bool) {
 	switch m.Command {
 	case "PRIVMSG", "NOTICE":
-		// Non-ACTION CTCP (VERSION probes, PING, and their reply
-		// NOTICEs) is protocol chatter, not conversation: persisting it
-		// would open unread query buffers for every probe.
-		if body := m.Trailing(); strings.HasPrefix(body, "\x01") &&
-			!strings.HasPrefix(body, "\x01ACTION") {
-			return "", false
-		}
-		t := m.Param(0)
-		if isChan(t) {
-			return t, true
-		}
-		if m.Prefix == nil || m.Prefix.Name == "" || ourNick == "" {
-			return "", false
-		}
-		// Addressed to us: file under the sender (queries, NickServ,
-		// server notices under the server's name).
-		if strings.EqualFold(t, ourNick) {
-			return m.Prefix.Name, true
-		}
-		// Our own message echoed back (echo-message): file under the
-		// recipient so sent PMs land in the query buffer.
-		if strings.EqualFold(m.Prefix.Name, ourNick) && t != "" {
-			return t, true
-		}
-		return "", false
+		return directTarget(m, ourNick, isChan)
 	case "JOIN", "PART", "TOPIC", "KICK", "MODE":
 		if t := m.Param(0); isChan(t) {
 			return t, true
 		}
 		return "", false
+	}
+	return "", false
+}
+
+// directTarget files a PRIVMSG/NOTICE: channels under themselves,
+// messages addressed to us under the sender (queries, NickServ, server
+// notices), and our own echoes under the recipient.
+func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool) (string, bool) {
+	// Non-ACTION CTCP (VERSION probes, PING, and their reply NOTICEs) is
+	// protocol chatter, not conversation: persisting it would open
+	// unread query buffers for every probe.
+	if body := m.Trailing(); strings.HasPrefix(body, "\x01") &&
+		!strings.HasPrefix(body, "\x01ACTION") {
+		return "", false
+	}
+	t := m.Param(0)
+	if isChan(t) {
+		return t, true
+	}
+	if m.Prefix == nil || m.Prefix.Name == "" || ourNick == "" {
+		return "", false
+	}
+	if strings.EqualFold(t, ourNick) {
+		return m.Prefix.Name, true
+	}
+	// echo-message: our own message reflected back — file under the
+	// recipient so sent PMs land in the query buffer.
+	if strings.EqualFold(m.Prefix.Name, ourNick) && t != "" {
+		return t, true
 	}
 	return "", false
 }

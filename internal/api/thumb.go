@@ -136,20 +136,24 @@ func thumbnail(src image.Image, maxDim int) image.Image {
 			if sx1 <= sx0 {
 				sx1 = sx0 + 1
 			}
-			var r, g, bl, a, n uint64
-			for sy := sy0; sy < sy1; sy++ {
-				for sx := sx0; sx < sx1; sx++ {
-					cr, cg, cb, ca := src.At(sx, sy).RGBA() // 16-bit channels
-					r, g, bl, a, n = r+uint64(cr), g+uint64(cg), bl+uint64(cb), a+uint64(ca), n+1
-				}
-			}
-			if n == 0 {
-				n = 1
-			}
-			dst.Set(dx, dy, color.RGBA64{
-				R: uint16(r / n), G: uint16(g / n), B: uint16(bl / n), A: uint16(a / n),
-			})
+			dst.Set(dx, dy, boxAverage(src, sx0, sx1, sy0, sy1))
 		}
 	}
 	return dst
+}
+
+// boxAverage returns the mean color of the source rectangle
+// [sx0,sx1) × [sy0,sy1), in 16-bit channels.
+func boxAverage(src image.Image, sx0, sx1, sy0, sy1 int) color.RGBA64 {
+	var r, g, b, a, n uint64
+	for sy := sy0; sy < sy1; sy++ {
+		for sx := sx0; sx < sx1; sx++ {
+			cr, cg, cb, ca := src.At(sx, sy).RGBA() // 16-bit channels
+			r, g, b, a, n = r+uint64(cr), g+uint64(cg), b+uint64(cb), a+uint64(ca), n+1
+		}
+	}
+	if n == 0 {
+		n = 1
+	}
+	return color.RGBA64{R: uint16(r / n), G: uint16(g / n), B: uint16(b / n), A: uint16(a / n)}
 }

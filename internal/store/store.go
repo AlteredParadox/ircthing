@@ -385,32 +385,13 @@ func (s *Store) bufferID(ctx context.Context, network, target string, create boo
 	if id, ok := s.buffers[key]; ok {
 		return id, nil
 	}
-	netID, ok := s.networks[network]
-	if !ok {
-		err := s.db.QueryRowContext(ctx,
-			`SELECT id FROM networks WHERE user_id = ? AND name = ?`,
-			defaultUserID, network).Scan(&netID)
-		if errors.Is(err, sql.ErrNoRows) {
-			if !create {
-				return 0, nil
-			}
-			res, err := s.db.ExecContext(ctx,
-				`INSERT INTO networks (user_id, name) VALUES (?, ?)`,
-				defaultUserID, network)
-			if err != nil {
-				return 0, err
-			}
-			if netID, err = res.LastInsertId(); err != nil {
-				return 0, err
-			}
-		} else if err != nil {
-			return 0, err
-		}
-		s.networks[network] = netID
+	netID, err := s.networkID(ctx, network, create)
+	if err != nil || netID == 0 {
+		return 0, err
 	}
 
 	var bufID int64
-	err := s.db.QueryRowContext(ctx,
+	err = s.db.QueryRowContext(ctx,
 		`SELECT id FROM buffers WHERE network_id = ? AND name = ?`, netID, target).Scan(&bufID)
 	if errors.Is(err, sql.ErrNoRows) {
 		if !create {

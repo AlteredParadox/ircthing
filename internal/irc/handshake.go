@@ -221,98 +221,114 @@ func (h *handshake) handleCAP(m *ircv4.Message) ([]*ircv4.Message, bool, error) 
 	}
 	switch strings.ToUpper(m.Params[1]) {
 	case "LS":
-		if h.phase != hsCapLS {
-			return nil, false, nil
-		}
-		// Multiline form: CAP <nick> LS * :<caps> — a lone "*" before the
-		// capability list means more lines follow.
-		more := len(m.Params) >= 4 && m.Params[2] == "*"
-		parseCapList(m.Params[len(m.Params)-1], h.caps)
-		if more {
-			return nil, false, nil
-		}
-		// STS (sts.go): on an insecure connection a valid port upgrades
-		// the connection (abort, secure redial); on a secure one the
-		// duration policy is recorded for the manager to persist. Never
-		// requested with CAP REQ.
-		if val, ok := h.caps["sts"]; ok {
-			v := parseSTS(val)
-			if !h.secure && v.port > 0 {
-				return nil, false, errSTSUpgrade{port: v.port}
-			}
-			if h.secure && v.hasDuration {
-				d := v.duration
-				h.stsDuration = &d
-			}
-		}
-		if h.cfg.SASL != nil {
-			mechs, offered := h.caps["sasl"]
-			if !offered {
-				return nil, false, errors.New("SASL configured but the server does not offer the sasl capability")
-			}
-			// Choose and build the mechanism now, from the advertised list
-			// (empty when the server didn't advertise one under CAP 302).
-			// When our mechanism isn't offered we still REQ sasl and only
-			// quit after the ACK — the conventional client flow (and the
-			// one irctest asserts); either way we never fall through to an
-			// unauthenticated session.
-			mech, err := newMech(h.cfg.SASL, mechs)
-			if err != nil {
-				h.mechErr = err
-			}
-			h.mech = mech
-		}
-		reqs := h.capsToRequest()
-		if len(reqs) == 0 {
-			h.phase = hsAwaitWelcome
-			return []*ircv4.Message{newMsg("CAP", "END")}, false, nil
-		}
-		h.phase = hsCapAck
-		h.lastReq = reqs
-		return []*ircv4.Message{newMsg("CAP", "REQ", strings.Join(reqs, " "))}, false, nil
-
+		return h.handleCapLS(m)
 	case "ACK":
-		if h.phase != hsCapAck {
-			return nil, false, nil
-		}
-		for _, tok := range strings.Fields(m.Params[len(m.Params)-1]) {
-			if name, ok := strings.CutPrefix(tok, "-"); ok {
-				delete(h.enabled, name)
-			} else {
-				h.enabled[tok] = true
-			}
-		}
-		if h.cfg.SASL != nil && h.enabled["sasl"] && h.mechErr != nil {
-			return []*ircv4.Message{newMsg("QUIT", "SASL mechanism unavailable")}, false, h.mechErr
-		}
-		if h.mech != nil && h.enabled["sasl"] && !h.saslDone {
-			h.phase = hsAuthChallenge
-			return []*ircv4.Message{newMsg("AUTHENTICATE", h.mech.Name())}, false, nil
-		}
-		h.phase = hsAwaitWelcome
-		return []*ircv4.Message{newMsg("CAP", "END")}, false, nil
-
+		return h.handleCapACK(m)
 	case "NAK":
-		if h.phase != hsCapAck {
-			return nil, false, nil
+		return h.handleCapNAK()
+	}
+	// NEW/DEL/LIST during registration: nothing to do yet.
+	return nil, false, nil
+}
+
+func (h *handshake) handleCapLS(m *ircv4.Message) ([]*ircv4.Message, bool, error) {
+	if h.phase != hsCapLS {
+		return nil, false, nil
+	}
+	// Multiline form: CAP <nick> LS * :<caps> — a lone "*" before the
+	// capability list means more lines follow.
+	more := len(m.Params) >= 4 && m.Params[2] == "*"
+	parseCapList(m.Params[len(m.Params)-1], h.caps)
+	if more {
+		return nil, false, nil
+	}
+	// STS (sts.go): on an insecure connection a valid port upgrades the
+	// connection (abort, secure redial); on a secure one the duration
+	// policy is recorded for the manager to persist. Never requested
+	// with CAP REQ.
+	if val, ok := h.caps["sts"]; ok {
+		v := parseSTS(val)
+		if !h.secure && v.port > 0 {
+			return nil, false, errSTSUpgrade{port: v.port}
 		}
-		// REQ is all-or-nothing (spec: "accepted as a whole, or rejected
-		// entirely"). A NAK of offered caps is abnormal; retry once with
-		// just sasl — that one we cannot proceed without.
-		if h.cfg.SASL != nil {
-			if !h.nakRetried && len(h.lastReq) > 1 {
-				h.nakRetried = true
-				h.lastReq = []string{"sasl"}
-				return []*ircv4.Message{newMsg("CAP", "REQ", "sasl")}, false, nil
-			}
-			return nil, false, errors.New("server refused the capability request including sasl")
+		if h.secure && v.hasDuration {
+			d := v.duration
+			h.stsDuration = &d
 		}
+	}
+	if err := h.chooseMech(); err != nil {
+		return nil, false, err
+	}
+	reqs := h.capsToRequest()
+	if len(reqs) == 0 {
 		h.phase = hsAwaitWelcome
 		return []*ircv4.Message{newMsg("CAP", "END")}, false, nil
 	}
+	h.phase = hsCapAck
+	h.lastReq = reqs
+	return []*ircv4.Message{newMsg("CAP", "REQ", strings.Join(reqs, " "))}, false, nil
+}
 
-	// NEW/DEL/LIST during registration: nothing to do yet.
-	return nil, false, nil
+// chooseMech picks and builds the SASL mechanism from the advertised
+// list (empty when the server didn't advertise one under CAP 302). When
+// our mechanism isn't offered we still REQ sasl and only quit after the
+// ACK — the conventional client flow (and the one irctest asserts);
+// either way we never fall through to an unauthenticated session.
+func (h *handshake) chooseMech() error {
+	if h.cfg.SASL == nil {
+		return nil
+	}
+	mechs, offered := h.caps["sasl"]
+	if !offered {
+		return errors.New("SASL configured but the server does not offer the sasl capability")
+	}
+	mech, err := newMech(h.cfg.SASL, mechs)
+	if err != nil {
+		h.mechErr = err
+	}
+	h.mech = mech
+	return nil
+}
+
+func (h *handshake) handleCapACK(m *ircv4.Message) ([]*ircv4.Message, bool, error) {
+	if h.phase != hsCapAck {
+		return nil, false, nil
+	}
+	for _, tok := range strings.Fields(m.Params[len(m.Params)-1]) {
+		if name, ok := strings.CutPrefix(tok, "-"); ok {
+			delete(h.enabled, name)
+		} else {
+			h.enabled[tok] = true
+		}
+	}
+	if h.cfg.SASL != nil && h.enabled["sasl"] && h.mechErr != nil {
+		return []*ircv4.Message{newMsg("QUIT", "SASL mechanism unavailable")}, false, h.mechErr
+	}
+	if h.mech != nil && h.enabled["sasl"] && !h.saslDone {
+		h.phase = hsAuthChallenge
+		return []*ircv4.Message{newMsg("AUTHENTICATE", h.mech.Name())}, false, nil
+	}
+	h.phase = hsAwaitWelcome
+	return []*ircv4.Message{newMsg("CAP", "END")}, false, nil
+}
+
+func (h *handshake) handleCapNAK() ([]*ircv4.Message, bool, error) {
+	if h.phase != hsCapAck {
+		return nil, false, nil
+	}
+	// REQ is all-or-nothing (spec: "accepted as a whole, or rejected
+	// entirely"). A NAK of offered caps is abnormal; retry once with
+	// just sasl — that one we cannot proceed without.
+	if h.cfg.SASL != nil {
+		if !h.nakRetried && len(h.lastReq) > 1 {
+			h.nakRetried = true
+			h.lastReq = []string{"sasl"}
+			return []*ircv4.Message{newMsg("CAP", "REQ", "sasl")}, false, nil
+		}
+		return nil, false, errors.New("server refused the capability request including sasl")
+	}
+	h.phase = hsAwaitWelcome
+	return []*ircv4.Message{newMsg("CAP", "END")}, false, nil
 }
 
 func (h *handshake) handleAuthenticate(m *ircv4.Message) ([]*ircv4.Message, bool, error) {

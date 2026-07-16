@@ -86,27 +86,32 @@ func (s *isupport) handle(m *ircv4.Message) {
 			continue
 		}
 		name, value, _ := strings.Cut(tok, "=")
-		value = unescapeValue(value)
-		s.raw[name] = value
-		switch name {
-		case "CHANTYPES":
-			s.chanTypes = value // empty is valid: no channels
-		case "PREFIX":
-			if modes, symbols, ok := parsePrefix(value); ok {
-				s.prefixModes, s.prefixSymbols = modes, symbols
-			}
-		case "CHANMODES":
-			parts := strings.SplitN(value, ",", 5)
-			var cm [4]string
-			for i := 0; i < len(parts) && i < 4; i++ {
-				cm[i] = parts[i]
-			}
-			s.chanModes = cm
-		case "CASEMAPPING":
-			switch value {
-			case "rfc1459", "rfc1459-strict", "ascii":
-				s.caseMapping = value
-			}
+		s.applyToken(name, unescapeValue(value))
+	}
+}
+
+// applyToken records one ISUPPORT token, updating the parsed views of
+// the parameters that drive behavior. Caller holds s.mu.
+func (s *isupport) applyToken(name, value string) {
+	s.raw[name] = value
+	switch name {
+	case "CHANTYPES":
+		s.chanTypes = value // empty is valid: no channels
+	case "PREFIX":
+		if modes, symbols, ok := parsePrefix(value); ok {
+			s.prefixModes, s.prefixSymbols = modes, symbols
+		}
+	case "CHANMODES":
+		parts := strings.SplitN(value, ",", 5)
+		var cm [4]string
+		for i := 0; i < len(parts) && i < 4; i++ {
+			cm[i] = parts[i]
+		}
+		s.chanModes = cm
+	case "CASEMAPPING":
+		switch value {
+		case "rfc1459", "rfc1459-strict", "ascii":
+			s.caseMapping = value
 		}
 	}
 }

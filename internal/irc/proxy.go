@@ -75,11 +75,27 @@ func dialProxy(ctx context.Context, proxy *url.URL, target string, timeout time.
 }
 
 // socks5Connect performs the RFC 1928 handshake and CONNECT on an open
-// proxy connection. Reads are exact-size (io.ReadFull), so no stream
-// bytes beyond the handshake are consumed.
+// proxy connection, one phase per helper. Reads are exact-size
+// (io.ReadFull), so no stream bytes beyond the handshake are consumed.
 func socks5Connect(conn net.Conn, user *url.Userinfo, target string) error {
-	// Method negotiation (RFC 1928 §3): no-auth, plus username/password
-	// when credentials are configured.
+	if err := socks5Negotiate(conn, user); err != nil {
+		return err
+	}
+	req, err := socks5Request(target)
+	if err != nil {
+		return err
+	}
+	if _, err := conn.Write(req); err != nil {
+		return err
+	}
+	return socks5ReadReply(conn)
+}
+
+// socks5Negotiate runs method negotiation (RFC 1928 §3) and, when the
+// proxy picks it, the username/password subnegotiation (RFC 1929 §2).
+func socks5Negotiate(conn net.Conn, user *url.Userinfo) error {
+	// Offer no-auth, plus username/password when credentials are
+	// configured.
 	methods := []byte{0x00}
 	if user != nil {
 		methods = append(methods, 0x02)
@@ -96,44 +112,55 @@ func socks5Connect(conn net.Conn, user *url.Userinfo, target string) error {
 	}
 	switch sel[1] {
 	case 0x00: // no auth
-	case 0x02: // username/password subnegotiation (RFC 1929 §2)
-		if user == nil {
-			return errors.New("socks5: proxy requires authentication but none is configured")
-		}
-		pass, _ := user.Password()
-		u, p := user.Username(), pass
-		if len(u) > 255 || len(p) > 255 {
-			return errors.New("socks5: username/password too long")
-		}
-		req := append([]byte{0x01, byte(len(u))}, u...)
-		req = append(append(req, byte(len(p))), p...)
-		if _, err := conn.Write(req); err != nil {
-			return err
-		}
-		var st [2]byte
-		if _, err := io.ReadFull(conn, st[:]); err != nil {
-			return fmt.Errorf("socks5 auth: %w", err)
-		}
-		if st[1] != 0x00 {
-			return errors.New("socks5: authentication rejected")
-		}
+		return nil
+	case 0x02:
+		return socks5Auth(conn, user)
 	default:
 		return errors.New("socks5: no acceptable authentication method")
 	}
+}
 
+// socks5Auth is the RFC 1929 §2 username/password subnegotiation.
+func socks5Auth(conn net.Conn, user *url.Userinfo) error {
+	if user == nil {
+		return errors.New("socks5: proxy requires authentication but none is configured")
+	}
+	pass, _ := user.Password()
+	u, p := user.Username(), pass
+	if len(u) > 255 || len(p) > 255 {
+		return errors.New("socks5: username/password too long")
+	}
+	req := append([]byte{0x01, byte(len(u))}, u...)
+	req = append(append(req, byte(len(p))), p...)
+	if _, err := conn.Write(req); err != nil {
+		return err
+	}
+	var st [2]byte
+	if _, err := io.ReadFull(conn, st[:]); err != nil {
+		return fmt.Errorf("socks5 auth: %w", err)
+	}
+	if st[1] != 0x00 {
+		return errors.New("socks5: authentication rejected")
+	}
+	return nil
+}
+
+// socks5Request builds the CONNECT request (RFC 1928 §4). A hostname is
+// sent as ATYP domain so the proxy resolves it (never us — no DNS leak).
+func socks5Request(target string) ([]byte, error) {
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("socks5: bad target port %q", portStr)
+		return nil, fmt.Errorf("socks5: bad target port %q", portStr)
 	}
-	req := []byte{0x05, 0x01, 0x00} // CONNECT request (RFC 1928 §4)
+	req := []byte{0x05, 0x01, 0x00}
 	switch ip := net.ParseIP(host); {
-	case ip == nil: // hostname: resolved by the proxy (ATYP 0x03, domain)
+	case ip == nil:
 		if len(host) > 255 {
-			return errors.New("socks5: hostname too long")
+			return nil, errors.New("socks5: hostname too long")
 		}
 		req = append(append(req, 0x03, byte(len(host))), host...)
 	case ip.To4() != nil:
@@ -141,19 +168,19 @@ func socks5Connect(conn net.Conn, user *url.Userinfo, target string) error {
 	default:
 		req = append(append(req, 0x04), ip.To16()...)
 	}
-	req = append(req, byte(port>>8), byte(port))
-	if _, err := conn.Write(req); err != nil {
-		return err
-	}
+	return append(req, byte(port>>8), byte(port)), nil
+}
 
-	var head [4]byte // reply VER REP RSV ATYP (RFC 1928 §6)
+// socks5ReadReply consumes the CONNECT reply (RFC 1928 §6), including
+// the bound address, so the tunneled stream starts clean.
+func socks5ReadReply(conn net.Conn) error {
+	var head [4]byte // VER REP RSV ATYP
 	if _, err := io.ReadFull(conn, head[:]); err != nil {
 		return fmt.Errorf("socks5 reply: %w", err)
 	}
 	if head[1] != 0x00 {
 		return fmt.Errorf("socks5: connect failed: %s", socks5Error(head[1]))
 	}
-	// Consume the bound address so the stream starts clean.
 	var bound int
 	switch head[3] {
 	case 0x01:
@@ -169,7 +196,7 @@ func socks5Connect(conn net.Conn, user *url.Userinfo, target string) error {
 	default:
 		return fmt.Errorf("socks5: bad address type %d in reply", head[3])
 	}
-	_, err = io.ReadFull(conn, make([]byte, bound+2)) // addr + port
+	_, err := io.ReadFull(conn, make([]byte, bound+2)) // addr + port
 	return err
 }
 

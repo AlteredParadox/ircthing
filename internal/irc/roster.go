@@ -112,70 +112,30 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 	us := func(nick string) bool { return ourNick != "" && r.isup.FoldEqual(nick, ourNick) }
 
 	switch m.Command {
-	case "353": // RPL_NAMREPLY: <me> <symbol> <channel> :<prefixed nicks>
-		st := r.chans[fold(m.Param(2))]
-		if st == nil {
-			return
-		}
-		if st.pending == nil {
-			st.pending = make(map[string]Member)
-		}
-		for _, raw := range strings.Fields(m.Param(3)) {
-			prefix, nick := splitNamesPrefix(r.isup.PrefixSymbols(), raw)
-			st.pending[fold(nick)] = Member{Nick: nick, Prefix: prefix}
-		}
-
-	case "366": // RPL_ENDOFNAMES: <me> <channel> — pending replaces live
-		if st := r.chans[fold(m.Param(1))]; st != nil && st.pending != nil {
-			// NAMES carries no away/account/bot data; keep what WHOX and
-			// the notify streams already taught us about surviving members.
-			for k, mem := range st.pending {
-				if old, ok := st.members[k]; ok {
-					mem.Away, mem.Account, mem.Bot = old.Away, old.Account, old.Bot
-					st.pending[k] = mem
-				}
-			}
-			st.members = st.pending
-			st.pending = nil
-		}
-
+	case "353": // RPL_NAMREPLY
+		r.namesReply(m)
+	case "366": // RPL_ENDOFNAMES
+		r.namesEnd(m)
 	case "332": // RPL_TOPIC: <me> <channel> :<topic>
 		if st := r.chans[fold(m.Param(1))]; st != nil {
 			st.topic = m.Param(2)
 		}
-
 	case "331": // RPL_NOTOPIC
 		if st := r.chans[fold(m.Param(1))]; st != nil {
 			st.topic = ""
 		}
-
 	case "TOPIC":
 		if st := r.chans[fold(m.Param(0))]; st != nil {
 			st.topic = m.Trailing()
 		}
-
 	case "JOIN":
-		ch := m.Param(0)
-		if us(sender) {
-			r.chans[fold(ch)] = &channelState{name: ch, members: make(map[string]Member)}
-		}
-		if st := r.chans[fold(ch)]; st != nil {
-			mem := Member{Nick: sender}
-			// extended-join (spec fetched 2026-07-16): JOIN carries
-			// <account> <realname>, account "*" when logged out.
-			if acct := m.Param(1); len(m.Params) >= 3 && acct != "*" {
-				mem.Account = acct
-			}
-			st.members[fold(sender)] = mem
-		}
-
+		r.memberJoin(m, sender, us(sender))
 	case "PART":
 		if us(sender) {
 			delete(r.chans, fold(m.Param(0)))
 		} else if st := r.chans[fold(m.Param(0))]; st != nil {
 			delete(st.members, fold(sender))
 		}
-
 	case "KICK": // <channel> <victim>
 		victim := m.Param(1)
 		if us(victim) {
@@ -183,75 +143,138 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 		} else if st := r.chans[fold(m.Param(0))]; st != nil {
 			delete(st.members, fold(victim))
 		}
-
 	case "QUIT":
 		for _, st := range r.chans {
 			delete(st.members, fold(sender))
 		}
-
 	case "NICK":
-		to := m.Param(0)
-		for _, st := range r.chans {
-			if mem, ok := st.members[fold(sender)]; ok {
-				delete(st.members, fold(sender))
-				mem.Nick = to
-				st.members[fold(to)] = mem
-			}
-		}
-
+		r.rename(sender, m.Param(0))
 	case "AWAY": // away-notify: a parameter means away, none means back
 		away := len(m.Params) > 0
-		for _, st := range r.chans {
-			if mem, ok := st.members[fold(sender)]; ok {
-				mem.Away = away
-				st.members[fold(sender)] = mem
-			}
-		}
-
+		r.updateEverywhere(sender, func(mem Member) Member {
+			mem.Away = away
+			return mem
+		})
 	case "ACCOUNT": // account-notify: <account>, "*" means logged out
 		acct := m.Param(0)
 		if acct == "*" {
 			acct = ""
 		}
-		for _, st := range r.chans {
-			if mem, ok := st.members[fold(sender)]; ok {
-				mem.Account = acct
-				st.members[fold(sender)] = mem
-			}
-		}
-
-	case "354": // RPL_WHOSPCRPL: our WHOX reply — <me> <token> <nick> <flags> <account>
-		if m.Param(1) != whoxToken || len(m.Params) < 5 {
-			return
-		}
-		nick, flags, acct := m.Param(2), m.Param(3), m.Param(4)
-		if acct == "0" { // logged out, per the WHOX spec
-			acct = ""
-		}
-		away := strings.ContainsRune(flags, 'G')
-		// Bot mode (https://ircv3.net/specs/extensions/bot-mode, fetched
-		// 2026-07-16): the ISUPPORT BOT letter appears in WHO flags.
-		bot := false
-		if letter, ok := r.isup.Raw("BOT"); ok && letter != "" {
-			bot = strings.Contains(flags, letter)
-		}
-		// The reply names no channel (we don't request the c field);
-		// away/account/bot are nick-level facts, applied wherever the
-		// nick is.
-		for _, st := range r.chans {
-			if mem, ok := st.members[fold(nick)]; ok {
-				mem.Away = away
-				mem.Account = acct
-				mem.Bot = bot
-				st.members[fold(nick)] = mem
-			}
-		}
-
+		r.updateEverywhere(sender, func(mem Member) Member {
+			mem.Account = acct
+			return mem
+		})
+	case "354": // RPL_WHOSPCRPL: our WHOX reply
+		r.whoxReply(m)
 	case "MODE":
 		if st := r.chans[fold(m.Param(0))]; st != nil {
 			r.applyChannelMode(st, m.Params)
 		}
 	}
+}
+
+// namesReply accumulates one 353 line: <me> <symbol> <channel>
+// :<prefixed nicks>. Caller holds r.mu.
+func (r *roster) namesReply(m *ircv4.Message) {
+	st := r.chans[r.isup.Fold(m.Param(2))]
+	if st == nil {
+		return
+	}
+	if st.pending == nil {
+		st.pending = make(map[string]Member)
+	}
+	for _, raw := range strings.Fields(m.Param(3)) {
+		prefix, nick := splitNamesPrefix(r.isup.PrefixSymbols(), raw)
+		st.pending[r.isup.Fold(nick)] = Member{Nick: nick, Prefix: prefix}
+	}
+}
+
+// namesEnd swaps the accumulated NAMES in on 366: <me> <channel>. NAMES
+// carries no away/account/bot data, so what WHOX and the notify streams
+// already taught us about surviving members is kept. Caller holds r.mu.
+func (r *roster) namesEnd(m *ircv4.Message) {
+	st := r.chans[r.isup.Fold(m.Param(1))]
+	if st == nil || st.pending == nil {
+		return
+	}
+	for k, mem := range st.pending {
+		if old, ok := st.members[k]; ok {
+			mem.Away, mem.Account, mem.Bot = old.Away, old.Account, old.Bot
+			st.pending[k] = mem
+		}
+	}
+	st.members = st.pending
+	st.pending = nil
+}
+
+// memberJoin records a JOIN; ours creates the channel. extended-join
+// (spec fetched 2026-07-16) carries <account> <realname>, account "*"
+// when logged out. Caller holds r.mu.
+func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
+	ch := m.Param(0)
+	if ours {
+		r.chans[r.isup.Fold(ch)] = &channelState{name: ch, members: make(map[string]Member)}
+	}
+	st := r.chans[r.isup.Fold(ch)]
+	if st == nil {
+		return
+	}
+	mem := Member{Nick: sender}
+	if acct := m.Param(1); len(m.Params) >= 3 && acct != "*" {
+		mem.Account = acct
+	}
+	st.members[r.isup.Fold(sender)] = mem
+}
+
+// rename re-keys a nick in every channel, keeping its state. Caller
+// holds r.mu.
+func (r *roster) rename(from, to string) {
+	fold := r.isup.Fold
+	for _, st := range r.chans {
+		if mem, ok := st.members[fold(from)]; ok {
+			delete(st.members, fold(from))
+			mem.Nick = to
+			st.members[fold(to)] = mem
+		}
+	}
+}
+
+// updateEverywhere applies fn to nick's membership in every channel —
+// the shape of nick-level facts (AWAY, ACCOUNT, WHOX). Caller holds r.mu.
+func (r *roster) updateEverywhere(nick string, fn func(Member) Member) {
+	key := r.isup.Fold(nick)
+	for _, st := range r.chans {
+		if mem, ok := st.members[key]; ok {
+			st.members[key] = fn(mem)
+		}
+	}
+}
+
+// whoxReply applies one of our WHOX 354 replies: <me> <token> <nick>
+// <flags> <account>. The reply names no channel (we don't request the c
+// field); away/account/bot are nick-level facts, applied wherever the
+// nick is. Caller holds r.mu.
+func (r *roster) whoxReply(m *ircv4.Message) {
+	if m.Param(1) != whoxToken || len(m.Params) < 5 {
+		return
+	}
+	nick, flags, acct := m.Param(2), m.Param(3), m.Param(4)
+	if acct == "0" { // logged out, per the WHOX spec
+		acct = ""
+	}
+	away := strings.ContainsRune(flags, 'G')
+	// Bot mode (https://ircv3.net/specs/extensions/bot-mode, fetched
+	// 2026-07-16): the ISUPPORT BOT letter appears in WHO flags.
+	bot := false
+	if letter, ok := r.isup.Raw("BOT"); ok && letter != "" {
+		bot = strings.Contains(flags, letter)
+	}
+	r.updateEverywhere(nick, func(mem Member) Member {
+		mem.Away = away
+		mem.Account = acct
+		mem.Bot = bot
+		return mem
+	})
 }
 
 // splitNamesPrefix splits a NAMES entry like "@+nick" or, under
@@ -299,18 +322,7 @@ func (r *roster) applyChannelMode(st *channelState, params []string) {
 		default:
 			switch r.isup.ChanModeType(c) {
 			case 'P': // status mode
-				nick := takeArg()
-				mem, ok := st.members[r.isup.Fold(nick)]
-				if !ok {
-					continue
-				}
-				sym := r.isup.SymbolForMode(c)
-				if adding {
-					mem.Prefix = addPrefix(r.isup.PrefixSymbols(), mem.Prefix, sym)
-				} else {
-					mem.Prefix = strings.ReplaceAll(mem.Prefix, sym, "")
-				}
-				st.members[r.isup.Fold(nick)] = mem
+				r.applyStatusMode(st, takeArg(), r.isup.SymbolForMode(c), adding)
 			case 'A', 'B': // always take an argument
 				takeArg()
 			case 'C': // argument only when setting
@@ -321,6 +333,21 @@ func (r *roster) applyChannelMode(st *channelState, params []string) {
 			}
 		}
 	}
+}
+
+// applyStatusMode grants or revokes one status prefix on a member.
+// Caller holds r.mu.
+func (r *roster) applyStatusMode(st *channelState, nick, sym string, adding bool) {
+	mem, ok := st.members[r.isup.Fold(nick)]
+	if !ok {
+		return
+	}
+	if adding {
+		mem.Prefix = addPrefix(r.isup.PrefixSymbols(), mem.Prefix, sym)
+	} else {
+		mem.Prefix = strings.ReplaceAll(mem.Prefix, sym, "")
+	}
+	st.members[r.isup.Fold(nick)] = mem
 }
 
 // addPrefix inserts a status prefix keeping rank order (highest first,

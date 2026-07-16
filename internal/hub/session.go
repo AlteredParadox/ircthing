@@ -73,6 +73,17 @@ func (s *Session) disconnect() {
 	s.once.Do(func() { close(s.done) })
 }
 
+// conn resolves a network name to its live connection, pushing the
+// standard error (tagged with seq) when it is not connected.
+func (s *Session) conn(seq int64, network string) (Conn, bool) {
+	c := s.hub.network(network)
+	if c == nil {
+		s.push(errEnvelope(seq, "unknown_network", "network is not connected"))
+		return nil, false
+	}
+	return c, true
+}
+
 // Handle processes one client envelope. Responses and errors are pushed
 // to this session's Outbound, tagged with the request's Seq; side effects
 // other sessions must see are broadcast.
@@ -127,9 +138,8 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", "send needs network, target and text"))
 		return
 	}
-	conn := s.hub.network(d.Network)
-	if conn == nil {
-		s.push(errEnvelope(env.Seq, "unknown_network", "network is not connected"))
+	conn, ok := s.conn(env.Seq, d.Network)
+	if !ok {
 		return
 	}
 	// With echo-message negotiated the server reflects our messages and
@@ -287,9 +297,8 @@ func (s *Session) handleRedact(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", "redact needs network, buffer and msgid"))
 		return
 	}
-	conn := s.hub.network(d.Network)
-	if conn == nil {
-		s.push(errEnvelope(env.Seq, "unknown_network", "network is not connected"))
+	conn, ok := s.conn(env.Seq, d.Network)
+	if !ok {
 		return
 	}
 	if !conn.CapEnabled("draft/message-redaction") {
@@ -356,9 +365,8 @@ func (s *Session) handleCommand(ctx context.Context, env Envelope) {
 			return
 		}
 	}
-	conn := s.hub.network(d.Network)
-	if conn == nil {
-		s.push(errEnvelope(env.Seq, "unknown_network", "network is not connected"))
+	conn, ok := s.conn(env.Seq, d.Network)
+	if !ok {
 		return
 	}
 	if err := conn.Send(&ircv4.Message{Command: cmd, Params: d.Params}); err != nil {

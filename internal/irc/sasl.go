@@ -54,6 +54,9 @@ func (m *externalMech) respond(_ []byte) ([]byte, error) {
 	return []byte(m.authzid), nil
 }
 
+// mechScram is the SCRAM mechanism we implement (see scram.go).
+const mechScram = "SCRAM-SHA-256"
+
 // newMech builds the client mechanism for the configured SASL settings,
 // choosing automatically when Mechanism is empty: EXTERNAL if no password
 // is set (cert-based), otherwise SCRAM-SHA-256 when the server offers it,
@@ -65,8 +68,8 @@ func newMech(cfg *SASLConfig, offered string) (saslMech, error) {
 		switch {
 		case cfg.Password == "":
 			mech = "EXTERNAL"
-		case offered == "" || mechListed(offered, "SCRAM-SHA-256"):
-			mech = "SCRAM-SHA-256"
+		case offered == "" || mechListed(offered, mechScram):
+			mech = mechScram
 		default:
 			mech = "PLAIN"
 		}
@@ -86,7 +89,7 @@ func newMech(cfg *SASLConfig, offered string) (saslMech, error) {
 		return &plainMech{authzid: authzid, authcid: cfg.Login, passwd: cfg.Password}, nil
 	case "EXTERNAL":
 		return &externalMech{authzid: cfg.Authzid}, nil
-	case "SCRAM-SHA-256":
+	case mechScram:
 		return newSCRAM(cfg.Authzid, cfg.Login, cfg.Password), nil
 	default:
 		return nil, fmt.Errorf("unsupported SASL mechanism %q", cfg.Mechanism)

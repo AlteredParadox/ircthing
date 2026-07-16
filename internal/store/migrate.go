@@ -27,40 +27,14 @@ func migrate(db *sql.DB) error {
 		return fmt.Errorf("store: create schema_migrations: %w", err)
 	}
 
-	applied := make(map[int64]bool)
-	var maxApplied int64
-	rows, err := db.Query(`SELECT version FROM schema_migrations`)
+	applied, maxApplied, err := appliedVersions(db)
 	if err != nil {
 		return err
 	}
-	for rows.Next() {
-		var v int64
-		if err := rows.Scan(&v); err != nil {
-			rows.Close()
-			return err
-		}
-		applied[v] = true
-		if v > maxApplied {
-			maxApplied = v
-		}
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-
-	entries, err := migrationsFS.ReadDir("migrations")
+	names, maxKnown, err := knownMigrations()
 	if err != nil {
 		return err
 	}
-	names := make([]string, 0, len(entries))
-	var maxKnown int64
-	for _, e := range entries {
-		names = append(names, e.Name())
-		if v, err := migrationVersion(e.Name()); err == nil && v > maxKnown {
-			maxKnown = v
-		}
-	}
-	sort.Strings(names) // zero-padded numeric prefixes sort correctly
 	if maxApplied > maxKnown {
 		return fmt.Errorf("store: database schema version %d is newer than this binary knows (%d) — refusing to open", maxApplied, maxKnown)
 	}
@@ -76,27 +50,78 @@ func migrate(db *sql.DB) error {
 		if version < maxApplied {
 			return fmt.Errorf("store: migration %s is older than already-applied version %d — migrations must only be appended", name, maxApplied)
 		}
-		sqlText, err := migrationsFS.ReadFile("migrations/" + name)
-		if err != nil {
+		if err := applyMigration(db, name, version); err != nil {
 			return err
-		}
-		tx, err := db.Begin()
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(string(sqlText)); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("store: migration %s: %w", name, err)
-		}
-		if _, err := tx.Exec(`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,
-			version, name, time.Now().UTC().Format(time.RFC3339)); err != nil {
-			tx.Rollback()
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("store: migration %s: commit: %w", name, err)
 		}
 		maxApplied = version
+	}
+	return nil
+}
+
+// appliedVersions reads schema_migrations: the applied set and its
+// highest version.
+func appliedVersions(db *sql.DB) (map[int64]bool, int64, error) {
+	applied := make(map[int64]bool)
+	var maxApplied int64
+	rows, err := db.Query(`SELECT version FROM schema_migrations`)
+	if err != nil {
+		return nil, 0, err
+	}
+	for rows.Next() {
+		var v int64
+		if err := rows.Scan(&v); err != nil {
+			rows.Close()
+			return nil, 0, err
+		}
+		applied[v] = true
+		if v > maxApplied {
+			maxApplied = v
+		}
+	}
+	return applied, maxApplied, rows.Close()
+}
+
+// knownMigrations lists the embedded migration files in apply order and
+// the highest version this binary carries.
+func knownMigrations() ([]string, int64, error) {
+	entries, err := migrationsFS.ReadDir("migrations")
+	if err != nil {
+		return nil, 0, err
+	}
+	names := make([]string, 0, len(entries))
+	var maxKnown int64
+	for _, e := range entries {
+		names = append(names, e.Name())
+		if v, err := migrationVersion(e.Name()); err == nil && v > maxKnown {
+			maxKnown = v
+		}
+	}
+	sort.Strings(names) // zero-padded numeric prefixes sort correctly
+	return names, maxKnown, nil
+}
+
+// applyMigration runs one migration file in its own transaction and
+// records it.
+func applyMigration(db *sql.DB, name string, version int64) error {
+	sqlText, err := migrationsFS.ReadFile("migrations/" + name)
+	if err != nil {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(string(sqlText)); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("store: migration %s: %w", name, err)
+	}
+	if _, err := tx.Exec(`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,
+		version, name, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: migration %s: commit: %w", name, err)
 	}
 	return nil
 }
