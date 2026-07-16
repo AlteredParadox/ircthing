@@ -592,9 +592,11 @@ func (s *Session) handleSetMarker(ctx context.Context, env Envelope) {
 	}
 }
 
-// maxPrefsBytes caps the stored prefs blob; it carries the user's custom
+// MaxPrefsBytes caps the stored prefs blob; it carries the user's custom
 // CSS, so it is generous, but not an unbounded write path into SQLite.
-const maxPrefsBytes = 64 * 1024
+// Exported so the WebSocket read limit can be sized to admit it (see
+// internal/api).
+const MaxPrefsBytes = 64 * 1024
 
 // prefsKey is the settings-table key for the client preferences blob.
 const prefsKey = "prefs"
@@ -622,7 +624,7 @@ func (s *Session) handleSetPrefs(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", "set_prefs needs a prefs value"))
 		return
 	}
-	if len(d.Prefs) > maxPrefsBytes {
+	if len(d.Prefs) > MaxPrefsBytes {
 		s.push(errEnvelope(env.Seq, "bad_request", "prefs too large"))
 		return
 	}

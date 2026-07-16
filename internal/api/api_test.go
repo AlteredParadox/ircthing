@@ -443,3 +443,88 @@ func TestSessionPruning(t *testing.T) {
 		t.Fatal("newest pre-existing token wrongly evicted")
 	}
 }
+
+
+// A large set_prefs (custom CSS between the 32 KiB default read limit
+// and the 64 KiB prefs cap) must round-trip: the WS read limit is sized
+// to admit it rather than closing the connection as oversized.
+func TestWSLargePrefs(t *testing.T) {
+	ts, h := newTestServer(t)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn := &fakeConn{ch: make(chan irc.Event, 4), name: "libera", nick: "AlteredParadox"}
+	go h.Run(ctx, conn)
+
+	header := http.Header{}
+	header.Set("Cookie", cookie.Name+"="+cookie.Value)
+	c, _, err := websocket.Dial(ctx, ts.URL+"/api/ws", &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.CloseNow()
+	c.SetReadLimit(hub.MaxPrefsBytes + 32*1024) // client must accept the echo too
+
+	// ~48 KiB of CSS: over the 32 KiB default, under the 64 KiB cap.
+	css := strings.Repeat("a", 48*1024)
+	prefs, err := json.Marshal(map[string]string{"css": css})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(hub.PrefsData{Prefs: prefs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := hub.Envelope{V: hub.ProtocolVersion, Type: "set_prefs", Seq: 7, Data: data}
+	raw, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= 32*1024 {
+		t.Fatalf("test payload %d bytes, must exceed the 32 KiB default", len(raw))
+	}
+	if err := c.Write(ctx, websocket.MessageText, raw); err != nil {
+		t.Fatalf("ws write: %v", err)
+	}
+
+	// The handler acknowledges rather than the connection closing.
+	_, respRaw, err := c.Read(ctx)
+	if err != nil {
+		t.Fatalf("ws read (connection closed as oversized?): %v", err)
+	}
+	var resp hub.Envelope
+	if err := json.Unmarshal(respRaw, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Type != "ok" || resp.Seq != 7 {
+		t.Fatalf("response = %+v, want ok/seq 7", resp)
+	}
+
+	// And it round-trips: get_prefs returns the large blob verbatim
+	// (also proving the read limit admits the reply, not just the send).
+	getEnv := hub.Envelope{V: hub.ProtocolVersion, Type: "get_prefs", Seq: 8}
+	getRaw, err := json.Marshal(getEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Write(ctx, websocket.MessageText, getRaw); err != nil {
+		t.Fatal(err)
+	}
+	_, gotRaw, err := c.Read(ctx)
+	if err != nil {
+		t.Fatalf("get_prefs read: %v", err)
+	}
+	var got hub.Envelope
+	if err := json.Unmarshal(gotRaw, &got); err != nil {
+		t.Fatal(err)
+	}
+	var pd hub.PrefsData
+	if err := json.Unmarshal(got.Data, &pd); err != nil {
+		t.Fatal(err)
+	}
+	if string(pd.Prefs) != string(prefs) {
+		t.Fatalf("round-tripped prefs length %d, want %d", len(pd.Prefs), len(prefs))
+	}
+}

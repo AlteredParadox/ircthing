@@ -25,6 +25,10 @@ import (
 
 const sessionCookie = "ircthing_session"
 
+// wsEnvelopeHeadroom is slack above the largest payload (a prefs blob)
+// for the JSON envelope wrapping it (v/type/seq/data keys and quoting).
+const wsEnvelopeHeadroom = 16 * 1024
+
 // maxSessions caps concurrently valid login sessions; the oldest is
 // evicted at issue time. Generous for one user across devices/tabs.
 const maxSessions = 128
@@ -253,6 +257,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return // Accept has already written the HTTP error
 	}
 	defer c.CloseNow()
+	// The default read limit (32 KiB) is below the prefs cap, so a valid
+	// set_prefs (custom CSS up to MaxPrefsBytes) plus its JSON envelope
+	// would be rejected as oversized before reaching the handler. Admit
+	// the largest legitimate message with envelope headroom.
+	c.SetReadLimit(hub.MaxPrefsBytes + wsEnvelopeHeadroom)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()

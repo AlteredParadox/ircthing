@@ -1299,7 +1299,7 @@ func TestPrefsFlow(t *testing.T) {
 	if e := decode[ErrorData](t, recv(t, a, "error")); e.Code != "bad_request" {
 		t.Fatalf("empty set_prefs error = %+v", e)
 	}
-	big := make([]byte, maxPrefsBytes+16)
+	big := make([]byte, MaxPrefsBytes+16)
 	for i := range big {
 		big[i] = 'x'
 	}
