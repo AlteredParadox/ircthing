@@ -29,6 +29,11 @@ const sessionCookie = "ircthing_session"
 // for the JSON envelope wrapping it (v/type/seq/data keys and quoting).
 const wsEnvelopeHeadroom = 16 * 1024
 
+// sessionRecheckInterval is how often a live WebSocket re-validates its
+// session token, so logout/expiry revokes an already-open connection.
+// A var so tests can shorten it.
+var sessionRecheckInterval = 30 * time.Second
+
 // maxSessions caps concurrently valid login sessions; the oldest is
 // evicted at issue time. Generous for one user across devices/tabs.
 const maxSessions = 128
@@ -236,6 +241,19 @@ func (s *Server) authed(r *http.Request) bool {
 	return ok
 }
 
+// tokenValid reports whether a session token is still live — used to
+// revoke an already-open WebSocket after logout or expiry.
+func (s *Server) tokenValid(token string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	expiry, ok := s.tokens[token]
+	if ok && time.Now().After(expiry) {
+		delete(s.tokens, token)
+		return false
+	}
+	return ok
+}
+
 // handleWS upgrades an authenticated request and bridges the connection
 // to a hub.Session: one goroutine writes Outbound envelopes to the
 // socket, the request goroutine reads client envelopes into Handle.
@@ -263,15 +281,30 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// the largest legitimate message with envelope headroom.
 	c.SetReadLimit(hub.MaxPrefsBytes + wsEnvelopeHeadroom)
 
+	// The session's token, so the live socket can be revoked when the
+	// user logs out or the token expires (auth is otherwise only checked
+	// once, at upgrade).
+	var token string
+	if ck, err := r.Cookie(sessionCookie); err == nil {
+		token = ck.Value
+	}
+
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
 	go func() {
 		defer cancel()
+		revoke := time.NewTicker(sessionRecheckInterval)
+		defer revoke.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-revoke.C:
+				if !s.tokenValid(token) {
+					c.Close(websocket.StatusPolicyViolation, "session ended")
+					return
+				}
 			case <-sess.Done():
 				c.Close(websocket.StatusPolicyViolation, "too slow, reconnect and refetch")
 				return

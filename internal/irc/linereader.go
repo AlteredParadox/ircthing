@@ -56,6 +56,10 @@ func (b *boundedLineReader) setLimit(want int) {
 	b.max.Store(int64(want))
 }
 
+// midLine reports whether bytes of the current line have been read since
+// the last newline — i.e. a partial line is in progress. Read-loop only.
+func (b *boundedLineReader) midLine() bool { return b.run > 0 }
+
 func (b *boundedLineReader) Read(p []byte) (int, error) {
 	n, err := b.r.Read(p)
 	max := int(b.max.Load())

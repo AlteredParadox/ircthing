@@ -528,3 +528,45 @@ func TestWSLargePrefs(t *testing.T) {
 		t.Fatalf("round-tripped prefs length %d, want %d", len(pd.Prefs), len(prefs))
 	}
 }
+
+// A live WebSocket is revoked when its session token is invalidated
+// (logout or expiry), not left working until the socket happens to drop.
+func TestWSRevokedOnLogout(t *testing.T) {
+	old := sessionRecheckInterval
+	sessionRecheckInterval = 50 * time.Millisecond
+	defer func() { sessionRecheckInterval = old }()
+
+	ts, h := newTestServer(t)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn := &fakeConn{ch: make(chan irc.Event, 4), name: "libera", nick: "AlteredParadox"}
+	go h.Run(ctx, conn)
+
+	header := http.Header{}
+	header.Set("Cookie", cookie.Name+"="+cookie.Value)
+	c, _, err := websocket.Dial(ctx, ts.URL+"/api/ws", &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.CloseNow()
+
+	// Invalidate the token (as logout does).
+	req, _ := http.NewRequest("POST", ts.URL+"/api/logout", nil)
+	req.AddCookie(cookie)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// The socket must close on its own within a few recheck intervals.
+	rctx, rcancel := context.WithTimeout(ctx, 3*time.Second)
+	defer rcancel()
+	if _, _, err := c.Read(rctx); err == nil {
+		t.Fatal("read succeeded after logout; socket not revoked")
+	} else if rctx.Err() != nil {
+		t.Fatal("socket still open 3s after logout")
+	}
+}

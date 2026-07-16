@@ -137,7 +137,11 @@ export function applyStatusMode(list, mode, expanded) {
 		if (run.length === 1) {
 			out.push(run[0]);
 		} else {
-			const id = "clp-" + run[0].id;
+			// Anchor the collapse-row id on the run's LAST event: a
+			// prepended older page can extend the run at its top (moving
+			// run[0]), which would change the id and break the virtual
+			// list's prepend scroll anchor / lose the expand state.
+			const id = "clp-" + run[run.length - 1].id;
 			const isOpen = !!expanded?.has(id);
 			out.push({
 				id, collapse: run, expanded: isOpen,

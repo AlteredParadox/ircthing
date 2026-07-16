@@ -272,7 +272,9 @@ test("applyStatusMode: collapse folds runs of 2+, leaves singles", () => {
 		pev(4, "PRIVMSG", "a"), pev(5, "PART", "d"), pev(6, "PRIVMSG", "b"),
 	];
 	const out = applyStatusMode(list, "collapse", new Set());
-	eq(out.map((e) => e.id), ["clp-1", 4, 5, 6]);
+	// The collapse-row id anchors on the run's LAST event (stable under
+	// a top-prepend), so run [1,2,3] -> "clp-3".
+	eq(out.map((e) => e.id), ["clp-3", 4, 5, 6]);
 	is(out[0].summary, "2 joined, 1 left");
 	is(out[0].expanded, false);
 	is(out[0].time, 3000);
@@ -280,8 +282,8 @@ test("applyStatusMode: collapse folds runs of 2+, leaves singles", () => {
 
 test("applyStatusMode: expanded run keeps the toggle row plus events", () => {
 	const list = [pev(1, "NICK", "a"), pev(2, "NICK", "b"), pev(3, "PRIVMSG", "x")];
-	const out = applyStatusMode(list, "collapse", new Set(["clp-1"]));
-	eq(out.map((e) => e.id), ["clp-1", 1, 2, 3]);
+	const out = applyStatusMode(list, "collapse", new Set(["clp-2"]));
+	eq(out.map((e) => e.id), ["clp-2", 1, 2, 3]);
 	is(out[0].expanded, true);
 	is(out[0].summary, "2 nick changes");
 });
@@ -301,4 +303,17 @@ test("mergeById: incoming replaces existing by id", () => {
 	const out = mergeById([{ id: 1, time: 1, v: "old" }], [{ id: 1, time: 1, v: "new" }]);
 	is(out.length, 1);
 	is(out[0].v, "new");
+});
+
+test("applyStatusMode: collapse-row id is stable when a run is extended at its top (prepend)", () => {
+	// Run of presence events 3,4,5; then an older page prepends 1,2 which
+	// are contiguous presence events, extending the run's TOP.
+	const runB = [pev(3, "JOIN", "a"), pev(4, "JOIN", "b"), pev(5, "QUIT", "c"), pev(6, "PRIVMSG", "x")];
+	const before = applyStatusMode(runB, "collapse", new Set());
+	const runA = [pev(1, "JOIN", "y"), pev(2, "PART", "z"), ...runB];
+	const after = applyStatusMode(runA, "collapse", new Set());
+	// The collapse row covering the (now larger) top run keeps its id,
+	// because it anchors on the unchanged last event (5).
+	is(before[0].id, "clp-5");
+	is(after[0].id, "clp-5");
 });

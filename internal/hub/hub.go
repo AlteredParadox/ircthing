@@ -473,7 +473,7 @@ func (h *Hub) applyUpstreamMarker(ctx context.Context, c Conn, ev irc.Event) {
 		return
 	}
 	h.broadcast(envelope("read_marker", 0, MarkerData{
-		Network: ev.Network, Buffer: target, Time: authoritative.UnixMilli(),
+		Network: ev.Network, Buffer: target, Time: markerMillis(authoritative),
 	}))
 }
 

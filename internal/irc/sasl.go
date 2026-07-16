@@ -68,9 +68,13 @@ func newMech(cfg *SASLConfig, offered string) (saslMech, error) {
 		switch {
 		case cfg.Password == "":
 			mech = "EXTERNAL"
-		case offered == "" || mechListed(offered, mechScram):
+		case mechListed(offered, mechScram):
 			mech = mechScram
 		default:
+			// Unknown list (bare `sasl` cap) or no SCRAM offered: PLAIN is
+			// universally supported. Defaulting to SCRAM here would loop
+			// forever against a PLAIN-only server that advertises `sasl`
+			// without a mechanism list.
 			mech = "PLAIN"
 		}
 	}

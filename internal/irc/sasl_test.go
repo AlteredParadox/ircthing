@@ -108,3 +108,45 @@ func lens(ss []string) []int {
 	}
 	return out
 }
+
+func TestNewMechAutoSelect(t *testing.T) {
+	cases := []struct {
+		name     string
+		cfg      *SASLConfig
+		offered  string
+		wantMech string // via the concrete type's name; checked below
+		wantErr  bool
+	}{
+		{"no password -> EXTERNAL", &SASLConfig{Login: "u"}, "", "external", false},
+		{"password, SCRAM offered -> SCRAM", &SASLConfig{Login: "u", Password: "p"}, "PLAIN,SCRAM-SHA-256", "scram", false},
+		{"password, bare sasl (unknown list) -> PLAIN", &SASLConfig{Login: "u", Password: "p"}, "", "plain", false},
+		{"password, only PLAIN offered -> PLAIN", &SASLConfig{Login: "u", Password: "p"}, "PLAIN", "plain", false},
+		{"explicit mech not offered -> error", &SASLConfig{Mechanism: "SCRAM-SHA-256", Login: "u", Password: "p"}, "PLAIN", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := newMech(tc.cfg, tc.offered)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want error, got mech %T", m)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("newMech: %v", err)
+			}
+			got := ""
+			switch m.(type) {
+			case *plainMech:
+				got = "plain"
+			case *externalMech:
+				got = "external"
+			case *scramClient:
+				got = "scram"
+			}
+			if got != tc.wantMech {
+				t.Fatalf("mech = %T (%s), want %s", m, got, tc.wantMech)
+			}
+		})
+	}
+}

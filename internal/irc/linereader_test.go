@@ -83,3 +83,23 @@ func TestLineReaderTagBudget(t *testing.T) {
 		t.Fatalf("tagged line at LINELEN rejected: %v", err)
 	}
 }
+
+// midLine reflects whether a partial line is in progress, so the read
+// loop can distinguish an idle-at-boundary timeout (keepalive) from a
+// mid-line stall (tear down).
+func TestBoundedLineReaderMidLine(t *testing.T) {
+	br := newBoundedLineReader(strings.NewReader("PARTIAL"))
+	buf := make([]byte, 16)
+	if _, err := br.Read(buf); err != nil && err != io.EOF {
+		t.Fatal(err)
+	}
+	if !br.midLine() {
+		t.Fatal("midLine false after reading a partial (no newline) line")
+	}
+	// A full line resets the boundary.
+	br2 := newBoundedLineReader(strings.NewReader("FULL\n"))
+	br2.Read(buf)
+	if br2.midLine() {
+		t.Fatal("midLine true after a completed line")
+	}
+}

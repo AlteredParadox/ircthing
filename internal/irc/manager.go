@@ -904,6 +904,15 @@ func (m *Manager) readMessage(lc *liveConn) (*ircv4.Message, error) {
 		if !errors.As(err, &ne) || !ne.Timeout() {
 			return nil, connError(lc.cctx, err)
 		}
+		// A timeout mid-line means the server sent a partial line and
+		// stalled: the underlying bufio reader has already discarded the
+		// buffered fragment, so continuing would parse the rest of the
+		// line as a corrupt standalone message. Tear the connection down
+		// instead — keepalive is only for a genuinely idle (at-boundary)
+		// connection.
+		if lc.blr.midLine() {
+			return nil, fmt.Errorf("read timeout mid-line: server stalled after a partial line")
+		}
 		if pinged {
 			return nil, fmt.Errorf("ping timeout: no traffic for %s after keepalive PING", m.cfg.PingTimeout)
 		}
