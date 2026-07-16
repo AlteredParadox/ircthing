@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "preact/hooks";
-import { pressable } from "./a11y.js";
 import { rankBuffers } from "./irc.js";
 
 // Channel switcher palette (Ctrl+K): type to filter buffers, arrows to
@@ -55,12 +54,13 @@ export function Switcher({ buffers, networks, onSelect, onClose }) {
 					{list.map((b, i) => {
 						const isChan = (networks?.[b.network]?.chantypes || "#&").includes(b.buffer[0]);
 						return (
-							<div
+							<button
+								type="button"
 								class={"switch-row" + (i === sel ? " sel" : "")}
 								key={b.key}
 								onMouseEnter={() => setIdx(i)}
 								onFocus={() => setIdx(i)}
-								{...pressable(() => onSelect(b.network, b.buffer))}
+								onClick={() => onSelect(b.network, b.buffer)}
 							>
 								<span class="chan-hash">{isChan ? b.buffer[0] : "@"}</span>
 								<span class="switch-name">{isChan ? b.buffer.slice(1) : b.buffer}</span>
@@ -70,7 +70,7 @@ export function Switcher({ buffers, networks, onSelect, onClose }) {
 										{b.unread > 99 ? "99+" : b.unread}
 									</span>
 								)}
-							</div>
+							</button>
 						);
 					})}
 				</div>

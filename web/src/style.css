@@ -1146,14 +1146,21 @@ input::placeholder {
 	max-height: 50vh;
 }
 
+/* The rows are native <button>s (keyboard targets); undo button chrome. */
 .switch-row {
 	display: flex;
 	align-items: center;
 	gap: 9px;
+	width: 100%;
 	padding: 7px 10px;
+	border: 0;
 	border-radius: 7px;
-	cursor: pointer;
+	background: transparent;
+	color: inherit;
+	font: inherit;
 	font-size: 0.9643rem;
+	text-align: left;
+	cursor: pointer;
 }
 
 .switch-row.sel {
