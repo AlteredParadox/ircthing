@@ -5,6 +5,8 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -275,5 +277,64 @@ func TestChathistoryReconnectReplay(t *testing.T) {
 		if n := countContaining(final, sub); n != 1 {
 			t.Fatalf("%q stored %d times after re-replay", sub, n)
 		}
+	}
+}
+
+// TestChathistoryPaginatedBackfill: with Ergo's page limit at 10
+// (chathistory-maxmessages in the test config), a 25-message gap needs
+// three CHATHISTORY rounds — the hub keeps paging while replay batches
+// come back full.
+func TestChathistoryPaginatedBackfill(t *testing.T) {
+	addr := startErgo(t)
+	st, h := newStoreAndHub(t)
+
+	s1 := startStack(t, st, h, irc.Config{
+		Name: "ergo", Addr: addr, Nick: "webuser", Channels: []string{"#page"},
+	})
+	s1.waitRegistered()
+	s1.waitJoined("webuser", "#page")
+
+	pal := dialRaw(t, addr, "pager")
+	pal.send("JOIN #page")
+	s1.waitEnvelope("event", func(d json.RawMessage) bool {
+		var ev hub.EventData
+		return json.Unmarshal(d, &ev) == nil && ev.Command == "JOIN" && ev.Sender == "pager"
+	})
+	pal.send("PRIVMSG #page :seed message")
+	s1.waitStored("ergo", "#page", func(m []store.Message) bool {
+		return countContaining(m, "seed message") == 1
+	})
+	s1.stop()
+
+	// 25 messages accumulate while we are gone — 2.5 server pages.
+	for i := 0; i < 25; i++ {
+		pal.send(fmt.Sprintf("PRIVMSG #page :offline %02d", i))
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	s2 := startStack(t, st, h, irc.Config{
+		Name: "ergo", Addr: addr, Nick: "webuser", Channels: []string{"#page"},
+	})
+	s2.waitRegistered()
+	msgs := s2.waitStored("ergo", "#page", func(m []store.Message) bool {
+		return countContaining(m, "offline ") == 25
+	})
+
+	// Every message exactly once, in order.
+	prev := -1
+	for _, m := range msgs {
+		if i := strings.Index(m.Raw, "offline "); i != -1 {
+			n, err := strconv.Atoi(m.Raw[i+8 : i+10])
+			if err != nil {
+				t.Fatalf("bad replay line %q", m.Raw)
+			}
+			if n != prev+1 {
+				t.Fatalf("out of order or duplicated: %d after %d\n%v", n, prev, rawsOf(msgs))
+			}
+			prev = n
+		}
+	}
+	if prev != 24 {
+		t.Fatalf("last replayed = %d, want 24", prev)
 	}
 }

@@ -33,6 +33,10 @@ type Conn interface {
 	// resume point (msgid preferred over sinceMs when non-empty); a
 	// no-op on networks without draft/chathistory.
 	RequestChatHistory(target string, sinceMs int64, msgid string)
+	// HistoryPageSize is the per-request message limit chathistory
+	// requests are clamped to (ISUPPORT CHATHISTORY); a replay batch of
+	// this size means the gap may extend past it.
+	HistoryPageSize() int
 	// EnsureNames lazily fetches a channel's membership under
 	// draft/no-implicit-names; a no-op otherwise.
 	EnsureNames(channel string)
@@ -83,10 +87,14 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 		h.mu.Unlock()
 	}()
 
-	// Open chathistory batches on this connection: ref -> target.
-	// Messages inside are replayed history — persisted, but not pushed
-	// as live events; a history_changed hint follows when the batch ends.
-	histBatch := make(map[string]string)
+	// Open chathistory batches on this connection: ref -> replay
+	// progress. Messages inside are replayed history — persisted, but
+	// not pushed as live events; a history_changed hint follows when the
+	// batch ends, and a full page triggers the next backfill request.
+	histBatches := make(map[string]*histBatch)
+	// backfillPages counts follow-up pages per target on the current
+	// connection, bounding paginated backfill (see maxBackfillPages).
+	backfillPages := make(map[string]int)
 
 	for {
 		select {
@@ -111,6 +119,10 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					Error:   errStr,
 				}))
 				if ev.State == irc.StateRegistered {
+					// Fresh connection: stale batch refs are gone and every
+					// target gets a full pagination budget again.
+					histBatches = make(map[string]*histBatch)
+					backfillPages = make(map[string]int)
 					h.backfill(ctx, c)
 					h.startMonitor(ctx, c)
 				}
@@ -135,10 +147,22 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					continue
 				}
 				if ev.Msg.Command == "BATCH" {
-					h.trackHistoryBatch(ev, histBatch)
+					h.trackHistoryBatch(ev, c, histBatches, backfillPages)
 					continue
 				}
-				replay := ev.Msg.Tags["batch"] != "" && histBatch[ev.Msg.Tags["batch"]] != ""
+				batch := histBatches[ev.Msg.Tags["batch"]]
+				replay := batch != nil
+				if replay {
+					// Track the batch's own newest message as the anchor
+					// for the next page: live traffic may already have
+					// stored rows newer than the gap, so the store's
+					// latest row would skip past it.
+					batch.count++
+					if t := messageTime(ev); !t.IsZero() {
+						batch.lastTS = t.UnixMilli()
+					}
+					batch.lastID = ev.Msg.Tags["msgid"]
+				}
 				if !replay {
 					if hint, affected := membersHint(ev.Msg); affected {
 						h.broadcast(envelope("members_changed", 0, MembersChangedData{
@@ -316,24 +340,47 @@ func (h *Hub) applyUpstreamMarker(ctx context.Context, ev irc.Event) {
 	}))
 }
 
-// trackHistoryBatch follows BATCH open/close for chathistory replays and
-// announces the affected buffer when a replay finishes, so clients drop
-// stale pages and refetch.
-func (h *Hub) trackHistoryBatch(ev irc.Event, histBatch map[string]string) {
+// histBatch is the replay progress of one open chathistory batch.
+type histBatch struct {
+	target string
+	count  int
+	lastTS int64  // unix ms of the batch's newest message
+	lastID string // its msgid, "" when it has none
+}
+
+// maxBackfillPages bounds paginated backfill per target per connection:
+// at the default 100-message pages a reconnect catches up on 1000
+// messages, the hot-scrollback scale. Older remainders stay reachable by
+// explicit history paging.
+const maxBackfillPages = 10
+
+// trackHistoryBatch follows BATCH open/close for chathistory replays.
+// When a replay finishes it announces the affected buffer (so clients
+// drop stale pages and refetch) and — if the batch filled a whole page,
+// meaning the gap may extend past it — requests the next page anchored
+// at the batch's own newest message.
+func (h *Hub) trackHistoryBatch(ev irc.Event, c Conn, batches map[string]*histBatch, pages map[string]int) {
 	if len(ev.Msg.Params) == 0 {
 		return
 	}
 	ref := ev.Msg.Params[0]
 	switch {
 	case strings.HasPrefix(ref, "+") && strings.Contains(ev.Msg.Param(1), "chathistory"):
-		histBatch[ref[1:]] = ev.Msg.Param(2)
+		batches[ref[1:]] = &histBatch{target: ev.Msg.Param(2)}
 	case strings.HasPrefix(ref, "-"):
-		if target := histBatch[ref[1:]]; target != "" {
-			delete(histBatch, ref[1:])
-			h.broadcast(envelope("history_changed", 0, HistoryChangedData{
-				Network: ev.Network, Buffer: target,
-			}))
+		b := batches[ref[1:]]
+		if b == nil {
+			return
 		}
+		delete(batches, ref[1:])
+		key := strings.ToLower(b.target)
+		if b.count >= c.HistoryPageSize() && b.lastTS > 0 && pages[key] < maxBackfillPages {
+			pages[key]++
+			c.RequestChatHistory(b.target, b.lastTS, b.lastID)
+		}
+		h.broadcast(envelope("history_changed", 0, HistoryChangedData{
+			Network: ev.Network, Buffer: b.target,
+		}))
 	}
 }
 

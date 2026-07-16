@@ -1277,3 +1277,64 @@ func TestPrefsFlow(t *testing.T) {
 		t.Fatalf("prefs after rejected writes = %s", d.Prefs)
 	}
 }
+
+func TestPaginatedBackfill(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox", pageSize: 2}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+	fullBatch := func(ref string, sec int) {
+		conn.ch <- ev(fmt.Sprintf(":srv BATCH +%s chathistory #go", ref))
+		conn.ch <- ev(fmt.Sprintf("@batch=%s;msgid=%sa;time=2026-07-15T00:00:%02d.000Z :bob!u@h PRIVMSG #go :a", ref, ref, sec))
+		conn.ch <- ev(fmt.Sprintf("@batch=%s;msgid=%sb;time=2026-07-15T00:00:%02d.500Z :bob!u@h PRIVMSG #go :b", ref, ref, sec))
+		conn.ch <- ev(fmt.Sprintf(":srv BATCH -%s", ref))
+		recv(t, s, "history_changed", "event", "state")
+	}
+	waitReqs := func(n int, what string) []string {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for len(conn.histReqs()) < n && time.Now().Before(deadline) {
+			time.Sleep(2 * time.Millisecond)
+		}
+		got := conn.histReqs()
+		if len(got) != n {
+			t.Fatalf("%s: requests = %v, want %d", what, got, n)
+		}
+		return got
+	}
+
+	// A full replay page means the gap may extend past it: closing the
+	// batch requests the next page, anchored at the batch's own newest
+	// message (time + msgid), not at whatever the store holds.
+	fullBatch("r1", 2)
+	want := fmt.Sprintf("#go@%d@r1b", time.Date(2026, 7, 15, 0, 0, 2, 500e6, time.UTC).UnixMilli())
+	if got := waitReqs(1, "after full page"); got[0] != want {
+		t.Fatalf("follow-up = %q, want %q", got[0], want)
+	}
+
+	// A partial page ends pagination.
+	conn.ch <- ev(":srv BATCH +r2 chathistory #go")
+	conn.ch <- ev("@batch=r2;msgid=r2a;time=2026-07-15T00:00:03.000Z :bob!u@h PRIVMSG #go :three")
+	conn.ch <- ev(":srv BATCH -r2")
+	recv(t, s, "history_changed", "event")
+	waitReqs(1, "after partial page")
+
+	// Follow-ups are bounded per target and connection.
+	for i := 0; i < 15; i++ {
+		fullBatch(fmt.Sprintf("b%d", i), 10+i)
+	}
+	waitReqs(maxBackfillPages, "at the page cap")
+
+	// A new registration restores the pagination budget.
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered, Time: time.Now()}
+	fullBatch("fresh", 50)
+	waitReqs(maxBackfillPages+1, "after re-registration")
+}

@@ -197,6 +197,7 @@ func (f *fakeConn) IsChannel(t string) bool {
 func (f *fakeConn) ChanTypes() string { return "#&" }
 
 func (f *fakeConn) RequestChatHistory(string, int64, string) {}
+func (f *fakeConn) HistoryPageSize() int                     { return 100 }
 
 func (f *fakeConn) EnsureNames(string) {}
 

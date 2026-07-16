@@ -116,6 +116,8 @@ type fakeConn struct {
 	topic string
 	chans map[string][]irc.Member
 	caps  map[string]bool
+	// pageSize is HistoryPageSize; 0 means the default 100.
+	pageSize int
 
 	mu        sync.Mutex
 	sent      []*ircv4.Message
@@ -134,6 +136,13 @@ func (f *fakeConn) Nick() string                 { return f.nick }
 func (f *fakeConn) CapEnabled(name string) bool  { return f.caps[name] }
 func (f *fakeConn) IsChannel(target string) bool { return defaultIsChannel(target) }
 func (f *fakeConn) ChanTypes() string            { return "#&" }
+
+func (f *fakeConn) HistoryPageSize() int {
+	if f.pageSize > 0 {
+		return f.pageSize
+	}
+	return 100
+}
 
 func (f *fakeConn) Channel(name string) (string, []irc.Member, bool) {
 	ms, ok := f.chans[name]

@@ -42,7 +42,9 @@ history:
   channel-length: 2048
   client-length: 256
   autoresize-window: 1h
-  chathistory-maxmessages: 100
+  # Small pages so the paginated-backfill test exercises multiple
+  # CHATHISTORY rounds without posting hundreds of messages.
+  chathistory-maxmessages: 10
   restrictions:
     expire-time: 1h
     query-cutoff: none

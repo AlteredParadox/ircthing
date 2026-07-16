@@ -265,19 +265,14 @@ func chunkTargets(targets []string, n int) [][]string {
 // cap. The msgid selector is preferred when the newest stored message
 // has one and MSGREFTYPES allows it: AFTER excludes equal timestamps, so
 // two messages in the same millisecond would lose the second one under a
-// timestamp selector. Single page, clamped to the CHATHISTORY ISUPPORT
-// limit: if more messages than that were missed, the older remainder is
-// not fetched (paginated backfill is a later refinement).
+// timestamp selector. One page per call, clamped to the CHATHISTORY
+// ISUPPORT limit; the hub keeps paging while replay batches come back
+// full (paginated backfill).
 func (m *Manager) RequestChatHistory(target string, sinceMs int64, msgid string) {
 	if !m.CapEnabled("draft/chathistory") {
 		return
 	}
-	limit := 100
-	if v, ok := m.isup.Raw("CHATHISTORY"); ok {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n < limit {
-			limit = n
-		}
-	}
+	limit := m.HistoryPageSize()
 	sel := "timestamp=" + time.UnixMilli(sinceMs).UTC().Format("2006-01-02T15:04:05.000Z")
 	if msgid != "" {
 		if refs, ok := m.isup.Raw("MSGREFTYPES"); ok && mechListed(refs, "msgid") {
@@ -286,6 +281,18 @@ func (m *Manager) RequestChatHistory(target string, sinceMs int64, msgid string)
 	}
 	// Best-effort: a full queue just means no backfill this round.
 	_ = m.Send(newMsg("CHATHISTORY", "AFTER", target, sel, strconv.Itoa(limit)))
+}
+
+// HistoryPageSize is the per-request chathistory message limit: 100,
+// lowered to the server's advertised CHATHISTORY maximum.
+func (m *Manager) HistoryPageSize() int {
+	limit := 100
+	if v, ok := m.isup.Raw("CHATHISTORY"); ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n < limit {
+			limit = n
+		}
+	}
+	return limit
 }
 
 // CapEnabled reports whether an IRCv3 capability was negotiated on the
