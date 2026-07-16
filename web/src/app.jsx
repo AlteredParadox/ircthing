@@ -347,6 +347,13 @@ export function App() {
 					mention: prev[key]?.mention || false,
 				};
 			}
+			// Preserve client-only open buffers the server list omits — a
+			// just-opened query/DM or a whois card buffer with no stored
+			// messages — so a refresh does not orphan the active key.
+			// Closed buffers are already removed from prev.
+			for (const key of Object.keys(prev)) {
+				if (!bufs[key] && prev[key].network in nets) bufs[key] = prev[key];
+			}
 			return bufs;
 		});
 	}
@@ -917,14 +924,21 @@ export function App() {
 			})
 			.then((page) => {
 				const older = page.messages || [];
-				setMsgs((m) => ({
-					...m,
-					[activeKey]: {
-						...m[activeKey],
-						list: mergeById(m[activeKey].list, older),
-						reachedTop: older.length < PAGE,
-					},
-				}));
+				setMsgs((m) => {
+					// The buffer's pages may have been dropped while the
+					// request was in flight (backfill, close, network
+					// removal) — don't resurrect a dropped buffer.
+					const prev = m[activeKey];
+					if (!prev) return m;
+					return {
+						...m,
+						[activeKey]: {
+							...prev,
+							list: mergeById(prev.list, older),
+							reachedTop: older.length < PAGE,
+						},
+					};
+				});
 			})
 			.catch(() => {});
 	}

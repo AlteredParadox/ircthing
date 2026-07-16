@@ -400,9 +400,17 @@ func (h *handshake) capsToRequest() []string {
 // parseCapList adds the entries of one CAP LS capability list
 // ("multi-prefix sasl=PLAIN,EXTERNAL server-time") to dst. Values (after
 // "=") are a CAP 302 feature and default to "".
+// maxAdvertisedCaps bounds the CAP LS accumulation against a server that
+// streams unbounded '*'-continued capability lines. Real servers
+// advertise a few dozen.
+const maxAdvertisedCaps = 512
+
 func parseCapList(list string, dst map[string]string) {
 	for _, tok := range strings.Fields(list) {
 		name, val, _ := strings.Cut(tok, "=")
+		if _, known := dst[name]; !known && len(dst) >= maxAdvertisedCaps {
+			continue // bound the map; ignore further new caps
+		}
 		dst[name] = val
 	}
 }

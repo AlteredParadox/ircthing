@@ -92,7 +92,14 @@ func (s *isupport) handle(m *ircv4.Message) {
 
 // applyToken records one ISUPPORT token, updating the parsed views of
 // the parameters that drive behavior. Caller holds s.mu.
+// maxISupportKeys bounds the ISUPPORT raw map against a server streaming
+// endless distinct 005 tokens. Real servers advertise well under 50.
+const maxISupportKeys = 256
+
 func (s *isupport) applyToken(name, value string) {
+	if _, known := s.raw[name]; !known && len(s.raw) >= maxISupportKeys {
+		return // bound the map; ignore further new keys
+	}
 	s.raw[name] = value
 	switch name {
 	case "CHANTYPES":

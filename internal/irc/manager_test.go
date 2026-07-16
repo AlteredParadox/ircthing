@@ -1279,3 +1279,60 @@ func TestManagerBoundsJoinedSet(t *testing.T) {
 		t.Fatalf("joined = %d, want <= %d", len(m.joined), maxJoinedChannels)
 	}
 }
+
+// A spoofed self-JOIN with a framing or over-length channel name is not
+// stored as rejoin intent, so it cannot brick the network on reconnect.
+func TestTrackJoinRejectsPoisonedChannel(t *testing.T) {
+	m, err := NewManager(Config{Addr: "x:1", Nick: "AlteredParadox", AllowPlaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.nick.Store("AlteredParadox")
+
+	bad := []string{
+		"#" + strings.Repeat("A", 600),    // over the 512 line limit at rejoin
+		"#chan\r\nOPER a b",               // framing injection
+		"#nul\x00byte",                    // NUL
+		"notachannel",                     // not a channel name
+	}
+	for _, ch := range bad {
+		if err := m.trackJoinIntent(ircv4.MustParseMessage(":AlteredParadox!u@h JOIN " + ch)); err != nil {
+			t.Fatalf("trackJoinIntent(%q) errored: %v", ch, err)
+		}
+	}
+	if len(m.joined) != 0 {
+		t.Fatalf("poisoned channels stored: %v", m.joined)
+	}
+	// A normal channel is still tracked.
+	if err := m.trackJoinIntent(ircv4.MustParseMessage(":AlteredParadox!u@h JOIN #good")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.joined["#good"]; !ok {
+		t.Fatalf("valid channel not tracked: %v", m.joined)
+	}
+}
+
+func TestISupportKeyCap(t *testing.T) {
+	s := newISupport()
+	for i := 0; i < maxISupportKeys+100; i++ {
+		s.handle(ircv4.MustParseMessage(":srv 005 me K" + strconv.Itoa(i) + "=x :are supported"))
+	}
+	s.mu.Lock()
+	n := len(s.raw)
+	s.mu.Unlock()
+	if n > maxISupportKeys {
+		t.Fatalf("ISUPPORT raw map = %d keys, want <= %d", n, maxISupportKeys)
+	}
+}
+
+func TestCapListCap(t *testing.T) {
+	dst := map[string]string{}
+	var fields []string
+	for i := 0; i < maxAdvertisedCaps+100; i++ {
+		fields = append(fields, "cap"+strconv.Itoa(i))
+	}
+	parseCapList(strings.Join(fields, " "), dst)
+	if len(dst) > maxAdvertisedCaps {
+		t.Fatalf("cap map = %d, want <= %d", len(dst), maxAdvertisedCaps)
+	}
+}

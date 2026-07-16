@@ -759,6 +759,13 @@ drain:
 	}
 	sort.Strings(rejoin)
 	for _, ch := range rejoin {
+		// Defensive: drop rather than fatally fail on an entry that
+		// somehow cannot be sent (mirrors sendAll's graceful rejection),
+		// so one bad channel never bricks the connection.
+		if !rejoinable(ch) {
+			delete(m.joined, ch)
+			continue
+		}
 		if err := send([]*ircv4.Message{newMsg("JOIN", ch)}); err != nil {
 			return err
 		}
@@ -1072,6 +1079,14 @@ func (m *Manager) maybeWHOX(channel string) *ircv4.Message {
 	return newMsg("WHO", channel, "%tnfa,"+whoxToken)
 }
 
+// rejoinable reports whether a JOIN for ch could be sent at rejoin time
+// (no framing bytes, fits the default line length) — so a stored rejoin
+// intent can never fatally fail the writer.
+func rejoinable(ch string) bool {
+	msg := newMsg("JOIN", ch)
+	return checkFraming(msg) == nil && checkLineLen(msg, defaultLineLen) == nil
+}
+
 // trackJoinIntent keeps the rejoin set in step with our own JOINs and
 // PARTs. Runs on the read-loop goroutine, which is the only writer of
 // m.joined after construction.
@@ -1081,15 +1096,21 @@ func (m *Manager) trackJoinIntent(in *ircv4.Message) error {
 	}
 	switch in.Command {
 	case "JOIN":
-		if ch := in.Param(0); ch != "" {
-			if _, known := m.joined[ch]; !known && len(m.joined) >= maxJoinedChannels {
-				// A hostile server spoofing self-JOINs could otherwise
-				// grow this never-reset map without bound. No real client
-				// is in this many channels.
-				return fmt.Errorf("irc: joined-channel set exceeded %d", maxJoinedChannels)
-			}
-			m.joined[ch] = ch
+		ch := in.Param(0)
+		// Only store a channel we could actually rejoin: a spoofed
+		// self-JOIN with framing bytes or an over-length name would
+		// otherwise poison the never-reset rejoin set, and since the
+		// rejoin JOIN bypasses sendAll and hits the writer's FATAL
+		// length/framing guard, it would brick the network on every
+		// reconnect. Validate against the registration-time line limit
+		// (isup is reset before rejoin, so lineLen is the default there).
+		if ch == "" || !m.isup.IsChannel(ch) || !rejoinable(ch) {
+			return nil
 		}
+		if _, known := m.joined[ch]; !known && len(m.joined) >= maxJoinedChannels {
+			return fmt.Errorf("irc: joined-channel set exceeded %d", maxJoinedChannels)
+		}
+		m.joined[ch] = ch
 	case "PART":
 		// Remove by the network's casemapping so a PART in any
 		// equivalent casing clears the rejoin intent.
