@@ -526,3 +526,45 @@ func TestMechListed(t *testing.T) {
 		}
 	}
 }
+
+// On a secure link PASS is sent up front (no eavesdropper), which also
+// reaches servers that never reply to CAP LS; on an insecure link it is
+// deferred to the CAP LS reply (STS protection).
+func TestHandshakePassSecureVsInsecure(t *testing.T) {
+	cfg := Config{Addr: "x:1", Nick: "AlteredParadox", Pass: "s3cret", TLS: true}
+
+	secure := newHandshake(&cfg)
+	secure.secure = true
+	got := wire(secure.start())
+	found := false
+	for _, l := range got {
+		if l == "PASS s3cret" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("secure start() = %q, want PASS included", got)
+	}
+
+	insecure := newHandshake(&cfg)
+	insecure.secure = false
+	for _, l := range wire(insecure.start()) {
+		if l == "PASS s3cret" {
+			t.Fatal("insecure start() leaked PASS before the STS decision")
+		}
+	}
+	// The deferred PASS comes with the CAP LS reply (no STS).
+	out, _, err := insecure.handle(ircv4.MustParseMessage("CAP * LS :multi-prefix"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found = false
+	for _, l := range wire(out) {
+		if l == "PASS s3cret" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("insecure CAP LS reply = %q, want deferred PASS", wire(out))
+	}
+}

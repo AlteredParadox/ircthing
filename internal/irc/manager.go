@@ -985,7 +985,9 @@ func (m *Manager) serviceLine(ctx context.Context, lc *liveConn, in *ircv4.Messa
 				return err
 			}
 		}
-		m.capNotifySTS(ctx, lc, in)
+		if err := m.capNotifySTS(ctx, lc, in); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1016,17 +1018,28 @@ func trackChathistoryBatch(in *ircv4.Message, histBatch map[string]bool) error {
 
 // capNotifySTS stores/refreshes the STS policy a CAP NEW on a secure
 // connection may carry (CAP DEL never disables it, per spec).
-func (m *Manager) capNotifySTS(ctx context.Context, lc *liveConn, in *ircv4.Message) {
-	if !lc.secure || len(in.Params) < 3 || strings.ToUpper(in.Params[1]) != "NEW" {
-		return
+func (m *Manager) capNotifySTS(ctx context.Context, lc *liveConn, in *ircv4.Message) error {
+	if len(in.Params) < 3 || strings.ToUpper(in.Params[1]) != "NEW" {
+		return nil
 	}
 	for _, tok := range strings.Fields(in.Params[len(in.Params)-1]) {
-		if name, val, _ := strings.Cut(tok, "="); name == "sts" {
-			if v := parseSTS(val); v.hasDuration {
-				m.applySTS(ctx, lc.addr, v.duration)
-			}
+		name, val, _ := strings.Cut(tok, "=")
+		if name != "sts" {
+			continue
+		}
+		v := parseSTS(val)
+		// Per the STS spec, an upgrade policy seen over an insecure link
+		// MUST trigger a secure reconnect (the same abort the CAP LS
+		// path uses). Nothing is persisted until it is verified on the
+		// secure connection.
+		if !lc.secure && v.port > 0 {
+			return errSTSUpgrade{port: v.port}
+		}
+		if lc.secure && v.hasDuration {
+			m.applySTS(ctx, lc.addr, v.duration)
 		}
 	}
+	return nil
 }
 
 // onLiveLine applies a live (non-replayed) line's side effects: CTCP

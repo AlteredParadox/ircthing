@@ -97,6 +97,7 @@ type handshake struct {
 	// carries a duration policy, for the manager to persist.
 	secure      bool
 	stsDuration *time.Duration
+	passSent    bool // PASS emitted (avoid double-send across start/CAP LS)
 }
 
 func newHandshake(cfg *Config) *handshake {
@@ -119,12 +120,19 @@ func newMsg(cmd string, params ...string) *ircv4.Message {
 // gives SASL room to run; servers without CAP support ignore it and
 // register us directly.
 func (h *handshake) start() []*ircv4.Message {
-	// PASS is deferred (see passLine): the server password is the one
-	// secret in the opening burst, and on an insecure link it must not
-	// go out before the CAP LS reply reveals a pending STS upgrade —
-	// otherwise a passive eavesdropper captures it before STS aborts the
-	// connection to redial over TLS. NICK/USER are public and stay here.
+	// PASS is the one secret in the opening burst. On a SECURE link
+	// there is no eavesdropper, so send it up front — this also delivers
+	// it to servers that never reply to CAP LS (no IRCv3 support), which
+	// a deferred PASS would silently drop. On an INSECURE link PASS is
+	// deferred (passLine, from handleCapLS) until the CAP LS reply shows
+	// no pending STS upgrade, so it is not captured before STS aborts to
+	// redial over TLS. (A non-CAP server reached over plaintext with a
+	// required PASS is the one unhandled case; use TLS for such servers.)
+	// NICK/USER are public and always go here.
 	out := []*ircv4.Message{newMsg("CAP", "LS", "302")}
+	if h.secure {
+		out = append(out, h.passLine()...)
+	}
 	username := h.cfg.Username
 	if username == "" {
 		username = h.cfg.Nick
@@ -139,12 +147,15 @@ func (h *handshake) start() []*ircv4.Message {
 	)
 }
 
-// passLine returns the deferred PASS message (empty when no server
-// password is configured), emitted only after the STS upgrade decision.
+// passLine returns the PASS message the first time it is called (empty
+// when no server password is configured or PASS was already sent). On a
+// secure link start() sends it; on an insecure link handleCapLS does,
+// after the STS decision.
 func (h *handshake) passLine() []*ircv4.Message {
-	if h.cfg.Pass == "" {
+	if h.cfg.Pass == "" || h.passSent {
 		return nil
 	}
+	h.passSent = true
 	return []*ircv4.Message{newMsg("PASS", h.cfg.Pass)}
 }
 

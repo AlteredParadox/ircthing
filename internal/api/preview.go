@@ -19,6 +19,9 @@ const (
 	maxHTMLBytes    = 512 * 1024
 	previewMaxTitle = 300
 	previewMaxDesc  = 500
+	// maxImageURL matches the /api/thumb URL limit; a longer og:image is
+	// useless (the proxy rejects it) and dangerous to cache.
+	maxImageURL = 2048
 )
 
 // PreviewData is the /api/preview JSON response.
@@ -108,7 +111,13 @@ func extractMeta(doc, pageURL string, pv *PreviewData) {
 	pv.Description = clip(firstNonEmpty(meta["og:description"], meta["twitter:description"], meta["description"]), previewMaxDesc)
 	pv.SiteName = clip(meta["og:site_name"], previewMaxTitle)
 	if img := firstNonEmpty(meta["og:image"], meta["og:image:url"], meta["twitter:image"]); img != "" {
-		pv.Image = resolveURL(pageURL, img)
+		// Drop an over-length image URL rather than cache it: /api/thumb
+		// rejects URLs past this bound anyway, and the raw og:image can
+		// be ~500 KB (bounded only by the HTML fetch cap), which would
+		// bloat the preview cache past the RSS target.
+		if abs := resolveURL(pageURL, img); len(abs) <= maxImageURL {
+			pv.Image = abs
+		}
 	}
 }
 

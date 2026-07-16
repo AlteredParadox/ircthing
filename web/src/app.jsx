@@ -260,12 +260,19 @@ export function App() {
 	}, [prefs, theme]);
 
 	const prefsPush = useRef(null);
+	// True while a local pref change has not been confirmed-synced to the
+	// server (e.g. changed while the socket was down). Used on reconnect
+	// to re-push rather than adopt the server's stale copy.
+	const prefsDirty = useRef(false);
 	function updatePrefs(next) {
 		setPrefs(next);
+		prefsDirty.current = true;
 		// Debounced: the custom-CSS textarea changes on every keystroke.
 		clearTimeout(prefsPush.current);
 		prefsPush.current = setTimeout(() => {
-			sock.current?.request("set_prefs", { prefs: next }).catch(() => {});
+			sock.current?.request("set_prefs", { prefs: next })
+				.then(() => { prefsDirty.current = false; })
+				.catch(() => {});
 		}, 400);
 	}
 
@@ -366,6 +373,15 @@ export function App() {
 	// yet (fresh install, pre-sync upgrade) is seeded from this
 	// browser's cache.
 	function adoptPrefs(d) {
+		// A change made while disconnected never reached the server, so
+		// its get_prefs is stale — re-push the local prefs instead of
+		// reverting to it.
+		if (prefsDirty.current) {
+			sock.current?.request("set_prefs", { prefs: prefsRef.current })
+				.then(() => { prefsDirty.current = false; })
+				.catch(() => {});
+			return;
+		}
 		if (d.prefs) setPrefs(normalizePrefs(d.prefs));
 		else sock.current.request("set_prefs", { prefs: prefsRef.current }).catch(() => {});
 	}
