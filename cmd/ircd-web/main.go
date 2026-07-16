@@ -127,22 +127,36 @@ func run(cfg *config) error {
 // first run, then starts every stored definition. A bad stored row is
 // skipped with a log line, not fatal.
 func startNetworks(ctx context.Context, st *store.Store, h *hub.Hub, fileNetworks []netconf.Network) error {
-	seedRows, err := hub.SeedRows(fileNetworks)
-	if err != nil {
-		return err
-	}
-	seeded, err := st.SeedNetworkConfigs(ctx, seedRows)
-	if err != nil {
-		return err
-	}
-	if seeded {
-		log.Printf("networks: imported %d definitions from the config file", len(seedRows))
-	}
 	stored, err := st.NetworkConfigs(ctx)
 	if err != nil {
 		return err
 	}
-	if !seeded && len(fileNetworks) > 0 {
+	if len(stored) == 0 && len(fileNetworks) > 0 {
+		// First run: seeds get the same full validation as web edits
+		// (TLS/SASL/proxy/certificate checks, not just the shallow shape
+		// validation) BEFORE anything is persisted — once a bad
+		// definition lands in the database, fixing config.json no longer
+		// helps, because the database wins. Refusing startup here leaves
+		// the database untouched. On later runs the file list is ignored
+		// and deliberately not validated (it may reference retired
+		// certificate paths).
+		for i := range fileNetworks {
+			if err := hub.ValidateNetwork(&fileNetworks[i]); err != nil {
+				return fmt.Errorf("config networks[%d] (%s): %w", i, fileNetworks[i].EffectiveName(), err)
+			}
+		}
+		seedRows, err := hub.SeedRows(fileNetworks)
+		if err != nil {
+			return err
+		}
+		if _, err := st.SeedNetworkConfigs(ctx, seedRows); err != nil {
+			return err
+		}
+		log.Printf("networks: imported %d definitions from the config file", len(seedRows))
+		if stored, err = st.NetworkConfigs(ctx); err != nil {
+			return err
+		}
+	} else if len(fileNetworks) > 0 {
 		log.Printf("networks: %d definitions in database; config file networks[] is ignored (manage networks in the web UI)", len(stored))
 	}
 	for _, row := range stored {

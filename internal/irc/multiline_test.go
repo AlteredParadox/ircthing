@@ -212,3 +212,32 @@ func TestSendAllAtomic(t *testing.T) {
 		t.Fatalf("queue = %d, want %d", len(m.out), before+3)
 	}
 }
+
+// Ordinary sends validate against LINELEN too — a 32 KiB single line
+// must not be acknowledged and then truncated/rejected by the server.
+func TestSendChecksLineLength(t *testing.T) {
+	m, err := NewManager(Config{Addr: "x:1", Nick: "n", AllowPlaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.registered.Store(true)
+
+	long := strings.Repeat("x", 600)
+	err = m.Send(&ircv4.Message{Command: "PRIVMSG", Params: []string{"#go", long}})
+	if err == nil || !strings.Contains(err.Error(), "limit is 512") {
+		t.Fatalf("oversized send: err = %v, want line-length error", err)
+	}
+	if len(m.out) != 0 {
+		t.Fatalf("oversized line was queued")
+	}
+	// Within the default limit: fine.
+	if err := m.Send(&ircv4.Message{Command: "PRIVMSG", Params: []string{"#go", "hello"}}); err != nil {
+		t.Fatal(err)
+	}
+	// A larger advertised LINELEN admits the long line; the batch tag
+	// does not count against it.
+	m.isup.handle(ircv4.MustParseMessage(":srv 005 n LINELEN=1024 :are supported by this server"))
+	if err := m.Send(&ircv4.Message{Tags: ircv4.Tags{"batch": "x"}, Command: "PRIVMSG", Params: []string{"#go", long}}); err != nil {
+		t.Fatalf("send within LINELEN=1024: %v", err)
+	}
+}

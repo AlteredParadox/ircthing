@@ -162,6 +162,28 @@ func (m *Manager) IsChannel(target string) bool {
 // Fold lowercases a name per the connection's ISUPPORT CASEMAPPING.
 func (m *Manager) Fold(name string) string { return m.isup.Fold(name) }
 
+// lineLen returns the server's advertised LINELEN (default 512).
+func (m *Manager) lineLen() int {
+	if v, ok := m.isup.Raw("LINELEN"); ok {
+		if n, _ := strconv.Atoi(v); n > 0 {
+			return n
+		}
+	}
+	return 512
+}
+
+// checkLineLen rejects a message whose serialized form (tags excluded —
+// message tags have their own separate budget per the IRCv3
+// message-tags spec) plus CRLF exceeds the server's line length.
+func checkLineLen(msg *ircv4.Message, limit int) error {
+	bare := *msg
+	bare.Tags = nil
+	if n := len(bare.String()) + 2; n > limit {
+		return fmt.Errorf("irc: line is %d bytes; the server's limit is %d", n, limit)
+	}
+	return nil
+}
+
 func (m *Manager) ChanTypes() string {
 	return m.isup.ChanTypes()
 }
@@ -208,11 +230,7 @@ func (m *Manager) resetNames() {
 // otherwise send one PRIVMSG per line.
 func (m *Manager) SendMultiline(target string, lines []string) error {
 	lim := parseMultilineLimits(m.CapValue("draft/multiline"))
-	lineLen := 0
-	if v, ok := m.isup.Raw("LINELEN"); ok {
-		lineLen, _ = strconv.Atoi(v)
-	}
-	if err := validateMultiline(target, lines, lim, lineLen); err != nil {
+	if err := validateMultiline(target, lines, lim, m.lineLen()); err != nil {
 		return err
 	}
 	ref := "ml" + strconv.FormatUint(m.batchSeq.Add(1), 10)
@@ -395,10 +413,19 @@ func (m *Manager) Send(msg *ircv4.Message) error {
 
 // sendAll enqueues msgs atomically: all of them or none (a batch must
 // never go out with lines missing because the queue filled partway).
-// sendMu serializes every writer, so the capacity check holds.
+// Every message is checked against the server's line-length limit first
+// — the server would truncate or reject an oversized line after we had
+// already acknowledged it. sendMu serializes every writer, so the
+// capacity check holds.
 func (m *Manager) sendAll(msgs []*ircv4.Message) error {
 	if !m.registered.Load() {
 		return ErrNotConnected
+	}
+	limit := m.lineLen()
+	for _, msg := range msgs {
+		if err := checkLineLen(msg, limit); err != nil {
+			return err
+		}
 	}
 	m.sendMu.Lock()
 	defer m.sendMu.Unlock()

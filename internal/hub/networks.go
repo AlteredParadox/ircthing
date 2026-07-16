@@ -135,7 +135,7 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 	// (plaintext opt-in, SASL, fingerprints, proxy) plus client
 	// certificate loading — so an invalid edit is rejected while the
 	// existing definition and its connection are still untouched.
-	if err := validateNetwork(nc); err != nil {
+	if err := ValidateNetwork(nc); err != nil {
 		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
 		return
 	}
@@ -220,10 +220,11 @@ func (h *Hub) rollbackPut(ctx context.Context, name string, prev *store.NetworkC
 	}
 }
 
-// validateNetwork runs the full connect-time validation without
+// ValidateNetwork runs the full connect-time validation without
 // connecting: certificate files load and a manager constructs, or the
-// definition is rejected.
-func validateNetwork(nc *netconf.Network) error {
+// definition is rejected. Used by put_network and by main for
+// config-file seeds — both persistence paths validate identically.
+func ValidateNetwork(nc *netconf.Network) error {
 	icfg, err := nc.IRCConfig()
 	if err != nil {
 		return err
