@@ -2,7 +2,7 @@ import { Fragment } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Completer } from "./complete.js";
 import { longPress } from "./menu.jsx";
-import { firstURL, fmtTime, linkify, nickColor, renderable, sameGroup, TypingSender, typingText } from "./irc.js";
+import { firstURL, fmtTime, linkify, nickColor, renderable, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
 import { WhoisCard } from "./whois.jsx";
@@ -34,7 +34,7 @@ function SysRow({ ev, r, focused }) {
 	);
 }
 
-function Row({ ev, prev, selfNick, theme, focused, isHighlight, onRedact, onNick }) {
+function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick }) {
 	const pressFired = { current: false };
 	if (ev.whois) return <WhoisCard whois={ev.whois} focused={focused} />;
 	const r = renderable(ev);
@@ -45,18 +45,14 @@ function Row({ ev, prev, selfNick, theme, focused, isHighlight, onRedact, onNick
 	const mention = !self && isHighlight(r.text);
 	// One preview per message (the first link), only for real messages.
 	const link = r.kind === "msg" || r.kind === "action" ? firstURL(r.text) : "";
-	const grouped = !mention && sameGroup(prev && { ...renderable(prev), sender: prev.sender, time: prev.time }, { ...r, sender: ev.sender, time: ev.time });
 	const color = self ? "var(--accent)" : nickColor(ev.sender, theme);
 	// Own messages can be deleted (server decides authorization).
 	const canRedact = self && ev.msgid && onRedact;
-	// Actions show "*" in the nick column (the sender leads the body);
-	// grouped runs hide the repeated nick.
-	let nickLabel = ev.sender;
-	if (r.kind === "action") nickLabel = "*";
-	else if (grouped) nickLabel = "";
+	// Actions show "*" in the nick column (the sender leads the body).
+	const nickLabel = r.kind === "action" ? "*" : ev.sender;
 	return (
 		<div class={"msg-row" + (mention ? " mention" : "") + (focused ? " flash" : "")}>
-			<span class="msg-time">{grouped ? "" : fmtTime(ev.time)}</span>
+			<span class="msg-time">{fmtTime(ev.time)}</span>
 			<span
 				class={"msg-nick" + (ev.sender ? " has-menu" : "")}
 				style={{ color }}
@@ -80,7 +76,7 @@ function Row({ ev, prev, selfNick, theme, focused, isHighlight, onRedact, onNick
 						}}
 					>{ev.sender} </span>
 				)}
-				{r.bot && !grouped && <span class="bot-chip" title="flagged as a bot">bot</span>}
+				{r.bot && <span class="bot-chip" title="flagged as a bot">bot</span>}
 				<Body text={r.text} />
 				{link && <LinkPreview url={link} />}
 			</div>
@@ -196,7 +192,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 					if (p) markRead();
 				}}
 				renderItem={(ev, i) => (
-					<Row ev={ev} prev={shown[i - 1]} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} />
+					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} />
 				)}
 			/>
 			<div class="composer">
