@@ -1,0 +1,36 @@
+# SonarQube scan on every push. SONAR_TOKEN and SONAR_HOST_URL are
+# repository secrets. Assumes the runner offers the ubuntu-latest label
+# and can fetch actions from github.com (act_runner defaults).
+name: sonarqube
+
+on:
+  push:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: SonarQube needs blame data for new-code periods.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Go tests with coverage
+        run: go test -covermode=atomic -coverprofile=coverage.out ./...
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Frontend tests
+        run: cd web && node --test test/
+
+      - name: SonarQube scan
+        uses: sonarsource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
