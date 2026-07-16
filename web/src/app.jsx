@@ -121,7 +121,9 @@ export function App() {
 
 		const applyBuffers = (data) => {
 			const nets = {};
-			for (const n of data.networks || []) nets[n.name] = { state: n.state, nick: n.nick };
+			for (const n of data.networks || []) {
+				nets[n.name] = { state: n.state, nick: n.nick, chantypes: n.chantypes || "#&" };
+			}
 			setNetworks(nets);
 			// Load each network's MONITOR buddy list with current presence.
 			for (const name of Object.keys(nets)) {
@@ -186,6 +188,14 @@ export function App() {
 
 		s.on("state", (d) => {
 			setNetworks((n) => ({ ...n, [d.network]: { ...(n[d.network] || {}), state: d.state } }));
+			// A (re)registered network's ISUPPORT (chantypes, nick) lands
+			// just after 001; refresh the buffer list once it settles.
+			if (d.state === "registered") {
+				clearTimeout(bufRefresh);
+				bufRefresh = setTimeout(() => {
+					s.request("get_buffers", null).then(applyBuffers).catch(() => {});
+				}, 1500);
+			}
 		});
 
 		s.on("event", (ev) => {
@@ -221,7 +231,7 @@ export function App() {
 			const mine = nick && ev.sender === nick;
 			// Highlight = a mention/keyword in a channel, or any message in
 			// a query (PM) buffer. PMs always alert.
-			const isChan = isChannelName(ev.buffer);
+			const isChan = isChannelName(ev.buffer, networksRef.current[ev.network]?.chantypes);
 			const highlight = isMsg && !mine &&
 				(!isChan ? true : highlightText(r.text, nick, rulesRef.current, ev.network));
 
@@ -378,7 +388,7 @@ export function App() {
 	// members_changed hints arrive in bursts (NAMES floods, netsplits).
 	useEffect(() => {
 		const buf = activeKey ? buffers[activeKey] : null;
-		if (!buf || !connected || !isChannelName(buf.buffer)) {
+		if (!buf || !connected || !isChannelName(buf.buffer, networks[buf.network]?.chantypes)) {
 			setChanInfo(null);
 			return;
 		}
@@ -528,7 +538,7 @@ export function App() {
 		const buf = buffers[activeKey];
 		if (!buf) return;
 		setCmdError("");
-		const p = parseInput(text, buf.buffer);
+		const p = parseInput(text, buf.buffer, networks[buf.network]?.chantypes);
 		const oops = (e) => setCmdError(e.message || "failed");
 		switch (p.type) {
 			case "error":
@@ -584,7 +594,7 @@ export function App() {
 	const activeBuf = activeKey ? buffers[activeKey] : null;
 	const selfNick = activeBuf ? networks[activeBuf.network]?.nick : "";
 	const netState = activeBuf ? networks[activeBuf.network]?.state : "";
-	const isChan = activeBuf && isChannelName(activeBuf.buffer);
+	const isChan = activeBuf && isChannelName(activeBuf.buffer, networks[activeBuf.network]?.chantypes);
 	const topicText =
 		netState && netState !== "registered"
 			? `${activeBuf?.network}: ${netState}…`

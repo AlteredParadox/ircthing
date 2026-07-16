@@ -16,6 +16,7 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, onSelec
 		name,
 		state: networks[name]?.state || "disconnected",
 		nick: networks[name]?.nick || "",
+		chantypes: networks[name]?.chantypes || "#&",
 		buffers: Object.values(buffers)
 			.filter((b) => b.network === name)
 			.sort((a, b) => a.buffer.localeCompare(b.buffer)),
@@ -41,7 +42,7 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, onSelec
 							const key = bufKey(b.network, b.buffer);
 							const active = key === activeKey;
 							const unread = b.unread > 0;
-							const isChan = b.buffer.startsWith("#") || b.buffer.startsWith("&");
+							const isChan = sec.chantypes.includes(b.buffer[0]);
 							return (
 								<div
 									class={"chan-row" + (active ? " active" : "") + (unread ? " unread" : "")}

@@ -78,3 +78,10 @@ test("groupMembers", () => {
 	eq(groupMembers([{ nick: "a" }]).map((g) => g.label), ["Members"]);
 	eq(groupMembers([]), []);
 });
+
+test("parseInput: commands follow the network's CHANTYPES", () => {
+	const p = parseInput("/join !weird", "#go", "#!");
+	eq(p, { type: "cmd", command: "JOIN", params: ["!weird"], switchTo: "!weird" });
+	is(parseInput("/join &nope", "#go", "#").type, "error", "& is not a channel here");
+	is(parseInput("/topic new topic", "!weird", "#!").type, "cmd");
+});

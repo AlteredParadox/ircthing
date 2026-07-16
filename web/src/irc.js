@@ -131,18 +131,22 @@ export function linkify(text) {
 	return out;
 }
 
-export function isChannelName(s) {
-	return !!s && (s[0] === "#" || s[0] === "&");
+// isChannelName follows the network's ISUPPORT CHANTYPES (sent with the
+// buffer list); "#&" is the RFC 1459 default for networks we have not
+// heard from yet.
+export function isChannelName(s, chantypes) {
+	return !!s && (chantypes || "#&").includes(s[0]);
 }
 
 // parseInput interprets composer input: plain text, a "//"-escaped
 // literal slash, or a command. `buffer` is the active buffer (default
-// target for /part and /topic). Returns one of:
+// target for /part and /topic); `chantypes` is the network's channel
+// prefixes. Returns one of:
 //   { type: "text", text }                    — send to the active buffer
 //   { type: "msg", target, text }             — /msg (caller switches)
 //   { type: "cmd", command, params, switchTo? }
 //   { type: "error", message }
-export function parseInput(input, buffer) {
+export function parseInput(input, buffer, chantypes) {
 	if (!input.startsWith("/")) return { type: "text", text: input };
 	if (input.startsWith("//")) return { type: "text", text: input.slice(1) };
 	const m = /^\/(\S+)\s*([^]*)$/.exec(input);
@@ -165,19 +169,19 @@ export function parseInput(input, buffer) {
 		case "join": {
 			if (!rest) return err("usage: /join <channel> [key]");
 			const [chan, key] = rest.split(/\s+/);
-			if (!isChannelName(chan)) return err("/join: " + chan + " is not a channel");
+			if (!isChannelName(chan, chantypes)) return err("/join: " + chan + " is not a channel");
 			return { type: "cmd", command: "JOIN", params: key ? [chan, key] : [chan], switchTo: chan };
 		}
 
 		case "part": {
 			let chan = buffer;
 			let reason = rest;
-			if (isChannelName(rest.split(/\s+/)[0] || "")) {
+			if (isChannelName(rest.split(/\s+/)[0] || "", chantypes)) {
 				const sp = rest.indexOf(" ");
 				chan = sp === -1 ? rest : rest.slice(0, sp);
 				reason = sp === -1 ? "" : rest.slice(sp + 1).trim();
 			}
-			if (!isChannelName(chan)) return err("/part: not in a channel");
+			if (!isChannelName(chan, chantypes)) return err("/part: not in a channel");
 			return { type: "cmd", command: "PART", params: reason ? [chan, reason] : [chan] };
 		}
 
@@ -186,7 +190,7 @@ export function parseInput(input, buffer) {
 			return { type: "cmd", command: "NICK", params: [rest] };
 
 		case "topic":
-			if (!isChannelName(buffer)) return err("/topic: not in a channel");
+			if (!isChannelName(buffer, chantypes)) return err("/topic: not in a channel");
 			if (!rest) return err("usage: /topic <text>");
 			return { type: "cmd", command: "TOPIC", params: [buffer, rest] };
 

@@ -2,7 +2,7 @@ import { deepStrictEqual as eq, strictEqual as is } from "node:assert";
 import { test } from "node:test";
 import {
 	bufKey, firstURL, fmtTime, hostOf, linkify, looksLikeImageURL,
-	mentionsMe, nickColor, parseHash, parseLine, renderable, sameGroup, toHash,
+	isChannelName, mentionsMe, nickColor, parseHash, parseLine, renderable, sameGroup, toHash,
 } from "../src/irc.js";
 
 test("parseLine", () => {
@@ -183,4 +183,13 @@ test("hostOf", () => {
 	is(hostOf("https://example.com/path?x=1"), "example.com");
 	is(hostOf("http://sub.example.com:8080/y"), "sub.example.com:8080");
 	is(hostOf("garbage"), "garbage");
+});
+
+test("isChannelName: per-network CHANTYPES", () => {
+	is(isChannelName("#go"), true, "default #");
+	is(isChannelName("&local"), true, "default &");
+	is(isChannelName("alice"), false);
+	is(isChannelName("", "#"), false);
+	is(isChannelName("&local", "#"), false, "network without & channels");
+	is(isChannelName("!weird", "#!"), true, "unusual prefix honored");
 });
