@@ -27,3 +27,7 @@ web/node_modules/
 
 # Local worklist exported from SonarQube findings; never committed
 /sonar-issues.md
+
+# Python bytecode (irctest controller)
+__pycache__/
+*.py[cod]

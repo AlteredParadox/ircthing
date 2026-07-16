@@ -1,0 +1,37 @@
+# Release gate: the checks a change must pass before merge. Runs on push
+# and pull requests. `make check` is the project's authoritative gate
+# (go vet, staticcheck, go test, frontend build + tests, and the binary
+# 30 MB / bundle 100 KB size gates); the race suite runs separately.
+#
+# The heavier suites are deliberately NOT here: `make integration` needs
+# a built Ergo, and `make irctest` a python3-venv checkout — both are run
+# locally before releases (and can move to a nightly/release workflow if
+# that cost is ever wanted). This keeps per-push CI fast while still
+# enforcing the size budgets and race safety that only ran locally.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # go vet, staticcheck, go test, frontend build + tests, and the
+      # binary (30 MB) and bundle (100 KB gzipped) size gates.
+      - name: make check
+        run: make check
+
+      - name: Race tests
+        run: go test -race ./internal/...
