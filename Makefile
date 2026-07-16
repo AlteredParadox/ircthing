@@ -45,7 +45,7 @@ check: vet staticcheck test frontend-test build binary-size-gate bundle-size-gat
 # Pure frontend logic (parsers, formatting) tested with node's built-in
 # runner — no extra test dependencies.
 frontend-test:
-	cd web && node --test test/
+	cd web && node --test
 
 vet:
 	$(GO) vet ./...

@@ -27,7 +27,7 @@ jobs:
           node-version: 22
 
       - name: Frontend tests
-        run: cd web && node --test test/
+        run: cd web && node --test
 
       - name: SonarQube scan
         uses: sonarsource/sonarqube-scan-action@v5
