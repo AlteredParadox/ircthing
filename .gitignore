@@ -24,3 +24,6 @@ web/node_modules/
 
 # Design-tool export artifact
 .thumbnail
+
+# Local worklist exported from SonarQube findings; never committed
+/sonar-issues.md
