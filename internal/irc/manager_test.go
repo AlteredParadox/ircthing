@@ -441,6 +441,28 @@ func TestManagerCapsAndNotify(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+
+	// A valued NEW: the value from the announcement is published once
+	// the capability is ACKed (the ACK itself carries only the name),
+	// and a DEL drops it again.
+	s.send(`CAP AlteredParadox NEW :draft/multiline=max-bytes=4096,max-lines=4`)
+	if req := s.readCmd("CAP"); req.Trailing() != "draft/multiline" {
+		t.Fatalf("REQ after valued NEW = %q", req.String())
+	}
+	s.send("CAP AlteredParadox ACK :draft/multiline")
+	for m.CapValue("draft/multiline") != "max-bytes=4096,max-lines=4" {
+		if time.Now().After(deadline) {
+			t.Fatalf("value never published after ACK (got %q)", m.CapValue("draft/multiline"))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	s.send("CAP AlteredParadox DEL :draft/multiline")
+	for m.CapValue("draft/multiline") != "" || m.CapEnabled("draft/multiline") {
+		if time.Now().After(deadline) {
+			t.Fatal("value/cap never dropped after DEL")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func TestManagerMonitor(t *testing.T) {

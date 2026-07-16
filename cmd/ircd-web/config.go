@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -57,6 +58,11 @@ func loadConfig(path string) (*config, error) {
 	var cfg config
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	// Strict means one document: trailing JSON would be silently ignored
+	// otherwise, hiding merge/templating mistakes.
+	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+		return nil, fmt.Errorf("%s: trailing data after the config object", path)
 	}
 	if cfg.Listen == "" {
 		cfg.Listen = "127.0.0.1:8067"

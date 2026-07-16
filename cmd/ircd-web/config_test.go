@@ -73,6 +73,11 @@ func TestLoadConfig(t *testing.T) {
 			errSub: "duplicate network name",
 		},
 		{"malformed json", `{`, "unexpected"},
+		{
+			name:    "trailing document rejected",
+			content: `{"user": {"username": "a", "password_hash": "h"}} {"oops": 1}`,
+			errSub:  "trailing data",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

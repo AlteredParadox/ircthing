@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 
 	"ircthing/internal/irc"
 )
@@ -80,6 +81,10 @@ func Parse(raw []byte) (*Network, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&n); err != nil {
 		return nil, err
+	}
+	// Strict means one document; see loadConfig.
+	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+		return nil, errors.New("trailing data after the network object")
 	}
 	if err := n.Validate(); err != nil {
 		return nil, err

@@ -81,16 +81,20 @@ var (
 // there is one read loop and one flood-limited writer goroutine per
 // connection; Run itself is the read loop.
 type Manager struct {
-	cfg        Config
-	events     chan Event
-	out        chan *ircv4.Message
-	sendMu     sync.Mutex // serializes writers to out (atomic batch enqueue)
-	registered atomic.Bool
-	nick       atomic.Value // string: current nick once registered
-	caps       atomic.Value // map[string]bool, copy-on-write: enabled capabilities
-	capVals    atomic.Value // map[string]string: values of enabled caps
-	isup       *isupport
-	roster     *roster
+	cfg    Config
+	events chan Event
+	out    chan *ircv4.Message
+	sendMu sync.Mutex // lifecycle lock: enqueue vs registered/drain
+	// pendingCapVals holds values from post-registration CAP NEW,
+	// published into capVals when the capability is ACKed. Read-loop
+	// only.
+	pendingCapVals map[string]string
+	registered     atomic.Bool
+	nick           atomic.Value // string: current nick once registered
+	caps           atomic.Value // map[string]bool, copy-on-write: enabled capabilities
+	capVals        atomic.Value // map[string]string: values of enabled caps
+	isup           *isupport
+	roster         *roster
 	// joined is the set of channels to (re)join after registration:
 	// the configured ones plus runtime JOINs, minus runtime PARTs (a KICK
 	// deliberately does not remove the intent — bouncers rejoin). Only
@@ -137,14 +141,15 @@ func NewManager(cfg Config) (*Manager, error) {
 	cfg.applyDefaults()
 	isup := newISupport()
 	m := &Manager{
-		cfg:      cfg,
-		events:   make(chan Event, 256),
-		out:      make(chan *ircv4.Message, 64),
-		isup:     isup,
-		roster:   newRoster(isup),
-		joined:   make(map[string]string),
-		namesReq: make(map[string]bool),
-		whoxDone: make(map[string]bool),
+		cfg:            cfg,
+		events:         make(chan Event, 256),
+		out:            make(chan *ircv4.Message, 64),
+		isup:           isup,
+		roster:         newRoster(isup),
+		joined:         make(map[string]string),
+		namesReq:       make(map[string]bool),
+		whoxDone:       make(map[string]bool),
+		pendingCapVals: make(map[string]string),
 	}
 	for _, ch := range cfg.Channels {
 		m.joined[isup.Fold(ch)] = ch
@@ -353,7 +358,10 @@ func (m *Manager) setCaps(caps map[string]bool) {
 // handleCapNotify processes CAP NEW/DEL/ACK after registration
 // (cap-notify, implicitly enabled by CAP LS 302). Returns messages to
 // send. sasl appearing in NEW is ignored — mid-session re-auth is out of
-// scope here.
+// scope here. Values advertised by NEW (e.g. draft/multiline's
+// max-bytes/max-lines) are stashed and published once the capability is
+// ACKed — the ACK itself carries only names. Read-loop only, so
+// pendingCapVals needs no locking.
 func (m *Manager) handleCapNotify(in *ircv4.Message) []*ircv4.Message {
 	if len(in.Params) < 3 {
 		return nil
@@ -363,9 +371,12 @@ func (m *Manager) handleCapNotify(in *ircv4.Message) []*ircv4.Message {
 	case "NEW":
 		var req []string
 		for _, tok := range strings.Fields(list) {
-			name, _, _ := strings.Cut(tok, "=")
+			name, value, _ := strings.Cut(tok, "=")
 			if wantedCapSet[name] && !m.CapEnabled(name) {
 				req = append(req, name)
+				if value != "" {
+					m.pendingCapVals[name] = value
+				}
 			}
 		}
 		if len(req) == 0 {
@@ -379,22 +390,35 @@ func (m *Manager) handleCapNotify(in *ircv4.Message) []*ircv4.Message {
 	return nil
 }
 
-// applyCapChange updates the enabled-capability set (copy-on-write) from
-// a post-registration CAP ACK or DEL list.
+// applyCapChange updates the enabled-capability set and its values
+// (both copy-on-write) from a post-registration CAP ACK or DEL list:
+// an ACK publishes the value stashed from the announcing NEW, a DEL
+// drops both the capability and any stale value.
 func (m *Manager) applyCapChange(enable bool, list string) {
 	old, _ := m.caps.Load().(map[string]bool)
 	caps := make(map[string]bool, len(old))
 	for k, v := range old {
 		caps[k] = v
 	}
+	oldVals, _ := m.capVals.Load().(map[string]string)
+	vals := make(map[string]string, len(oldVals))
+	for k, v := range oldVals {
+		vals[k] = v
+	}
 	for _, tok := range strings.Fields(list) {
 		name, removed := strings.CutPrefix(tok, "-")
 		if enable && !removed {
 			caps[name] = true
+			if v, ok := m.pendingCapVals[name]; ok {
+				vals[name] = v
+				delete(m.pendingCapVals, name)
+			}
 		} else {
+			delete(vals, name)
 			delete(caps, name)
 		}
 	}
+	m.capVals.Store(vals)
 	m.setCaps(caps)
 }
 
@@ -415,12 +439,14 @@ func (m *Manager) Send(msg *ircv4.Message) error {
 // never go out with lines missing because the queue filled partway).
 // Every message is checked against the server's line-length limit first
 // — the server would truncate or reject an oversized line after we had
-// already acknowledged it. sendMu serializes every writer, so the
-// capacity check holds.
+// already acknowledged it.
+//
+// sendMu is the connection-generation lifecycle lock: it serializes
+// every enqueue with the registered transitions and the stale-queue
+// drain (see runOnce), so a message can never be enqueued for one
+// connection and consumed by the next — the registered check and the
+// enqueue happen atomically with respect to disconnect and drain.
 func (m *Manager) sendAll(msgs []*ircv4.Message) error {
-	if !m.registered.Load() {
-		return ErrNotConnected
-	}
 	limit := m.lineLen()
 	for _, msg := range msgs {
 		if err := checkLineLen(msg, limit); err != nil {
@@ -429,6 +455,9 @@ func (m *Manager) sendAll(msgs []*ircv4.Message) error {
 	}
 	m.sendMu.Lock()
 	defer m.sendMu.Unlock()
+	if !m.registered.Load() {
+		return ErrNotConnected
+	}
 	if cap(m.out)-len(m.out) < len(msgs) {
 		return ErrSendQueueFull
 	}
@@ -436,6 +465,15 @@ func (m *Manager) sendAll(msgs []*ircv4.Message) error {
 		m.out <- msg
 	}
 	return nil
+}
+
+// setRegistered flips the registration flag under the lifecycle lock,
+// so in-flight sendAll calls either complete before the flip or observe
+// the new state — never a stale one.
+func (m *Manager) setRegistered(v bool) {
+	m.sendMu.Lock()
+	m.registered.Store(v)
+	m.sendMu.Unlock()
 }
 
 // Run connects and reconnects until ctx is canceled.
@@ -572,7 +610,12 @@ func (m *Manager) emit(ctx context.Context, ev Event) {
 // until the connection dies or ctx is canceled.
 func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	// Drop messages queued for a previous connection so stale lines are
-	// not written into the middle of the new registration.
+	// not written into the middle of the new registration. Under the
+	// lifecycle lock: registered is already false (set under the same
+	// lock when the previous connection ended), so no enqueue can slip
+	// in after this drain — anything sent from here until registration
+	// completes is rejected with ErrNotConnected.
+	m.sendMu.Lock()
 drain:
 	for {
 		select {
@@ -581,6 +624,7 @@ drain:
 			break drain
 		}
 	}
+	m.sendMu.Unlock()
 
 	addr, secure := m.effectiveAddr()
 	conn, err := m.dial(ctx, addr, secure)
@@ -652,8 +696,9 @@ drain:
 		}
 	}
 	m.capVals.Store(vals)
-	m.registered.Store(true)
-	defer m.registered.Store(false)
+	m.pendingCapVals = make(map[string]string)
+	m.setRegistered(true)
+	defer m.setRegistered(false)
 	bo.reset()
 	m.emit(ctx, Event{Kind: EventState, State: StateRegistered})
 

@@ -241,14 +241,18 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	// Register the hub session BEFORE the upgrade: once Accept returns
+	// on the wire, the client considers itself subscribed, so events
+	// arriving during the handshake must already land in this session's
+	// outbound queue rather than being broadcast past it.
+	sess := s.hub.NewSession()
+	defer sess.Close()
+
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return // Accept has already written the HTTP error
 	}
 	defer c.CloseNow()
-
-	sess := s.hub.NewSession()
-	defer sess.Close()
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
