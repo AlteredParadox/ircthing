@@ -388,6 +388,20 @@ func TestReadMarkers(t *testing.T) {
 		t.Fatalf("unset marker = %v, %v", got, err)
 	}
 
+	// Markers never create buffers; give the buffer a stored message.
+	if _, err := s.Append(ctx, "net", "#chan", Message{
+		Time: time.UnixMilli(9000), Sender: "a", Command: "PRIVMSG", Raw: ":a PRIVMSG #chan :hi",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Setting a marker on an unknown buffer is a silent no-op.
+	if err := s.SetReadMarker(ctx, "net", "#ghost", time.UnixMilli(5000)); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.ReadMarker(ctx, "net", "#ghost"); !got.IsZero() {
+		t.Fatalf("marker created a buffer: %v", got)
+	}
+
 	t1 := time.UnixMilli(5000)
 	t2 := time.UnixMilli(9000)
 	if err := s.SetReadMarker(ctx, "net", "#chan", t1); err != nil {

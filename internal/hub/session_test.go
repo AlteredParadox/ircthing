@@ -267,6 +267,13 @@ func TestSessionReadMarkers(t *testing.T) {
 	defer b.Close()
 	ctx := context.Background()
 
+	// Markers never create buffers: #go needs a stored message first.
+	if _, err := h.store.Append(ctx, "libera", "#go", store.Message{
+		Time: time.UnixMilli(1752570009999), Sender: "a", Command: "PRIVMSG", Raw: ":a PRIVMSG #go :hi",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
 	// Unset marker reads as 0.
 	a.Handle(ctx, request(t, "get_read_marker", 1, MarkerRef{Network: "libera", Buffer: "#go"}))
 	if got := decode[MarkerData](t, recv(t, a, "read_marker")); got.Time != 0 {
@@ -1070,6 +1077,11 @@ func TestReadMarkerBridgeOutbound(t *testing.T) {
 	s := h.NewSession()
 	defer s.Close()
 
+	if _, err := h.store.Append(ctx, "libera", "#go", store.Message{
+		Time: time.UnixMilli(1752570000000), Sender: "a", Command: "PRIVMSG", Raw: ":a PRIVMSG #go :hi",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	s.Handle(ctx, request(t, "set_read_marker", 2, SetMarkerData{Network: "libera", Buffer: "#go", Time: 1752570000000}))
 	recv(t, s, "read_marker")
 	deadline := time.Now().Add(5 * time.Second)
@@ -1110,6 +1122,13 @@ func TestReadMarkerBridgeInbound(t *testing.T) {
 
 	ev := func(line string) irc.Event {
 		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+
+	// Markers never create buffers: #go needs stored scrollback first.
+	if _, err := h.store.Append(ctx, "libera", "#go", store.Message{
+		Time: time.UnixMilli(1752570000000), Sender: "a", Command: "PRIVMSG", Raw: ":a PRIVMSG #go :hi",
+	}); err != nil {
+		t.Fatal(err)
 	}
 
 	// Another device of ours read #go: store updates and sessions learn.

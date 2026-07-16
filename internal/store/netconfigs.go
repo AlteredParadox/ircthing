@@ -169,13 +169,21 @@ func (s *Store) dropNetworkCachesLocked(network string) {
 }
 
 // SeedNetworkConfigs imports definitions only when the table is empty
-// (first run with a pre-UI config file). Returns whether it seeded.
+// (first run with a pre-UI config file). Returns whether it seeded. The
+// emptiness check and every insert run in one transaction: a partial
+// seed would strand the remaining networks forever, because a non-empty
+// table makes every later run ignore the config file.
 func (s *Store) SeedNetworkConfigs(ctx context.Context, configs []NetworkConfig) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM network_configs`).Scan(&n)
+	err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM network_configs`).Scan(&n)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
@@ -183,11 +191,14 @@ func (s *Store) SeedNetworkConfigs(ctx context.Context, configs []NetworkConfig)
 		return false, nil
 	}
 	for _, nc := range configs {
-		if _, err := s.db.ExecContext(ctx,
+		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO network_configs (name, config) VALUES (?, ?)`,
 			nc.Name, nc.Config); err != nil {
 			return false, err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
 	}
 	return true, nil
 }

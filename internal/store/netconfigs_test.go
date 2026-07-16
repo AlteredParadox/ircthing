@@ -183,6 +183,11 @@ func TestReadMarkerClamped(t *testing.T) {
 	}
 
 	// Ordinary marker at the message's own time still works.
+	if _, err := s.Append(ctx, "net", "#y", Message{
+		Time: stored.Time, Sender: "a", Command: "PRIVMSG", Raw: ":a PRIVMSG #y :hi",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.SetReadMarker(ctx, "net", "#y", stored.Time); err != nil {
 		t.Fatal(err)
 	}

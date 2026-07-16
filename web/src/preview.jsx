@@ -1,12 +1,17 @@
 import { useEffect, useState } from "preact/hooks";
 import { hostOf, looksLikeImageURL } from "./irc.js";
+import { LRU } from "./lru.js";
 
 // Link previews and image thumbnails. All remote content is loaded
 // through the server media proxy — the browser never fetches a remote
-// origin directly. Results are cached per URL across the whole app so a
-// URL repeated in scrollback is fetched once.
+// origin directly. Results are cached per URL in a bounded LRU so a URL
+// repeated in scrollback is fetched once, without the cache growing for
+// the lifetime of the page; failures (null) are kept only briefly so a
+// flood of dead links cannot occupy the cache and a flaky preview
+// retries soon.
 
-const cache = new Map(); // url -> PreviewData | null (null = failed)
+const cache = new LRU(300, 60 * 60 * 1000); // url -> PreviewData | null
+const FAIL_TTL = 5 * 60 * 1000;
 const inflight = new Map(); // url -> Promise
 
 function fetchPreview(url) {
@@ -16,7 +21,7 @@ function fetchPreview(url) {
 		.then((r) => (r.ok ? r.json() : null))
 		.catch(() => null)
 		.then((data) => {
-			cache.set(url, data);
+			cache.set(url, data, data === null ? FAIL_TTL : undefined);
 			inflight.delete(url);
 			return data;
 		});

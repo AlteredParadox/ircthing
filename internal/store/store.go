@@ -346,8 +346,13 @@ func (s *Store) SetReadMarker(ctx context.Context, network, target string, t tim
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	bufID, err := s.bufferID(ctx, network, target, true)
-	if err != nil {
+	// A marker never creates a buffer: it references reading state for
+	// scrollback that exists. Creation here let any malformed
+	// authenticated request mint phantom network/buffer rows that then
+	// appeared in every sidebar (and let a closed buffer resurrect via
+	// the markRead path). Unknown buffers are a silent no-op.
+	bufID, err := s.bufferID(ctx, network, target, false)
+	if err != nil || bufID == 0 {
 		return err
 	}
 	// Clamp to plausibility: a marker only means "read up to here", so
