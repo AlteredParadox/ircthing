@@ -16,8 +16,13 @@ import (
 // ceiling a negotiated LINELEN may raise the active limit up to, but
 // never past.
 const (
-	defaultIncomingLine   = 16 * 1024
+	defaultIncomingLine    = 16 * 1024
 	maxIncomingLineCeiling = 64 * 1024
+	// maxTagBytes is the IRCv3 message-tag budget that rides on top of a
+	// line's LINELEN (client tag budget is 4094; servers get more —
+	// 8191 is the conventional server-tag ceiling). Added to the reader
+	// limit so a tagged line at the advertised LINELEN is not cut off.
+	maxTagBytes = 8191
 )
 
 // boundedLineReader passes bytes through while counting the current

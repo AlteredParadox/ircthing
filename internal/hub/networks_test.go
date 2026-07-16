@@ -268,3 +268,57 @@ func TestWhoisMapBounded(t *testing.T) {
 		t.Fatalf("whois map = %d entries, want <= %d", len(whois), maxOpenWhois)
 	}
 }
+
+// A far-future server-time is distrusted at ingestion, so it cannot sort
+// a message to the bottom of scrollback or poison the read-marker clamp.
+func TestMessageTimeClampsFuture(t *testing.T) {
+	now := time.Now()
+	ev := func(tag string) irc.Event {
+		return irc.Event{
+			Network: "n", Kind: irc.EventMessage, Time: now,
+			Msg: ircv4.MustParseMessage("@time=" + tag + " :a!u@h PRIVMSG #c :hi"),
+		}
+	}
+	// A plausible (small-skew) tag is honored.
+	near := now.Add(time.Minute).UTC().Format(time.RFC3339Nano)
+	if got := messageTime(ev(near)); got.Sub(now.Add(time.Minute)).Abs() > time.Second {
+		t.Fatalf("near-future tag not honored: %v", got)
+	}
+	// A far-future tag falls back to the receipt time.
+	far := now.Add(100 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if got := messageTime(ev(far)); got.After(now.Add(serverTimeSkew)) {
+		t.Fatalf("far-future tag not clamped: %v", got)
+	}
+	// A past tag (chathistory replay) is honored.
+	past := now.Add(-24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if got := messageTime(ev(past)); got.After(now) {
+		t.Fatalf("past tag not honored: %v", got)
+	}
+}
+
+// An empty chathistory BATCH reference must not create histBatches[""],
+// which would classify all un-batched live traffic as replay (persisted
+// but never broadcast).
+func TestEmptyBatchRefIgnored(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+	// Bare "+" reference — must be ignored, not stored under "".
+	conn.ch <- ev(":srv BATCH + chathistory #go")
+	// A normal live message must still be broadcast (not swallowed as replay).
+	conn.ch <- ev(":alice!u@h PRIVMSG #go :live and visible")
+	got := decode[EventData](t, recv(t, s, "event"))
+	if got.Raw == "" || got.Sender != "alice" {
+		t.Fatalf("live message not broadcast: %+v", got)
+	}
+}

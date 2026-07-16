@@ -596,6 +596,15 @@ export function App() {
 		return () => clearInterval(t);
 	}, []);
 
+	// Clear the previous channel's roster/topic the instant the active
+	// buffer changes, so the members panel, topic bar, and op/kick/ban
+	// menu never render the old channel's data during the debounced
+	// get_channel round-trip below. Keyed on activeKey only (not
+	// chanTick), so live member updates don't flicker the panel.
+	useEffect(() => {
+		setChanInfo(null);
+	}, [activeKey]);
+
 	// Channel state (topic + members) for the active buffer. Debounced:
 	// members_changed hints arrive in bursts (NAMES floods, netsplits).
 	useEffect(() => {

@@ -870,8 +870,10 @@ func (m *Manager) serveLoop(ctx context.Context, lc *liveConn) error {
 		if in.Command == "005" {
 			// A negotiated LINELEN may legally exceed the default cap;
 			// raise the reader's limit (bounded by the hard ceiling) so
-			// long-but-legal lines are not cut off.
-			lc.blr.setLimit(m.lineLen())
+			// long-but-legal lines are not cut off. Add the IRCv3 message
+			// tag budget: LINELEN bounds the message + CRLF only, while
+			// tags ride on top and the reader counts every wire byte.
+			lc.blr.setLimit(m.lineLen() + maxTagBytes)
 		}
 		var affected []string
 		if !playback {
@@ -1007,7 +1009,9 @@ func (m *Manager) onLiveLine(in *ircv4.Message, send func([]*ircv4.Message) erro
 		}
 	}
 	m.roster.handle(m.Nick(), in)
-	m.trackJoinIntent(in)
+	if err := m.trackJoinIntent(in); err != nil {
+		return affected, err
+	}
 	return affected, nil
 }
 
@@ -1062,13 +1066,19 @@ func (m *Manager) maybeWHOX(channel string) *ircv4.Message {
 // trackJoinIntent keeps the rejoin set in step with our own JOINs and
 // PARTs. Runs on the read-loop goroutine, which is the only writer of
 // m.joined after construction.
-func (m *Manager) trackJoinIntent(in *ircv4.Message) {
+func (m *Manager) trackJoinIntent(in *ircv4.Message) error {
 	if in.Prefix == nil || !m.isup.FoldEqual(in.Prefix.Name, m.Nick()) {
-		return
+		return nil
 	}
 	switch in.Command {
 	case "JOIN":
 		if ch := in.Param(0); ch != "" {
+			if _, known := m.joined[ch]; !known && len(m.joined) >= maxJoinedChannels {
+				// A hostile server spoofing self-JOINs could otherwise
+				// grow this never-reset map without bound. No real client
+				// is in this many channels.
+				return fmt.Errorf("irc: joined-channel set exceeded %d", maxJoinedChannels)
+			}
 			m.joined[ch] = ch
 		}
 	case "PART":
@@ -1081,7 +1091,11 @@ func (m *Manager) trackJoinIntent(in *ircv4.Message) {
 			}
 		}
 	}
+	return nil
 }
+
+// maxJoinedChannels bounds the rejoin-intent set (see trackJoinIntent).
+const maxJoinedChannels = 4096
 
 // redactRaw prepares one raw IRC line for the debug log with credentials
 // removed: the PASS parameter (server password) and any non-control

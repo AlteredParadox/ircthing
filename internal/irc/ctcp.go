@@ -22,6 +22,9 @@ const ctcpVersion = "ircthing"
 // when msg carries none (or one we do not answer). The caller has
 // already checked that msg is a PRIVMSG addressed to us and not a
 // history replay.
+// maxCTCPPingToken caps the CTCP PING token we echo back (see below).
+const maxCTCPPingToken = 64
+
 func ctcpReply(msg *ircv4.Message) *ircv4.Message {
 	if msg.Prefix == nil || msg.Prefix.Name == "" || len(msg.Params) < 2 {
 		return nil
@@ -40,7 +43,14 @@ func ctcpReply(msg *ircv4.Message) *ircv4.Message {
 	case "VERSION":
 		reply = "VERSION " + ctcpVersion
 	case "PING":
-		// Echo the token back verbatim; the sender computes the latency.
+		// Echo the token back so the sender computes latency, but cap it:
+		// echoing an arbitrarily long attacker-supplied token verbatim
+		// would produce an over-length NOTICE that the writer rejects
+		// fatally (a remote reconnect-loop DoS). Real PING tokens are a
+		// timestamp; 64 bytes is ample.
+		if len(args) > maxCTCPPingToken {
+			args = args[:maxCTCPPingToken]
+		}
 		reply = strings.TrimSpace("PING " + args)
 	case "TIME":
 		reply = "TIME " + time.Now().Format(time.RFC1123)

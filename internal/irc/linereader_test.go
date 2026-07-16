@@ -61,3 +61,25 @@ func TestBoundedLineReader(t *testing.T) {
 		t.Fatalf("flood err = %v, want line-length error", err)
 	}
 }
+
+
+// A tagged line at a large advertised LINELEN is accepted: the reader
+// limit includes the message-tag budget on top of LINELEN.
+func TestLineReaderTagBudget(t *testing.T) {
+	// Simulate the manager's setLimit(lineLen + maxTagBytes) for a big
+	// advertised LINELEN, then feed a line at that LINELEN plus tags.
+	lineLen := 16384
+	br := newBoundedLineReader(strings.NewReader(""))
+	br.setLimit(lineLen + maxTagBytes)
+	if got := int(br.max.Load()); got < lineLen+4000 {
+		t.Fatalf("limit = %d, want room for LINELEN + tags", got)
+	}
+	// A line of LINELEN message bytes plus ~6 KB of tags fits.
+	line := "@" + strings.Repeat("t", 6000) + " " + strings.Repeat("x", lineLen) + "\n"
+	r := newBoundedLineReader(strings.NewReader(line))
+	r.setLimit(lineLen + maxTagBytes)
+	rd := bufio.NewReader(r)
+	if _, err := rd.ReadString('\n'); err != nil {
+		t.Fatalf("tagged line at LINELEN rejected: %v", err)
+	}
+}

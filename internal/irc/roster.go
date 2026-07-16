@@ -10,6 +10,14 @@ import (
 
 // Channel membership and topic tracking for one connection.
 //
+// maxRosterChannels and maxChannelMembers bound roster growth against a
+// hostile server spoofing self-JOINs or flooding NAMES. Legitimate use
+// (real channel membership) stays far below these.
+const (
+	maxRosterChannels = 4096
+	maxChannelMembers = 100_000
+)
+
 // Sources: NAMES on join (353 accumulated until 366), then live
 // JOIN/PART/KICK/QUIT/NICK/MODE/TOPIC/332/331/AWAY. Status prefixes are
 // kept as display characters, all of them ordered highest first when
@@ -188,6 +196,9 @@ func (r *roster) namesReply(m *ircv4.Message) {
 		st.pending = make(map[string]Member)
 	}
 	for _, raw := range strings.Fields(m.Param(3)) {
+		if len(st.pending) >= maxChannelMembers {
+			break // bound NAMES flood from a hostile server
+		}
 		prefix, nick := splitNamesPrefix(r.isup.PrefixSymbols(), raw)
 		st.pending[r.isup.Fold(nick)] = Member{Nick: nick, Prefix: prefix}
 	}
@@ -217,17 +228,25 @@ func (r *roster) namesEnd(m *ircv4.Message) {
 func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
 	ch := m.Param(0)
 	if ours {
+		// Bound the channel set against a server spoofing self-JOINs.
+		if _, known := r.chans[r.isup.Fold(ch)]; !known && len(r.chans) >= maxRosterChannels {
+			return
+		}
 		r.chans[r.isup.Fold(ch)] = &channelState{name: ch, members: make(map[string]Member)}
 	}
 	st := r.chans[r.isup.Fold(ch)]
 	if st == nil {
 		return
 	}
+	k := r.isup.Fold(sender)
+	if _, known := st.members[k]; !known && len(st.members) >= maxChannelMembers {
+		return
+	}
 	mem := Member{Nick: sender}
 	if acct := m.Param(1); len(m.Params) >= 3 && acct != "*" {
 		mem.Account = acct
 	}
-	st.members[r.isup.Fold(sender)] = mem
+	st.members[k] = mem
 }
 
 // rename re-keys a nick in every channel, keeping its state. Caller

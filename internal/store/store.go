@@ -76,6 +76,11 @@ var maxCursor = Cursor{TS: math.MaxInt64, ID: math.MaxInt64}
 // so the store pins this id rather than threading a user through the API.
 const defaultUserID = 1
 
+// markerSkewMs bounds how far ahead of now a read marker may be set,
+// tolerating clock skew while preventing a future-dated message from
+// poisoning the never-regressing marker.
+const markerSkewMs = 5 * 60 * 1000
+
 var ErrMsgIDNotFound = errors.New("store: msgid not found")
 
 type Options struct {
@@ -444,17 +449,13 @@ func (s *Store) SetReadMarker(ctx context.Context, network, target string, t tim
 		return err
 	}
 	// Clamp to plausibility: a marker only means "read up to here", so
-	// nothing past the newest stored message (or the present, for a
-	// quiet buffer) is meaningful. Without the clamp one buggy or
-	// malicious timestamp near MaxInt64 would suppress unread counts
-	// forever, because markers never regress.
-	var latest int64
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(MAX(ts), 0) FROM messages WHERE buffer_id = ?`,
-		bufID).Scan(&latest); err != nil {
-		return err
-	}
-	ts := min(t.UnixMilli(), max(latest, time.Now().UnixMilli()))
+	// nothing meaningfully past the present is valid. Ceilinged at
+	// now + a small skew tolerance rather than at the newest stored ts —
+	// a message carrying a far-future server-time would otherwise raise
+	// that ceiling and let one marker suppress unread counts forever
+	// (markers never regress). Legitimate clock skew stays within the
+	// tolerance.
+	ts := min(t.UnixMilli(), time.Now().UnixMilli()+markerSkewMs)
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO read_markers (buffer_id, ts) VALUES (?, ?)
 		 ON CONFLICT (buffer_id) DO UPDATE SET ts = max(ts, excluded.ts)`,

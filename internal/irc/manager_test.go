@@ -1,6 +1,7 @@
 package irc
 
 import (
+	"strconv"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -1254,4 +1255,27 @@ func TestManagerDisconnectsOnOversizedInternalLine(t *testing.T) {
 	s2 := accept(t, conns) // torn down, reconnects
 	s2.register("AlteredParadox")
 	waitState(t, m, StateRegistered)
+}
+
+// A server spoofing an unbounded stream of self-JOINs is torn down
+// rather than growing the never-reset rejoin set without bound.
+func TestManagerBoundsJoinedSet(t *testing.T) {
+	m, err := NewManager(Config{Addr: "x:1", Nick: "AlteredParadox", AllowPlaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.nick.Store("AlteredParadox")
+	var terr error
+	for i := 0; i <= maxJoinedChannels+1; i++ {
+		terr = m.trackJoinIntent(ircv4.MustParseMessage(":AlteredParadox!u@h JOIN #c" + strconv.Itoa(i)))
+		if terr != nil {
+			break
+		}
+	}
+	if terr == nil {
+		t.Fatal("no error after exceeding the joined-channel cap")
+	}
+	if len(m.joined) > maxJoinedChannels {
+		t.Fatalf("joined = %d, want <= %d", len(m.joined), maxJoinedChannels)
+	}
 }

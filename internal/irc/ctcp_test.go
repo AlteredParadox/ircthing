@@ -47,3 +47,22 @@ func TestCTCPReply(t *testing.T) {
 		})
 	}
 }
+
+// An over-length CTCP PING token is truncated so the auto-reply can
+// never exceed the line limit (which would fatally tear the connection
+// down — a remote reconnect-loop DoS).
+func TestCTCPPingTokenCapped(t *testing.T) {
+	huge := strings.Repeat("A", 4000)
+	reply := ctcpReply(ircv4.MustParseMessage(":pal!u@h PRIVMSG AlteredParadox :\x01PING " + huge + "\x01"))
+	if reply == nil {
+		t.Fatal("no reply")
+	}
+	// The serialized NOTICE must fit the default line limit.
+	if err := checkLineLen(reply, defaultLineLen); err != nil {
+		t.Fatalf("capped reply still over-length: %v", err)
+	}
+	body := strings.Trim(reply.Trailing(), "\x01")
+	if len(body) > len("PING ")+maxCTCPPingToken {
+		t.Fatalf("token not capped: %d bytes", len(body))
+	}
+}

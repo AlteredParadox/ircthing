@@ -217,8 +217,14 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 		h.trackHistoryBatch(ev, c, histBatches, backfillPages)
 		return nil
 	}
-	batch := histBatches[ev.Msg.Tags["batch"]]
-	replay := batch != nil
+	// An empty batch tag must never match: histBatches[""] could exist
+	// if a server opened a chathistory batch with a bare "+" reference
+	// (guarded below in trackHistoryBatch), and would then classify all
+	// un-batched live traffic as replay — persisted but never
+	// broadcast.
+	batchRef := ev.Msg.Tags["batch"]
+	replay := batchRef != "" && histBatches[batchRef] != nil
+	batch := histBatches[batchRef]
 	if replay {
 		// Track the batch's own newest message as the anchor for the
 		// next page: live traffic may already have stored rows newer
@@ -650,6 +656,9 @@ func (h *Hub) trackHistoryBatch(ev irc.Event, c Conn, batches map[string]*histBa
 	ref := ev.Msg.Params[0]
 	switch {
 	case strings.HasPrefix(ref, "+") && strings.Contains(ev.Msg.Param(1), "chathistory"):
+		if ref[1:] == "" {
+			return // empty reference: ignore, or it becomes histBatches[""]
+		}
 		if len(batches) >= maxOpenHistBatches {
 			return // bound the map; the manager tears the connection down at this cap
 		}
@@ -927,11 +936,26 @@ func defaultIsChannel(target string) bool {
 func messageTime(ev irc.Event) time.Time {
 	if v, ok := ev.Msg.Tags["time"]; ok {
 		if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
-			return t
+			// Reject an implausible far-future server-time (clock skew or
+			// a malicious server): it would sort the message to the
+			// bottom of scrollback permanently and poison the
+			// read-marker clamp (which ceilings on the newest ts). Fall
+			// back to our receipt time.
+			ref := ev.Time
+			if ref.IsZero() {
+				ref = time.Now()
+			}
+			if !t.After(ref.Add(serverTimeSkew)) {
+				return t
+			}
 		}
 	}
 	return ev.Time
 }
+
+// serverTimeSkew is how far ahead of receipt a server-time tag may be
+// before we distrust it (clock skew allowance).
+const serverTimeSkew = 5 * time.Minute
 
 // storeMessage converts an event to its stored form.
 func storeMessage(ev irc.Event) store.Message {

@@ -159,8 +159,8 @@ func TestReadMarkerClamped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Near-MaxInt64 clamps to now (not the message: reading a quiet
-	// buffer "up to now" is legitimate).
+	// Near-MaxInt64 clamps to now + a small skew tolerance, not to the
+	// far-future value — so it cannot suppress real traffic forever.
 	if err := s.SetReadMarker(ctx, "net", "#x", time.UnixMilli(1<<62)); err != nil {
 		t.Fatal(err)
 	}
@@ -168,13 +168,13 @@ func TestReadMarkerClamped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.After(time.Now().Add(time.Minute)) {
-		t.Fatalf("marker %v not clamped", got)
+	if got.After(time.Now().Add(6 * time.Minute)) {
+		t.Fatalf("marker %v not clamped to ~now", got)
 	}
-	// The clamp was to "now", so a message arriving later still counts
-	// as unread — the poison attempt bought nothing.
+	// A message arriving well beyond the skew window is still unread —
+	// the poison attempt could not mark future traffic as read.
 	if _, err := s.Append(ctx, "net", "#x", Message{
-		Time: time.Now().Add(2 * time.Minute), Sender: "a", Command: "PRIVMSG", Raw: ":a PRIVMSG #x :later",
+		Time: time.Now().Add(30 * time.Minute), Sender: "a", Command: "PRIVMSG", Raw: ":a PRIVMSG #x :later",
 	}); err != nil {
 		t.Fatal(err)
 	}
