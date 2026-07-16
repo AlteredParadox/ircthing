@@ -101,7 +101,7 @@ DCC file transfer/chat, IRCv3 vendor extensions other than soju.im ones we choos
 
 - Unit tests alongside all protocol code. Table-driven tests for message parsing/serialization edge cases.
 - Integration: `make integration` spins up a local Ergo IRCd in a container and runs end-to-end tests (connect, SASL, join, chathistory, reconnect-replay).
-- Run the relevant parts of `irctest` (https://github.com/progval/irctest) against our client behavior where applicable.
+- `make irctest` runs the client suite of `irctest` (https://github.com/progval/irctest) against the real binary: a pinned checkout plays the IRC server and drives our CAP/SASL/TLS/STS handshake via the controller in `integration/irctest/`. Needs `python3-venv`. Run it after changes to registration, SASL, TLS, or STS.
 - Frontend: component tests for the virtualized list and input handling; no heavyweight e2e framework — a small Playwright suite for smoke tests only.
 
 ## Working rules for Claude Code
