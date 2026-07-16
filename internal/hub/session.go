@@ -122,6 +122,16 @@ func (s *Session) Handle(ctx context.Context, env Envelope) {
 		s.handleGetPrefs(ctx, env)
 	case "set_prefs":
 		s.handleSetPrefs(ctx, env)
+	case "get_networks":
+		s.handleGetNetworks(ctx, env)
+	case "put_network":
+		s.handlePutNetwork(ctx, env)
+	case "delete_network":
+		s.handleDeleteNetwork(ctx, env)
+	case "join_channel":
+		s.handleJoinChannel(ctx, env, true)
+	case "part_channel":
+		s.handleJoinChannel(ctx, env, false)
 	default:
 		// Unknown message types are ignored, not errored (protocol
 		// forward-compatibility rule).

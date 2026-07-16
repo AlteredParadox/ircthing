@@ -25,7 +25,7 @@ import (
 
 	"ircthing/internal/api"
 	"ircthing/internal/hub"
-	"ircthing/internal/irc"
+	"ircthing/internal/netconf"
 	"ircthing/internal/store"
 	"ircthing/web"
 )
@@ -64,30 +64,39 @@ func run(cfg *config) error {
 
 	h := hub.New(st)
 
-	// Per network: one manager (its Run is the read loop) plus one hub
-	// consumer for its events.
+	// Networks live in the database and are managed from the web UI. The
+	// config file's networks[] seeds the table on first run only; once
+	// rows exist the file list is ignored.
 	var wg sync.WaitGroup
-	for _, nc := range cfg.Networks {
-		icfg, err := nc.ircConfig()
+	h.UseRoot(ctx, &wg)
+	seedRows, err := hub.SeedRows(cfg.Networks)
+	if err != nil {
+		return fmt.Errorf("networks: %w", err)
+	}
+	seeded, err := st.SeedNetworkConfigs(ctx, seedRows)
+	if err != nil {
+		return fmt.Errorf("networks: %w", err)
+	}
+	if seeded {
+		log.Printf("networks: imported %d definitions from the config file", len(seedRows))
+	}
+	stored, err := st.NetworkConfigs(ctx)
+	if err != nil {
+		return fmt.Errorf("networks: %w", err)
+	}
+	if !seeded && len(cfg.Networks) > 0 {
+		log.Printf("networks: %d definitions in database; config file networks[] is ignored (manage networks in the web UI)", len(stored))
+	}
+	for _, row := range stored {
+		nc, err := netconf.Parse([]byte(row.Config))
 		if err != nil {
-			return err
+			// A bad stored row should not take the daemon down with it.
+			log.Printf("networks: skipping %q: %v", row.Name, err)
+			continue
 		}
-		// STS policies persist in the store so upgrade-to-TLS survives
-		// restarts.
-		icfg.STS = st
-		m, err := irc.NewManager(icfg)
-		if err != nil {
-			return fmt.Errorf("network %q: %w", nc.effectiveName(), err)
+		if err := h.StartNetwork(nc); err != nil {
+			log.Printf("networks: starting %q: %v", row.Name, err)
 		}
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			m.Run(ctx)
-		}()
-		go func() {
-			defer wg.Done()
-			h.Run(ctx, m)
-		}()
 	}
 
 	assets, err := fs.Sub(web.Dist, "dist")

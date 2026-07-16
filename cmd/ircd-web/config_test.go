@@ -105,7 +105,7 @@ func TestConfigDefaultsAndMapping(t *testing.T) {
 		t.Fatalf("sessionTTL with no config = %v, want 0 (api default)", cfg.sessionTTL())
 	}
 
-	ic, err := cfg.Networks[0].ircConfig()
+	ic, err := cfg.Networks[0].IRCConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,10 +120,10 @@ func TestConfigDefaultsAndMapping(t *testing.T) {
 	}
 
 	second := cfg.Networks[1]
-	if second.effectiveName() != "irc.other.net:6667" {
-		t.Fatalf("effectiveName = %q", second.effectiveName())
+	if second.EffectiveName() != "irc.other.net:6667" {
+		t.Fatalf("effectiveName = %q", second.EffectiveName())
 	}
-	sc, err := second.ircConfig()
+	sc, err := second.IRCConfig()
 	if err != nil {
 		t.Fatal(err)
 	}

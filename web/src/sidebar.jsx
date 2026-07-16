@@ -1,6 +1,6 @@
 import { useRef, useState } from "preact/hooks";
 import { pressable } from "./a11y.js";
-import { longPress } from "./menu.jsx";
+import { longPress, menuTrigger } from "./menu.jsx";
 import { bufKey, nickColor } from "./irc.js";
 
 function stateDot(state) {
@@ -9,7 +9,7 @@ function stateDot(state) {
 	return "offline";
 }
 
-export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSet, onSelect, onSettings, onBufferMenu, onAddMonitor, onRemoveMonitor }) {
+export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSet, onSelect, onSettings, onBufferMenu, onNetworkMenu, onAddNetwork, onAddMonitor, onRemoveMonitor }) {
 	// One shared flag: a long-press that opened a menu suppresses the tap
 	// that follows it.
 	const pressFired = useRef(false);
@@ -35,11 +35,12 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSe
 				<div class="logo">λ</div>
 				<div class="side-title">ircthing</div>
 				<div class="side-meta">{sections.length} net{sections.length === 1 ? "" : "s"}</div>
+				<button class="monitor-addbtn" title="Add network" onClick={onAddNetwork}>+</button>
 			</div>
 			<div class="side-list scroll">
 				{sections.map((sec) => (
 					<div class="net-group" key={sec.name}>
-						<div class="net-head">
+						<div class="net-head has-menu" {...menuTrigger((x, y) => onNetworkMenu(sec.name, x, y))}>
 							<span class={"dot " + stateDot(sec.state)} />
 							<span>{sec.name}</span>
 						</div>

@@ -76,7 +76,15 @@ loudly. See `config.example.json` for a complete example.
 | `session_ttl_days` | Login cookie lifetime. Default 30. |
 | `ring_size` | Hot scrollback kept in memory per buffer. Default 200; older history is read from SQLite. |
 
-Per network (`networks[]`):
+Networks are managed from the web UI: the **+** button in the sidebar
+adds one; clicking a network's name offers *Join channel*, *Edit
+network* (rename keeps the scrollback; saving reconnects), and — inside
+the edit form — removal, which deletes the network's scrollback too.
+Definitions live in the database; the config file's `networks[]` seeds
+it on the **first run only** and is ignored once the table has rows, so
+it can be left empty when starting fresh.
+
+Per network (`networks[]` seed / edit form):
 
 | Field | Meaning |
 |---|---|
@@ -87,7 +95,7 @@ Per network (`networks[]`):
 | `nick`, `username`, `realname` | Identity. `username`/`realname` default to the nick. |
 | `pass` | Server password (`PASS`), rarely needed. |
 | `sasl` | `mechanism` `""` picks automatically (EXTERNAL without a password, else SCRAM-SHA-256 when offered, else PLAIN). `cert_file`/`key_file` supply the client certificate for EXTERNAL. |
-| `channels` | Joined after every registration, so they come back on reconnect. |
+| `channels` | Joined after every registration, so they come back on reconnect. The UI keeps this in sync: joining via the network menu adds to it, the *Leave channel* action removes. |
 
 ## Deployment
 

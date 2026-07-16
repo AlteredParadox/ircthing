@@ -315,3 +315,40 @@ func envelope(typ string, seq int64, data any) Envelope {
 func errEnvelope(seq int64, code, msg string) Envelope {
 	return envelope("error", seq, ErrorData{Code: code, Message: msg})
 }
+
+// ---- network management (get_networks / put_network / delete_network,
+// join_channel / part_channel) ----
+
+// NetworkConfigData is one stored network definition plus its live
+// connection state ("" when not running).
+type NetworkConfigData struct {
+	Name   string          `json:"name"`
+	State  string          `json:"state,omitempty"`
+	Config json.RawMessage `json:"config"`
+}
+
+// NetworksData answers "get_networks".
+type NetworksData struct {
+	Networks []NetworkConfigData `json:"networks"`
+}
+
+// PutNetworkReq adds or edits a network. OldName identifies the
+// definition being edited (empty = add); a differing effective name in
+// Config renames, carrying the stored history along.
+type PutNetworkReq struct {
+	OldName string          `json:"old_name,omitempty"`
+	Config  json.RawMessage `json:"config"`
+}
+
+// NetworkRef names a network ("delete_network" request,
+// "network_removed" push).
+type NetworkRef struct {
+	Network string `json:"network"`
+}
+
+// ChannelRef names a channel on a network ("join_channel" /
+// "part_channel").
+type ChannelRef struct {
+	Network string `json:"network"`
+	Channel string `json:"channel"`
+}

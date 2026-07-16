@@ -7,6 +7,7 @@ import { applyPrefs, loadPrefs, normalizePrefs, resolveTheme, savePrefs } from "
 import { isIgnored, isMuted, loadIgnores, loadMutes, toggleIgnore, toggleMute } from "./local.js";
 import { ContextMenu } from "./menu.jsx";
 import { Members } from "./members.jsx";
+import { ChannelPrompt, NetworkForm } from "./netform.jsx";
 import { SearchOverlay } from "./search.jsx";
 import { Settings } from "./settings.jsx";
 import { Sidebar } from "./sidebar.jsx";
@@ -197,6 +198,14 @@ export function App() {
 	const [connected, setConnected] = useState(false);
 	const [networks, setNetworks] = useState({});
 	const [buffers, setBuffers] = useState({});
+	// Network management: the add/edit form ({ initial, oldName } | null)
+	// and the join-channel prompt ({ network } | null), with the last
+	// server error for each.
+	const [netForm, setNetForm] = useState(null);
+	const [netFormError, setNetFormError] = useState("");
+	const [netFormBusy, setNetFormBusy] = useState(false);
+	const [chanPrompt, setChanPrompt] = useState(null);
+	const [chanPromptError, setChanPromptError] = useState("");
 	const [msgs, setMsgs] = useState({});
 	const [activeKey, setActiveKey] = useState(() => {
 		const h = parseHash(location.hash);
@@ -423,6 +432,32 @@ export function App() {
 					location.hash = toHash(ev.network, ev.buffer);
 					setActiveKey(key);
 				});
+			}
+		});
+
+		// A network was deleted or renamed away: drop its buffers and
+		// state. New/renamed networks introduce themselves via "state"
+		// pushes and the buffer refresh.
+		s.on("network_removed", (d) => {
+			setNetworks((n) => {
+				const next = { ...n };
+				delete next[d.network];
+				return next;
+			});
+			const gone = Object.values(buffersRef.current).filter((b) => b.network === d.network);
+			setBuffers((b) => {
+				const next = { ...b };
+				for (const g of gone) delete next[g.key];
+				return next;
+			});
+			setMsgs((m) => {
+				let next = m;
+				for (const g of gone) next = dropBufferMsgs(next, g.key);
+				return next;
+			});
+			if (gone.some((g) => g.key === activeKeyRef.current)) {
+				setActiveKey(null);
+				location.hash = "";
 			}
 		});
 
@@ -742,12 +777,67 @@ export function App() {
 			? {
 				label: "Leave channel", danger: true,
 				onClick: () => {
-					sendCommand(network, "PART", [buffer]);
+					// part_channel also removes the channel from autojoin.
+					sock.current?.request("part_channel", { network, channel: buffer })
+						.catch(() => sendCommand(network, "PART", [buffer]));
 					closeBuffer(network, buffer);
 				},
 			}
 			: { label: "Close", danger: true, onClick: () => closeBuffer(network, buffer) });
 		setMenu({ x, y, title: buffer, items });
+	}
+
+	// openNetworkMenu: click/right-click on a network header row.
+	function openNetworkMenu(network, x, y) {
+		setMenu({
+			x, y, title: network,
+			items: [
+				{ label: "Join channel…", onClick: () => { setChanPromptError(""); setChanPrompt({ network }); } },
+				{ label: "Edit network…", onClick: () => editNetwork(network) },
+				{ label: "Add network…", onClick: () => { setNetFormError(""); setNetForm({ initial: null, oldName: "" }); } },
+			],
+		});
+	}
+
+	function editNetwork(network) {
+		sock.current?.request("get_networks", null).then((d) => {
+			const n = (d.networks || []).find((x) => x.name === network);
+			if (!n) return;
+			setNetFormError("");
+			setNetForm({ initial: n.config, oldName: network });
+		}).catch(() => {});
+	}
+
+	function saveNetwork(cfg, oldName) {
+		setNetFormBusy(true);
+		sock.current?.request("put_network", { old_name: oldName || undefined, config: cfg })
+			.then(() => {
+				setNetForm(null);
+				setNetFormError("");
+			})
+			.catch((e) => setNetFormError(e.message || "saving failed"))
+			.finally(() => setNetFormBusy(false));
+	}
+
+	function deleteNetwork(name) {
+		setNetFormBusy(true);
+		sock.current?.request("delete_network", { network: name })
+			.then(() => {
+				setNetForm(null);
+				setNetFormError("");
+			})
+			.catch((e) => setNetFormError(e.message || "deleting failed"))
+			.finally(() => setNetFormBusy(false));
+	}
+
+	function joinChannel(network, channel) {
+		sock.current?.request("join_channel", { network, channel })
+			.then(() => {
+				setChanPrompt(null);
+				setChanPromptError("");
+				select(network, channel);
+			})
+			.catch((e) => setChanPromptError(e.message || "join failed"));
 	}
 
 	// jumpTo opens a search result: load a window centered on the message
@@ -859,7 +949,8 @@ export function App() {
 					networks={networks} buffers={buffers} activeKey={activeKey}
 					monitors={monitors} theme={theme} mutedSet={mutedSet} onSelect={select}
 					onSettings={() => setSettingsOpen(true)}
-					onBufferMenu={openBufferMenu}
+					onBufferMenu={openBufferMenu} onNetworkMenu={openNetworkMenu}
+					onAddNetwork={() => { setNetFormError(""); setNetForm({ initial: null, oldName: "" }); }}
 					onAddMonitor={addMonitor} onRemoveMonitor={removeMonitor}
 				/>
 			</div>
@@ -930,6 +1021,21 @@ export function App() {
 					networks={networks} rules={rules} onRules={updateRules}
 					prefs={prefs} onPrefs={updatePrefs}
 					notifier={notifier.current} onClose={() => setSettingsOpen(false)}
+				/>
+			)}
+			{netForm && (
+				<NetworkForm
+					key={netForm.oldName || "new"}
+					initial={netForm.initial} oldName={netForm.oldName}
+					error={netFormError} busy={netFormBusy}
+					onSave={saveNetwork} onDelete={deleteNetwork}
+					onClose={() => setNetForm(null)}
+				/>
+			)}
+			{chanPrompt && (
+				<ChannelPrompt
+					network={chanPrompt.network} error={chanPromptError}
+					onJoin={joinChannel} onClose={() => setChanPrompt(null)}
 				/>
 			)}
 			<ContextMenu menu={menu} onClose={() => setMenu(null)} />

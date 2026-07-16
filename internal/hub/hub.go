@@ -53,11 +53,18 @@ type Conn interface {
 type Hub struct {
 	store *store.Store
 
+	// Root lifetime for dynamically started networks (see UseRoot).
+	rootCtx context.Context
+	rootWG  *sync.WaitGroup
+	// netOps serializes network start/stop/config operations.
+	netOps sync.Mutex
+
 	mu         sync.Mutex
 	networks   map[string]Conn
 	states     map[string]string          // last known connection state per network
 	presence   map[string]map[string]bool // network -> monitored nick -> online (MONITOR)
 	motdWanted map[string]bool            // networks with an explicit /motd pending
+	procs      map[string]*netProc        // running network lifecycles
 	sessions   map[*Session]struct{}
 }
 
@@ -68,6 +75,7 @@ func New(st *store.Store) *Hub {
 		states:     make(map[string]string),
 		presence:   make(map[string]map[string]bool),
 		motdWanted: make(map[string]bool),
+		procs:      make(map[string]*netProc),
 		sessions:   make(map[*Session]struct{}),
 	}
 }

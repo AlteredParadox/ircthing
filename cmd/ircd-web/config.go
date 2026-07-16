@@ -1,14 +1,13 @@
 package main
 
 import (
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"time"
 
-	"ircthing/internal/irc"
+	"ircthing/internal/netconf"
 )
 
 // Config file: JSON (stdlib, no dependency), parsed strictly — unknown
@@ -21,9 +20,13 @@ type config struct {
 	Listen string `json:"listen"`
 	// Database is the SQLite path, created on first run. Default
 	// ircthing.db in the working directory.
-	Database string      `json:"database"`
-	User     userConfig  `json:"user"`
-	Networks []netConfig `json:"networks"`
+	Database string     `json:"database"`
+	User     userConfig `json:"user"`
+	// Networks seeds the database on first run only: once the
+	// network_configs table is non-empty (including after adding a
+	// network in the web UI), the database is the source of truth and
+	// this list is ignored. Manage networks from the UI thereafter.
+	Networks []netconf.Network `json:"networks"`
 	// RingSize overrides the per-buffer hot scrollback bound (messages
 	// kept in memory per channel/query). 0 = default.
 	RingSize int `json:"ring_size"`
@@ -36,39 +39,6 @@ type userConfig struct {
 	// PasswordHash is a bcrypt hash; generate one with
 	// `ircd-web -hash-password`.
 	PasswordHash string `json:"password_hash"`
-}
-
-type netConfig struct {
-	Name           string `json:"name"`
-	Addr           string `json:"addr"`
-	TLS            bool   `json:"tls"`
-	AllowPlaintext bool   `json:"allow_plaintext"`
-	// TrustedFingerprints pins the server certificate: hex SHA-256 of the
-	// leaf cert. A match replaces CA verification (for self-signed
-	// servers).
-	TrustedFingerprints []string `json:"trusted_fingerprints"`
-	// Proxy routes this network through "socks5://[user:pass@]host:port"
-	// (DNS resolved proxy-side, Tor-friendly) or "http://host:port"
-	// (CONNECT tunnel). Empty connects directly.
-	Proxy    string      `json:"proxy"`
-	Nick     string      `json:"nick"`
-	Username string      `json:"username"`
-	Realname string      `json:"realname"`
-	Pass     string      `json:"pass"`
-	SASL     *saslConfig `json:"sasl"`
-	Channels []string    `json:"channels"`
-}
-
-type saslConfig struct {
-	// Mechanism is "PLAIN", "EXTERNAL", "SCRAM-SHA-256", or "" to choose
-	// automatically (EXTERNAL when no password, else SCRAM-SHA-256 if
-	// offered, else PLAIN).
-	Mechanism string `json:"mechanism"`
-	Login     string `json:"login"`
-	Password  string `json:"password"`
-	// CertFile/KeyFile provide the TLS client certificate for EXTERNAL.
-	CertFile string `json:"cert_file"`
-	KeyFile  string `json:"key_file"`
 }
 
 func loadConfig(path string) (*config, error) {
@@ -102,58 +72,16 @@ func (c *config) validate() error {
 	}
 	seen := make(map[string]bool)
 	for i, n := range c.Networks {
-		if n.Addr == "" {
-			return fmt.Errorf("networks[%d]: addr is required", i)
+		if err := n.Validate(); err != nil {
+			return fmt.Errorf("networks[%d]: %w", i, err)
 		}
-		name := n.effectiveName()
+		name := n.EffectiveName()
 		if seen[name] {
 			return fmt.Errorf("networks[%d]: duplicate network name %q", i, name)
 		}
 		seen[name] = true
 	}
 	return nil
-}
-
-// effectiveName mirrors irc.Config's Name default so the duplicate check
-// matches what the hub registry will see.
-func (n *netConfig) effectiveName() string {
-	if n.Name != "" {
-		return n.Name
-	}
-	return n.Addr
-}
-
-func (n *netConfig) ircConfig() (irc.Config, error) {
-	cfg := irc.Config{
-		Name:                n.Name,
-		Addr:                n.Addr,
-		TLS:                 n.TLS,
-		AllowPlaintext:      n.AllowPlaintext,
-		TrustedFingerprints: n.TrustedFingerprints,
-		Proxy:               n.Proxy,
-		Nick:                n.Nick,
-		Username:            n.Username,
-		Realname:            n.Realname,
-		Pass:                n.Pass,
-		Channels:            n.Channels,
-	}
-	if n.SASL != nil {
-		cfg.SASL = &irc.SASLConfig{
-			Mechanism: n.SASL.Mechanism,
-			Login:     n.SASL.Login,
-			Password:  n.SASL.Password,
-		}
-		// A client certificate (SASL EXTERNAL) is presented during the
-		// TLS handshake.
-		if n.SASL.CertFile != "" {
-			cert, err := tls.LoadX509KeyPair(n.SASL.CertFile, n.SASL.KeyFile)
-			if err != nil {
-				return irc.Config{}, fmt.Errorf("network %q: loading client certificate: %w", n.effectiveName(), err)
-			}
-			cfg.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
-		}
-	}
-	return cfg, nil
 }
 
 func (c *config) sessionTTL() time.Duration {
