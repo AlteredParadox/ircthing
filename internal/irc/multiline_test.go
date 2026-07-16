@@ -2,6 +2,7 @@ package irc
 
 import (
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -14,7 +15,10 @@ func runBatch(t *testing.T, lines ...string) (emitted []*ircv4.Message, consumed
 	t.Helper()
 	ml := newMultiline()
 	for _, l := range lines {
-		emit, consumed := ml.feed(ircv4.MustParseMessage(l))
+		emit, consumed, err := ml.feed(ircv4.MustParseMessage(l))
+		if err != nil {
+			t.Fatalf("feed(%q): %v", l, err)
+		}
 		if consumed {
 			consumedCount++
 		}
@@ -108,7 +112,10 @@ func TestMultilineReconstruct(t *testing.T) {
 
 	t.Run("untagged messages pass through", func(t *testing.T) {
 		ml := newMultiline()
-		_, consumed := ml.feed(ircv4.MustParseMessage(":a!u@h PRIVMSG #go :normal"))
+		_, consumed, err := ml.feed(ircv4.MustParseMessage(":a!u@h PRIVMSG #go :normal"))
+		if err != nil {
+			t.Fatal(err)
+		}
 		if consumed {
 			t.Fatal("normal message consumed")
 		}
@@ -271,4 +278,64 @@ func TestSendRejectsFramingBytes(t *testing.T) {
 	if err := m.Send(&ircv4.Message{Command: "PRIVMSG", Params: []string{"#chan", "hello"}}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+
+func TestMultilineIncomingLimits(t *testing.T) {
+	t.Run("too many open batches", func(t *testing.T) {
+		ml := newMultiline()
+		for i := 0; i < maxOpenMLBatches; i++ {
+			ref := "b" + strconv.Itoa(i)
+			if _, _, err := ml.feed(ircv4.MustParseMessage(":s BATCH +" + ref + " draft/multiline #go")); err != nil {
+				t.Fatalf("batch %d: %v", i, err)
+			}
+		}
+		_, consumed, err := ml.feed(ircv4.MustParseMessage(":s BATCH +over draft/multiline #go"))
+		if err == nil || !consumed {
+			t.Fatalf("over-limit open: consumed=%v err=%v, want consumed + error", consumed, err)
+		}
+	})
+
+	t.Run("too many lines", func(t *testing.T) {
+		ml := newMultiline()
+		ml.feed(ircv4.MustParseMessage(":s BATCH +r draft/multiline #go"))
+		var err error
+		for i := 0; i <= maxMLBatchLines; i++ {
+			_, _, err = ml.feed(ircv4.MustParseMessage("@batch=r :a!u@h PRIVMSG #go :x"))
+			if err != nil {
+				break
+			}
+		}
+		if err == nil {
+			t.Fatal("no error after exceeding the line ceiling")
+		}
+	})
+
+	t.Run("too many bytes", func(t *testing.T) {
+		ml := newMultiline()
+		ml.feed(ircv4.MustParseMessage(":s BATCH +r draft/multiline #go"))
+		chunk := "@batch=r;draft/multiline-concat :a!u@h PRIVMSG #go :" + strings.Repeat("y", 400)
+		var err error
+		for i := 0; i < maxMLBatchBytes/400+2; i++ {
+			_, _, err = ml.feed(ircv4.MustParseMessage(chunk))
+			if err != nil {
+				break
+			}
+		}
+		if err == nil {
+			t.Fatal("no error after exceeding the byte ceiling")
+		}
+	})
+
+	t.Run("a normal batch is unaffected", func(t *testing.T) {
+		emitted, _ := runBatch(t,
+			":a!u@h BATCH +e draft/multiline #go",
+			"@batch=e :a!u@h PRIVMSG #go :one",
+			"@batch=e :a!u@h PRIVMSG #go :two",
+			":a!u@h BATCH -e",
+		)
+		if len(emitted) != 1 || emitted[0].Trailing() != "one\ntwo" {
+			t.Fatalf("normal batch = %+v", emitted)
+		}
+	})
 }

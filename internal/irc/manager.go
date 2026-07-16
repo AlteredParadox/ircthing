@@ -853,7 +853,9 @@ func (m *Manager) serveLoop(ctx context.Context, lc *liveConn) error {
 		if err := m.serviceLine(ctx, lc, in); err != nil {
 			return err
 		}
-		if m.feedMultiline(ctx, ml, in) {
+		if consumed, err := m.feedMultiline(ctx, ml, in); err != nil {
+			return err
+		} else if consumed {
 			continue
 		}
 		trackChathistoryBatch(in, histBatch)
@@ -907,12 +909,15 @@ func (m *Manager) readMessage(lc *liveConn) (*ircv4.Message, error) {
 // feedMultiline runs draft/multiline reconstruction: batch lines are
 // buffered (consumed, not processed further) and the single
 // reconstructed message is emitted when the batch closes.
-func (m *Manager) feedMultiline(ctx context.Context, ml *multiline, in *ircv4.Message) (consumed bool) {
-	emit, consumed := ml.feed(in)
+func (m *Manager) feedMultiline(ctx context.Context, ml *multiline, in *ircv4.Message) (consumed bool, err error) {
+	emit, consumed, err := ml.feed(in)
+	if err != nil {
+		return consumed, err
+	}
 	if emit != nil {
 		m.emit(ctx, Event{Kind: EventMessage, Msg: emit})
 	}
-	return consumed
+	return consumed, nil
 }
 
 // serviceLine answers protocol housekeeping on a line: server PINGs and

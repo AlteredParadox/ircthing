@@ -23,6 +23,19 @@ import (
 
 const concatTag = "draft/multiline-concat"
 
+// Defensive ceilings on INCOMING multiline reconstruction. A batch's
+// lines are consumed by the read loop (never reaching the bounded event
+// channel) and held in memory until the server sends the matching close,
+// so without these a malicious or compromised server could open batches
+// without bound or stream indefinitely into one. These are independent
+// of any draft/multiline limits we advertise for our own sends (those
+// bound what WE send); exceeding any of them tears the connection down.
+const (
+	maxOpenMLBatches = 8
+	maxMLBatchLines  = 1024
+	maxMLBatchBytes  = 64 * 1024
+)
+
 // mlAccum accumulates one open multiline batch.
 type mlAccum struct {
 	target  string
@@ -31,6 +44,7 @@ type mlAccum struct {
 	tags    ircv4.Tags    // msgid/time for the whole message (from BATCH open)
 	body    strings.Builder
 	first   bool
+	lines   int
 }
 
 // multiline reconstructs incoming multiline batches. It is used only by
@@ -45,43 +59,66 @@ func newMultiline() *multiline {
 
 // feed processes one incoming message. consumed is true when the message
 // is part of a multiline batch (and must not be handled normally); emit
-// is non-nil only on batch close, carrying the reconstructed message.
-func (ml *multiline) feed(in *ircv4.Message) (emit *ircv4.Message, consumed bool) {
+// is non-nil only on batch close, carrying the reconstructed message. A
+// non-nil error means a defensive limit was exceeded and the caller must
+// tear the connection down.
+func (ml *multiline) feed(in *ircv4.Message) (emit *ircv4.Message, consumed bool, err error) {
 	// Batch open: "BATCH +<ref> draft/multiline <target>".
 	if in.Command == "BATCH" && len(in.Params) >= 3 &&
 		strings.HasPrefix(in.Params[0], "+") && in.Params[1] == "draft/multiline" {
+		if len(ml.batches) >= maxOpenMLBatches {
+			return nil, true, fmt.Errorf("irc: too many open multiline batches (>%d)", maxOpenMLBatches)
+		}
 		ml.batches[in.Params[0][1:]] = &mlAccum{
 			target: in.Params[2],
 			prefix: in.Prefix,
 			tags:   in.Tags.Copy(),
 			first:  true,
 		}
-		return nil, true
+		return nil, true, nil
 	}
 	// Batch close: reconstruct if it was a multiline batch we tracked.
 	if in.Command == "BATCH" && len(in.Params) >= 1 && strings.HasPrefix(in.Params[0], "-") {
 		ref := in.Params[0][1:]
 		acc, ok := ml.batches[ref]
 		if !ok {
-			return nil, false // some other batch type; let the caller handle it
+			return nil, false, nil // some other batch type; let the caller handle it
 		}
 		delete(ml.batches, ref)
-		return acc.build(), true
+		return acc.build(), true, nil
 	}
 	// A line inside a tracked multiline batch.
 	if ref := in.Tags["batch"]; ref != "" {
 		if acc, ok := ml.batches[ref]; ok {
-			acc.add(in)
-			return nil, true
+			if err := acc.add(in); err != nil {
+				return nil, true, err
+			}
+			return nil, true, nil
 		}
 	}
-	return nil, false
+	return nil, false, nil
 }
 
-// add appends one PRIVMSG/NOTICE line to the accumulated message.
-func (a *mlAccum) add(in *ircv4.Message) {
+// add appends one PRIVMSG/NOTICE line to the accumulated message, or
+// errors when the batch would exceed a defensive line/byte ceiling.
+func (a *mlAccum) add(in *ircv4.Message) error {
 	if in.Command != "PRIVMSG" && in.Command != "NOTICE" {
-		return // non-message lines in a multiline batch are ignored
+		return nil // non-message lines in a multiline batch are ignored
+	}
+	body := in.Trailing()
+	newline := !a.first
+	if _, concat := in.Tags[concatTag]; concat {
+		newline = false
+	}
+	sep := 0
+	if newline {
+		sep = 1
+	}
+	if a.lines+1 > maxMLBatchLines {
+		return fmt.Errorf("irc: multiline batch exceeded %d lines", maxMLBatchLines)
+	}
+	if a.body.Len()+sep+len(body) > maxMLBatchBytes {
+		return fmt.Errorf("irc: multiline batch exceeded %d bytes", maxMLBatchBytes)
 	}
 	if a.first {
 		a.command = in.Command
@@ -89,10 +126,12 @@ func (a *mlAccum) add(in *ircv4.Message) {
 			a.prefix = in.Prefix
 		}
 		a.first = false
-	} else if _, concat := in.Tags[concatTag]; !concat {
+	} else if newline {
 		a.body.WriteByte('\n')
 	}
-	a.body.WriteString(in.Trailing())
+	a.body.WriteString(body)
+	a.lines++
+	return nil
 }
 
 // build synthesizes the single reconstructed message, or nil if the batch

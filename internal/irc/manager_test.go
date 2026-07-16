@@ -1153,3 +1153,30 @@ func TestManagerJoinPrecedesUserMessage(t *testing.T) {
 	}
 	t.Fatal("never saw the PRIVMSG")
 }
+
+// A server streaming an oversized incoming multiline batch is
+// disconnected rather than allowed to grow memory without bound.
+func TestManagerDisconnectsOversizedBatch(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	s.send(":srv BATCH +b draft/multiline #go")
+	line := "@batch=b;draft/multiline-concat :a!u@h PRIVMSG #go :" + strings.Repeat("z", 500)
+	for i := 0; i < maxMLBatchBytes/500+4; i++ {
+		s.send(line)
+	}
+
+	// The manager tears the connection down and reconnects (testCfg
+	// backoff is short), so a second connection arrives.
+	s2 := accept(t, conns)
+	s2.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+}
