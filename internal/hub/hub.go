@@ -232,7 +232,7 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 		}
 		return nil
 	case "MARKREAD": // marker state, never persisted
-		h.applyUpstreamMarker(ctx, ev)
+		h.applyUpstreamMarker(ctx, c, ev)
 		return nil
 	case "REDACT": // updates an existing row, not a new one
 		h.applyRedaction(ctx, ev, c, replay)
@@ -283,6 +283,10 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	if !ok {
 		return nil
 	}
+	// Resolve to the stored spelling: an echoed message can carry
+	// client-supplied casing, and #Go/#go must not split into two
+	// buffers.
+	target = h.store.CanonicalBuffer(ctx, ev.Network, target, c.Fold)
 	// Our own PART must not create a buffer: the UI's "Leave channel"
 	// deletes the stored buffer (close_buffer) while our PART echo is
 	// still in flight, and either arrival order must leave it closed.
@@ -406,7 +410,7 @@ func (h *Hub) lastStored(ctx context.Context, network, target string) (int64, st
 // client of our account read something, or a reply to our get/set) into
 // the store and tells sessions. The store clamps regressions, so the
 // pushed value is always the newest known position.
-func (h *Hub) applyUpstreamMarker(ctx context.Context, ev irc.Event) {
+func (h *Hub) applyUpstreamMarker(ctx context.Context, c Conn, ev irc.Event) {
 	target := ev.Msg.Param(0)
 	sel := ev.Msg.Param(1)
 	v, ok := strings.CutPrefix(sel, "timestamp=")
@@ -417,6 +421,7 @@ func (h *Hub) applyUpstreamMarker(ctx context.Context, ev irc.Event) {
 	if err != nil {
 		return
 	}
+	target = h.store.CanonicalBuffer(ctx, ev.Network, target, c.Fold)
 	if err := h.store.SetReadMarker(ctx, ev.Network, target, t); err != nil {
 		log.Printf("irc[%s]: upstream read marker for %q: %v", ev.Network, target, err)
 		return
@@ -726,6 +731,7 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 	if !c.IsChannel(target) && ev.Msg.Prefix != nil && c.Fold(target) == c.Fold(c.Nick()) {
 		buffer = ev.Msg.Prefix.Name
 	}
+	buffer = h.store.CanonicalBuffer(ctx, ev.Network, buffer, c.Fold)
 	ok, err := h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason)
 	if err != nil {
 		log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)

@@ -39,10 +39,16 @@ function thumbSrc(url) {
 export function LinkPreview({ url }) {
 	const [data, setData] = useState(() => (cache.has(url) ? cache.get(url) : undefined));
 
+	// Re-resolve whenever the url prop changes: a reused component must
+	// not keep rendering the previous url's preview (the old early
+	// return on defined data did exactly that).
 	useEffect(() => {
-		if (data !== undefined) return;
 		let alive = true;
-		fetchPreview(url).then((d) => alive && setData(d));
+		const cached = cache.has(url) ? cache.get(url) : undefined;
+		setData(cached);
+		if (cached === undefined) {
+			fetchPreview(url).then((d) => alive && setData(d));
+		}
 		return () => {
 			alive = false;
 		};
@@ -71,6 +77,8 @@ export function LinkPreview({ url }) {
 
 function ImageThumb({ url }) {
 	const [failed, setFailed] = useState(false);
+	// A failure belongs to one url; reset when the component is reused.
+	useEffect(() => setFailed(false), [url]);
 	if (failed) return null;
 	return (
 		<a class="preview-thumb" href={url} target="_blank" rel="noopener noreferrer">

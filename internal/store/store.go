@@ -527,6 +527,25 @@ func reverse(msgs []Message) {
 	}
 }
 
+// CanonicalBuffer resolves target to an existing buffer's stored
+// spelling under fold (the network's casemapping), so one IRC entity
+// never splits across case-variant buffers (#Go vs #go, or rfc1459
+// pairs) — echoed messages can arrive with client-supplied casing.
+// Returns target unchanged when no buffer exists yet; the fast path
+// (exact spelling already cached) costs one map lookup.
+func (s *Store) CanonicalBuffer(ctx context.Context, network, target string, fold func(string) string) string {
+	s.mu.Lock()
+	if _, ok := s.buffers[bufKey{network: network, target: target}]; ok {
+		s.mu.Unlock()
+		return target
+	}
+	s.mu.Unlock()
+	if name, ok, err := s.FindBuffer(ctx, network, target, fold); err == nil && ok {
+		return name
+	}
+	return target
+}
+
 // FindBuffer returns the stored buffer whose name matches target under
 // fold (the network's IRC casemapping — SQLite's NOCASE is ASCII-only
 // and would miss the rfc1459 []\^ pairs), preserving its stored casing.

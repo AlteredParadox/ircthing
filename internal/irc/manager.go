@@ -645,7 +645,7 @@ drain:
 		conn.Close()
 	}()
 
-	r := ircv4.NewReader(conn)
+	r := ircv4.NewReader(&boundedLineReader{r: conn, max: maxIncomingLine})
 	w := ircv4.NewWriter(conn)
 	if os.Getenv("IRCTHING_DEBUG_RAW") != "" {
 		r.DebugCallback = func(line string) {

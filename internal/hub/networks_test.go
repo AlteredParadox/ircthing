@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	ircv4 "gopkg.in/irc.v4"
+
+	"ircthing/internal/irc"
 	"ircthing/internal/store"
 )
 
@@ -128,5 +131,51 @@ func TestPutNetworkValidatesFirst(t *testing.T) {
 	h.mu.Unlock()
 	if !running {
 		t.Fatal("network no longer running after rejected edits")
+	}
+}
+
+// Case-variant targets resolve to one buffer: an echoed "#Go" message
+// lands in the existing "#go" scrollback instead of splitting it.
+func TestBufferCanonicalization(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+	conn.ch <- ev(":alice!u@h PRIVMSG #go :first")
+	conn.ch <- ev(":alice!u@h PRIVMSG #GO :second")
+	conn.ch <- ev(":bob[x]!u@h PRIVMSG AlteredParadox :query")
+	conn.ch <- ev(":bob{x}!u@h PRIVMSG AlteredParadox :query again") // rfc1459-equal sender
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		msgs, err := h.store.Latest(ctxb, "libera", "#go", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(msgs) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("#go has %d messages, want both casings merged", len(msgs))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	bufs, err := h.store.Buffers(ctxb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(bufs))
+	for _, b := range bufs {
+		names = append(names, b.Target)
+	}
+	if len(bufs) != 2 { // #go and bob[x] — no case-variant duplicates
+		t.Fatalf("buffers = %v, want exactly [#go bob[x]]", names)
 	}
 }

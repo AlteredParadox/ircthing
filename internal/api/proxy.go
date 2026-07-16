@@ -160,6 +160,12 @@ var specialPurposePrefixes = func() []netip.Prefix {
 		"::/128",        // unspecified (also caught by IsUnspecified)
 		"::1/128",       // loopback (also caught by IsLoopback)
 		"::ffff:0:0/96", // IPv4-mapped (unwrapped before this check)
+		// Deprecated IPv4-embedding forms (RFC 5156): like NAT64, these
+		// encode an IPv4 destination, and a lingering translation or
+		// tunnel route would reach IPv4 space this policy blocks. An
+		// SSRF allowlist has no use for deprecated transition space.
+		"::/96",           // IPv4-compatible (deprecated, RFC 4291 §2.5.5.1)
+		"::ffff:0:0:0/96", // IPv4-translated (SIIT, RFC 2765)
 		// NAT64 translation prefixes embed an IPv4 destination: on a
 		// NAT64 host, 64:ff9b::a9fe:a9fe reaches 169.254.169.254 even
 		// though the direct IPv4 form is blocked. The whole well-known

@@ -202,6 +202,9 @@ func nonEmptyLines(text string) []string {
 // persistOwn stores and broadcasts one of our own sent messages, used
 // when echo-message is unavailable to reflect it.
 func (s *Session) persistOwn(ctx context.Context, conn Conn, network, target, text string) {
+	// The target is client-supplied: file under the stored spelling so
+	// "/msg #Go" does not open a second buffer next to #go.
+	target = s.hub.store.CanonicalBuffer(ctx, network, target, conn.Fold)
 	msg := &ircv4.Message{Command: "PRIVMSG", Params: []string{target, text}}
 	stored, err := s.hub.store.Append(ctx, network, target, store.Message{
 		Time:    time.Now(),
