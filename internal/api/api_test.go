@@ -357,3 +357,59 @@ func TestLoginBackoffGrows(t *testing.T) {
 		t.Fatal("unrelated source blocked")
 	}
 }
+
+func TestSecurityHeaders(t *testing.T) {
+	ts, _ := newTestServer(t)
+	resp, err := ts.Client().Get(ts.URL + "/api/ws") // any route gets them
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	for k, want := range map[string]string{
+		"X-Content-Type-Options": "nosniff",
+		"Referrer-Policy":        "no-referrer",
+		"X-Frame-Options":        "DENY",
+	} {
+		if got := resp.Header.Get(k); got != want {
+			t.Fatalf("%s = %q, want %q", k, got, want)
+		}
+	}
+	csp := resp.Header.Get("Content-Security-Policy")
+	for _, want := range []string{"default-src 'self'", "frame-ancestors 'none'", "connect-src 'self' ws://", "img-src 'self' data:"} {
+		if !strings.Contains(csp, want) {
+			t.Fatalf("CSP %q missing %q", csp, want)
+		}
+	}
+}
+
+func TestSecureCookieFlag(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"), store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	hash, _ := bcrypt.GenerateFromPassword([]byte("hunter2"), bcrypt.MinCost)
+	srv, err := New(Config{Username: "AlteredParadox", PasswordHash: string(hash), SecureCookies: true}, hub.New(st), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	c := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	if !c.Secure || c.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("session cookie = %+v, want Secure + SameSite=Strict", c)
+	}
+	// Logout's deletion cookie carries matching attributes.
+	req, _ := http.NewRequest("POST", ts.URL+"/api/logout", nil)
+	req.AddCookie(c)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	del := sessionCookieOf(t, resp)
+	if !del.Secure || del.SameSite != http.SameSiteStrictMode || del.MaxAge >= 0 {
+		t.Fatalf("deletion cookie = %+v, want Secure + Strict + expired", del)
+	}
+}

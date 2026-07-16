@@ -29,6 +29,10 @@ type Config struct {
 	Username     string
 	PasswordHash string        // bcrypt hash of the user's password
 	SessionTTL   time.Duration // default 30 days
+	// SecureCookies marks session cookies Secure (HTTPS-only). Enable
+	// whenever TLS terminates in front of the binary; off by default
+	// because the default deployment is plain HTTP on loopback.
+	SecureCookies bool
 }
 
 // Server is the http.Handler for everything: /api/* plus the embedded
@@ -101,6 +105,20 @@ func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h := w.Header()
+	// Browser hardening on every response. The CSP locks everything to
+	// same-origin (no inline script/style anywhere in the app); the
+	// WebSocket origin is named explicitly because older browsers do not
+	// count ws:// under 'self'.
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("X-Frame-Options", "DENY")
+	// style-src allows inline styles: the user-CSS override feature
+	// injects a <style> element, and style attributes are harmless next
+	// to a locked-down script-src ('self' via default-src).
+	h.Set("Content-Security-Policy",
+		"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://"+r.Host+" wss://"+r.Host+
+			"; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -155,8 +173,9 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   int(s.cfg.SessionTTL.Seconds()),
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		// Secure is not forced: TLS termination is expected at a reverse
-		// proxy for now. Revisit when built-in TLS serving lands.
+		// Secure follows config: on when TLS terminates in front of the
+		// binary (the recommended deployment), off for plain loopback.
+		Secure: s.cfg.SecureCookies,
 	})
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -167,8 +186,11 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		delete(s.tokens, c.Value)
 		s.mu.Unlock()
 	}
+	// The deletion cookie carries the same attributes as the session
+	// cookie so every browser treats it as the same cookie.
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true,
+		SameSite: http.SameSiteStrictMode, Secure: s.cfg.SecureCookies,
 	})
 	w.WriteHeader(http.StatusNoContent)
 }

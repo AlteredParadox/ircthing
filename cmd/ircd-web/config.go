@@ -32,6 +32,10 @@ type config struct {
 	RingSize int `json:"ring_size"`
 	// SessionTTLDays is how long login cookies stay valid. 0 = 30 days.
 	SessionTTLDays int `json:"session_ttl_days"`
+	// SecureCookies marks the session cookie Secure (sent over HTTPS
+	// only). Turn this on when a TLS-terminating reverse proxy fronts
+	// the binary — i.e. any deployment beyond plain-HTTP loopback.
+	SecureCookies bool `json:"secure_cookies"`
 }
 
 type userConfig struct {

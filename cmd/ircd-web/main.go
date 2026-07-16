@@ -78,17 +78,25 @@ func run(cfg *config) error {
 		return fmt.Errorf("embedded assets: %w", err)
 	}
 	handler, err := api.New(api.Config{
-		Username:     cfg.User.Username,
-		PasswordHash: cfg.User.PasswordHash,
-		SessionTTL:   cfg.sessionTTL(),
+		Username:      cfg.User.Username,
+		PasswordHash:  cfg.User.PasswordHash,
+		SessionTTL:    cfg.sessionTTL(),
+		SecureCookies: cfg.SecureCookies,
 	}, h, assets)
 	if err != nil {
 		return err
 	}
+	// Full server timeouts; the WebSocket endpoint hijacks its
+	// connection at upgrade, after which the library manages deadlines,
+	// so long-lived sessions are unaffected.
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second, // media proxy fetches cap at 15s
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    32 << 10,
 	}
 
 	serveErr := make(chan error, 1)

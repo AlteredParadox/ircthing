@@ -100,10 +100,12 @@ Per network (`networks[]` seed / edit form):
 ## Deployment
 
 The listen address stays on loopback by design: put a TLS-terminating
-reverse proxy (Caddy, nginx) in front for anything beyond localhost —
-the session cookie is not marked `Secure`, on the assumption that TLS
-terminates in front of the binary. WebSocket upgrade for `/api/ws` must
-be allowed through the proxy (Caddy does this automatically).
+reverse proxy (Caddy, nginx) in front for anything beyond localhost,
+and set `"secure_cookies": true` so the session cookie is only ever
+sent over HTTPS. WebSocket upgrade for `/api/ws` must be allowed
+through the proxy (Caddy does this automatically); rate-limiting
+`/api/login` at the proxy is also recommended (the binary applies its
+own per-source backoff as a second layer).
 
 A hardened systemd unit ships in [`deploy/ircthing.service`](deploy/ircthing.service):
 
