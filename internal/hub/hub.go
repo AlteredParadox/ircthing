@@ -133,8 +133,21 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					h.clearPresence(ev.Network)
 				}
 			case irc.EventMessage:
-				if ev.Msg.Command == "FAIL" { // standard-replies
-					log.Printf("irc[%s]: server failure: %s", ev.Network, ev.Msg.String())
+				// standard-replies: machine-readable server feedback the
+				// user should see ("FAIL * INVALID_UTF8 :..."). FAILs are
+				// also logged.
+				switch ev.Msg.Command {
+				case "FAIL", "WARN", "NOTE":
+					if ev.Msg.Command == "FAIL" {
+						log.Printf("irc[%s]: server failure: %s", ev.Network, ev.Msg.String())
+					}
+					if txt := strings.TrimSpace(strings.Join(ev.Msg.Params, " ")); txt != "" {
+						h.broadcast(envelope("server_info", 0, ServerInfoData{
+							Network: ev.Network,
+							Text:    strings.ToLower(ev.Msg.Command) + ": " + txt,
+						}))
+					}
+					continue
 				}
 				switch ev.Msg.Command {
 				case "730": // RPL_MONONLINE
@@ -176,6 +189,19 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					if hint, affected := membersHint(ev.Msg); affected {
 						h.broadcast(envelope("members_changed", 0, MembersChangedData{
 							Network: ev.Network, Buffer: hint,
+						}))
+					}
+					// An INVITE has no reply numeric to forward — surface
+					// it directly (both direct invites and invite-notify's
+					// third-party ones).
+					if ev.Msg.Command == "INVITE" && ev.Msg.Prefix != nil && len(ev.Msg.Params) >= 2 {
+						who := ev.Msg.Param(0)
+						if strings.EqualFold(who, c.Nick()) {
+							who = "you"
+						}
+						h.broadcast(envelope("server_info", 0, ServerInfoData{
+							Network: ev.Network,
+							Text:    ev.Msg.Prefix.Name + " invited " + who + " to " + ev.Msg.Param(1),
 						}))
 					}
 					// Our own JOIN is the moment to backfill that channel:

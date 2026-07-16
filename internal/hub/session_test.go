@@ -1444,3 +1444,53 @@ func TestCommandAllowlistAdditions(t *testing.T) {
 		}
 	}
 }
+
+func TestInviteSurfaced(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 4), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+
+	// A direct invite names "you".
+	conn.ch <- ev(":alice!u@h INVITE AlteredParadox #secret")
+	if info := decode[ServerInfoData](t, recv(t, s, "server_info")); info.Text != "alice invited you to #secret" {
+		t.Fatalf("direct invite = %+v", info)
+	}
+
+	// invite-notify: someone else being invited is shown by nick.
+	conn.ch <- ev(":alice!u@h INVITE bob #secret")
+	if info := decode[ServerInfoData](t, recv(t, s, "server_info")); info.Text != "alice invited bob to #secret" {
+		t.Fatalf("third-party invite = %+v", info)
+	}
+}
+
+func TestStandardRepliesSurfaced(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 4), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	s := h.NewSession()
+	defer s.Close()
+
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+		Msg: ircv4.MustParseMessage(":srv FAIL REHASH CONFIG_BAD :Invalid config")}
+	info := decode[ServerInfoData](t, recv(t, s, "server_info"))
+	if info.Text != "fail: REHASH CONFIG_BAD Invalid config" {
+		t.Fatalf("FAIL = %+v", info)
+	}
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+		Msg: ircv4.MustParseMessage(":srv WARN * INVALID_UTF8 :Message dropped")}
+	if info := decode[ServerInfoData](t, recv(t, s, "server_info")); info.Text != "warn: * INVALID_UTF8 Message dropped" {
+		t.Fatalf("WARN = %+v", info)
+	}
+}
