@@ -35,13 +35,13 @@ function SysRow({ ev, r, focused }) {
 }
 
 // A folded run of join/part/quit/nick lines; clicking toggles the run.
+// The Lounge look: no timestamp, left-aligned, chevron trailing; the
+// expanded lines render as ordinary status rows below it.
 function CollapsedRow({ ev, onToggle }) {
 	return (
-		<div class="sys-row">
-			<span class="msg-time">{fmtTime(ev.time)}</span>
-			<span class="sys-mark mode">{ev.expanded ? "▾" : "▸"}</span>
+		<div class="sys-row collapse-row">
 			<button type="button" class="sys-toggle" onClick={() => onToggle(ev.id)}>
-				{ev.summary}
+				{ev.summary} <span class="sys-chevron">{ev.expanded ? "▾" : "▸"}</span>
 			</button>
 		</div>
 	);

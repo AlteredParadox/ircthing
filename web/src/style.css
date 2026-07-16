@@ -613,6 +613,11 @@ input::placeholder {
 	text-align: left;
 }
 
+.sys-chevron {
+	font-size: 0.75em;
+	color: var(--text-faint);
+}
+
 .sys-toggle:hover {
 	color: var(--text);
 	text-decoration: underline;
