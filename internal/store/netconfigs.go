@@ -52,52 +52,78 @@ func (s *Store) PutNetworkConfig(ctx context.Context, name, config string) error
 	return err
 }
 
-// DeleteNetworkConfig removes a stored definition (not the network's
-// scrollback — see DeleteNetworkData).
-func (s *Store) DeleteNetworkConfig(ctx context.Context, name string) error {
+// ReplaceNetworkConfig stores a definition, atomically retiring an old
+// name when the definition was renamed: the history (networks row, so
+// buffers/messages/markers/monitors follow) moves to the new name and
+// the old definition row goes, all in one transaction — a failure
+// changes nothing. oldName == "" or == name is a plain upsert. Caches
+// are evicted only after commit.
+func (s *Store) ReplaceNetworkConfig(ctx context.Context, oldName, name, config string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, err := s.db.ExecContext(ctx, `DELETE FROM network_configs WHERE name = ?`, name)
-	return err
-}
-
-// RenameNetworkData moves a network's stored data (buffers, messages,
-// read markers, monitors — everything keyed by the networks row) to a
-// new name, so scrollback survives a rename from the UI.
-func (s *Store) RenameNetworkData(ctx context.Context, oldName, newName string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE networks SET name = ? WHERE user_id = ? AND name = ?`,
-		newName, defaultUserID, oldName)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		var target string
-		// A unique-constraint hit means the new name already has data;
-		// surface something actionable instead of the raw SQLite error.
-		if row := s.db.QueryRowContext(ctx,
-			`SELECT name FROM networks WHERE user_id = ? AND name = ?`,
-			defaultUserID, newName); row.Scan(&target) == nil {
-			return fmt.Errorf("network %q already has stored history", newName)
-		}
 		return err
 	}
-	s.dropNetworkCachesLocked(oldName)
+	defer tx.Rollback()
+	renamed := oldName != "" && oldName != name
+	if renamed {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE networks SET name = ? WHERE user_id = ? AND name = ?`,
+			name, defaultUserID, oldName); err != nil {
+			// A unique-constraint hit means the new name already has
+			// stored history; surface something actionable.
+			var taken string
+			if row := tx.QueryRowContext(ctx,
+				`SELECT name FROM networks WHERE user_id = ? AND name = ?`,
+				defaultUserID, name); row.Scan(&taken) == nil {
+				return fmt.Errorf("network %q already has stored history", name)
+			}
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM network_configs WHERE name = ?`, oldName); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO network_configs (name, config) VALUES (?, ?)
+		ON CONFLICT (name) DO UPDATE SET config = excluded.config`,
+		name, config); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if renamed {
+		s.dropNetworkCachesLocked(oldName)
+	}
 	return nil
 }
 
-// DeleteNetworkData removes a network's stored history: the networks row
-// and, via cascades, its buffers, messages (FTS rows via trigger), read
-// markers, and monitors. The definition row is separate
-// (DeleteNetworkConfig).
-func (s *Store) DeleteNetworkData(ctx context.Context, name string) error {
+// DeleteNetwork removes a network entirely — its definition row and its
+// stored history (the networks row; buffers, messages with their FTS
+// rows, read markers, and monitors follow via cascades) — in one
+// transaction. Caches are evicted only after commit.
+func (s *Store) DeleteNetwork(ctx context.Context, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM networks WHERE user_id = ? AND name = ?`, defaultUserID, name)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM network_configs WHERE name = ?`, name); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM networks WHERE user_id = ? AND name = ?`, defaultUserID, name); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
 		return err
 	}
 	s.dropNetworkCachesLocked(name)

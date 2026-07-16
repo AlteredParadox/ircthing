@@ -80,3 +80,53 @@ func TestNetworkManagement(t *testing.T) {
 		t.Fatalf("history survived delete: %v", msgs)
 	}
 }
+
+// An invalid edit must be rejected before anything is persisted or
+// stopped: the stored definition and the running connection survive.
+func TestPutNetworkValidatesFirst(t *testing.T) {
+	h := newTestHub(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	h.UseRoot(ctx, &wg)
+	defer wg.Wait() // after cancel: reap the manager goroutines
+	defer cancel()
+	s := h.NewSession()
+	defer s.Close()
+	ctxb := context.Background()
+
+	good := json.RawMessage(`{"name":"alpha","addr":"127.0.0.1:1","allow_plaintext":true,"nick":"AlteredParadox"}`)
+	s.Handle(ctxb, request(t, "put_network", 1, PutNetworkReq{Config: good}))
+	recv(t, s, "ok", "networks_changed", "state")
+
+	bad := []json.RawMessage{
+		// plaintext without the explicit opt-in
+		json.RawMessage(`{"name":"alpha","addr":"127.0.0.1:1","nick":"AlteredParadox"}`),
+		// invalid proxy URL
+		json.RawMessage(`{"name":"alpha","addr":"127.0.0.1:1","allow_plaintext":true,"nick":"AlteredParadox","proxy":"ftp://x:1"}`),
+		// unreadable client certificate
+		json.RawMessage(`{"name":"alpha","addr":"127.0.0.1:1","tls":true,"nick":"AlteredParadox","sasl":{"mechanism":"EXTERNAL","cert_file":"/nonexistent.pem","key_file":"/nonexistent.key"}}`),
+	}
+	for i, cfg := range bad {
+		s.Handle(ctxb, request(t, "put_network", int64(10+i), PutNetworkReq{OldName: "alpha", Config: cfg}))
+		if env := recv(t, s, "error", "networks_changed", "state", "network_removed"); env.Seq != int64(10+i) {
+			t.Fatalf("bad edit %d: got seq %d", i, env.Seq)
+		}
+	}
+
+	// Stored definition unchanged, network still running.
+	s.Handle(ctxb, request(t, "get_networks", 20, nil))
+	nets := decode[NetworksData](t, recv(t, s, "networks", "networks_changed", "state"))
+	if len(nets.Networks) != 1 || nets.Networks[0].Name != "alpha" {
+		t.Fatalf("networks = %+v", nets.Networks)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(nets.Networks[0].Config, &got); err != nil || got["proxy"] != nil {
+		t.Fatalf("config mutated: %s (%v)", nets.Networks[0].Config, err)
+	}
+	h.mu.Lock()
+	_, running := h.procs["alpha"]
+	h.mu.Unlock()
+	if !running {
+		t.Fatal("network no longer running after rejected edits")
+	}
+}

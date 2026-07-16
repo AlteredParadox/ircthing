@@ -35,7 +35,7 @@ func TestNetworkConfigCRUD(t *testing.T) {
 		t.Fatalf("configs = %+v", configs)
 	}
 
-	if err := s.DeleteNetworkConfig(ctx, "libera"); err != nil {
+	if err := s.DeleteNetwork(ctx, "libera"); err != nil {
 		t.Fatal(err)
 	}
 	configs, _ = s.NetworkConfigs(ctx)
@@ -56,22 +56,36 @@ func TestDeleteAndRenameNetworkData(t *testing.T) {
 	if _, err := s.Append(ctx, "netB", "#y", msg); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.PutNetworkConfig(ctx, "netA", `{"addr":"a:1"}`); err != nil {
+		t.Fatal(err)
+	}
 
-	// Rename carries history to the new name.
-	if err := s.RenameNetworkData(ctx, "netA", "netC"); err != nil {
+	// Rename atomically carries history and the definition to the new
+	// name.
+	if err := s.ReplaceNetworkConfig(ctx, "netA", "netC", `{"addr":"c:1"}`); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.Latest(ctx, "netC", "#x", 10)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("after rename: %v, %v", got, err)
 	}
-	// Renaming onto a name with existing history is refused.
-	if err := s.RenameNetworkData(ctx, "netC", "netB"); err == nil {
+	configs, err := s.NetworkConfigs(ctx)
+	if err != nil || len(configs) != 1 || configs[0].Name != "netC" {
+		t.Fatalf("configs after rename = %+v, %v", configs, err)
+	}
+	// Renaming onto a name with existing history is refused, and the
+	// failed transaction changes nothing: netC keeps its definition.
+	if err := s.ReplaceNetworkConfig(ctx, "netC", "netB", `{"addr":"b:1"}`); err == nil {
 		t.Fatal("rename onto existing data: want error")
 	}
+	configs, _ = s.NetworkConfigs(ctx)
+	if len(configs) != 1 || configs[0].Name != "netC" || configs[0].Config != `{"addr":"c:1"}` {
+		t.Fatalf("configs after refused rename = %+v", configs)
+	}
 
-	// Delete removes all rows for the network; other networks keep theirs.
-	if err := s.DeleteNetworkData(ctx, "netC"); err != nil {
+	// Delete removes the definition and all rows for the network; other
+	// networks keep theirs.
+	if err := s.DeleteNetwork(ctx, "netC"); err != nil {
 		t.Fatal(err)
 	}
 	bufs, err := s.Buffers(ctx)

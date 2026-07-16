@@ -131,6 +131,14 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
 		return
 	}
+	// Full validation up front — the complete irc.Config checks
+	// (plaintext opt-in, SASL, fingerprints, proxy) plus client
+	// certificate loading — so an invalid edit is rejected while the
+	// existing definition and its connection are still untouched.
+	if err := validateNetwork(nc); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
+		return
+	}
 	name := nc.EffectiveName()
 
 	// Serialize start/stop against other network operations.
@@ -146,19 +154,43 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", msg))
 		return
 	}
-	renamed := d.OldName != "" && d.OldName != name
-	if code, msg := s.hub.persistNetwork(ctx, nc, d.OldName, renamed); msg != "" {
-		s.push(errEnvelope(env.Seq, code, msg))
+	canonical, err := json.Marshal(nc)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "encoding network failed"))
 		return
 	}
 
-	// Editing reconnects: stop the old instance (under either name),
-	// then start with the new definition.
+	// Stop before persisting: a rename moves history, and the running
+	// connection must not append rows under the old name mid-move. The
+	// previous definition is captured first so a failure can restore it.
+	prev := findConfig(stored, d.OldName, name)
+	renamed := d.OldName != "" && d.OldName != name
 	if d.OldName != "" {
 		s.hub.StopNetwork(d.OldName)
 	}
 	s.hub.StopNetwork(name)
+	oldForReplace := ""
+	if renamed {
+		oldForReplace = d.OldName
+	}
+	if err := s.hub.store.ReplaceNetworkConfig(ctx, oldForReplace, name, string(canonical)); err != nil {
+		// Atomic replace failed = nothing changed; put the previous
+		// definition's connection back.
+		s.hub.restartNetwork(prev)
+		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
+		return
+	}
 	if err := s.hub.StartNetwork(nc); err != nil {
+		// Validated above, so this is exceptional (e.g. a certificate
+		// file changed on disk since). Restore the previous definition.
+		if prev != nil {
+			if rerr := s.hub.store.ReplaceNetworkConfig(ctx, name, prev.Name, prev.Config); rerr != nil {
+				log.Printf("network %q: rollback failed: %v", name, rerr)
+			}
+			s.hub.restartNetwork(prev)
+		} else if derr := s.hub.store.DeleteNetwork(ctx, name); derr != nil {
+			log.Printf("network %q: rollback failed: %v", name, derr)
+		}
 		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
 		return
 	}
@@ -167,6 +199,48 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcast(envelope("networks_changed", 0, nil))
+}
+
+// validateNetwork runs the full connect-time validation without
+// connecting: certificate files load and a manager constructs, or the
+// definition is rejected.
+func validateNetwork(nc *netconf.Network) error {
+	icfg, err := nc.IRCConfig()
+	if err != nil {
+		return err
+	}
+	_, err = irc.NewManager(icfg)
+	return err
+}
+
+// findConfig returns the stored definition a put would displace (the
+// old name when editing, the target name otherwise), nil for an add.
+func findConfig(stored []store.NetworkConfig, oldName, name string) *store.NetworkConfig {
+	want := oldName
+	if want == "" {
+		want = name
+	}
+	for i := range stored {
+		if stored[i].Name == want {
+			return &stored[i]
+		}
+	}
+	return nil
+}
+
+// restartNetwork best-effort restarts a stored definition after a
+// failed put, so an error leaves the previous network running.
+func (h *Hub) restartNetwork(prev *store.NetworkConfig) {
+	if prev == nil {
+		return
+	}
+	nc, err := netconf.Parse([]byte(prev.Config))
+	if err == nil {
+		err = h.StartNetwork(nc)
+	}
+	if err != nil {
+		log.Printf("network %q: restart after failed edit: %v", prev.Name, err)
+	}
 }
 
 // putNetworkConflict reports (as a user-facing message, "" for none)
@@ -191,29 +265,6 @@ func putNetworkConflict(stored []store.NetworkConfig, oldName, name string) stri
 	return ""
 }
 
-// persistNetwork applies a validated put: moves history on a rename and
-// stores the canonical definition. Returns an error code+message for
-// the client, or ("", "") on success.
-func (h *Hub) persistNetwork(ctx context.Context, nc *netconf.Network, oldName string, renamed bool) (code, msg string) {
-	name := nc.EffectiveName()
-	if renamed {
-		if err := h.store.RenameNetworkData(ctx, oldName, name); err != nil {
-			return "bad_request", err.Error()
-		}
-		if err := h.store.DeleteNetworkConfig(ctx, oldName); err != nil {
-			return "internal", "renaming network failed"
-		}
-	}
-	canonical, err := json.Marshal(nc)
-	if err != nil {
-		return "internal", "encoding network failed"
-	}
-	if err := h.store.PutNetworkConfig(ctx, name, string(canonical)); err != nil {
-		return "internal", "storing network failed"
-	}
-	return "", ""
-}
-
 func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
 	var d NetworkRef
 	if err := json.Unmarshal(env.Data, &d); err != nil || d.Network == "" {
@@ -224,14 +275,10 @@ func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
 	defer s.hub.netOps.Unlock()
 
 	s.hub.StopNetwork(d.Network)
-	if err := s.hub.store.DeleteNetworkConfig(ctx, d.Network); err != nil {
+	// One transaction: the definition and the stored history (that is
+	// what "delete" means) go together or not at all.
+	if err := s.hub.store.DeleteNetwork(ctx, d.Network); err != nil {
 		s.push(errEnvelope(env.Seq, "internal", "deleting network failed"))
-		return
-	}
-	// Removing a network removes its history too — that is what
-	// "delete" means; the definition alone is put_network's domain.
-	if err := s.hub.store.DeleteNetworkData(ctx, d.Network); err != nil {
-		s.push(errEnvelope(env.Seq, "internal", "deleting network data failed"))
 		return
 	}
 	log.Printf("network %q deleted", d.Network)
