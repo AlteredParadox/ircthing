@@ -46,13 +46,16 @@ func TestIsPublicIP(t *testing.T) {
 		{"192.88.99.1", false},    // 6to4 relay anycast (deprecated)
 		{"240.0.0.1", false},      // reserved
 		{"255.255.255.255", false},
-		{"100::1", false},          // discard-only
-		{"2001:db8::1", false},     // documentation
-		{"2001::42", false},        // TEREDO / protocol assignments
-		{"2002:808:808::1", false}, // 6to4
-		{"3fff::1", false},         // documentation (RFC 9637)
-		{"64:ff9b:1::1", false},    // local-use translation
-		{"2620:fe::fe", true},      // Quad9 — ordinary global unicast
+		{"100::1", false},             // discard-only
+		{"2001:db8::1", false},        // documentation
+		{"2001::42", false},           // TEREDO / protocol assignments
+		{"2002:808:808::1", false},    // 6to4
+		{"3fff::1", false},            // documentation (RFC 9637)
+		{"64:ff9b:1::1", false},       // local-use translation
+		{"64:ff9b::a9fe:a9fe", false}, // NAT64-embedded 169.254.169.254
+		{"64:ff9b::7f00:1", false},    // NAT64-embedded 127.0.0.1
+		{"64:ff9b::808:808", false},   // NAT64-embedded 8.8.8.8: the whole prefix is out
+		{"2620:fe::fe", true},         // Quad9 — ordinary global unicast
 	}
 	for _, tc := range cases {
 		ip := net.ParseIP(tc.ip)

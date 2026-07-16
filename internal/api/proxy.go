@@ -157,10 +157,16 @@ var specialPurposePrefixes = func() []netip.Prefix {
 		"198.18.0.0/15",   // benchmarking
 		"240.0.0.0/4",     // reserved (incl. 255.255.255.255 broadcast)
 		// IPv6
-		"::/128",         // unspecified (also caught by IsUnspecified)
-		"::1/128",        // loopback (also caught by IsLoopback)
-		"::ffff:0:0/96",  // IPv4-mapped (unwrapped before this check)
-		"64:ff9b:1::/48", // local-use IPv4/IPv6 translation
+		"::/128",        // unspecified (also caught by IsUnspecified)
+		"::1/128",       // loopback (also caught by IsLoopback)
+		"::ffff:0:0/96", // IPv4-mapped (unwrapped before this check)
+		// NAT64 translation prefixes embed an IPv4 destination: on a
+		// NAT64 host, 64:ff9b::a9fe:a9fe reaches 169.254.169.254 even
+		// though the direct IPv4 form is blocked. The whole well-known
+		// prefix is denied (site-specific NSP prefixes cannot be known
+		// statically and are the deployment's responsibility).
+		"64:ff9b::/96",   // well-known NAT64 (RFC 6052)
+		"64:ff9b:1::/48", // local-use IPv4/IPv6 translation (RFC 8215)
 		"100::/64",       // discard-only
 		"2001::/23",      // protocol assignments (TEREDO, ORCHID, benchmarking)
 		"2001:db8::/32",  // documentation
