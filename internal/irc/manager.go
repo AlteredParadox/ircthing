@@ -1058,6 +1058,14 @@ func (m *Manager) writeLoop(ctx context.Context, cancel context.CancelCauseFunc,
 		if err := tb.wait(ctx); err != nil {
 			return
 		}
+		// Last-resort framing guard: no message reaches the wire with
+		// CR/LF/NUL, even the internally-queued handshake/PONG lines that
+		// never pass through sendAll. A tainted message tears the
+		// connection down rather than emitting an injected line.
+		if err := checkFraming(out); err != nil {
+			cancel(err)
+			return
+		}
 		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		if err := w.WriteMessage(m.scrubUTF8(out)); err != nil {
 			cancel(fmt.Errorf("write: %w", err))

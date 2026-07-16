@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"ircthing/internal/irc"
 )
@@ -62,13 +63,34 @@ func (n *Network) EffectiveName() string {
 }
 
 // Validate checks the fields a broken value of which would only surface
-// as a confusing connect-time failure.
+// as a confusing connect-time failure, and rejects the IRC framing
+// characters (CR, LF, NUL) in every value that reaches the wire during
+// registration — these go out via PASS/NICK/USER/JOIN and would
+// otherwise inject extra protocol lines on every (re)connect.
 func (n *Network) Validate() error {
 	if n.Addr == "" {
 		return errors.New("addr is required")
 	}
 	if n.Nick == "" {
 		return errors.New("nick is required")
+	}
+	fields := map[string]string{
+		"addr": n.Addr, "nick": n.Nick, "username": n.Username,
+		"realname": n.Realname, "pass": n.Pass, "proxy": n.Proxy,
+	}
+	if n.SASL != nil {
+		fields["sasl.login"] = n.SASL.Login
+		fields["sasl.password"] = n.SASL.Password
+	}
+	for name, v := range fields {
+		if strings.ContainsAny(v, "\r\n\x00") {
+			return fmt.Errorf("%s must not contain CR, LF, or NUL", name)
+		}
+	}
+	for i, ch := range n.Channels {
+		if strings.ContainsAny(ch, " \r\n\x00") { // space too: one JOIN target
+			return fmt.Errorf("channels[%d] must not contain spaces, CR, LF, or NUL", i)
+		}
 	}
 	return nil
 }

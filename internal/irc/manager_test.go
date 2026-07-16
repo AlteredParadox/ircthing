@@ -1049,3 +1049,40 @@ func TestManagerQuitNickAffected(t *testing.T) {
 		}
 	}
 }
+
+// The writer boundary drops any message carrying framing bytes, even a
+// handshake line built from a tainted config that slipped past
+// validation — the connection is torn down and the injected line never
+// reaches the wire.
+func TestWriterRejectsFramingInHandshake(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+
+	cfg := testCfg(ln.Addr().String())
+	cfg.Realname = "evil\r\nOPER admin secret" // injected extra command
+	m := startManager(t, cfg)
+	_ = m
+
+	s := accept(t, conns)
+	// CAP LS and NICK precede USER and are clean; the USER line is the
+	// tainted one, so the connection dies at or before it. The server
+	// must never see an OPER line. Read until the connection closes or a
+	// short window elapses, asserting no injected command appears.
+	s.c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	r := ircv4.NewReader(s.c)
+	for {
+		msg, err := r.ReadMessage()
+		if err != nil {
+			break // connection torn down (expected) or deadline
+		}
+		if msg.Command == "OPER" {
+			t.Fatalf("injected OPER reached the wire: %q", msg.String())
+		}
+		if msg.Command == "USER" {
+			t.Fatalf("tainted USER line was written: %q", msg.String())
+		}
+	}
+}

@@ -377,10 +377,13 @@ func TestSessionGetBuffers(t *testing.T) {
 	conn := &fakeConn{ch: make(chan irc.Event, 4), name: "libera", nick: "AlteredParadox"}
 	go h.Run(ctx, conn)
 	waitForNetwork(t, h, "libera")
-	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered}
 
+	// Subscribe BEFORE emitting the event: a broadcast is not a
+	// synchronization primitive — if Run processed the event before
+	// NewSession, the session would legitimately miss it.
 	s := h.NewSession()
 	defer s.Close()
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered}
 	recv(t, s, "state") // wait until the state event has been processed
 
 	s.Handle(ctx, request(t, "get_buffers", 3, nil))
