@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"syscall"
 	"time"
@@ -135,10 +136,51 @@ func (f *fetcher) get(ctx context.Context, rawURL string) (contentType string, b
 	return resp.Header.Get("Content-Type"), body, nil
 }
 
+// specialPurposePrefixes are the IANA special-purpose registry blocks
+// (plus multicast/reserved space) that net.IP's classification methods
+// do not cover — "not private" is weaker than "globally routable".
+// Tables: iana.org/assignments/iana-ipv4-special-registry and
+// iana-ipv6-special-registry (fetched 2026-07-18).
+var specialPurposePrefixes = func() []netip.Prefix {
+	specs := []string{
+		// IPv4
+		"0.0.0.0/8",       // "this network"
+		"192.0.0.0/24",    // protocol assignments (incl. 192.0.0.0/29 DS-Lite)
+		"192.0.2.0/24",    // TEST-NET-1
+		"198.51.100.0/24", // TEST-NET-2
+		"203.0.113.0/24",  // TEST-NET-3
+		"192.31.196.0/24", // AS112-v4
+		"192.52.193.0/24", // AMT
+		"192.88.99.0/24",  // deprecated 6to4 relay anycast
+		"192.175.48.0/24", // AS112 direct delegation
+		"100.64.0.0/10",   // CGNAT shared address space
+		"198.18.0.0/15",   // benchmarking
+		"240.0.0.0/4",     // reserved (incl. 255.255.255.255 broadcast)
+		// IPv6
+		"::/128",         // unspecified (also caught by IsUnspecified)
+		"::1/128",        // loopback (also caught by IsLoopback)
+		"::ffff:0:0/96",  // IPv4-mapped (unwrapped before this check)
+		"64:ff9b:1::/48", // local-use IPv4/IPv6 translation
+		"100::/64",       // discard-only
+		"2001::/23",      // protocol assignments (TEREDO, ORCHID, benchmarking)
+		"2001:db8::/32",  // documentation
+		"2002::/16",      // 6to4
+		"3fff::/20",      // documentation (RFC 9637)
+		"5f00::/16",      // segment routing
+	}
+	out := make([]netip.Prefix, len(specs))
+	for i, s := range specs {
+		out[i] = netip.MustParsePrefix(s)
+	}
+	return out
+}()
+
 // isPublicIP reports whether ip is a globally-routable public address —
 // the allowlist gate for outbound proxy fetches. It rejects loopback,
-// RFC1918/ULA private ranges, link-local (incl. the 169.254.169.254 cloud
-// metadata endpoint), unspecified, multicast, and CGNAT 100.64.0.0/10.
+// RFC1918/ULA private ranges, link-local (incl. the 169.254.169.254
+// cloud metadata endpoint), unspecified, multicast, CGNAT, and the IANA
+// special-purpose blocks (documentation, benchmarking, 0/8, 240/4,
+// translation/transition ranges).
 func isPublicIP(ip net.IP) bool {
 	if ip == nil {
 		return false
@@ -151,8 +193,15 @@ func isPublicIP(ip net.IP) bool {
 		ip.IsMulticast() || ip.IsInterfaceLocalMulticast() {
 		return false
 	}
-	if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
-		return false // CGNAT 100.64.0.0/10
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, p := range specialPurposePrefixes {
+		if p.Contains(addr) {
+			return false
+		}
 	}
 	return true
 }

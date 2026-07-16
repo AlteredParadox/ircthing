@@ -35,6 +35,24 @@ func TestIsPublicIP(t *testing.T) {
 		{"100.128.0.1", true},  // just outside CGNAT
 		{"::ffff:127.0.0.1", false},
 		{"::ffff:10.0.0.1", false},
+		// IANA special-purpose blocks beyond the stdlib classifications.
+		{"0.1.2.3", false},        // 0.0.0.0/8 "this network"
+		{"192.0.0.8", false},      // protocol assignments
+		{"192.0.2.10", false},     // TEST-NET-1
+		{"198.51.100.7", false},   // TEST-NET-2
+		{"203.0.113.99", false},   // TEST-NET-3
+		{"198.18.0.1", false},     // benchmarking
+		{"198.19.255.255", false}, // benchmarking upper
+		{"192.88.99.1", false},    // 6to4 relay anycast (deprecated)
+		{"240.0.0.1", false},      // reserved
+		{"255.255.255.255", false},
+		{"100::1", false},          // discard-only
+		{"2001:db8::1", false},     // documentation
+		{"2001::42", false},        // TEREDO / protocol assignments
+		{"2002:808:808::1", false}, // 6to4
+		{"3fff::1", false},         // documentation (RFC 9637)
+		{"64:ff9b:1::1", false},    // local-use translation
+		{"2620:fe::fe", true},      // Quad9 — ordinary global unicast
 	}
 	for _, tc := range cases {
 		ip := net.ParseIP(tc.ip)
