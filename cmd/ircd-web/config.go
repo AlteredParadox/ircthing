@@ -46,13 +46,17 @@ type netConfig struct {
 	// TrustedFingerprints pins the server certificate: hex SHA-256 of the
 	// leaf cert. A match replaces CA verification (for self-signed
 	// servers).
-	TrustedFingerprints []string    `json:"trusted_fingerprints"`
-	Nick                string      `json:"nick"`
-	Username            string      `json:"username"`
-	Realname            string      `json:"realname"`
-	Pass                string      `json:"pass"`
-	SASL                *saslConfig `json:"sasl"`
-	Channels            []string    `json:"channels"`
+	TrustedFingerprints []string `json:"trusted_fingerprints"`
+	// Proxy routes this network through "socks5://[user:pass@]host:port"
+	// (DNS resolved proxy-side, Tor-friendly) or "http://host:port"
+	// (CONNECT tunnel). Empty connects directly.
+	Proxy    string      `json:"proxy"`
+	Nick     string      `json:"nick"`
+	Username string      `json:"username"`
+	Realname string      `json:"realname"`
+	Pass     string      `json:"pass"`
+	SASL     *saslConfig `json:"sasl"`
+	Channels []string    `json:"channels"`
 }
 
 type saslConfig struct {
@@ -126,6 +130,7 @@ func (n *netConfig) ircConfig() (irc.Config, error) {
 		TLS:                 n.TLS,
 		AllowPlaintext:      n.AllowPlaintext,
 		TrustedFingerprints: n.TrustedFingerprints,
+		Proxy:               n.Proxy,
 		Nick:                n.Nick,
 		Username:            n.Username,
 		Realname:            n.Realname,

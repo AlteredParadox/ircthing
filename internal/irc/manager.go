@@ -840,9 +840,22 @@ func connError(cctx context.Context, readErr error) error {
 
 // dial connects to addr, with TLS when secure — usually the configured
 // address/mode, unless an STS policy upgraded them (see effectiveAddr).
+// A configured proxy carries the raw TCP leg; TLS runs inside the
+// tunnel.
 func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn, error) {
-	d := &net.Dialer{Timeout: m.cfg.DialTimeout}
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	var conn net.Conn
+	var err error
+	if m.cfg.Proxy != "" {
+		// Validated by NewManager; a parse error here cannot happen.
+		proxy, perr := parseProxyURL(m.cfg.Proxy)
+		if perr != nil {
+			return nil, perr
+		}
+		conn, err = dialProxy(ctx, proxy, addr, m.cfg.DialTimeout)
+	} else {
+		d := &net.Dialer{Timeout: m.cfg.DialTimeout}
+		conn, err = d.DialContext(ctx, "tcp", addr)
+	}
 	if err != nil {
 		return nil, err
 	}

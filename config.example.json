@@ -23,6 +23,7 @@
       "name": "selfhosted-example",
       "addr": "irc.example.org:6697",
       "tls": true,
+      "proxy": "socks5://127.0.0.1:9050",
       "trusted_fingerprints": [
         "<sha256 hex of the server's certificate, for self-signed servers>"
       ],

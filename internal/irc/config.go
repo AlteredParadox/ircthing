@@ -32,6 +32,12 @@ type Config struct {
 	// to trust a self-signed IRC server without disabling verification.
 	TrustedFingerprints []string
 
+	// Proxy routes the connection through a proxy: "socks5://host:port"
+	// (optionally user:pass@; DNS happens proxy-side) or
+	// "http://host:port" (CONNECT tunnel). Empty connects directly. TLS
+	// to the IRC server runs inside the tunnel as usual.
+	Proxy string
+
 	Nick     string
 	Username string // defaults to Nick
 	Realname string // defaults to Nick
@@ -107,6 +113,11 @@ func (c *Config) validate() error {
 	}
 	if _, err := fingerprintSet(c.TrustedFingerprints); err != nil {
 		return err
+	}
+	if c.Proxy != "" {
+		if _, err := parseProxyURL(c.Proxy); err != nil {
+			return err
+		}
 	}
 	return nil
 }
