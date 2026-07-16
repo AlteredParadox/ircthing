@@ -1180,3 +1180,31 @@ func TestManagerDisconnectsOversizedBatch(t *testing.T) {
 	s2.register("AlteredParadox")
 	waitState(t, m, StateRegistered)
 }
+
+func TestRedactRaw(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"PASS hunter2", "PASS <redacted>"},
+		{"PASS s3cr3t\r\n", "PASS <redacted>"},
+		{"AUTHENTICATE AGF0YgBwYXNzd29yZA==", "AUTHENTICATE <redacted>"},
+		{"AUTHENTICATE PLAIN", "AUTHENTICATE <redacted>"}, // mechanism over-redacted, safe
+		{":srv AUTHENTICATE Zm9vYmFy", "AUTHENTICATE <redacted>"},
+		{"AUTHENTICATE +", "AUTHENTICATE +"}, // control token, not a secret
+		{"AUTHENTICATE *", "AUTHENTICATE *"},
+		{"NICK AlteredParadox", "NICK AlteredParadox"},
+		{"PRIVMSG #go :hello world", "PRIVMSG #go :hello world"},
+	}
+	for _, tc := range cases {
+		if got := redactRaw(tc.in); got != tc.want {
+			t.Errorf("redactRaw(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	// No credential material survives redaction of a PLAIN payload.
+	for _, secret := range []string{"hunter2", "AGF0YgBwYXNzd29yZA=="} {
+		if strings.Contains(redactRaw("PASS "+secret), secret) ||
+			strings.Contains(redactRaw("AUTHENTICATE "+secret), secret) {
+			t.Fatalf("secret %q survived redaction", secret)
+		}
+	}
+}

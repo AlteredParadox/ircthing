@@ -98,34 +98,58 @@ type Store struct {
 	stats    struct{ ringPages, dbPages int } // observability for tests
 }
 
-// secureDBFile ensures the database file exists with 0600 permissions,
-// creating it if absent (O_EXCL so we set the mode ourselves, not the
-// umask) and tightening it — with a logged warning — if an existing file
-// is group- or world-accessible. In-memory databases have no file and
-// are skipped.
+// secureDBFile ensures the database file (and any pre-existing WAL/SHM
+// sidecars) are 0600 before SQLite opens them: the main file is created
+// with O_EXCL if absent so we set the mode ourselves rather than the
+// umask, and an existing group/world-accessible file is tightened. A
+// loose file that cannot be tightened fails the open. In-memory
+// databases have no file and are skipped.
 func secureDBFile(path string) error {
 	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file::memory:") {
 		return nil
 	}
-	fi, err := os.Stat(path)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err != nil {
 			return fmt.Errorf("store: creating database %s: %w", path, err)
 		}
-		return f.Close()
-	case err != nil:
-		return fmt.Errorf("store: stat database %s: %w", path, err)
-	default:
-		if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-			if err := os.Chmod(path, 0o600); err != nil {
-				return fmt.Errorf("store: database %s is group/world-accessible (%#o) and could not be tightened: %w", path, perm, err)
-			}
-			log.Printf("store: tightened database permissions on %s from %#o to 0600", path, perm)
+		if err := f.Close(); err != nil {
+			return err
 		}
+	} else if err != nil {
+		return fmt.Errorf("store: stat database %s: %w", path, err)
+	}
+	// The main file (if it pre-existed loose) and any leftover sidecars
+	// from a previous run — a WAL can hold uncheckpointed rows — before
+	// SQLite reads them.
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := tightenPath(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tightenPath chmods p to 0600 when it exists and is group- or
+// world-accessible, propagating stat/chmod failures rather than leaving
+// a credential-bearing file readable. A missing file is not an error.
+func tightenPath(p string) error {
+	fi, err := os.Stat(p)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("store: stat %s: %w", p, err)
+	}
+	perm := fi.Mode().Perm()
+	if perm&0o077 == 0 {
+		return nil
+	}
+	if err := os.Chmod(p, 0o600); err != nil {
+		return fmt.Errorf("store: %s is group/world-accessible (%#o) and could not be tightened: %w", p, perm, err)
+	}
+	log.Printf("store: tightened permissions on %s from %#o to 0600", p, perm)
+	return nil
 }
 
 type bufKey struct{ network, target string }
@@ -168,12 +192,14 @@ func Open(path string, opts Options) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	// The WAL/SHM sidecars, created during migration's first write,
-	// inherit the db file's mode on unix; tighten them explicitly in
-	// case a platform or a pre-existing sidecar differs.
+	// The WAL/SHM sidecars are created during migration's first write and
+	// inherit the db file's mode on unix; re-check them and fail closed
+	// if any is loose and cannot be tightened — a group/world-readable
+	// WAL carries the same credentials as the main file.
 	for _, suffix := range []string{"-wal", "-shm"} {
-		if fi, err := os.Stat(path + suffix); err == nil && fi.Mode().Perm()&0o077 != 0 {
-			_ = os.Chmod(path+suffix, 0o600)
+		if err := tightenPath(path + suffix); err != nil {
+			db.Close()
+			return nil, err
 		}
 	}
 	return &Store{

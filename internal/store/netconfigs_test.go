@@ -322,4 +322,48 @@ func TestDatabasePermissions(t *testing.T) {
 	if got := fi.Mode().Perm(); got != 0o600 {
 		t.Fatalf("existing loose db mode after open = %#o, want 0600", got)
 	}
+
+	// A pre-existing loose WAL sidecar is tightened before SQLite opens
+	// it (it can hold uncheckpointed credential rows).
+	waldb := filepath.Join(dir, "wal.db")
+	for _, p := range []string{waldb, waldb + "-wal", waldb + "-shm"} {
+		f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+	}
+	s3, err := Open(waldb, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s3.Close()
+	for _, p := range []string{waldb, waldb + "-wal", waldb + "-shm"} {
+		if fi, err := os.Stat(p); err == nil && fi.Mode().Perm() != 0o600 {
+			t.Fatalf("%s mode after open = %#o, want 0600", p, fi.Mode().Perm())
+		}
+	}
+}
+
+// tightenPath propagates a stat failure (rather than silently
+// continuing) and treats a missing file as a no-op.
+func TestTightenPathErrors(t *testing.T) {
+	dir := t.TempDir()
+
+	// Missing file: no-op.
+	if err := tightenPath(filepath.Join(dir, "absent-wal")); err != nil {
+		t.Fatalf("missing sidecar should be a no-op, got %v", err)
+	}
+
+	// Stat failure: a path whose "parent" is a regular file yields
+	// ENOTDIR, which must propagate, not be swallowed.
+	blocker := filepath.Join(dir, "blocker")
+	if f, err := os.OpenFile(blocker, os.O_CREATE|os.O_WRONLY, 0o600); err != nil {
+		t.Fatal(err)
+	} else {
+		f.Close()
+	}
+	if err := tightenPath(filepath.Join(blocker, "child-wal")); err == nil {
+		t.Fatal("stat error was swallowed")
+	}
 }

@@ -694,10 +694,10 @@ drain:
 	w := ircv4.NewWriter(conn)
 	if os.Getenv("IRCTHING_DEBUG_RAW") != "" {
 		r.DebugCallback = func(line string) {
-			log.Printf("irc[%s] << %s", m.cfg.Name, strings.TrimRight(line, "\r\n"))
+			log.Printf("irc[%s] << %s", m.cfg.Name, redactRaw(line))
 		}
 		w.DebugCallback = func(line string) {
-			log.Printf("irc[%s] >> %s", m.cfg.Name, strings.TrimRight(line, "\r\n"))
+			log.Printf("irc[%s] >> %s", m.cfg.Name, redactRaw(line))
 		}
 	}
 	internal := make(chan *ircv4.Message, 16)
@@ -1065,6 +1065,31 @@ func (m *Manager) trackJoinIntent(in *ircv4.Message) {
 			}
 		}
 	}
+}
+
+// redactRaw prepares one raw IRC line for the debug log with credentials
+// removed: the PASS parameter (server password) and any non-control
+// AUTHENTICATE payload (SASL PLAIN reveals the password outright, and a
+// SCRAM transcript enables offline guessing). Everything else is logged
+// verbatim. "+" and "*" are AUTHENTICATE control tokens and carry no
+// secret.
+func redactRaw(line string) string {
+	trimmed := strings.TrimRight(line, "\r\n")
+	msg, err := ircv4.ParseMessage(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	switch strings.ToUpper(msg.Command) {
+	case "PASS":
+		if len(msg.Params) > 0 {
+			return "PASS <redacted>"
+		}
+	case "AUTHENTICATE":
+		if p := msg.Param(0); p != "" && p != "+" && p != "*" {
+			return "AUTHENTICATE <redacted>"
+		}
+	}
+	return trimmed
 }
 
 // writeLoop is the per-connection writer goroutine: it serializes
