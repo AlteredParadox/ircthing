@@ -94,7 +94,7 @@ func sessionCookieOf(t *testing.T, resp *http.Response) *http.Cookie {
 }
 
 func TestLogin(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, srv := newTestServerWithRef(t)
 	cases := []struct {
 		name, user, pass string
 		wantStatus       int
@@ -106,6 +106,11 @@ func TestLogin(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Each case starts with a clean slate; failure backoff is
+			// exercised separately in TestLoginBackoff.
+			srv.login.mu.Lock()
+			clear(srv.login.sources)
+			srv.login.mu.Unlock()
 			resp := login(t, ts, tc.user, tc.pass)
 			if resp.StatusCode != tc.wantStatus {
 				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
@@ -297,5 +302,58 @@ func TestWSEndToEnd(t *testing.T) {
 	}
 	if ev.Sender != "bob" {
 		t.Fatalf("event = %+v", ev)
+	}
+}
+
+
+func TestLoginBackoff(t *testing.T) {
+	ts, srv := newTestServerWithRef(t)
+
+	// First failure blocks the source; an immediate retry is refused
+	// without reaching bcrypt.
+	if resp := login(t, ts, "AlteredParadox", "wrong"); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("first failure status = %d", resp.StatusCode)
+	}
+	resp := login(t, ts, "AlteredParadox", "hunter2")
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("during backoff status = %d, want 429", resp.StatusCode)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Fatal("429 without Retry-After")
+	}
+
+	// Once the block expires, a good login succeeds and clears the slate.
+	srv.login.mu.Lock()
+	for _, s := range srv.login.sources {
+		s.blockedUntil = time.Now().Add(-time.Second)
+	}
+	srv.login.mu.Unlock()
+	if resp := login(t, ts, "AlteredParadox", "hunter2"); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("after backoff status = %d", resp.StatusCode)
+	}
+	srv.login.mu.Lock()
+	n := len(srv.login.sources)
+	srv.login.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("success did not clear the source (%d left)", n)
+	}
+}
+
+func TestLoginBackoffGrows(t *testing.T) {
+	l := newLoginLimiter()
+	now := time.Now()
+	var waits []time.Duration
+	for i := 0; i < 8; i++ {
+		l.fail("src", now)
+		waits = append(waits, l.retryAfter("src", now))
+	}
+	if waits[0] != time.Second || waits[1] != 2*time.Second || waits[2] != 4*time.Second {
+		t.Fatalf("early backoff = %v", waits[:3])
+	}
+	if waits[7] != time.Minute {
+		t.Fatalf("backoff cap = %v, want 1m", waits[7])
+	}
+	if l.retryAfter("other", now) != 0 {
+		t.Fatal("unrelated source blocked")
 	}
 }

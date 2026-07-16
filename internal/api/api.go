@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -47,6 +48,8 @@ type Server struct {
 	thumbCache   *ttlCache[thumbResult]
 	thumbSem     chan struct{}
 
+	login *loginLimiter
+
 	mu     sync.Mutex
 	tokens map[string]time.Time // session token -> expiry
 }
@@ -70,6 +73,7 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		previewCache: newTTLCache[PreviewData](30*time.Minute, 512),
 		thumbCache:   newTTLCache[thumbResult](24*time.Hour, maxThumbCache),
 		thumbSem:     make(chan struct{}, 4),
+		login:        newLoginLimiter(),
 		tokens:       make(map[string]time.Time),
 	}
 	s.mux.HandleFunc("POST /api/login", s.handleLogin)
@@ -108,14 +112,30 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "malformed login request", http.StatusBadRequest)
 		return
 	}
+	// Login is the one unauthenticated endpoint that burns CPU (bcrypt):
+	// per-source failure backoff plus a bounded hashing semaphore keep it
+	// from being a cheap exhaustion vector.
+	source := loginSourceKey(r)
+	if wait := s.login.retryAfter(source, time.Now()); wait > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds()+1)))
+		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
+		return
+	}
+	if !s.login.acquire(r.Context()) {
+		http.Error(w, "busy, retry later", http.StatusTooManyRequests)
+		return
+	}
 	// Evaluate both checks unconditionally so a wrong username costs the
 	// same time as a wrong password.
 	userOK := subtle.ConstantTimeCompare([]byte(req.Username), []byte(s.cfg.Username)) == 1
 	passErr := bcrypt.CompareHashAndPassword([]byte(s.cfg.PasswordHash), []byte(req.Password))
+	s.login.release()
 	if !userOK || passErr != nil {
+		s.login.fail(source, time.Now())
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
+	s.login.ok(source)
 
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
