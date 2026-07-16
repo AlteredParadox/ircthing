@@ -98,6 +98,9 @@ type handshake struct {
 	secure      bool
 	stsDuration *time.Duration
 	passSent    bool // PASS emitted (avoid double-send across start/CAP LS)
+	// challengeBuf accumulates a server SASL challenge split across
+	// 400-byte AUTHENTICATE lines (reassembled before decoding).
+	challengeBuf string
 }
 
 func newHandshake(cfg *Config) *handshake {
@@ -367,8 +370,23 @@ func (h *handshake) handleAuthenticate(m *ircv4.Message) ([]*ircv4.Message, bool
 		return nil, false, nil
 	}
 	// A server AUTHENTICATE carries the base64 challenge, or "+" for an
-	// empty one. Multi-round mechanisms (SCRAM) reassemble across it.
-	challenge, err := decodeChallenge(m.Param(0))
+	// empty one. Per SASL 3.2 a challenge longer than 400 bytes is split
+	// across consecutive lines: a 400-byte chunk means more follows; a
+	// shorter chunk (or a trailing "+" when the total was a multiple of
+	// 400) terminates. Reassemble before decoding.
+	arg := m.Param(0)
+	if arg != "+" {
+		h.challengeBuf += arg
+	}
+	if len(arg) == 400 {
+		return nil, false, nil // more chunks coming
+	}
+	full := h.challengeBuf
+	h.challengeBuf = ""
+	if full == "" {
+		full = "+" // empty challenge
+	}
+	challenge, err := decodeChallenge(full)
 	if err != nil {
 		return nil, false, err
 	}

@@ -1,4 +1,4 @@
-import { mentionsMe } from "./irc.js";
+import { mentionsMe, uuid } from "./irc.js";
 
 // Notifications: highlight detection, desktop Web Notifications, and a
 // dynamically-drawn favicon badge. Highlight rules live in localStorage
@@ -28,7 +28,7 @@ export function loadRules() {
 		const v = JSON.parse(localStorage.getItem("highlightRules"));
 		if (!Array.isArray(v)) return [];
 		// Stable ids key the settings rows (rules are edited in place).
-		return v.map((r) => ({ ...r, id: r.id || crypto.randomUUID() }));
+		return v.map((r) => ({ ...r, id: r.id || uuid() }));
 	} catch {
 		return [];
 	}

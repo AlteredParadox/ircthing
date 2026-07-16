@@ -1627,3 +1627,30 @@ func TestWhoisAccumulation(t *testing.T) {
 	conn.ch <- ev(":srv 318 AlteredParadox nobody :End of /WHOIS list")
 	expectSilence(t, s)
 }
+
+// Concurrent hub sessions are capped; the next NewSession returns nil so
+// the transport can reject the upgrade.
+func TestHubSessionCap(t *testing.T) {
+	h := newTestHub(t)
+	var sessions []*Session
+	for i := 0; i < maxHubSessions; i++ {
+		s := h.NewSession()
+		if s == nil {
+			t.Fatalf("NewSession returned nil at %d, before the cap", i)
+		}
+		sessions = append(sessions, s)
+	}
+	if over := h.NewSession(); over != nil {
+		t.Fatal("NewSession over the cap returned a session, want nil")
+	}
+	// Closing one frees a slot.
+	sessions[0].Close()
+	if s := h.NewSession(); s == nil {
+		t.Fatal("NewSession after a Close returned nil")
+	} else {
+		s.Close()
+	}
+	for _, s := range sessions[1:] {
+		s.Close()
+	}
+}

@@ -401,3 +401,43 @@ func TestBufferCountCap(t *testing.T) {
 		t.Fatalf("append to existing buffer at cap = %+v, %v", got, err)
 	}
 }
+
+// AdoptOwnMsgID reconciles a replayed own message with its local
+// placeholder so the msgid-bearing copy dedups instead of duplicating.
+func TestAdoptOwnMsgID(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+
+	local := time.Now()
+	// Local no-msgid placeholder (persistOwn).
+	if _, err := s.Append(ctx, "net", "#c", Message{
+		Time: local, Sender: "me", Command: "PRIVMSG", Raw: ":me PRIVMSG #c :hello", Text: "hello",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The server's later-timestamped copy carries a msgid.
+	adopted, err := s.AdoptOwnMsgID(ctx, "net", "#c", "hello", "srv-msgid-1", local.Add(-time.Minute).UnixMilli())
+	if err != nil || !adopted {
+		t.Fatalf("adopt = %v, %v; want true", adopted, err)
+	}
+	// The replayed copy now dedups (same msgid) instead of inserting.
+	got, err := s.Append(ctx, "net", "#c", Message{
+		Time: local.Add(time.Second), Sender: "me", Command: "PRIVMSG",
+		MsgID: "srv-msgid-1", Raw: ":me PRIVMSG #c :hello", Text: "hello",
+	})
+	if err != nil || got.ID != 0 {
+		t.Fatalf("replayed copy = %+v, %v; want deduped (ID 0)", got, err)
+	}
+	msgs, err := s.Latest(ctx, "net", "#c", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("scrollback has %d messages, want 1 (no duplicate)", len(msgs))
+	}
+	// No matching placeholder -> no adoption.
+	if adopted, _ := s.AdoptOwnMsgID(ctx, "net", "#c", "different", "x", 0); adopted {
+		t.Fatal("adopted a non-matching row")
+	}
+}

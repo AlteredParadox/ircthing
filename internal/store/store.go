@@ -334,6 +334,44 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 	return true, nil
 }
 
+// AdoptOwnMsgID reconciles a chathistory-replayed copy of one of our own
+// messages with the local no-msgid placeholder persistOwn stored: it
+// finds the newest msgid-less row in the buffer with matching text
+// (newer than sinceMs) and stamps the server's msgid onto it. The caller
+// then relies on the normal (buffer_id, msgid) dedup to drop the
+// replayed insert, so a no-echo-message + chathistory server does not
+// duplicate own messages after a reconnect. Reports whether it adopted.
+func (s *Store) AdoptOwnMsgID(ctx context.Context, network, target, text, msgid string, sinceMs int64) (bool, error) {
+	if msgid == "" || text == "" {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bufID, err := s.bufferID(ctx, network, target, false)
+	if err != nil || bufID == 0 {
+		return false, err
+	}
+	var id int64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id FROM messages
+		 WHERE buffer_id = ? AND msgid IS NULL AND text = ? AND ts >= ?
+		 ORDER BY ts DESC, id DESC LIMIT 1`, bufID, text, sinceMs).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE messages SET msgid = ? WHERE id = ?`, msgid, id); err != nil {
+		return false, err
+	}
+	if r, ok := s.rings[bufID]; ok {
+		r.adoptMsgID(id, msgid)
+	}
+	return true, nil
+}
+
 // Latest returns the newest messages of a buffer, ascending.
 func (s *Store) Latest(ctx context.Context, network, target string, limit int) ([]Message, error) {
 	return s.Before(ctx, network, target, maxCursor, limit)

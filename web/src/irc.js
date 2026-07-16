@@ -544,3 +544,13 @@ export function mergeById(existing, incoming) {
 	for (const e of incoming) byId.set(e.id, e);
 	return [...byId.values()].sort(byTimeId);
 }
+
+// uuid returns a random id. crypto.randomUUID is secure-context-only
+// (HTTPS/localhost) — unavailable over plain HTTP at a LAN address, the
+// "open from my phone" case — so fall back to getRandomValues, which is
+// available in any context.
+export function uuid() {
+	if (globalThis.crypto?.randomUUID) return crypto.randomUUID();
+	const b = crypto.getRandomValues(new Uint32Array(4));
+	return "r-" + b[0].toString(16) + b[1].toString(16) + b[2].toString(16) + b[3].toString(16);
+}

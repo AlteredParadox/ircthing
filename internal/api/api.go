@@ -322,6 +322,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// arriving during the handshake must already land in this session's
 	// outbound queue rather than being broadcast past it.
 	sess := s.hub.NewSession()
+	if sess == nil {
+		http.Error(w, "too many active sessions", http.StatusServiceUnavailable)
+		return
+	}
 	defer sess.Close()
 
 	c, err := websocket.Accept(w, r, nil)

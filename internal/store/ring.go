@@ -82,6 +82,17 @@ func (r *ring) pageAfter(c Cursor, limit int) ([]Message, bool) {
 
 // redact marks a cached message (by msgid) as deleted so ring-served
 // history pages reflect the redaction without a database round-trip.
+// adoptMsgID stamps a msgid onto the ring's copy of a row (matched by
+// id), keeping the hot cache consistent with AdoptOwnMsgID.
+func (r *ring) adoptMsgID(id int64, msgid string) {
+	for i := range r.msgs {
+		if r.msgs[i].ID == id {
+			r.msgs[i].MsgID = msgid
+			return
+		}
+	}
+}
+
 func (r *ring) redact(msgid, reason string) {
 	for i := range r.msgs {
 		if r.msgs[i].MsgID == msgid {

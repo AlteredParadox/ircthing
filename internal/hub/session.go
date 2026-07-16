@@ -29,6 +29,14 @@ type Session struct {
 	once sync.Once
 }
 
+// maxHubSessions bounds concurrent hub (WebSocket) sessions: each costs
+// goroutines and an O(N) term in every broadcast, and one login token
+// can open many connections. Generous for one user across devices/tabs.
+const maxHubSessions = 64
+
+// NewSession registers a session, or returns nil when the session cap is
+// reached (the caller rejects the upgrade). A nil session needs no
+// Close.
 func (h *Hub) NewSession() *Session {
 	s := &Session{
 		hub:  h,
@@ -36,8 +44,11 @@ func (h *Hub) NewSession() *Session {
 		done: make(chan struct{}),
 	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.sessions) >= maxHubSessions {
+		return nil
+	}
 	h.sessions[s] = struct{}{}
-	h.mu.Unlock()
 	return s
 }
 

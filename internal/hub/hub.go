@@ -325,6 +325,19 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	if ev.Msg.Command == "JOIN" && ev.Msg.Prefix != nil && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick()) {
 		h.unmarkClosed(ev.Network, c.Fold(target))
 	}
+	// A chathistory replay of one of our own messages (no echo-message,
+	// so persistOwn stored a no-msgid placeholder) must not duplicate:
+	// stamp the server's msgid onto the placeholder first, so the insert
+	// below dedups against it.
+	if replay && (ev.Msg.Command == "PRIVMSG" || ev.Msg.Command == "NOTICE") &&
+		ev.Msg.Prefix != nil && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick()) {
+		if mid := ev.Msg.Tags["msgid"]; mid != "" {
+			since := messageTime(ev).Add(-ownDedupWindow).UnixMilli()
+			if _, aerr := h.store.AdoptOwnMsgID(ctx, ev.Network, target, searchText(ev.Msg), mid, since); aerr != nil {
+				log.Printf("irc[%s]: own-message dedup for %q: %v", ev.Network, target, aerr)
+			}
+		}
+	}
 	var stored store.Message
 	var err error
 	if selfPart || h.recentlyClosed(ev.Network, c.Fold(target)) {
@@ -378,6 +391,7 @@ const (
 	maxOpenWhois       = 64          // concurrent WHOIS accumulations
 	maxOpenHistBatches = 256         // concurrent chathistory replay batches
 	closeGraceMs       = 10_000      // buffer stays closed against stragglers this long
+	ownDedupWindow     = 10 * time.Minute // reconcile a replayed own message with its local placeholder
 )
 
 func (h *Hub) updatePresence(network string, m *ircv4.Message, online bool) {

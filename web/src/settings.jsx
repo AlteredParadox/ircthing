@@ -1,5 +1,6 @@
 import { useEffect, useState } from "preact/hooks";
 import { ACCENT_RGB, ACCENTS } from "./prefs.js";
+import { uuid } from "./irc.js";
 
 // NotifControl renders the notification section for the current
 // permission state: unsupported, not yet granted, or toggleable.
@@ -65,7 +66,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 		setEnabled(notifier.enabled);
 	}
 
-	const addRule = () => onRules([...rules, { id: crypto.randomUUID(), pattern: "", network: "" }]);
+	const addRule = () => onRules([...rules, { id: uuid(), pattern: "", network: "" }]);
 	const updateRule = (i, patch) => onRules(rules.map((r, j) => (j === i ? { ...r, ...patch } : r)));
 	const removeRule = (i) => onRules(rules.filter((_, j) => j !== i));
 

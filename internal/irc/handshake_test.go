@@ -609,3 +609,43 @@ func TestHandshakeSCRAMEarly903Rejected(t *testing.T) {
 		t.Fatalf("PLAIN 903 rejected: %v", err)
 	}
 }
+
+// A server SASL challenge split across 400-byte AUTHENTICATE lines is
+// reassembled before the mechanism decodes it.
+func TestHandshakeAuthenticateChunkReassembly(t *testing.T) {
+	// Build a >400-byte base64 challenge (an empty-ish PLAIN won't do;
+	// use SCRAM's server-first which the client feeds to scramClient).
+	cfg := Config{
+		Addr: "irc.test:6697", Nick: "AlteredParadox", TLS: true,
+		SASL: &SASLConfig{Mechanism: "SCRAM-SHA-256", Login: "AlteredParadox", Password: "pencil"},
+	}
+	hs := newHandshake(&cfg)
+	hs.start()
+	hs.handle(ircv4.MustParseMessage("CAP * LS :sasl=SCRAM-SHA-256"))
+	hs.handle(ircv4.MustParseMessage("CAP AlteredParadox ACK :sasl"))
+	out, _, _ := hs.handle(ircv4.MustParseMessage("AUTHENTICATE +")) // client-first
+	clientFirst := out[0].Param(0)
+	bareB, _ := base64.StdEncoding.DecodeString(clientFirst)
+	bare := strings.TrimPrefix(string(bareB), "n,,")
+	attrs, _ := parseScramAttrs(bare)
+	cnonce := attrs["r"]
+
+	// Server-first, padded so its base64 exceeds 400 bytes to force a split.
+	serverFirst := "r=" + cnonce + "srv,s=" + base64.StdEncoding.EncodeToString([]byte("0123456789abcdef")) + ",i=4096"
+	b64 := base64Encode(serverFirst)
+	if len(b64) <= 400 {
+		b64 = base64Encode(serverFirst + ",x=" + strings.Repeat("y", 400))
+	}
+	// Split into a 400-byte chunk + remainder.
+	first, rest := b64[:400], b64[400:]
+	if r, _, err := hs.handle(ircv4.MustParseMessage("AUTHENTICATE " + first)); err != nil || len(r) != 0 {
+		t.Fatalf("first chunk -> %v, %v; want buffered (no output)", wire(r), err)
+	}
+	r, _, err := hs.handle(ircv4.MustParseMessage("AUTHENTICATE " + rest))
+	if err != nil {
+		t.Fatalf("second chunk: %v", err)
+	}
+	if len(r) == 0 || r[0].Command != "AUTHENTICATE" {
+		t.Fatalf("reassembled challenge did not produce a client-final: %v", wire(r))
+	}
+}

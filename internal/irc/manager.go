@@ -1087,9 +1087,12 @@ func (m *Manager) onLiveLine(in *ircv4.Message, send func([]*ircv4.Message) erro
 func (m *Manager) autoReply(in *ircv4.Message, send func([]*ircv4.Message) error) error {
 	if in.Command == "PRIVMSG" && m.isup.FoldEqual(in.Param(0), m.Nick()) {
 		if reply := ctcpReply(in); reply != nil {
-			if err := send([]*ircv4.Message{reply}); err != nil {
-				return err
-			}
+			// Best-effort via the normal (droppable, non-priority) queue,
+			// NOT the internal priority lane: CTCP replies are remotely
+			// inducible in unbounded quantity, so a flood must not starve
+			// user/hub output. A full queue (or any send error) just
+			// drops the reply.
+			_ = m.Send(reply)
 		}
 	}
 	if in.Command == "366" {
