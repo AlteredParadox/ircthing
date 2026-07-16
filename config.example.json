@@ -18,6 +18,21 @@
         "password": "my-nickserv-password"
       },
       "channels": ["#go-nuts", "#linux"]
+    },
+    {
+      "name": "selfhosted-example",
+      "addr": "irc.example.org:6697",
+      "tls": true,
+      "trusted_fingerprints": [
+        "<sha256 hex of the server's certificate, for self-signed servers>"
+      ],
+      "nick": "mynick",
+      "sasl": {
+        "mechanism": "EXTERNAL",
+        "cert_file": "/etc/ircthing/client-cert.pem",
+        "key_file": "/etc/ircthing/client-key.pem"
+      },
+      "channels": ["#home"]
     }
   ],
   "session_ttl_days": 30

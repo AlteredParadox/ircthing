@@ -14,7 +14,8 @@ import (
 // wantedCaps is the capability set we negotiate: the ratified IRCv3 set
 // plus the draft caps CLAUDE.md treats as required (sasl is appended when
 // configured). Caps the server doesn't offer are simply not requested.
-// STS and the remaining drafts come in later chunks.
+// sts is deliberately absent — the spec forbids requesting it; it is
+// handled out-of-band at CAP LS (see sts.go).
 var wantedCaps = []string{
 	"account-notify",
 	"account-tag",
