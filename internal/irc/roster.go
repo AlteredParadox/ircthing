@@ -139,6 +139,9 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 	case "QUIT":
 		for _, st := range r.chans {
 			delete(st.members, fold(sender))
+			if st.pending != nil {
+				delete(st.pending, fold(sender))
+			}
 		}
 	case "NICK":
 		r.rename(sender, m.Param(0))
@@ -181,7 +184,11 @@ func (r *roster) memberLeft(channel, nick string, ours bool) {
 		return
 	}
 	if st := r.chans[r.isup.Fold(channel)]; st != nil {
-		delete(st.members, r.isup.Fold(nick))
+		fk := r.isup.Fold(nick)
+		delete(st.members, fk)
+		if st.pending != nil {
+			delete(st.pending, fk)
+		}
 	}
 }
 
@@ -228,11 +235,16 @@ func (r *roster) namesEnd(m *ircv4.Message) {
 func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
 	ch := m.Param(0)
 	if ours {
-		// Bound the channel set against a server spoofing self-JOINs.
-		if _, known := r.chans[r.isup.Fold(ch)]; !known && len(r.chans) >= maxRosterChannels {
-			return
+		// Create the channel only if unknown — a repeat self-JOIN (a
+		// buggy/hostile server, or a netsplit rejoin edge) must not wipe
+		// the accumulated members and topic. Bound the set against a
+		// server spoofing distinct self-JOINs.
+		if _, known := r.chans[r.isup.Fold(ch)]; !known {
+			if len(r.chans) >= maxRosterChannels {
+				return
+			}
+			r.chans[r.isup.Fold(ch)] = &channelState{name: ch, members: make(map[string]Member)}
 		}
-		r.chans[r.isup.Fold(ch)] = &channelState{name: ch, members: make(map[string]Member)}
 	}
 	st := r.chans[r.isup.Fold(ch)]
 	if st == nil {
@@ -247,18 +259,31 @@ func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
 		mem.Account = acct
 	}
 	st.members[k] = mem
+	// If a NAMES accumulation is in flight for this channel, apply the
+	// live join to the pending snapshot too, so the 366 swap does not
+	// revert it (leaving a ghost/missing member).
+	if st.pending != nil {
+		st.pending[k] = mem
+	}
 }
 
 // rename re-keys a nick in every channel, keeping its state. Caller
 // holds r.mu.
 func (r *roster) rename(from, to string) {
 	fold := r.isup.Fold
-	for _, st := range r.chans {
-		if mem, ok := st.members[fold(from)]; ok {
-			delete(st.members, fold(from))
-			mem.Nick = to
-			st.members[fold(to)] = mem
+	rekey := func(mp map[string]Member) {
+		if mp == nil {
+			return
 		}
+		if mem, ok := mp[fold(from)]; ok {
+			delete(mp, fold(from))
+			mem.Nick = to
+			mp[fold(to)] = mem
+		}
+	}
+	for _, st := range r.chans {
+		rekey(st.members)
+		rekey(st.pending) // keep an in-flight NAMES snapshot consistent
 	}
 }
 

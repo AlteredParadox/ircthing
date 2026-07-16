@@ -840,7 +840,14 @@ func eventData(m store.Message) EventData {
 // msgid dedup makes the fan-out idempotent under overlapping backfill.
 func (h *Hub) persistMembership(ctx context.Context, c Conn, ev irc.Event, replay bool, batch *histBatch) {
 	for _, target := range h.membershipTargets(ctx, ev, replay, batch, c.Fold) {
-		stored, err := h.store.Append(ctx, ev.Network, target, storeMessage(ev))
+		// A just-closed buffer must not be resurrected by QUIT/NICK
+		// fan-out either (mirrors persistEvent's grace): append without
+		// creation during the close window.
+		appendFn := h.store.Append
+		if !replay && h.recentlyClosed(ev.Network, c.Fold(target)) {
+			appendFn = h.store.AppendExisting
+		}
+		stored, err := appendFn(ctx, ev.Network, target, storeMessage(ev))
 		if err != nil {
 			log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
 			continue

@@ -99,20 +99,30 @@ func TestEncodeThumb(t *testing.T) {
 	}
 }
 
-func TestDecodeConfigRejectsBomb(t *testing.T) {
-	// A tiny PNG declaring huge dimensions must be caught by the
-	// DecodeConfig pixel gate before a full decode is attempted.
-	big := makePNG(t, 100, 100) // real image; assert the gate math instead
+func TestDecodeByteGate(t *testing.T) {
+	big := makePNG(t, 100, 100)
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(big))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Width*cfg.Height > maxDecodePixels {
-		t.Fatal("test image unexpectedly over the pixel cap")
+	// A small image is under the byte cap.
+	if int64(cfg.Width)*int64(cfg.Height)*bytesPerPixel(cfg.ColorModel) > maxDecodeBytes {
+		t.Fatal("test image unexpectedly over the byte cap")
 	}
-	// The cap itself must reject a plausible bomb (e.g. 20000×20000).
-	if 20000*20000 <= maxDecodePixels {
-		t.Fatal("maxDecodePixels too high to stop a 400MP bomb")
+	// A plausible decompression bomb (20000x20000 @ 4 B/px = 1.6 GB) is
+	// rejected.
+	if int64(20000)*20000*4 <= maxDecodeBytes {
+		t.Fatal("maxDecodeBytes too high to stop a bomb")
+	}
+	// bytesPerPixel distinguishes 16-bit depth: an 8 B/px image hits the
+	// cap at half the pixels a 4 B/px one does.
+	if bytesPerPixel(color.RGBA64Model) != 8 || bytesPerPixel(color.RGBAModel) != 4 {
+		t.Fatal("bytesPerPixel wrong for 16-bit vs 8-bit models")
+	}
+	// A 3000x3000 16-bit image (8 B/px = 72 MB) is now rejected, where a
+	// pixel-only cap of 9 MP would have allowed it.
+	if int64(3000)*3000*bytesPerPixel(color.NRGBA64Model) <= maxDecodeBytes {
+		t.Fatal("16-bit 3000x3000 should exceed the byte cap")
 	}
 }
 

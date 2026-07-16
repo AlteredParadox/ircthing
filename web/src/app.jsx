@@ -961,11 +961,13 @@ export function App() {
 		}
 	}
 
-	const readSent = useRef(0);
+	// Per-buffer optimistic dedupe: a global value let two buffers that
+	// share the newest-message timestamp suppress each other's marker.
+	const readSent = useRef({});
 	function markRead(time) {
 		const buf = buffers[activeKey];
-		if (!buf || time <= buf.marker || time === readSent.current) return;
-		readSent.current = time;
+		if (!buf || time <= buf.marker || time === readSent.current[activeKey]) return;
+		readSent.current[activeKey] = time;
 		sock.current
 			.request("set_read_marker", { network: buf.network, buffer: buf.buffer, time })
 			.then((d) => setBuffers((b) => applyMarkerState(b, activeKey, d.time)))

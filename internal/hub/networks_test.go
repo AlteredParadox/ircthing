@@ -225,7 +225,7 @@ func TestCloseBufferResurrectionGuard(t *testing.T) {
 	s := h.NewSession()
 	defer s.Close()
 	s.Handle(ctxb, request(t, "close_buffer", 1, BufferRef{Network: "libera", Buffer: "#go"}))
-	recv(t, s, "ok", "buffer_closed")
+	recv(t, s, "ok", "buffer_closed", "event") // a racing seed event may arrive
 	conn.ch <- ev(":bob!u@h PRIVMSG #GO :straggler")
 
 	// Give the event loop time to (not) recreate it.
@@ -320,5 +320,51 @@ func TestEmptyBatchRefIgnored(t *testing.T) {
 	got := decode[EventData](t, recv(t, s, "event"))
 	if got.Raw == "" || got.Sender != "alice" {
 		t.Fatalf("live message not broadcast: %+v", got)
+	}
+}
+
+// QUIT/NICK fan-out honors the recentClose grace: a straggler QUIT for a
+// just-closed channel does not resurrect its buffer.
+func TestQuitDoesNotResurrectClosedBuffer(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox",
+		chans: map[string][]irc.Member{"#foo": {{Nick: "AlteredParadox"}, {Nick: "bob"}}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	ev := func(line string, affected ...string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+			Msg: ircv4.MustParseMessage(line), Affected: affected}
+	}
+	// Seed #foo.
+	conn.ch <- ev(":bob!u@h PRIVMSG #foo :hi")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#foo", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed not persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Close it, then a straggler QUIT touching #foo arrives.
+	s := h.NewSession()
+	defer s.Close()
+	s.Handle(ctxb, request(t, "close_buffer", 1, BufferRef{Network: "libera", Buffer: "#foo"}))
+	recv(t, s, "ok", "buffer_closed", "event") // a racing seed event may arrive
+	conn.ch <- ev(":bob!u@h QUIT :bye", "#foo")
+
+	time.Sleep(200 * time.Millisecond)
+	bufs, err := h.store.Buffers(ctxb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bufs) != 0 {
+		t.Fatalf("QUIT resurrected the closed buffer: %+v", bufs)
 	}
 }

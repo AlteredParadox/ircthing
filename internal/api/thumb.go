@@ -19,20 +19,32 @@ import (
 const (
 	maxImageBytes = 10 * 1024 * 1024
 	thumbMaxDim   = 400
-	// maxDecodePixels caps the decoded bitmap to defuse decompression
-	// bombs: a small file can declare enormous dimensions. 9 MP covers
-	// ~3000x3000 (most shared content; full-res photos usually exceed
-	// the byte cap anyway) at ~36 MB RGBA. With mediaSlots request-wide
-	// slots the media path's worst case is bounded at roughly
-	// slots x (body + bitmap) ~ 2 x 46 MB transiently — the steady-state
-	// RSS target is unaffected.
-	maxDecodePixels = 9 * 1000 * 1000
+	// maxDecodeBytes caps the decoded bitmap size to defuse decompression
+	// bombs (a small file can declare enormous dimensions) AND deep bit
+	// depths (16-bit images are 8 bytes/pixel). ~36 MB covers 9 MP at
+	// 4 bytes/pixel, or ~4.5 MP at 8 — most shared content; full-res
+	// photos usually exceed the byte cap on the wire anyway. With
+	// mediaSlots request-wide slots the media path's worst case stays
+	// bounded transiently and the steady-state RSS target is unaffected.
+	maxDecodeBytes = 36 * 1024 * 1024
 	maxThumbCache   = 128
 )
 
 type thumbResult struct {
 	contentType string
 	data        []byte
+}
+
+// bytesPerPixel estimates a decoded image's per-pixel cost from its
+// color model: 16-bit models decode to 8 bytes/pixel, everything else to
+// at most 4. Used to bound decoded memory, not just pixel count.
+func bytesPerPixel(m color.Model) int64 {
+	switch m {
+	case color.RGBA64Model, color.NRGBA64Model, color.Gray16Model:
+		return 8
+	default:
+		return 4
+	}
 }
 
 func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
@@ -65,10 +77,14 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reject oversized dimensions from the cheap header read, before
-	// committing to a full decode.
+	// Reject oversized decodes from the cheap header read, before
+	// committing to a full decode. Bound decoded BYTES, not just pixels:
+	// a 16-bit-depth image decodes to 8 bytes/pixel (RGBA64/NRGBA64/
+	// Gray16), double the assumed 4, so a pixel-only cap would let it
+	// use twice the intended memory.
 	cfg, format, err := image.DecodeConfig(bytes.NewReader(body))
-	if err != nil || cfg.Width*cfg.Height > maxDecodePixels || cfg.Width == 0 || cfg.Height == 0 {
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 ||
+		int64(cfg.Width)*int64(cfg.Height)*bytesPerPixel(cfg.ColorModel) > maxDecodeBytes {
 		http.Error(w, "unsupported image", http.StatusUnsupportedMediaType)
 		return
 	}

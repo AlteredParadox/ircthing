@@ -81,6 +81,11 @@ const defaultUserID = 1
 // poisoning the never-regressing marker.
 const markerSkewMs = 5 * 60 * 1000
 
+// maxBuffersPerNetwork bounds buffers auto-created from inbound traffic,
+// so server-controlled target/sender names cannot grow the store without
+// limit (mirrors the manager-side server-fed caps).
+const maxBuffersPerNetwork = 4096
+
 var ErrMsgIDNotFound = errors.New("store: msgid not found")
 
 type Options struct {
@@ -518,6 +523,19 @@ func (s *Store) bufferID(ctx context.Context, network, target string, create boo
 	if errors.Is(err, sql.ErrNoRows) {
 		if !create {
 			return 0, nil
+		}
+		// Bound the number of buffers a network accrues from inbound
+		// traffic: server-controlled target/sender names would otherwise
+		// create buffers (and rings, and message rows) without limit —
+		// the last unbounded server-fed structure. A legitimate user's
+		// channels + queries stay far below this.
+		var count int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM buffers WHERE network_id = ?`, netID).Scan(&count); err != nil {
+			return 0, err
+		}
+		if count >= maxBuffersPerNetwork {
+			return 0, nil // at cap: drop rather than create
 		}
 		res, err := s.db.ExecContext(ctx,
 			`INSERT INTO buffers (network_id, name) VALUES (?, ?)`, netID, target)

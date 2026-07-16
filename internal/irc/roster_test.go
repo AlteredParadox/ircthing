@@ -509,3 +509,54 @@ func TestChannelsWith(t *testing.T) {
 		t.Fatalf("channelsWith(ghost) = %v", got)
 	}
 }
+
+// A repeat self-JOIN for a channel we are already in preserves the
+// accumulated members and topic instead of wiping them.
+func TestRosterDuplicateSelfJoinPreserves(t *testing.T) {
+	r := testRoster()
+	feed(t, r,
+		":AlteredParadox JOIN #chan",
+		":srv 353 AlteredParadox = #chan :AlteredParadox alice bob",
+		":srv 366 AlteredParadox #chan :end",
+		":srv 332 AlteredParadox #chan :the topic",
+	)
+	if got := len(members(t, r, "#chan")); got != 3 {
+		t.Fatalf("setup members = %d, want 3", got)
+	}
+	// Duplicate self-JOIN must not reset the channel.
+	feed(t, r, ":AlteredParadox JOIN #chan")
+	if got := len(members(t, r, "#chan")); got != 3 {
+		t.Fatalf("members after dup self-JOIN = %d, want 3 (state preserved)", got)
+	}
+	if topic, _, _ := r.channel("#chan"); topic != "the topic" {
+		t.Fatalf("topic lost on dup self-JOIN: %q", topic)
+	}
+}
+
+// A member departing mid-NAMES (between 353 and 366) is not resurrected
+// by the 366 swap.
+func TestRosterLiveDepartureDuringNames(t *testing.T) {
+	r := testRoster()
+	feed(t, r, ":AlteredParadox JOIN #chan") // channel exists, empty
+	// NAMES burst begins, listing bob.
+	feed(t, r, ":srv 353 AlteredParadox = #chan :AlteredParadox alice bob")
+	// bob QUITs before 366.
+	feed(t, r, ":bob QUIT :gone")
+	// Also a live JOIN of carol before 366.
+	feed(t, r, ":carol JOIN #chan")
+	feed(t, r, ":srv 366 AlteredParadox #chan :end")
+
+	names := map[string]bool{}
+	for _, m := range members(t, r, "#chan") {
+		names[m.Nick] = true
+	}
+	if names["bob"] {
+		t.Fatal("bob (quit mid-NAMES) resurrected by the 366 swap")
+	}
+	if !names["carol"] {
+		t.Fatal("carol (joined mid-NAMES) lost by the 366 swap")
+	}
+	if !names["alice"] || !names["AlteredParadox"] {
+		t.Fatalf("NAMES members missing: %v", names)
+	}
+}

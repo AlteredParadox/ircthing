@@ -1,6 +1,7 @@
 package store
 
 import (
+	"strconv"
 	"context"
 	"os"
 	"path/filepath"
@@ -365,5 +366,38 @@ func TestTightenPathErrors(t *testing.T) {
 	}
 	if err := tightenPath(filepath.Join(blocker, "child-wal")); err == nil {
 		t.Fatal("stat error was swallowed")
+	}
+}
+
+// Buffer creation from inbound traffic is bounded per network, so a
+// server (or botnet) streaming distinct target/sender names cannot grow
+// the store without limit.
+func TestBufferCountCap(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+
+	msg := Message{Time: time.Now(), Sender: "x", Command: "PRIVMSG", Raw: ":x PRIVMSG t :hi"}
+	// Fill to the cap.
+	for i := 0; i < maxBuffersPerNetwork; i++ {
+		if _, err := s.Append(ctx, "net", "#c"+strconv.Itoa(i), msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Past the cap: creation is refused (message dropped, ID 0).
+	got, err := s.Append(ctx, "net", "#over", msg)
+	if err != nil || got.ID != 0 {
+		t.Fatalf("Append past cap = %+v, %v; want dropped", got, err)
+	}
+	bufs, err := s.Buffers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bufs) != maxBuffersPerNetwork {
+		t.Fatalf("buffers = %d, want %d", len(bufs), maxBuffersPerNetwork)
+	}
+	// An existing buffer still accepts messages.
+	if got, err := s.Append(ctx, "net", "#c0", msg); err != nil || got.ID == 0 {
+		t.Fatalf("append to existing buffer at cap = %+v, %v", got, err)
 	}
 }
