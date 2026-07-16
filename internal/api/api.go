@@ -25,6 +25,10 @@ import (
 
 const sessionCookie = "ircthing_session"
 
+// maxSessions caps concurrently valid login sessions; the oldest is
+// evicted at issue time. Generous for one user across devices/tabs.
+const maxSessions = 128
+
 type Config struct {
 	Username     string
 	PasswordHash string        // bcrypt hash of the user's password
@@ -107,18 +111,17 @@ func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()
 	// Browser hardening on every response. The CSP locks everything to
-	// same-origin (no inline script/style anywhere in the app); the
-	// WebSocket origin is named explicitly because older browsers do not
-	// count ws:// under 'self'.
+	// same-origin; connect-src 'self' covers the same-origin WebSocket
+	// in every current browser, and nothing request-controlled (Host)
+	// is interpolated into the header. style-src allows inline styles:
+	// the user-CSS override feature injects a <style> element, and
+	// style attributes are harmless next to a locked-down script-src
+	// ('self' via default-src).
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Frame-Options", "DENY")
-	// style-src allows inline styles: the user-CSS override feature
-	// injects a <style> element, and style attributes are harmless next
-	// to a locked-down script-src ('self' via default-src).
 	h.Set("Content-Security-Policy",
-		"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://"+r.Host+" wss://"+r.Host+
-			"; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -163,7 +166,26 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	token := hex.EncodeToString(buf)
 	s.mu.Lock()
-	s.tokens[token] = time.Now().Add(s.cfg.SessionTTL)
+	// Housekeeping at issue time: drop expired sessions (otherwise they
+	// only leave when their exact token is presented again), and cap the
+	// live set by evicting the oldest — repeated logins must not grow
+	// the map forever.
+	now := time.Now()
+	for t, exp := range s.tokens {
+		if now.After(exp) {
+			delete(s.tokens, t)
+		}
+	}
+	for len(s.tokens) >= maxSessions {
+		oldest, oldestExp := "", time.Time{}
+		for t, exp := range s.tokens {
+			if oldest == "" || exp.Before(oldestExp) {
+				oldest, oldestExp = t, exp
+			}
+		}
+		delete(s.tokens, oldest)
+	}
+	s.tokens[token] = now.Add(s.cfg.SessionTTL)
 	s.mu.Unlock()
 
 	http.SetCookie(w, &http.Cookie{

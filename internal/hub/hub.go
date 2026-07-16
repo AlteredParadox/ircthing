@@ -287,7 +287,7 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	// deletes the stored buffer (close_buffer) while our PART echo is
 	// still in flight, and either arrival order must leave it closed.
 	append := h.store.Append
-	if ev.Msg.Command == "PART" && ev.Msg.Prefix != nil && ev.Msg.Prefix.Name == c.Nick() {
+	if ev.Msg.Command == "PART" && ev.Msg.Prefix != nil && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick()) {
 		append = h.store.AppendExisting
 	}
 	stored, err := append(ctx, ev.Network, target, storeMessage(ev))
@@ -619,7 +619,7 @@ func (h *Hub) trackHistoryBatch(ev irc.Event, c Conn, batches map[string]*histBa
 			return
 		}
 		delete(batches, ref[1:])
-		key := strings.ToLower(b.target)
+		key := c.Fold(b.target)
 		if b.count >= c.HistoryPageSize() && b.lastTS > 0 && pages[key] < maxBackfillPages {
 			pages[key]++
 			c.RequestChatHistory(b.target, b.lastTS, b.lastID)

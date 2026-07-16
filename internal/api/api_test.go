@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -375,7 +376,7 @@ func TestSecurityHeaders(t *testing.T) {
 		}
 	}
 	csp := resp.Header.Get("Content-Security-Policy")
-	for _, want := range []string{"default-src 'self'", "frame-ancestors 'none'", "connect-src 'self' ws://", "img-src 'self' data:"} {
+	for _, want := range []string{"default-src 'self'", "frame-ancestors 'none'", "connect-src 'self'", "img-src 'self' data:"} {
 		if !strings.Contains(csp, want) {
 			t.Fatalf("CSP %q missing %q", csp, want)
 		}
@@ -411,5 +412,34 @@ func TestSecureCookieFlag(t *testing.T) {
 	del := sessionCookieOf(t, resp)
 	if !del.Secure || del.SameSite != http.SameSiteStrictMode || del.MaxAge >= 0 {
 		t.Fatalf("deletion cookie = %+v, want Secure + Strict + expired", del)
+	}
+}
+
+// Session tokens are pruned at issue time: expired entries go, and the
+// live set is capped by evicting the oldest.
+func TestSessionPruning(t *testing.T) {
+	ts, srv := newTestServerWithRef(t)
+
+	srv.mu.Lock()
+	srv.tokens["expired"] = time.Now().Add(-time.Hour)
+	for i := 0; i < maxSessions; i++ {
+		srv.tokens[strconv.Itoa(i)] = time.Now().Add(time.Duration(i+1) * time.Minute)
+	}
+	srv.mu.Unlock()
+
+	sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if len(srv.tokens) > maxSessions {
+		t.Fatalf("tokens = %d, want <= %d", len(srv.tokens), maxSessions)
+	}
+	if _, ok := srv.tokens["expired"]; ok {
+		t.Fatal("expired token survived a login")
+	}
+	if _, ok := srv.tokens["0"]; ok {
+		t.Fatal("oldest token not evicted at the cap")
+	}
+	if _, ok := srv.tokens[strconv.Itoa(maxSessions-1)]; !ok {
+		t.Fatal("newest pre-existing token wrongly evicted")
 	}
 }

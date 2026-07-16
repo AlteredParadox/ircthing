@@ -294,10 +294,20 @@ func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
 	s.hub.netOps.Lock()
 	defer s.hub.netOps.Unlock()
 
+	// Capture the definition first: if the delete transaction fails
+	// after the stop, the network must come back up, not stay stopped
+	// with its definition intact.
+	stored, err := s.hub.store.NetworkConfigs(ctx)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "loading networks failed"))
+		return
+	}
+	prev := findConfig(stored, d.Network, d.Network)
 	s.hub.StopNetwork(d.Network)
 	// One transaction: the definition and the stored history (that is
 	// what "delete" means) go together or not at all.
 	if err := s.hub.store.DeleteNetwork(ctx, d.Network); err != nil {
+		s.hub.restartNetwork(prev)
 		s.push(errEnvelope(env.Seq, "internal", "deleting network failed"))
 		return
 	}
