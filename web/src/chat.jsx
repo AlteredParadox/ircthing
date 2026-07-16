@@ -1,3 +1,4 @@
+import { Fragment } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Completer } from "./complete.js";
 import { firstURL, fmtTime, linkify, nickColor, renderable, sameGroup, TypingSender, typingText } from "./irc.js";
@@ -10,27 +11,31 @@ function Body({ text }) {
 	// on its own row, linkifying within each.
 	const lines = text.split("\n");
 	return lines.map((line, li) => (
-		<>
+		<Fragment key={li}>
 			{li > 0 && <br />}
-			{linkify(line).map((seg) =>
+			{linkify(line).map((seg, si) =>
 				seg.link
-					? <a href={seg.text} target="_blank" rel="noopener noreferrer">{seg.text}</a>
+					? <a key={si} href={seg.text} target="_blank" rel="noopener noreferrer">{seg.text}</a>
 					: seg.text,
 			)}
-		</>
+		</Fragment>
 	));
+}
+
+function SysRow({ ev, r, focused }) {
+	return (
+		<div class={"sys-row" + (r.kind === "redacted" ? " redacted" : "") + (focused ? " flash" : "")}>
+			<span class="msg-time">{fmtTime(ev.time)}</span>
+			<span class={"sys-mark " + r.markClass}>{r.mark}</span>
+			<span>{r.text}</span>
+		</div>
+	);
 }
 
 function Row({ ev, prev, selfNick, theme, focused, isHighlight, onRedact }) {
 	const r = renderable(ev);
 	if (r.kind === "system" || r.kind === "redacted") {
-		return (
-			<div class={"sys-row" + (r.kind === "redacted" ? " redacted" : "") + (focused ? " flash" : "")}>
-				<span class="msg-time">{fmtTime(ev.time)}</span>
-				<span class={"sys-mark " + r.markClass}>{r.mark}</span>
-				<span>{r.text}</span>
-			</div>
-		);
+		return <SysRow ev={ev} r={r} focused={focused} />;
 	}
 	const self = selfNick && ev.sender === selfNick;
 	const mention = !self && isHighlight(r.text);
@@ -40,11 +45,16 @@ function Row({ ev, prev, selfNick, theme, focused, isHighlight, onRedact }) {
 	const color = self ? "var(--accent)" : nickColor(ev.sender, theme);
 	// Own messages can be deleted (server decides authorization).
 	const canRedact = self && ev.msgid && onRedact;
+	// Actions show "*" in the nick column (the sender leads the body);
+	// grouped runs hide the repeated nick.
+	let nickLabel = ev.sender;
+	if (r.kind === "action") nickLabel = "*";
+	else if (grouped) nickLabel = "";
 	return (
 		<div class={"msg-row" + (mention ? " mention" : "") + (focused ? " flash" : "")}>
 			<span class="msg-time">{grouped ? "" : fmtTime(ev.time)}</span>
 			<span class="msg-nick" style={{ color }} title={ev.sender}>
-				{r.kind === "action" ? "*" : grouped ? "" : ev.sender}
+				{nickLabel}
 			</span>
 			<div class={"msg-body" + (r.kind === "action" ? " action" : "") + (r.kind === "notice" ? " notice" : "")}>
 				{r.kind === "action" && <span style={{ color, fontWeight: 600 }}>{ev.sender} </span>}

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
 import { bufferOrder, bufKey, isChannelName, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
@@ -23,6 +23,135 @@ function wsURL() {
 	return `${proto}//${location.host}/api/ws`;
 }
 
+function makeBuffer(network, buffer) {
+	return { key: bufKey(network, buffer), network, buffer, lastTime: 0, marker: 0, unread: 0, mention: false };
+}
+
+// Pure state transitions for the socket handlers, hoisted so the
+// handlers stay shallow and each shape is testable in isolation.
+
+// dropBufferMsgs forgets a buffer's cached pages (it refetches on view).
+function dropBufferMsgs(m, key) {
+	if (!m[key]) return m;
+	const next = { ...m };
+	delete next[key];
+	return next;
+}
+
+// appendEventMsgs appends a live event, bounding per-buffer memory.
+function appendEventMsgs(m, key, ev) {
+	const cur = m[key];
+	// A buffer showing a search-jump window (not the live tail) must not
+	// append — that would leave a temporal gap; the message is on disk
+	// and appears when the user returns to the tail.
+	if (cur?.loaded && cur.atTail === false) return m;
+	// Accumulate even before history is loaded — the fetch response
+	// merges and dedupes, so events racing an in-flight history request
+	// are never lost.
+	let list = [...(cur?.list || []), ev];
+	let reachedTop = cur?.reachedTop;
+	if (list.length > TRIM_AT) {
+		list = list.slice(list.length - TRIM_TO);
+		reachedTop = false;
+	}
+	return { ...m, [key]: { ...cur, list, reachedTop } };
+}
+
+// appendInfoLine appends an ephemeral server_info system line.
+function appendInfoLine(m, key, ev) {
+	const cur = m[key];
+	if (cur?.loaded && cur.atTail === false) return m;
+	return { ...m, [key]: { ...cur, list: [...(cur?.list || []), ev] } };
+}
+
+// clearTyperFor drops one nick's typing state (they just spoke).
+function clearTyperFor(t, key, sender) {
+	if (!t[key]?.[sender]) return t;
+	const cur = { ...t[key] };
+	delete cur[sender];
+	return { ...t, [key]: cur };
+}
+
+// setTypingState records a typing push; "done" clears it.
+function setTypingState(t, key, d) {
+	const cur = { ...t[key] };
+	if (d.state === "done") delete cur[d.nick];
+	else cur[d.nick] = { state: d.state, at: Date.now() };
+	return { ...t, [key]: cur };
+}
+
+// bumpBufferActivity advances a buffer's last-activity/unread/mention
+// state for a live event (creating the buffer on first traffic).
+function bumpBufferActivity(b, key, ev, countUnread, highlight) {
+	const cur = b[key] || makeBuffer(ev.network, ev.buffer);
+	return {
+		...b,
+		[key]: {
+			...cur,
+			lastTime: ev.time,
+			unread: countUnread ? cur.unread + 1 : cur.unread,
+			mention: cur.mention || highlight,
+		},
+	};
+}
+
+// applyMarkerState moves a buffer's read marker, clearing unread/mention
+// when it reaches the newest message.
+function applyMarkerState(b, key, time) {
+	const cur = b[key];
+	if (!cur) return b;
+	const cleared = time >= cur.lastTime;
+	return {
+		...b,
+		[key]: {
+			...cur, marker: time,
+			unread: cleared ? 0 : cur.unread,
+			mention: cleared ? false : cur.mention,
+		},
+	};
+}
+
+// applyPresenceUpdate flips one monitored nick's online state.
+function applyPresenceUpdate(all, d) {
+	const list = all[d.network] || [];
+	const idx = list.findIndex((m) => m.nick === d.nick);
+	if (idx === -1) return all; // not (or no longer) in the list
+	const next = list.slice();
+	next[idx] = { ...next[idx], online: d.online };
+	return { ...all, [d.network]: next };
+}
+
+// applyRedaction tombstones the message with the redacted msgid.
+function applyRedaction(m, key, d) {
+	const cur = m[key];
+	if (!cur?.list) return m;
+	let hit = false;
+	const list = cur.list.map((ev) => {
+		if (ev.msgid !== d.msgid || ev.redacted) return ev;
+		hit = true;
+		return { ...ev, redacted: true, redact_reason: d.reason };
+	});
+	return hit ? { ...m, [key]: { ...cur, list } } : m;
+}
+
+// mergeHistoryPage installs a fetched page, keeping events that streamed
+// in while the fetch was in flight (the page is authoritative for what
+// it covers).
+function mergeHistoryPage(m, key, page) {
+	const pageMsgs = page.messages || [];
+	const seen = new Set(pageMsgs.map((e) => e.id));
+	const streamed = (m[key]?.list || []).filter((e) => !seen.has(e.id));
+	return {
+		...m,
+		[key]: {
+			list: [...pageMsgs, ...streamed],
+			loaded: true,
+			reachedTop: pageMsgs.length < PAGE,
+			atTail: true,
+		},
+	};
+}
+
 export function App() {
 	const [phase, setPhase] = useState("checking"); // checking | login | app
 	const [connected, setConnected] = useState(false);
@@ -35,11 +164,11 @@ export function App() {
 	});
 	const [prefs, setPrefs] = useState(loadPrefs);
 	const [sysDark, setSysDark] = useState(
-		() => window.matchMedia("(prefers-color-scheme: dark)").matches,
+		() => globalThis.matchMedia("(prefers-color-scheme: dark)").matches,
 	);
 	const theme = resolveTheme(prefs.theme, sysDark);
-	const [sideOpen, setSideOpen] = useState(() => window.innerWidth >= 760);
-	const [rightOpen, setRightOpen] = useState(() => window.innerWidth >= 1000);
+	const [sideOpen, setSideOpen] = useState(() => globalThis.innerWidth >= 760);
+	const [rightOpen, setRightOpen] = useState(() => globalThis.innerWidth >= 1000);
 	const [chanInfo, setChanInfo] = useState(null);
 	const [chanTick, setChanTick] = useState(0);
 	const [cmdError, setCmdError] = useState("");
@@ -80,7 +209,7 @@ export function App() {
 
 	// Track the OS theme so the "system" preference follows it live.
 	useEffect(() => {
-		const mq = window.matchMedia("(prefers-color-scheme: dark)");
+		const mq = globalThis.matchMedia("(prefers-color-scheme: dark)");
 		const onChange = (e) => setSysDark(e.matches);
 		mq.addEventListener("change", onChange);
 		return () => mq.removeEventListener("change", onChange);
@@ -99,8 +228,8 @@ export function App() {
 			const h = parseHash(location.hash);
 			if (h) setActiveKey(bufKey(h.network, h.buffer));
 		};
-		window.addEventListener("hashchange", onHash);
-		return () => window.removeEventListener("hashchange", onHash);
+		globalThis.addEventListener("hashchange", onHash);
+		return () => globalThis.removeEventListener("hashchange", onHash);
 	}, []);
 
 	// Global shortcuts: Ctrl/Cmd+K channel switcher, Ctrl/Cmd+Shift+F
@@ -121,8 +250,8 @@ export function App() {
 				stepRef.current?.(e.key === "ArrowDown" ? 1 : -1, e.shiftKey);
 			}
 		};
-		window.addEventListener("keydown", onKey);
-		return () => window.removeEventListener("keydown", onKey);
+		globalThis.addEventListener("keydown", onKey);
+		return () => globalThis.removeEventListener("keydown", onKey);
 	}, []);
 
 	// Socket lifecycle, once authed.
@@ -186,12 +315,7 @@ export function App() {
 		let bufRefresh;
 		s.on("history_changed", (d) => {
 			const key = bufKey(d.network, d.buffer);
-			setMsgs((m) => {
-				if (!m[key]) return m;
-				const next = { ...m };
-				delete next[key];
-				return next;
-			});
+			setMsgs((m) => dropBufferMsgs(m, key));
 			clearTimeout(bufRefresh);
 			bufRefresh = setTimeout(() => {
 				s.request("get_buffers", null).then(applyBuffers).catch(() => {});
@@ -212,31 +336,9 @@ export function App() {
 
 		s.on("event", (ev) => {
 			const key = bufKey(ev.network, ev.buffer);
-			setMsgs((m) => {
-				const cur = m[key];
-				// When a buffer is showing a search-jump window (not the
-				// live tail), appending would leave a temporal gap — skip
-				// it; the message is on disk and appears when the user
-				// returns to the tail.
-				if (cur?.loaded && cur.atTail === false) return m;
-				// Accumulate even before history is loaded — the fetch
-				// response merges and dedupes, so events racing an
-				// in-flight history request are never lost.
-				let list = [...(cur?.list || []), ev];
-				let reachedTop = cur?.reachedTop;
-				if (list.length > TRIM_AT) {
-					list = list.slice(list.length - TRIM_TO);
-					reachedTop = false;
-				}
-				return { ...m, [key]: { ...(cur || {}), list, reachedTop } };
-			});
+			setMsgs((m) => appendEventMsgs(m, key, ev));
 			// A message from someone clears their typing indicator.
-			setTypers((t) => {
-				if (!t[key]?.[ev.sender]) return t;
-				const cur = { ...t[key] };
-				delete cur[ev.sender];
-				return { ...t, [key]: cur };
-			});
+			setTypers((t) => clearTyperFor(t, key, ev.sender));
 			const r = renderable(ev);
 			const isMsg = r.kind !== "system";
 			const nick = networksRef.current[ev.network]?.nick;
@@ -245,23 +347,9 @@ export function App() {
 			// a query (PM) buffer. PMs always alert.
 			const isChan = isChannelName(ev.buffer, networksRef.current[ev.network]?.chantypes);
 			const highlight = isMsg && !mine &&
-				(!isChan ? true : highlightText(r.text, nick, rulesRef.current, ev.network));
+				(isChan ? highlightText(r.text, nick, rulesRef.current, ev.network) : true);
 
-			setBuffers((b) => {
-				const cur = b[key] || {
-					key, network: ev.network, buffer: ev.buffer,
-					lastTime: 0, marker: 0, unread: 0, mention: false,
-				};
-				return {
-					...b,
-					[key]: {
-						...cur,
-						lastTime: ev.time,
-						unread: isMsg && !mine ? cur.unread + 1 : cur.unread,
-						mention: cur.mention || highlight,
-					},
-				};
-			});
+			setBuffers((b) => bumpBufferActivity(b, key, ev, isMsg && !mine, highlight));
 
 			// Desktop notification when a highlight lands somewhere the user
 			// isn't looking (tab hidden, or a different buffer active).
@@ -288,52 +376,18 @@ export function App() {
 			const buf = buffersRef.current[key];
 			if (!buf) return;
 			const text = (buf.network === d.network ? "" : `[${d.network}] `) + d.text;
-			setMsgs((m) => {
-				const cur = m[key];
-				if (cur?.loaded && cur.atTail === false) return m;
-				const ev = {
-					id: `si${++infoSeq}`, network: buf.network, buffer: buf.buffer,
-					time: Date.now(), sender: "", command: "INFO", raw: text,
-				};
-				return { ...m, [key]: { ...(cur || {}), list: [...(cur?.list || []), ev] } };
-			});
+			const ev = {
+				id: `si${++infoSeq}`, network: buf.network, buffer: buf.buffer,
+				time: Date.now(), sender: "", command: "INFO", raw: text,
+			};
+			setMsgs((m) => appendInfoLine(m, key, ev));
 		});
 
-		s.on("presence", (d) => {
-			setMonitors((all) => {
-				const list = all[d.network] || [];
-				const idx = list.findIndex((m) => m.nick === d.nick);
-				if (idx === -1) return all; // not (or no longer) in the list
-				const next = list.slice();
-				next[idx] = { ...next[idx], online: d.online };
-				return { ...all, [d.network]: next };
-			});
-		});
+		s.on("presence", (d) => setMonitors((all) => applyPresenceUpdate(all, d)));
 
-		s.on("redact", (d) => {
-			const key = bufKey(d.network, d.buffer);
-			setMsgs((m) => {
-				const cur = m[key];
-				if (!cur?.list) return m;
-				let hit = false;
-				const list = cur.list.map((ev) => {
-					if (ev.msgid !== d.msgid || ev.redacted) return ev;
-					hit = true;
-					return { ...ev, redacted: true, redact_reason: d.reason };
-				});
-				return hit ? { ...m, [key]: { ...cur, list } } : m;
-			});
-		});
+		s.on("redact", (d) => setMsgs((m) => applyRedaction(m, bufKey(d.network, d.buffer), d)));
 
-		s.on("typing", (d) => {
-			const key = bufKey(d.network, d.buffer);
-			setTypers((t) => {
-				const cur = { ...(t[key] || {}) };
-				if (d.state === "done") delete cur[d.nick];
-				else cur[d.nick] = { state: d.state, at: Date.now() };
-				return { ...t, [key]: cur };
-			});
-		});
+		s.on("typing", (d) => setTypers((t) => setTypingState(t, bufKey(d.network, d.buffer), d)));
 
 		s.on("members_changed", (d) => {
 			const buf = buffersRef.current[activeKeyRef.current];
@@ -345,22 +399,8 @@ export function App() {
 			}
 		});
 
-		s.on("read_marker", (d) => {
-			const key = bufKey(d.network, d.buffer);
-			setBuffers((b) => {
-				const cur = b[key];
-				if (!cur) return b;
-				const cleared = d.time >= cur.lastTime;
-				return {
-					...b,
-					[key]: {
-						...cur, marker: d.time,
-						unread: cleared ? 0 : cur.unread,
-						mention: cleared ? false : cur.mention,
-					},
-				};
-			});
-		});
+		s.on("read_marker", (d) =>
+			setBuffers((b) => applyMarkerState(b, bufKey(d.network, d.buffer), d.time)));
 
 		s.connect();
 		return () => s.close();
@@ -446,24 +486,7 @@ export function App() {
 		if (!buf || msgs[activeKey]?.loaded) return;
 		sock.current
 			.request("get_history", { network: buf.network, buffer: buf.buffer, limit: PAGE })
-			.then((page) => {
-				setMsgs((m) => {
-					// Keep events that streamed in while the fetch was in
-					// flight; the page is authoritative for what it covers.
-					const pageMsgs = page.messages || [];
-					const seen = new Set(pageMsgs.map((e) => e.id));
-					const streamed = (m[activeKey]?.list || []).filter((e) => !seen.has(e.id));
-					return {
-						...m,
-						[activeKey]: {
-							list: [...pageMsgs, ...streamed],
-							loaded: true,
-							reachedTop: pageMsgs.length < PAGE,
-							atTail: true,
-						},
-					};
-				});
-			})
+			.then((page) => setMsgs((m) => mergeHistoryPage(m, activeKey, page)))
 			.catch(() => {});
 	}, [activeKey, connected, buffers, msgs]);
 
@@ -510,10 +533,6 @@ export function App() {
 	}
 	stepRef.current = stepBuffer;
 
-	function makeBuffer(network, buffer) {
-		return { key: bufKey(network, buffer), network, buffer, lastTime: 0, marker: 0, unread: 0, mention: false };
-	}
-
 	function select(network, buffer) {
 		const key = bufKey(network, buffer);
 		// A buffer may not exist yet (/join, /msg to a fresh target):
@@ -521,19 +540,12 @@ export function App() {
 		setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(network, buffer) }));
 		// Returning to a buffer that's showing a search-jump window drops
 		// it so the live tail reloads.
-		setMsgs((m) => {
-			if (m[key] && m[key].atTail === false) {
-				const next = { ...m };
-				delete next[key];
-				return next;
-			}
-			return m;
-		});
+		setMsgs((m) => (m[key]?.atTail === false ? dropBufferMsgs(m, key) : m));
 		setFocusId(null);
 		location.hash = toHash(network, buffer);
 		setActiveKey(key);
 		setCmdError("");
-		if (window.innerWidth < 760) setSideOpen(false);
+		if (globalThis.innerWidth < 760) setSideOpen(false);
 	}
 
 	// jumpTo opens a search result: load a window centered on the message
@@ -623,18 +635,7 @@ export function App() {
 		readSent.current = time;
 		sock.current
 			.request("set_read_marker", { network: buf.network, buffer: buf.buffer, time })
-			.then((d) => {
-				setBuffers((b) => b[activeKey]
-					? {
-						...b,
-						[activeKey]: {
-							...b[activeKey], marker: d.time,
-							unread: d.time >= b[activeKey].lastTime ? 0 : b[activeKey].unread,
-							mention: d.time >= b[activeKey].lastTime ? false : b[activeKey].mention,
-						},
-					}
-					: b);
-			})
+			.then((d) => setBuffers((b) => applyMarkerState(b, activeKey, d.time)))
 			.catch(() => {});
 	}
 
@@ -660,7 +661,7 @@ export function App() {
 					onAddMonitor={addMonitor} onRemoveMonitor={removeMonitor}
 				/>
 			</div>
-			{sideOpen && <div class="side-scrim" onClick={() => setSideOpen(false)} />}
+			{sideOpen && <div class="side-scrim" role="presentation" onClick={() => setSideOpen(false)} />}
 			<div class="main">
 				<div class="topbar">
 					<button
@@ -718,7 +719,7 @@ export function App() {
 					<div class="empty-state">no buffers yet — waiting for traffic</div>
 				)}
 			</div>
-			{isChan && rightOpen && <div class="right-scrim" onClick={() => setRightOpen(false)} />}
+			{isChan && rightOpen && <div class="right-scrim" role="presentation" onClick={() => setRightOpen(false)} />}
 			{isChan && (
 				<div class={"rightbar" + (rightOpen ? " open" : "")}>
 					<Members info={chanInfo} theme={theme} />

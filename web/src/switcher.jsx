@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "preact/hooks";
+import { pressable } from "./a11y.js";
 import { rankBuffers } from "./irc.js";
 
 // Channel switcher palette (Ctrl+K): type to filter buffers, arrows to
@@ -14,8 +15,8 @@ export function Switcher({ buffers, networks, onSelect, onClose }) {
 	useEffect(() => inputRef.current?.focus(), []);
 	useEffect(() => {
 		const onKey = (e) => e.key === "Escape" && onClose();
-		window.addEventListener("keydown", onKey);
-		return () => window.removeEventListener("keydown", onKey);
+		globalThis.addEventListener("keydown", onKey);
+		return () => globalThis.removeEventListener("keydown", onKey);
 	}, []);
 
 	function onKeyDown(e) {
@@ -32,8 +33,8 @@ export function Switcher({ buffers, networks, onSelect, onClose }) {
 	}
 
 	return (
-		<div class="search-scrim" onClick={onClose}>
-			<div class="search-panel switch-panel" onClick={(e) => e.stopPropagation()}>
+		<div class="search-scrim" role="presentation" onClick={onClose}>
+			<div class="search-panel switch-panel" role="presentation" onClick={(e) => e.stopPropagation()}>
 				<div class="search-head">
 					<span class="search-icon">›</span>
 					<input
@@ -58,7 +59,7 @@ export function Switcher({ buffers, networks, onSelect, onClose }) {
 								class={"switch-row" + (i === sel ? " sel" : "")}
 								key={b.key}
 								onMouseEnter={() => setIdx(i)}
-								onClick={() => onSelect(b.network, b.buffer)}
+								{...pressable(() => onSelect(b.network, b.buffer))}
 							>
 								<span class="chan-hash">{isChan ? b.buffer[0] : "@"}</span>
 								<span class="switch-name">{isChan ? b.buffer.slice(1) : b.buffer}</span>

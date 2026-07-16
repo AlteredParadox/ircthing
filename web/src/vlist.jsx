@@ -49,7 +49,7 @@ export function VirtualList({
 	// A new focus target (a search jump) unpins and requests a scroll-to
 	// once the item is present. Set synchronously so the window below
 	// renders around the target rather than the tail.
-	const focusIdx = focusId != null ? geo.indexOf(focusId) : -1;
+	const focusIdx = focusId == null ? -1 : geo.indexOf(focusId);
 	if (focusId !== prevFocus.current) {
 		prevFocus.current = focusId;
 		if (focusId != null && focusIdx !== -1) {
@@ -101,16 +101,8 @@ export function VirtualList({
 				// Two passes so the offset table is rebuilt once, not per
 				// entry: classify rows against pre-measure geometry, then
 				// apply all measurements.
-				const batch = [];
 				const hh = headerEl.current?.offsetHeight || 0;
-				for (const e of entries) {
-					const id = idOf(e.target.dataset.vid);
-					if (id === null) continue;
-					const h = e.borderBoxSize?.[0]?.blockSize ?? e.target.offsetHeight;
-					if (h === 0) continue; // detached row
-					const i = geo.indexOf(id);
-					batch.push({ id, h, above: i !== -1 && geo.offsetOf(i) + hh < sc.scrollTop });
-				}
+				const batch = classifyEntries(entries, geo, sc.scrollTop, hh);
 				let above = 0;
 				let changed = false;
 				for (const b of batch) {
@@ -203,6 +195,22 @@ export function VirtualList({
 			<div style={{ height: bottomPad }} />
 		</div>
 	);
+}
+
+// classifyEntries turns ResizeObserver entries into measurement records,
+// noting which rows sit above the viewport (their growth must be
+// compensated in scrollTop).
+function classifyEntries(entries, geo, scrollTop, headerH) {
+	const batch = [];
+	for (const e of entries) {
+		const id = idOf(e.target.dataset.vid);
+		if (id === null) continue;
+		const h = e.borderBoxSize?.[0]?.blockSize ?? e.target.offsetHeight;
+		if (h === 0) continue; // detached row
+		const i = geo.indexOf(id);
+		batch.push({ id, h, above: i !== -1 && geo.offsetOf(i) + headerH < scrollTop });
+	}
+	return batch;
 }
 
 function idOf(s) {

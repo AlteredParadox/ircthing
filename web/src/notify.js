@@ -26,7 +26,9 @@ export function highlightText(text, nick, rules, network) {
 export function loadRules() {
 	try {
 		const v = JSON.parse(localStorage.getItem("highlightRules"));
-		return Array.isArray(v) ? v : [];
+		if (!Array.isArray(v)) return [];
+		// Stable ids key the settings rows (rules are edited in place).
+		return v.map((r) => ({ ...r, id: r.id || crypto.randomUUID() }));
 	} catch {
 		return [];
 	}
@@ -94,7 +96,8 @@ export class Notifier {
 // the total unread count, coloured red when any of it is a highlight.
 export function applyBadge(unread, mention) {
 	if (typeof document === "undefined") return;
-	document.title = unread > 0 ? `(${unread > 99 ? "99+" : unread}) ircthing` : "ircthing";
+	const count = unread > 99 ? "99+" : unread;
+	document.title = unread > 0 ? `(${count}) ircthing` : "ircthing";
 	const accent =
 		getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#2a6fdb";
 	setFaviconHref(renderFavicon(unread, mention, accent));

@@ -1,6 +1,31 @@
 import { useEffect, useState } from "preact/hooks";
 import { ACCENT_RGB, ACCENTS } from "./prefs.js";
 
+// NotifControl renders the notification section for the current
+// permission state: unsupported, not yet granted, or toggleable.
+function NotifControl({ perm, enabled, onEnable, onToggle }) {
+	if (perm === "unsupported") {
+		return <div class="settings-note">Not supported in this browser.</div>;
+	}
+	if (perm === "granted") {
+		return (
+			<label class="settings-toggle">
+				<input
+					type="checkbox"
+					checked={enabled}
+					onChange={(e) => onToggle(e.currentTarget.checked)}
+				/>
+				<span>Notify on highlights and private messages</span>
+			</label>
+		);
+	}
+	return (
+		<button class="btn-accent" onClick={onEnable}>
+			Enable desktop notifications
+		</button>
+	);
+}
+
 // Seg: a small segmented control — one button per option.
 function Seg({ value, options, labels, onPick }) {
 	return (
@@ -22,12 +47,12 @@ function Seg({ value, options, labels, onPick }) {
 export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, onClose }) {
 	const [perm, setPerm] = useState(notifier.permission());
 	const [enabled, setEnabled] = useState(notifier.enabled);
-	const netNames = Object.keys(networks).sort();
+	const netNames = Object.keys(networks).sort((a, b) => a.localeCompare(b));
 
 	useEffect(() => {
 		const onKey = (e) => e.key === "Escape" && onClose();
-		window.addEventListener("keydown", onKey);
-		return () => window.removeEventListener("keydown", onKey);
+		globalThis.addEventListener("keydown", onKey);
+		return () => globalThis.removeEventListener("keydown", onKey);
 	}, []);
 
 	async function enableNotif() {
@@ -40,13 +65,13 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 		setEnabled(notifier.enabled);
 	}
 
-	const addRule = () => onRules([...rules, { pattern: "", network: "" }]);
+	const addRule = () => onRules([...rules, { id: crypto.randomUUID(), pattern: "", network: "" }]);
 	const updateRule = (i, patch) => onRules(rules.map((r, j) => (j === i ? { ...r, ...patch } : r)));
 	const removeRule = (i) => onRules(rules.filter((_, j) => j !== i));
 
 	return (
-		<div class="search-scrim" onClick={onClose}>
-			<div class="settings-panel" onClick={(e) => e.stopPropagation()}>
+		<div class="search-scrim" role="presentation" onClick={onClose}>
+			<div class="settings-panel" role="presentation" onClick={(e) => e.stopPropagation()}>
 				<div class="settings-head">
 					<div class="settings-title">Settings</div>
 					<button class="search-close" onClick={onClose} title="Close (Esc)">✕</button>
@@ -123,22 +148,10 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 
 					<section class="settings-section">
 						<div class="settings-label">Desktop notifications</div>
-						{perm === "unsupported" ? (
-							<div class="settings-note">Not supported in this browser.</div>
-						) : perm !== "granted" ? (
-							<button class="btn-accent" onClick={enableNotif}>
-								Enable desktop notifications
-							</button>
-						) : (
-							<label class="settings-toggle">
-								<input
-									type="checkbox"
-									checked={enabled}
-									onChange={(e) => toggleNotif(e.currentTarget.checked)}
-								/>
-								<span>Notify on highlights and private messages</span>
-							</label>
-						)}
+						<NotifControl
+							perm={perm} enabled={enabled}
+							onEnable={enableNotif} onToggle={toggleNotif}
+						/>
 					</section>
 
 					<section class="settings-section">
@@ -148,7 +161,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 							network or all.
 						</div>
 						{rules.map((r, i) => (
-							<div class="rule-row" key={i}>
+							<div class="rule-row" key={r.id}>
 								<input
 									class="rule-input"
 									value={r.pattern}

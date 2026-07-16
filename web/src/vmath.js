@@ -27,7 +27,7 @@ export class Geometry {
 			old.length > 0 &&
 			items.length >= old.length &&
 			items[0] === old[0] &&
-			items[old.length - 1] === old[old.length - 1];
+			items[old.length - 1] === old.at(-1);
 		if (appended) {
 			for (let i = old.length; i < items.length; i++) this.index.set(items[i].id, i);
 		} else {
@@ -48,7 +48,7 @@ export class Geometry {
 	heightAt(i) {
 		const it = this.items[i];
 		const m = this.measured.get(it.id);
-		return m !== undefined ? m : this.estimate(it);
+		return m === undefined ? this.estimate(it) : m;
 	}
 
 	// measure records a row's real height and returns the delta against

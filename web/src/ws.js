@@ -64,7 +64,7 @@ export class Socket {
 
 	request(type, data, timeoutMs = 10000) {
 		return new Promise((resolve, reject) => {
-			if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			if (this.ws?.readyState !== WebSocket.OPEN) {
 				reject(new Error("not connected"));
 				return;
 			}
@@ -82,7 +82,7 @@ export class Socket {
 	// Silently dropped while disconnected — fine for ephemeral state
 	// like typing.
 	notify(type, data) {
-		if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+		if (this.ws?.readyState === WebSocket.OPEN) {
 			this.ws.send(JSON.stringify({ v: V, type, data }));
 		}
 	}

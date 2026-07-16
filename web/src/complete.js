@@ -18,26 +18,33 @@ export function completions(text, caret, { nicks = [] } = {}) {
 	if (!token) return null;
 	const start = caret - token.length;
 
-	if (token[0] === "/" && start === 0) {
+	if (token.startsWith("/") && start === 0) {
 		const q = token.slice(1).toLowerCase();
 		const options = COMMANDS.filter((c) => c.startsWith(q)).map((c) => "/" + c + " ");
 		return options.length ? { start, options } : null;
 	}
-	if (token[0] === ":" && token.length > 1) {
+	if (token.startsWith(":") && token.length > 1) {
 		const q = token.slice(1).toLowerCase();
 		const options = EMOJI.filter(([name]) => name.startsWith(q)).map(([, ch]) => ch + " ");
 		return options.length ? { start, options } : null;
 	}
-	const q = token.toLowerCase();
+	const options = nickOptions(nicks, token.toLowerCase(), start === 0);
+	return options.length ? { start, options } : null;
+}
+
+// nickOptions matches roster nicks by case-insensitive prefix, deduped,
+// with the conventional suffix: "nick: " at the start of the line,
+// "nick " elsewhere.
+function nickOptions(nicks, q, atStart) {
 	const seen = new Set();
 	const options = [];
 	for (const n of nicks) {
 		if (n && n.toLowerCase().startsWith(q) && !seen.has(n.toLowerCase())) {
 			seen.add(n.toLowerCase());
-			options.push(n + (start === 0 ? ": " : " "));
+			options.push(n + (atStart ? ": " : " "));
 		}
 	}
-	return options.length ? { start, options } : null;
+	return options;
 }
 
 // Completer cycles through candidates on repeated Tab. A cycle stays
@@ -59,7 +66,7 @@ export class Completer {
 	// next returns { text, caret } for the following candidate (dir +1)
 	// or the previous one (dir -1), or null when nothing completes.
 	next(text, caret, dir, ctx) {
-		if (this.applied && this.applied.text === text && this.applied.caret === caret) {
+		if (this.applied?.text === text && this.applied.caret === caret) {
 			this.idx = (this.idx + dir + this.options.length) % this.options.length;
 		} else {
 			const c = completions(text, caret, ctx);

@@ -1,4 +1,5 @@
 import { useState } from "preact/hooks";
+import { pressable } from "./a11y.js";
 import { bufKey, nickColor } from "./irc.js";
 
 function stateDot(state) {
@@ -12,7 +13,7 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, onSelec
 	// get a section so a fresh install isn't a blank panel.
 	const names = new Set(Object.keys(networks));
 	for (const b of Object.values(buffers)) names.add(b.network);
-	const sections = [...names].sort().map((name) => ({
+	const sections = [...names].sort((a, b) => a.localeCompare(b)).map((name) => ({
 		name,
 		state: networks[name]?.state || "disconnected",
 		nick: networks[name]?.nick || "",
@@ -47,7 +48,7 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, onSelec
 								<div
 									class={"chan-row" + (active ? " active" : "") + (unread ? " unread" : "")}
 									key={key}
-									onClick={() => onSelect(b.network, b.buffer)}
+									{...pressable(() => onSelect(b.network, b.buffer))}
 								>
 									<span class="chan-hash">{isChan ? b.buffer[0] : "@"}</span>
 									<span class="chan-name">{isChan ? b.buffer.slice(1) : b.buffer}</span>
@@ -119,7 +120,7 @@ function MonitorSection({ network, list, onOpen, onAdd, onRemove }) {
 				</form>
 			)}
 			{list.map((m) => (
-				<div class="monitor-row" key={m.nick} onClick={() => onOpen(m.nick)}>
+				<div class="monitor-row" key={m.nick} {...pressable(() => onOpen(m.nick))}>
 					<span class={"dot " + (m.online ? "online" : "offline")} />
 					<span class={"monitor-nick" + (m.online ? "" : " off")}>{m.nick}</span>
 					<button

@@ -37,6 +37,16 @@ export function parseLine(raw) {
 	return out;
 }
 
+// renderMessage renders a PRIVMSG/NOTICE: plain text, CTCP ACTION, or a
+// notice — with the bot-mode chip when the server tagged the sender as a
+// bot (a bare "bot" tag).
+function renderMessage(command, line, last) {
+	const bot = "bot" in line.tags;
+	const m = /^\x01ACTION ([^]*?)\x01?$/.exec(last);
+	if (m) return { kind: "action", text: m[1], bot };
+	return { kind: command === "NOTICE" ? "notice" : "msg", text: last, bot };
+}
+
 // renderable turns a protocol EventData into what a row displays:
 //   { kind: "msg" | "action" | "notice", text }
 //   { kind: "system", mark, markClass, text }
@@ -46,17 +56,11 @@ export function renderable(ev) {
 		return { kind: "redacted", mark: "⌫", markClass: "mode", text: `message deleted${why}` };
 	}
 	const line = parseLine(ev.raw);
-	const last = line.params.length ? line.params[line.params.length - 1] : "";
+	const last = line.params.at(-1) ?? "";
 	switch (ev.command) {
 		case "PRIVMSG":
-		case "NOTICE": {
-			// bot-mode: servers tag messages from +B users with a bare
-			// "bot" tag; rows show a chip.
-			const bot = "bot" in line.tags;
-			const m = /^\x01ACTION ([^]*?)\x01?$/.exec(last);
-			if (m) return { kind: "action", text: m[1], bot };
-			return { kind: ev.command === "NOTICE" ? "notice" : "msg", text: last, bot };
-		}
+		case "NOTICE":
+			return renderMessage(ev.command, line, last);
 		case "JOIN":
 			return { kind: "system", mark: "→", markClass: "join", text: `${ev.sender} has joined` };
 		case "PART":
@@ -97,7 +101,7 @@ export function renderable(ev) {
 // chroma per theme.
 export function nickColor(nick, theme) {
 	let h = 0;
-	for (const c of nick) h = (h * 31 + c.charCodeAt(0)) % 360;
+	for (const c of nick) h = (h * 31 + c.codePointAt(0)) % 360;
 	const light = theme === "light";
 	return `oklch(${light ? 0.5 : 0.74} ${light ? 0.15 : 0.13} ${h})`;
 }
@@ -118,7 +122,7 @@ export function sameGroup(prev, cur) {
 
 // mentionsMe: \b is wrong for IRC nicks (nick_ , nick[] ...), so use the
 // nickname alphabet as the boundary.
-const NICK_CHARS = "A-Za-z0-9_\\-\\[\\]\\\\`^{}|";
+const NICK_CHARS = String.raw`A-Za-z0-9_\-\[\]\\` + "`^{}|";
 export function mentionsMe(text, nick) {
 	if (!nick) return false;
 	const esc = nick.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -207,30 +211,14 @@ export function parseInput(input, buffer, chantypes) {
 			return { type: "text", text: "\x01ACTION " + rest + "\x01" };
 
 		case "msg":
-		case "query": {
-			const sp = rest.indexOf(" ");
-			if (sp === -1 || !rest.slice(sp + 1).trim()) return err("usage: /msg <target> <text>");
-			return { type: "msg", target: rest.slice(0, sp), text: rest.slice(sp + 1).trim() };
-		}
+		case "query":
+			return parseMsgCmd(rest, err);
 
-		case "join": {
-			if (!rest) return err("usage: /join <channel> [key]");
-			const [chan, key] = rest.split(/\s+/);
-			if (!isChannelName(chan, chantypes)) return err("/join: " + chan + " is not a channel");
-			return { type: "cmd", command: "JOIN", params: key ? [chan, key] : [chan], switchTo: chan };
-		}
+		case "join":
+			return parseJoinCmd(rest, chantypes, err);
 
-		case "part": {
-			let chan = buffer;
-			let reason = rest;
-			if (isChannelName(rest.split(/\s+/)[0] || "", chantypes)) {
-				const sp = rest.indexOf(" ");
-				chan = sp === -1 ? rest : rest.slice(0, sp);
-				reason = sp === -1 ? "" : rest.slice(sp + 1).trim();
-			}
-			if (!isChannelName(chan, chantypes)) return err("/part: not in a channel");
-			return { type: "cmd", command: "PART", params: reason ? [chan, reason] : [chan] };
-		}
+		case "part":
+			return parsePartCmd(rest, buffer, chantypes, err);
 
 		case "nick":
 			if (!rest || /\s/.test(rest)) return err("usage: /nick <newnick>");
@@ -266,40 +254,76 @@ export function parseInput(input, buffer, chantypes) {
 			return { type: "cmd", command: "NOTICE", params: [rest.slice(0, sp), rest.slice(sp + 1).trim()] };
 		}
 
-		case "mode": {
-			// /mode queries the current buffer; /mode +m sets modes on it;
-			// /mode <target> ... names one explicitly.
-			const parts = rest ? rest.split(/\s+/) : [];
-			let target = buffer;
-			if (parts.length && !/^[+-]/.test(parts[0])) target = parts.shift();
-			if (parts.length > 5) return err("/mode: too many parameters");
-			return { type: "cmd", command: "MODE", params: [target, ...parts] };
-		}
+		case "mode":
+			return parseModeCmd(rest, buffer, err);
 
-		case "kick": {
-			// /kick <nick> [reason] in a channel; /kick <channel> <nick>
-			// [reason] anywhere.
-			const parts = rest ? rest.split(/\s+/) : [];
-			let chan = buffer;
-			if (parts.length && isChannelName(parts[0], chantypes)) chan = parts.shift();
-			const nick = parts.shift();
-			if (!nick) return err("usage: /kick [channel] <nick> [reason]");
-			if (!isChannelName(chan, chantypes)) return err("/kick: not in a channel");
-			const reason = parts.join(" ");
-			return { type: "cmd", command: "KICK", params: reason ? [chan, nick, reason] : [chan, nick] };
-		}
+		case "kick":
+			return parseKickCmd(rest, buffer, chantypes, err);
 
-		case "invite": {
-			const parts = rest ? rest.split(/\s+/) : [];
-			if (!parts.length || parts.length > 2) return err("usage: /invite <nick> [channel]");
-			const chan = parts[1] || buffer;
-			if (!isChannelName(chan, chantypes)) return err("/invite: not in a channel");
-			return { type: "cmd", command: "INVITE", params: [parts[0], chan] };
-		}
+		case "invite":
+			return parseInviteCmd(rest, buffer, chantypes, err);
 
 		default:
 			return err("unknown command /" + cmd);
 	}
+}
+
+function parseMsgCmd(rest, err) {
+	const sp = rest.indexOf(" ");
+	if (sp === -1 || !rest.slice(sp + 1).trim()) return err("usage: /msg <target> <text>");
+	return { type: "msg", target: rest.slice(0, sp), text: rest.slice(sp + 1).trim() };
+}
+
+function parseJoinCmd(rest, chantypes, err) {
+	if (!rest) return err("usage: /join <channel> [key]");
+	const [chan, key] = rest.split(/\s+/);
+	if (!isChannelName(chan, chantypes)) return err("/join: " + chan + " is not a channel");
+	return { type: "cmd", command: "JOIN", params: key ? [chan, key] : [chan], switchTo: chan };
+}
+
+// parsePartCmd: /part [channel] [reason], defaulting to the current
+// buffer when the first word is not a channel.
+function parsePartCmd(rest, buffer, chantypes, err) {
+	let chan = buffer;
+	let reason = rest;
+	if (isChannelName(rest.split(/\s+/)[0] || "", chantypes)) {
+		const sp = rest.indexOf(" ");
+		chan = sp === -1 ? rest : rest.slice(0, sp);
+		reason = sp === -1 ? "" : rest.slice(sp + 1).trim();
+	}
+	if (!isChannelName(chan, chantypes)) return err("/part: not in a channel");
+	return { type: "cmd", command: "PART", params: reason ? [chan, reason] : [chan] };
+}
+
+// parseModeCmd: /mode queries the current buffer; /mode +m sets modes
+// on it; /mode <target> ... names one explicitly.
+function parseModeCmd(rest, buffer, err) {
+	const parts = rest ? rest.split(/\s+/) : [];
+	let target = buffer;
+	if (parts.length && !/^[+-]/.test(parts[0])) target = parts.shift();
+	if (parts.length > 5) return err("/mode: too many parameters");
+	return { type: "cmd", command: "MODE", params: [target, ...parts] };
+}
+
+// parseKickCmd: /kick <nick> [reason] in a channel; /kick <channel>
+// <nick> [reason] anywhere.
+function parseKickCmd(rest, buffer, chantypes, err) {
+	const parts = rest ? rest.split(/\s+/) : [];
+	let chan = buffer;
+	if (parts.length && isChannelName(parts[0], chantypes)) chan = parts.shift();
+	const nick = parts.shift();
+	if (!nick) return err("usage: /kick [channel] <nick> [reason]");
+	if (!isChannelName(chan, chantypes)) return err("/kick: not in a channel");
+	const reason = parts.join(" ");
+	return { type: "cmd", command: "KICK", params: reason ? [chan, nick, reason] : [chan, nick] };
+}
+
+function parseInviteCmd(rest, buffer, chantypes, err) {
+	const parts = rest ? rest.split(/\s+/) : [];
+	if (!parts.length || parts.length > 2) return err("usage: /invite <nick> [channel]");
+	const chan = parts[1] || buffer;
+	if (!isChannelName(chan, chantypes)) return err("/invite: not in a channel");
+	return { type: "cmd", command: "INVITE", params: [parts[0], chan] };
 }
 
 // groupMembers buckets a channel roster for the members panel by the

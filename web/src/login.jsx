@@ -35,12 +35,12 @@ export function Login({ onLogin }) {
 					<div class="logo">λ</div>
 					<div class="login-title">ircthing</div>
 				</div>
-				<label class="login-label" for="login-user">username</label>
+				<label class="login-label" htmlFor="login-user">username</label>
 				<input
 					id="login-user" class="login-input" autocomplete="username" autofocus
 					value={username} onInput={(e) => setUsername(e.currentTarget.value)}
 				/>
-				<label class="login-label" for="login-pass">password</label>
+				<label class="login-label" htmlFor="login-pass">password</label>
 				<input
 					id="login-pass" class="login-input" type="password" autocomplete="current-password"
 					value={password} onInput={(e) => setPassword(e.currentTarget.value)}

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "preact/hooks";
+import { pressable } from "./a11y.js";
 import { fmtTime, renderable } from "./irc.js";
 
 // Full-text search overlay. Debounced queries hit the server FTS index;
@@ -16,8 +17,8 @@ export function SearchOverlay({ sock, onJump, onClose }) {
 		const onKey = (e) => {
 			if (e.key === "Escape") onClose();
 		};
-		window.addEventListener("keydown", onKey);
-		return () => window.removeEventListener("keydown", onKey);
+		globalThis.addEventListener("keydown", onKey);
+		return () => globalThis.removeEventListener("keydown", onKey);
 	}, []);
 
 	useEffect(() => {
@@ -43,8 +44,8 @@ export function SearchOverlay({ sock, onJump, onClose }) {
 	}, [query]);
 
 	return (
-		<div class="search-scrim" onClick={onClose}>
-			<div class="search-panel" onClick={(e) => e.stopPropagation()}>
+		<div class="search-scrim" role="presentation" onClick={onClose}>
+			<div class="search-panel" role="presentation" onClick={(e) => e.stopPropagation()}>
 				<div class="search-head">
 					<span class="search-icon">⌕</span>
 					<input
@@ -65,7 +66,7 @@ export function SearchOverlay({ sock, onJump, onClose }) {
 							<div
 								class="search-result"
 								key={ev.id}
-								onClick={() => onJump(ev)}
+								{...pressable(() => onJump(ev))}
 							>
 								<div class="search-result-meta">
 									<span class="search-result-buf">{ev.network}/{ev.buffer}</span>
