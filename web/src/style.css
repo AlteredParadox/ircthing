@@ -30,6 +30,7 @@
 	--online: #3ec489;
 	--away: #e0a63a;
 	--offline: #565e70;
+	--danger: #e05656;
 	--ui-font: system-ui, "Segoe UI", Roboto, sans-serif;
 	--mono-font: ui-monospace, "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
 	--msg-font: var(--ui-font);
@@ -62,6 +63,7 @@
 	--away: #c98a1e;
 	--offline: #a7afbd;
 	color-scheme: light;
+	--danger: #b93131;
 }
 
 /* Accent palette — swatches in settings mirror these (prefs.js). */
@@ -277,6 +279,11 @@ input::placeholder {
 	display: flex;
 	align-items: center;
 	gap: 8px;
+	width: 100%;
+	border: 0;
+	background: transparent;
+	font: inherit;
+	text-align: left;
 	padding: var(--pad-row) 10px;
 	border-radius: 7px;
 	cursor: pointer;
@@ -1307,7 +1314,7 @@ input::placeholder {
 .ctx-item.danger:focus-visible {
 	background: rgb(var(--accent-rgb) / 0);
 	background-color: rgba(224, 70, 70, 0.14);
-	color: #e04646;
+	color: var(--danger);
 }
 
 /* muted buffers and ignored members are dimmed */
@@ -1448,14 +1455,14 @@ input::placeholder {
 	border-radius: 7px;
 	height: 30px;
 	padding: 0 12px;
-	color: var(--danger, #c33);
+	color: var(--danger);
 	cursor: pointer;
 	font: inherit;
 	font-size: 0.8571rem;
 }
 
 .nf-danger.confirm {
-	background: var(--danger, #c33);
+	background: var(--danger);
 	color: #fff;
 	border-color: transparent;
 }

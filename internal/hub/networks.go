@@ -142,44 +142,13 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "internal", "loading networks failed"))
 		return
 	}
-	exists := func(n string) bool {
-		for _, c := range stored {
-			if c.Name == n {
-				return true
-			}
-		}
-		return false
+	if msg := putNetworkConflict(stored, d.OldName, name); msg != "" {
+		s.push(errEnvelope(env.Seq, "bad_request", msg))
+		return
 	}
 	renamed := d.OldName != "" && d.OldName != name
-	switch {
-	case d.OldName == "" && exists(name):
-		s.push(errEnvelope(env.Seq, "bad_request", fmt.Sprintf("network %q already exists", name)))
-		return
-	case d.OldName != "" && !exists(d.OldName):
-		s.push(errEnvelope(env.Seq, "bad_request", fmt.Sprintf("network %q not found", d.OldName)))
-		return
-	case renamed && exists(name):
-		s.push(errEnvelope(env.Seq, "bad_request", fmt.Sprintf("network %q already exists", name)))
-		return
-	}
-
-	if renamed {
-		if err := s.hub.store.RenameNetworkData(ctx, d.OldName, name); err != nil {
-			s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
-			return
-		}
-		if err := s.hub.store.DeleteNetworkConfig(ctx, d.OldName); err != nil {
-			s.push(errEnvelope(env.Seq, "internal", "renaming network failed"))
-			return
-		}
-	}
-	canonical, err := json.Marshal(nc)
-	if err != nil {
-		s.push(errEnvelope(env.Seq, "internal", "encoding network failed"))
-		return
-	}
-	if err := s.hub.store.PutNetworkConfig(ctx, name, string(canonical)); err != nil {
-		s.push(errEnvelope(env.Seq, "internal", "storing network failed"))
+	if code, msg := s.hub.persistNetwork(ctx, nc, d.OldName, renamed); msg != "" {
+		s.push(errEnvelope(env.Seq, code, msg))
 		return
 	}
 
@@ -198,6 +167,51 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcast(envelope("networks_changed", 0, nil))
+}
+
+// putNetworkConflict reports (as a user-facing message, "" for none)
+// name conflicts for an add or edit: an existing name may not be taken,
+// and an edit must reference a definition that exists.
+func putNetworkConflict(stored []store.NetworkConfig, oldName, name string) string {
+	exists := func(n string) bool {
+		for _, c := range stored {
+			if c.Name == n {
+				return true
+			}
+		}
+		return false
+	}
+	renamed := oldName != "" && oldName != name
+	if oldName != "" && !exists(oldName) {
+		return fmt.Sprintf("network %q not found", oldName)
+	}
+	if (oldName == "" || renamed) && exists(name) {
+		return fmt.Sprintf("network %q already exists", name)
+	}
+	return ""
+}
+
+// persistNetwork applies a validated put: moves history on a rename and
+// stores the canonical definition. Returns an error code+message for
+// the client, or ("", "") on success.
+func (h *Hub) persistNetwork(ctx context.Context, nc *netconf.Network, oldName string, renamed bool) (code, msg string) {
+	name := nc.EffectiveName()
+	if renamed {
+		if err := h.store.RenameNetworkData(ctx, oldName, name); err != nil {
+			return "bad_request", err.Error()
+		}
+		if err := h.store.DeleteNetworkConfig(ctx, oldName); err != nil {
+			return "internal", "renaming network failed"
+		}
+	}
+	canonical, err := json.Marshal(nc)
+	if err != nil {
+		return "internal", "encoding network failed"
+	}
+	if err := h.store.PutNetworkConfig(ctx, name, string(canonical)); err != nil {
+		return "internal", "storing network failed"
+	}
+	return "", ""
 }
 
 func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
@@ -305,9 +319,24 @@ func (h *Hub) updateAutojoin(ctx context.Context, network, channel string, add b
 	if err != nil {
 		return err
 	}
-	out := nc.Channels[:0]
+	out, changed := editChannelList(nc.Channels, channel, add)
+	if !changed {
+		return nil
+	}
+	nc.Channels = out
+	canonical, err := json.Marshal(nc)
+	if err != nil {
+		return err
+	}
+	return h.store.PutNetworkConfig(ctx, network, string(canonical))
+}
+
+// editChannelList adds or removes a channel (case-insensitive dedup),
+// reporting whether the list changed.
+func editChannelList(chans []string, channel string, add bool) ([]string, bool) {
+	out := make([]string, 0, len(chans)+1)
 	found := false
-	for _, ch := range nc.Channels {
+	for _, ch := range chans {
 		if strings.EqualFold(ch, channel) {
 			found = true
 			if !add {
@@ -316,17 +345,13 @@ func (h *Hub) updateAutojoin(ctx context.Context, network, channel string, add b
 		}
 		out = append(out, ch)
 	}
-	if add && !found {
-		out = append(out, channel)
-	} else if add || !found {
-		return nil // nothing to change
+	if add {
+		if found {
+			return chans, false
+		}
+		return append(out, channel), true
 	}
-	nc.Channels = out
-	canonical, err := json.Marshal(nc)
-	if err != nil {
-		return err
-	}
-	return h.store.PutNetworkConfig(ctx, network, string(canonical))
+	return out, found
 }
 
 // SeedRows converts config-file networks into store rows for

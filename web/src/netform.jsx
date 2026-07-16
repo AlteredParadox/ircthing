@@ -25,7 +25,7 @@ function Field({ label, children }) {
 export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, onClose }) {
 	const [cfg, setCfg] = useState(() => ({
 		tls: true,
-		...(initial || {}),
+		...initial,
 	}));
 	const [channels, setChannels] = useState((initial?.channels || []).join(" "));
 	const [confirmDel, setConfirmDel] = useState(false);
@@ -37,7 +37,7 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 		else {
 			set({
 				sasl: {
-					...(cfg.sasl || {}),
+					...cfg.sasl,
 					mechanism: choice === "auto" ? "" : choice,
 				},
 			});
@@ -84,12 +84,12 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 						<div class="nf-check-row">
 							<label class="nf-check">
 								<input type="checkbox" checked={!!cfg.tls} onChange={(e) => set({ tls: e.currentTarget.checked })} />
-								Use TLS
+								<span>Use TLS</span>
 							</label>
 							{!cfg.tls && (
 								<label class="nf-check">
 									<input type="checkbox" checked={!!cfg.allow_plaintext} onChange={(e) => set({ allow_plaintext: e.currentTarget.checked })} />
-									Allow plaintext (unencrypted)
+									<span>Allow plaintext (unencrypted)</span>
 								</label>
 							)}
 						</div>

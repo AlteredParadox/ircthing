@@ -755,29 +755,23 @@ export function App() {
 		const isOp = /[~&@]/.test(me.prefix || "");
 		const isHalfop = (me.prefix || "").includes("%");
 		if (!isOp && !isHalfop) return [];
+		const tp = target.prefix || "";
 		const mode = (flag) => () => sendCommand(network, "MODE", [buf.buffer, flag, nick]);
-		const items = [{ divider: true }];
-		if (isOp) {
-			items.push(
-				(target.prefix || "").includes("@")
-					? { label: "Remove op (-o)", onClick: mode("-o") }
-					: { label: "Give op (+o)", onClick: mode("+o") },
-			);
-		}
-		items.push(
-			(target.prefix || "").includes("+")
+		// Ban is by nick mask; we do not track member hostnames.
+		return [
+			{ divider: true },
+			...(isOp ? [tp.includes("@")
+				? { label: "Remove op (-o)", onClick: mode("-o") }
+				: { label: "Give op (+o)", onClick: mode("+o") }] : []),
+			tp.includes("+")
 				? { label: "Remove voice (-v)", onClick: mode("-v") }
 				: { label: "Give voice (+v)", onClick: mode("+v") },
-		);
-		items.push({ label: "Kick", danger: true, onClick: () => sendCommand(network, "KICK", [buf.buffer, nick]) });
-		if (isOp) {
-			// Ban by nick mask; we do not track member hostnames.
-			items.push({
+			{ label: "Kick", danger: true, onClick: () => sendCommand(network, "KICK", [buf.buffer, nick]) },
+			...(isOp ? [{
 				label: "Ban", danger: true,
 				onClick: () => sendCommand(network, "MODE", [buf.buffer, "+b", `${nick}!*@*`]),
-			});
-		}
-		return items;
+			}] : []),
+		];
 	}
 
 	// openBufferMenu: the right-click menu for a sidebar row — channel
@@ -786,32 +780,33 @@ export function App() {
 		const key = bufKey(network, buffer);
 		const muted = isMuted(mutesRef.current, key);
 		const chan = isChannelName(buffer, networksRef.current[network]?.chantypes);
-		const items = [];
-		if (chan) {
-			items.push({ label: "Edit topic", onClick: () => editTopic(network, buffer) });
-		} else {
-			const ig = isIgnored(ignoresRef.current, network, buffer);
-			items.push({ label: "Whois", onClick: () => sendCommand(network, "WHOIS", [buffer]) });
-			items.push({
-				label: ig ? "Unignore" : "Ignore", danger: !ig,
-				onClick: () => setIgnores((x2) => toggleIgnore(x2, network, buffer)),
-			});
-		}
-		items.push({
-			label: muted ? "Unmute" : "Mute",
-			onClick: () => setMutes((m) => toggleMute(m, key)),
-		});
-		items.push(chan
-			? {
-				label: "Leave channel", danger: true,
-				onClick: () => {
-					// part_channel also removes the channel from autojoin.
-					sock.current?.request("part_channel", { network, channel: buffer })
-						.catch(() => sendCommand(network, "PART", [buffer]));
-					closeBuffer(network, buffer);
-				},
-			}
-			: { label: "Close", danger: true, onClick: () => closeBuffer(network, buffer) });
+		const ig = !chan && isIgnored(ignoresRef.current, network, buffer);
+		const items = [
+			...(chan
+				? [{ label: "Edit topic", onClick: () => editTopic(network, buffer) }]
+				: [
+					{ label: "Whois", onClick: () => sendCommand(network, "WHOIS", [buffer]) },
+					{
+						label: ig ? "Unignore" : "Ignore", danger: !ig,
+						onClick: () => setIgnores((x2) => toggleIgnore(x2, network, buffer)),
+					},
+				]),
+			{
+				label: muted ? "Unmute" : "Mute",
+				onClick: () => setMutes((m) => toggleMute(m, key)),
+			},
+			chan
+				? {
+					label: "Leave channel", danger: true,
+					onClick: () => {
+						// part_channel also removes the channel from autojoin.
+						sock.current?.request("part_channel", { network, channel: buffer })
+							.catch(() => sendCommand(network, "PART", [buffer]));
+						closeBuffer(network, buffer);
+					},
+				}
+				: { label: "Close", danger: true, onClick: () => closeBuffer(network, buffer) },
+		];
 		setMenu({ x, y, title: buffer, items });
 	}
 

@@ -69,34 +69,8 @@ func run(cfg *config) error {
 	// rows exist the file list is ignored.
 	var wg sync.WaitGroup
 	h.UseRoot(ctx, &wg)
-	seedRows, err := hub.SeedRows(cfg.Networks)
-	if err != nil {
+	if err := startNetworks(ctx, st, h, cfg.Networks); err != nil {
 		return fmt.Errorf("networks: %w", err)
-	}
-	seeded, err := st.SeedNetworkConfigs(ctx, seedRows)
-	if err != nil {
-		return fmt.Errorf("networks: %w", err)
-	}
-	if seeded {
-		log.Printf("networks: imported %d definitions from the config file", len(seedRows))
-	}
-	stored, err := st.NetworkConfigs(ctx)
-	if err != nil {
-		return fmt.Errorf("networks: %w", err)
-	}
-	if !seeded && len(cfg.Networks) > 0 {
-		log.Printf("networks: %d definitions in database; config file networks[] is ignored (manage networks in the web UI)", len(stored))
-	}
-	for _, row := range stored {
-		nc, err := netconf.Parse([]byte(row.Config))
-		if err != nil {
-			// A bad stored row should not take the daemon down with it.
-			log.Printf("networks: skipping %q: %v", row.Name, err)
-			continue
-		}
-		if err := h.StartNetwork(nc); err != nil {
-			log.Printf("networks: starting %q: %v", row.Name, err)
-		}
 	}
 
 	assets, err := fs.Sub(web.Dist, "dist")
@@ -138,6 +112,41 @@ func run(cfg *config) error {
 	defer cancel()
 	srv.Shutdown(shutdownCtx)
 	wg.Wait()
+	return nil
+}
+
+// startNetworks seeds the network_configs table from the config file on
+// first run, then starts every stored definition. A bad stored row is
+// skipped with a log line, not fatal.
+func startNetworks(ctx context.Context, st *store.Store, h *hub.Hub, fileNetworks []netconf.Network) error {
+	seedRows, err := hub.SeedRows(fileNetworks)
+	if err != nil {
+		return err
+	}
+	seeded, err := st.SeedNetworkConfigs(ctx, seedRows)
+	if err != nil {
+		return err
+	}
+	if seeded {
+		log.Printf("networks: imported %d definitions from the config file", len(seedRows))
+	}
+	stored, err := st.NetworkConfigs(ctx)
+	if err != nil {
+		return err
+	}
+	if !seeded && len(fileNetworks) > 0 {
+		log.Printf("networks: %d definitions in database; config file networks[] is ignored (manage networks in the web UI)", len(stored))
+	}
+	for _, row := range stored {
+		nc, err := netconf.Parse([]byte(row.Config))
+		if err != nil {
+			log.Printf("networks: skipping %q: %v", row.Name, err)
+			continue
+		}
+		if err := h.StartNetwork(nc); err != nil {
+			log.Printf("networks: starting %q: %v", row.Name, err)
+		}
+	}
 	return nil
 }
 

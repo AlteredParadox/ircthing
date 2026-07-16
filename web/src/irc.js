@@ -124,9 +124,11 @@ export function applyStatusMode(list, mode, expanded) {
 	if (mode === "show") return list;
 	if (mode === "hide") return list.filter((ev) => !isPresence(ev));
 	const out = [];
-	for (let i = 0; i < list.length; i++) {
+	let i = 0;
+	while (i < list.length) {
 		if (!isPresence(list[i])) {
 			out.push(list[i]);
+			i++;
 			continue;
 		}
 		let j = i;
@@ -144,7 +146,7 @@ export function applyStatusMode(list, mode, expanded) {
 			});
 			if (isOpen) out.push(...run);
 		}
-		i = j - 1;
+		i = j;
 	}
 	return out;
 }

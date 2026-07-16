@@ -52,23 +52,16 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSe
 							const isChan = sec.chantypes.includes(b.buffer[0]);
 							const openMenu = (x, y) => onBufferMenu(b.network, b.buffer, x, y);
 							return (
-								<div
+								<button
+									type="button"
 									class={"chan-row" + (active ? " active" : "") + (unread ? " unread" : "") + (muted ? " muted" : "")}
 									key={key}
-									role="button"
-									tabIndex={0}
 									onClick={() => {
 										if (pressFired.current) {
 											pressFired.current = false;
 											return;
 										}
 										onSelect(b.network, b.buffer);
-									}}
-									onKeyDown={(e) => {
-										if (e.key === "Enter" || e.key === " ") {
-											e.preventDefault();
-											onSelect(b.network, b.buffer);
-										}
 									}}
 									onContextMenu={(e) => {
 										e.preventDefault();
@@ -84,7 +77,7 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSe
 											{b.unread > 99 ? "99+" : b.unread}
 										</span>
 									)}
-								</div>
+								</button>
 							);
 						})}
 						<MonitorSection
