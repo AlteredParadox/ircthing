@@ -120,9 +120,12 @@ irctest: build .cache/irctest-src .cache/irctest-venv
 	.cache/irctest-venv/bin/pip install --quiet pytest pytest-timeout filelock
 
 # RSS scenario: 5 networks / 50 channels / 10k hot messages under
-# GOMEMLIMIT=64MiB, verified against the 72 MB target.
-memcheck:
-	@echo "memcheck: not implemented yet (stub)"; exit 1
+# GOMEMLIMIT=64MiB, asserted against the 72 MB RSS target. Run before
+# releases and after changes to buffering, caching, or the store — not
+# part of `make check` (RSS is too noisy for CI pass/fail).
+memcheck: build
+	IRCTHING_BIN=$(CURDIR)/$(BIN) \
+	go test -tags memcheck -count=1 -v -timeout 300s -run TestMemoryScenario ./integration/
 
 clean:
 	rm -rf bin
