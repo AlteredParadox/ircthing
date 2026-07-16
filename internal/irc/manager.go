@@ -213,11 +213,18 @@ func hasFramingBytes(s string) bool {
 // checkFraming rejects a message whose command, parameters, prefix, or
 // tags contain framing bytes.
 func checkFraming(msg *ircv4.Message) error {
-	if hasFramingBytes(msg.Command) {
+	if hasFramingBytes(msg.Command) || strings.IndexByte(msg.Command, ' ') != -1 {
 		return ErrUnsafeFraming
 	}
-	for _, p := range msg.Params {
+	for i, p := range msg.Params {
 		if hasFramingBytes(p) {
+			return ErrUnsafeFraming
+		}
+		// A space in a non-trailing parameter would be re-parsed by the
+		// receiver as a parameter boundary — intra-line injection. Only
+		// the last parameter is serialized as trailing (":...") and may
+		// legitimately contain spaces.
+		if i < len(msg.Params)-1 && strings.IndexByte(p, ' ') != -1 {
 			return ErrUnsafeFraming
 		}
 	}

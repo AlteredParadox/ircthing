@@ -32,6 +32,7 @@ type scramClient struct {
 	clientNonce     string
 	serverSig       []byte
 	step            int
+	verified        bool
 }
 
 
@@ -148,9 +149,13 @@ func (c *scramClient) verify(serverFinal string) ([]byte, error) {
 	if subtle.ConstantTimeCompare(got, c.serverSig) != 1 {
 		return nil, errors.New("scram: server signature mismatch (possible MITM)")
 	}
-	// Authenticated: reply with an empty message to complete the exchange.
+	// Authenticated: the server proved knowledge of the password.
+	c.verified = true
+	// Reply with an empty message to complete the exchange.
 	return []byte{}, nil
 }
+
+func (c *scramClient) completed() bool { return c.verified }
 
 func scramHMAC(key, msg []byte) []byte {
 	h := hmac.New(sha256.New, key)

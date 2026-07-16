@@ -265,6 +265,9 @@ func TestSendRejectsFramingBytes(t *testing.T) {
 		{Command: "PRIVMSG", Params: []string{"#chan", "bare\rcr"}},
 		{Command: "PRIVMSG", Params: []string{"#chan", "nul\x00byte"}},
 		{Command: "PRIVMSG", Tags: ircv4.Tags{"k": "v\r\nx"}, Params: []string{"#chan", "hi"}},
+		// A space in a non-trailing param would be re-parsed as a boundary.
+		{Command: "MODE", Params: []string{"#chan +o victim\r\nJOIN #evil", "x"}},
+		{Command: "MODE", Params: []string{"#chan +o extra-arg", "final"}},
 	}
 	for i, msg := range cases {
 		if err := m.Send(msg); err != ErrUnsafeFraming {

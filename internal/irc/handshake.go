@@ -212,6 +212,13 @@ func (h *handshake) handle(m *ircv4.Message) (out []*ircv4.Message, done bool, e
 		return nil, false, errors.New("SASL: nick locked by services (902)")
 
 	case "903": // RPL_SASLSUCCESS
+		// Do not trust a success the mechanism has not actually
+		// completed: for SCRAM this forces the server-signature
+		// verification (RFC 5802 §5), so an impostor server or MITM
+		// cannot skip the server-final and claim success.
+		if h.mech != nil && !h.mech.completed() {
+			return nil, false, fmt.Errorf("SASL %s: server reported success before the exchange completed (missing server verification)", h.mech.Name())
+		}
 		h.saslDone = true
 		h.phase = hsAwaitWelcome
 		return []*ircv4.Message{newMsg("CAP", "END")}, false, nil

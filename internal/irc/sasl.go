@@ -17,6 +17,13 @@ import (
 type saslMech interface {
 	Name() string
 	respond(challenge []byte) ([]byte, error)
+	// completed reports whether the exchange reached a state in which
+	// SASL success (903) may be trusted. For one-shot mechanisms this is
+	// once the response was sent; for SCRAM it is only after the
+	// server's ServerSignature has been verified (RFC 5802 §5), so a
+	// server cannot claim success without proving knowledge of the
+	// password.
+	completed() bool
 }
 
 // plainMech is SASL PLAIN (RFC 4616): a one-shot [authzid] NUL authcid
@@ -26,7 +33,8 @@ type plainMech struct {
 	sent                     bool
 }
 
-func (m *plainMech) Name() string { return "PLAIN" }
+func (m *plainMech) Name() string    { return "PLAIN" }
+func (m *plainMech) completed() bool { return m.sent }
 
 func (m *plainMech) respond(_ []byte) ([]byte, error) {
 	if m.sent {
@@ -44,7 +52,8 @@ type externalMech struct {
 	sent    bool
 }
 
-func (m *externalMech) Name() string { return "EXTERNAL" }
+func (m *externalMech) Name() string    { return "EXTERNAL" }
+func (m *externalMech) completed() bool { return m.sent }
 
 func (m *externalMech) respond(_ []byte) ([]byte, error) {
 	if m.sent {

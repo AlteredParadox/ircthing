@@ -367,19 +367,20 @@ func (s *Session) handleCloseBuffer(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", "close_buffer needs a network and a buffer"))
 		return
 	}
-	if err := s.hub.store.DeleteBuffer(ctx, d.Network, d.Buffer); err != nil {
-		s.push(errEnvelope(env.Seq, "internal", "closing buffer failed"))
-		return
-	}
-	// Guard against straggler inbound traffic re-creating the buffer we
-	// just deleted (see persistEvent). Fold with the network's
-	// casemapping when it is connected; otherwise a plain key still
-	// matches most cases.
+	// Mark closed BEFORE deleting, so a straggler that races the delete
+	// already takes the non-creating AppendExisting path (see
+	// persistEvent) and cannot re-create the buffer in the gap between
+	// the two operations. Fold with the network's casemapping when it is
+	// connected; otherwise a plain key still matches most cases.
 	fold := func(x string) string { return x }
 	if c := s.hub.network(d.Network); c != nil {
 		fold = c.Fold
 	}
 	s.hub.markClosed(d.Network, fold(d.Buffer), time.Now().UnixMilli())
+	if err := s.hub.store.DeleteBuffer(ctx, d.Network, d.Buffer); err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "closing buffer failed"))
+		return
+	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcast(envelope("buffer_closed", 0, d))
 }

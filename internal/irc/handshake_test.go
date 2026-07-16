@@ -568,3 +568,44 @@ func TestHandshakePassSecureVsInsecure(t *testing.T) {
 		t.Fatalf("insecure CAP LS reply = %q, want deferred PASS", wire(out))
 	}
 }
+
+// An early 903 — before the SCRAM server-final that carries the
+// ServerSignature — must be rejected, so a server/MITM cannot bypass
+// SCRAM mutual authentication.
+func TestHandshakeSCRAMEarly903Rejected(t *testing.T) {
+	cfg := Config{
+		Addr: "irc.test:6697", Nick: "AlteredParadox", TLS: true,
+		SASL: &SASLConfig{Mechanism: "SCRAM-SHA-256", Login: "AlteredParadox", Password: "pencil"},
+	}
+	hs := newHandshake(&cfg)
+	hs.start()
+	if _, _, err := hs.handle(ircv4.MustParseMessage("CAP * LS :sasl=SCRAM-SHA-256")); err != nil {
+		t.Fatal(err)
+	}
+	hs.handle(ircv4.MustParseMessage("CAP AlteredParadox ACK :sasl"))
+	hs.handle(ircv4.MustParseMessage("AUTHENTICATE +")) // client-first
+
+	// Server sends the server-first (so the client sends client-final)...
+	serverFirst := "r=" + "srvnonce" + ",s=" + base64.StdEncoding.EncodeToString([]byte("0123456789abcdef")) + ",i=4096"
+	// Note: nonce won't extend the client nonce, so client-final fails —
+	// use a fresh handshake that reaches client-final legitimately is
+	// overkill; instead test the pure guard: after ACK, before any
+	// server-final verification, a 903 is rejected.
+	_ = serverFirst
+	_, _, err := hs.handle(ircv4.MustParseMessage(":srv 903 AlteredParadox :ok"))
+	if err == nil || !strings.Contains(err.Error(), "before the exchange completed") {
+		t.Fatalf("early 903 err = %v, want rejection", err)
+	}
+
+	// PLAIN, by contrast, legitimately completes on its single response,
+	// so its 903 is accepted.
+	pcfg := Config{Addr: "x:1", Nick: "AlteredParadox", TLS: true, SASL: &SASLConfig{Mechanism: "PLAIN", Login: "AlteredParadox", Password: "pw"}}
+	ph := newHandshake(&pcfg)
+	ph.start()
+	ph.handle(ircv4.MustParseMessage("CAP * LS :sasl=PLAIN"))
+	ph.handle(ircv4.MustParseMessage("CAP AlteredParadox ACK :sasl"))
+	ph.handle(ircv4.MustParseMessage("AUTHENTICATE +")) // sends the PLAIN response
+	if _, _, err := ph.handle(ircv4.MustParseMessage(":srv 903 AlteredParadox :ok")); err != nil {
+		t.Fatalf("PLAIN 903 rejected: %v", err)
+	}
+}

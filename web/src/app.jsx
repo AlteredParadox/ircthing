@@ -248,6 +248,13 @@ export function App() {
 	// buffer, so a live event arriving mid-load cannot fire a second,
 	// window-slid request that corrupts ordering.
 	const loadingHistory = useRef(new Set());
+	// Per-buffer load generation: a history_changed (backfill) bumps it,
+	// so an in-flight get_history whose generation is stale on resolve is
+	// discarded and refetched instead of installing pre-backfill data.
+	const historyGen = useRef({});
+	// Bumped when a load settles, to re-run the load effect (a ref clear
+	// alone would not).
+	const [loadTick, setLoadTick] = useState(0);
 
 	// The server is the source of truth for prefs; localStorage is a
 	// write-through cache so the first paint has the right theme. This
@@ -412,6 +419,7 @@ export function App() {
 		let bufRefresh;
 		s.on("history_changed", (d) => {
 			const key = bufKey(d.network, d.buffer);
+			historyGen.current[key] = (historyGen.current[key] || 0) + 1;
 			setMsgs((m) => dropBufferMsgs(m, key));
 			clearTimeout(bufRefresh);
 			bufRefresh = setTimeout(refreshBuffers, 300);
@@ -657,13 +665,23 @@ export function App() {
 		const buf = buffers[activeKey];
 		if (!buf || msgs[activeKey]?.loaded || loadingHistory.current.has(activeKey)) return;
 		const key = activeKey;
+		const gen = historyGen.current[key] || 0;
 		loadingHistory.current.add(key);
 		sock.current
 			.request("get_history", { network: buf.network, buffer: buf.buffer, limit: PAGE })
-			.then((page) => setMsgs((m) => mergeHistoryPage(m, key, page)))
+			.then((page) => {
+				// A history_changed invalidated this buffer while the
+				// request was in flight — discard the pre-backfill page;
+				// the effect refetches once loadingHistory clears.
+				if ((historyGen.current[key] || 0) !== gen) return;
+				setMsgs((m) => mergeHistoryPage(m, key, page));
+			})
 			.catch(() => {})
-			.finally(() => loadingHistory.current.delete(key));
-	}, [activeKey, connected, buffers, msgs]);
+			.finally(() => {
+				loadingHistory.current.delete(key);
+				setLoadTick((t) => t + 1);
+			});
+	}, [activeKey, connected, buffers, msgs, loadTick]);
 
 	// Default to the first buffer once the sidebar is known.
 	useEffect(() => {
