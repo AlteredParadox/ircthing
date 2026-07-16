@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"strings"
 	"context"
 	"encoding/json"
 	"sync"
@@ -108,6 +109,8 @@ func TestPutNetworkValidatesFirst(t *testing.T) {
 		json.RawMessage(`{"name":"alpha","addr":"127.0.0.1:1","allow_plaintext":true,"nick":"AlteredParadox","proxy":"ftp://x:1"}`),
 		// unreadable client certificate
 		json.RawMessage(`{"name":"alpha","addr":"127.0.0.1:1","tls":true,"nick":"AlteredParadox","sasl":{"mechanism":"EXTERNAL","cert_file":"/nonexistent.pem","key_file":"/nonexistent.key"}}`),
+		// realname long enough to overflow the registration line
+		json.RawMessage(`{"name":"alpha","addr":"127.0.0.1:1","allow_plaintext":true,"nick":"AlteredParadox","realname":"` + strings.Repeat("z", 600) + `"}`),
 	}
 	for i, cfg := range bad {
 		s.Handle(ctxb, request(t, "put_network", int64(10+i), PutNetworkReq{OldName: "alpha", Config: cfg}))

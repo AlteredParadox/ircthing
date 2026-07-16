@@ -174,6 +174,10 @@ func (m *Manager) IsChannel(target string) bool {
 // Fold lowercases a name per the connection's ISUPPORT CASEMAPPING.
 func (m *Manager) Fold(name string) string { return m.isup.Fold(name) }
 
+// defaultLineLen is the RFC 1459 line limit (message + CRLF) used until a
+// server advertises ISUPPORT LINELEN, and always during registration.
+const defaultLineLen = 512
+
 // lineLen returns the server's advertised LINELEN (default 512).
 func (m *Manager) lineLen() int {
 	if v, ok := m.isup.Raw("LINELEN"); ok {
@@ -181,7 +185,7 @@ func (m *Manager) lineLen() int {
 			return n
 		}
 	}
-	return 512
+	return defaultLineLen
 }
 
 // checkLineLen rejects a message whose serialized form (tags excluded —
@@ -1127,8 +1131,19 @@ func (m *Manager) writeLoop(ctx context.Context, cancel context.CancelCauseFunc,
 			cancel(err)
 			return
 		}
+		// Final line-length backstop, after UTF-8 scrubbing (which can
+		// grow a line by replacing invalid bytes with U+FFFD): internal
+		// handshake/PONG/rejoin lines never pass through sendAll's
+		// check, so enforce it here too. An overlong line tears the
+		// connection down rather than emitting something the server
+		// would reject or truncate.
+		scrubbed := m.scrubUTF8(out)
+		if err := checkLineLen(scrubbed, m.lineLen()); err != nil {
+			cancel(err)
+			return
+		}
 		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-		if err := w.WriteMessage(m.scrubUTF8(out)); err != nil {
+		if err := w.WriteMessage(scrubbed); err != nil {
 			cancel(fmt.Errorf("write: %w", err))
 			return
 		}

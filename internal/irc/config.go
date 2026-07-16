@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	ircv4 "gopkg.in/irc.v4"
 )
 
 // Config describes one IRC network connection.
@@ -117,6 +119,42 @@ func (c *Config) validate() error {
 	if c.Proxy != "" {
 		if _, err := parseProxyURL(c.Proxy); err != nil {
 			return err
+		}
+	}
+	if err := c.validateRegistrationLines(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateRegistrationLines rejects configuration whose registration or
+// autojoin messages would exceed the protocol line length. Registration
+// happens before any ISUPPORT LINELEN is known, so these are always
+// bounded by the 512-byte default — an oversized PASS/NICK/USER/JOIN
+// would be rejected by the server on every attempt, pinning the network
+// in a reconnect loop, so it is caught here (at add/edit time) instead.
+func (c *Config) validateRegistrationLines() error {
+	username := c.Username
+	if username == "" {
+		username = c.Nick
+	}
+	realname := c.Realname
+	if realname == "" {
+		realname = c.Nick
+	}
+	msgs := []*ircv4.Message{
+		newMsg("NICK", c.Nick),
+		newMsg("USER", username, "0", "*", realname),
+	}
+	if c.Pass != "" {
+		msgs = append(msgs, newMsg("PASS", c.Pass))
+	}
+	for _, ch := range c.Channels {
+		msgs = append(msgs, newMsg("JOIN", ch))
+	}
+	for _, m := range msgs {
+		if err := checkLineLen(m, defaultLineLen); err != nil {
+			return fmt.Errorf("irc: config: registration %s too long: %w", m.Command, err)
 		}
 	}
 	return nil

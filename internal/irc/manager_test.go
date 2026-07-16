@@ -1208,3 +1208,50 @@ func TestRedactRaw(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigRejectsOversizedRegistration(t *testing.T) {
+	long := strings.Repeat("z", 600)
+	base := func() Config { return Config{Addr: "x:1", Nick: "n", AllowPlaintext: true} }
+	cases := []struct {
+		name string
+		mut  func(*Config)
+	}{
+		{"realname", func(c *Config) { c.Realname = long }},
+		{"username", func(c *Config) { c.Username = long }},
+		{"pass", func(c *Config) { c.Pass = long }},
+		{"nick", func(c *Config) { c.Nick = long }},
+		{"channel", func(c *Config) { c.Channels = []string{"#" + long} }},
+	}
+	for _, tc := range cases {
+		cfg := base()
+		tc.mut(&cfg)
+		if _, err := NewManager(cfg); err == nil || !strings.Contains(err.Error(), "too long") {
+			t.Fatalf("%s: err = %v, want registration-too-long", tc.name, err)
+		}
+	}
+	if _, err := NewManager(base()); err != nil {
+		t.Fatalf("normal config rejected: %v", err)
+	}
+}
+
+// An internal line that would exceed the line limit after serialization
+// (here a PONG echoing an over-long server PING) tears the connection
+// down at the writer rather than emitting a line the server rejects.
+func TestManagerDisconnectsOnOversizedInternalLine(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	s.send("PING :" + strings.Repeat("x", 600)) // PONG echo > 512
+
+	s2 := accept(t, conns) // torn down, reconnects
+	s2.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+}
