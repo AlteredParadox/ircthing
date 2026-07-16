@@ -1,6 +1,7 @@
 package irc
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -131,15 +132,40 @@ func parseMultilineLimits(value string) multilineLimits {
 	return lim
 }
 
+// validateMultiline checks a prospective outgoing batch against the
+// server's advertised limits BEFORE anything is enqueued: max-lines and
+// max-bytes from the draft/multiline cap value, and each line against
+// the line length (ISUPPORT LINELEN, default 512) minus the batch
+// framing overhead. Nothing is ever silently truncated — an oversized
+// message is rejected whole, with an error naming the limit.
+func validateMultiline(target string, lines []string, lim multilineLimits, lineLen int) error {
+	if lim.maxLines > 0 && len(lines) > lim.maxLines {
+		return fmt.Errorf("message is %d lines; the server allows at most %d per message", len(lines), lim.maxLines)
+	}
+	if lineLen <= 0 {
+		lineLen = 512
+	}
+	// Worst-case per-line framing: "@batch=<ref> PRIVMSG <target> :" +
+	// CRLF, with the ref up to ~22 bytes ("ml" + uint64).
+	overhead := len("@batch=ml18446744073709551615 PRIVMSG ") + len(target) + len(" :\r\n")
+	total := 0
+	for _, line := range lines {
+		if len(line)+overhead > lineLen {
+			return fmt.Errorf("a line is %d bytes; the server's %d-byte line limit allows %d here", len(line), lineLen, lineLen-overhead)
+		}
+		total += len(line)
+	}
+	total += len(lines) - 1 // the newlines the joined message represents
+	if lim.maxBytes > 0 && total > lim.maxBytes {
+		return fmt.Errorf("message is %d bytes; the server allows at most %d per multiline message", total, lim.maxBytes)
+	}
+	return nil
+}
+
 // buildMultilineBatch turns a multi-line message into the wire messages of
 // a draft/multiline batch: BATCH open, one PRIVMSG per line, BATCH close.
-// Lines beyond max-lines are dropped (the composer should prevent this);
-// max-bytes is not split with concat here — long single lines are sent
-// as-is and the server may reject with FAIL, which we surface.
-func buildMultilineBatch(ref, target string, lines []string, lim multilineLimits) []*ircv4.Message {
-	if lim.maxLines > 0 && len(lines) > lim.maxLines {
-		lines = lines[:lim.maxLines]
-	}
+// The lines must already have passed validateMultiline.
+func buildMultilineBatch(ref, target string, lines []string) []*ircv4.Message {
 	out := make([]*ircv4.Message, 0, len(lines)+2)
 	out = append(out, &ircv4.Message{Command: "BATCH", Params: []string{"+" + ref, "draft/multiline", target}})
 	for _, line := range lines {

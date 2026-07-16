@@ -2,6 +2,7 @@ package irc
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	ircv4 "gopkg.in/irc.v4"
@@ -115,7 +116,7 @@ func TestMultilineReconstruct(t *testing.T) {
 }
 
 func TestBuildMultilineBatch(t *testing.T) {
-	msgs := buildMultilineBatch("r1", "#go", []string{"a", "b", "c"}, multilineLimits{})
+	msgs := buildMultilineBatch("r1", "#go", []string{"a", "b", "c"})
 	got := make([]string, len(msgs))
 	for i, m := range msgs {
 		got[i] = m.String()
@@ -130,11 +131,37 @@ func TestBuildMultilineBatch(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("batch wire:\n got %q\nwant %q", got, want)
 	}
+}
 
-	// max-lines truncates.
-	capped := buildMultilineBatch("r2", "#go", []string{"1", "2", "3", "4"}, multilineLimits{maxLines: 2})
-	if len(capped) != 4 { // open + 2 lines + close
-		t.Fatalf("max-lines not honored: %d messages", len(capped))
+func TestValidateMultiline(t *testing.T) {
+	long := strings.Repeat("x", 600)
+	cases := []struct {
+		name   string
+		lines  []string
+		lim    multilineLimits
+		len    int
+		errSub string // "" = must pass
+	}{
+		{"within limits", []string{"a", "b"}, multilineLimits{maxLines: 4, maxBytes: 100}, 0, ""},
+		{"no limits advertised", []string{"a", "b", "c"}, multilineLimits{}, 0, ""},
+		{"too many lines", []string{"1", "2", "3"}, multilineLimits{maxLines: 2}, 0, "at most 2 per message"},
+		{"too many bytes", []string{"aaaa", "bbbb"}, multilineLimits{maxBytes: 8}, 0, "at most 8 per multiline"},
+		{"line over LINELEN default", []string{long}, multilineLimits{}, 0, "line limit"},
+		{"line fits larger LINELEN", []string{long}, multilineLimits{}, 1024, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateMultiline("#go", tc.lines, tc.lim, tc.len)
+			if tc.errSub == "" {
+				if err != nil {
+					t.Fatalf("validateMultiline: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.errSub) {
+				t.Fatalf("err = %v, want containing %q", err, tc.errSub)
+			}
+		})
 	}
 }
 
@@ -148,5 +175,40 @@ func TestParseMultilineLimits(t *testing.T) {
 	}
 	if got := parseMultilineLimits("max-lines=10"); got.maxLines != 10 || got.maxBytes != 0 {
 		t.Fatalf("partial = %+v", got)
+	}
+}
+
+// A batch must never be enqueued partially: when the send queue lacks
+// room for the whole batch, nothing goes out.
+func TestSendAllAtomic(t *testing.T) {
+	m, err := NewManager(Config{Addr: "x:1", Nick: "n", AllowPlaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.registered.Store(true)
+
+	// Fill the queue to 3 short of capacity; a 5-message batch (open +
+	// 3 lines + close) must be rejected whole.
+	for i := 0; i < cap(m.out)-3; i++ {
+		if err := m.Send(newMsg("PING", "x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := len(m.out)
+	if err := m.SendMultiline("#go", []string{"a", "b", "c"}); err != ErrSendQueueFull {
+		t.Fatalf("err = %v, want ErrSendQueueFull", err)
+	}
+	if len(m.out) != before {
+		t.Fatalf("queue grew from %d to %d on a rejected batch", before, len(m.out))
+	}
+	// A batch that fits goes out complete.
+	for i := 0; i < 2; i++ {
+		<-m.out
+	}
+	if err := m.SendMultiline("#go", []string{"a", "b", "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.out) != before+3 { // drained 2, added 5
+		t.Fatalf("queue = %d, want %d", len(m.out), before+3)
 	}
 }

@@ -84,6 +84,7 @@ type Manager struct {
 	cfg        Config
 	events     chan Event
 	out        chan *ircv4.Message
+	sendMu     sync.Mutex // serializes writers to out (atomic batch enqueue)
 	registered atomic.Bool
 	nick       atomic.Value // string: current nick once registered
 	caps       atomic.Value // map[string]bool, copy-on-write: enabled capabilities
@@ -196,18 +197,23 @@ func (m *Manager) resetNames() {
 	m.namesMu.Unlock()
 }
 
-// SendMultiline sends a multi-line message as a draft/multiline batch,
-// respecting the server's advertised limits. Callers should only use this
-// when draft/multiline is negotiated; otherwise send one PRIVMSG per line.
+// SendMultiline sends a multi-line message as a draft/multiline batch.
+// The whole message is validated against the server's advertised limits
+// (max-lines, max-bytes, LINELEN) and enqueued atomically — it either
+// goes out complete or not at all; nothing is silently truncated.
+// Callers should only use this when draft/multiline is negotiated;
+// otherwise send one PRIVMSG per line.
 func (m *Manager) SendMultiline(target string, lines []string) error {
-	ref := "ml" + strconv.FormatUint(m.batchSeq.Add(1), 10)
 	lim := parseMultilineLimits(m.CapValue("draft/multiline"))
-	for _, msg := range buildMultilineBatch(ref, target, lines, lim) {
-		if err := m.Send(msg); err != nil {
-			return err
-		}
+	lineLen := 0
+	if v, ok := m.isup.Raw("LINELEN"); ok {
+		lineLen, _ = strconv.Atoi(v)
 	}
-	return nil
+	if err := validateMultiline(target, lines, lim, lineLen); err != nil {
+		return err
+	}
+	ref := "ml" + strconv.FormatUint(m.batchSeq.Add(1), 10)
+	return m.sendAll(buildMultilineBatch(ref, target, lines))
 }
 
 // SetMonitored replaces the MONITOR list with nicks (MONITOR extension,
@@ -381,15 +387,25 @@ func (m *Manager) Events() <-chan Event { return m.events }
 // when a connection dies are dropped rather than replayed into the next
 // session.
 func (m *Manager) Send(msg *ircv4.Message) error {
+	return m.sendAll([]*ircv4.Message{msg})
+}
+
+// sendAll enqueues msgs atomically: all of them or none (a batch must
+// never go out with lines missing because the queue filled partway).
+// sendMu serializes every writer, so the capacity check holds.
+func (m *Manager) sendAll(msgs []*ircv4.Message) error {
 	if !m.registered.Load() {
 		return ErrNotConnected
 	}
-	select {
-	case m.out <- msg:
-		return nil
-	default:
+	m.sendMu.Lock()
+	defer m.sendMu.Unlock()
+	if cap(m.out)-len(m.out) < len(msgs) {
 		return ErrSendQueueFull
 	}
+	for _, msg := range msgs {
+		m.out <- msg
+	}
+	return nil
 }
 
 // Run connects and reconnects until ctx is canceled.
