@@ -102,7 +102,7 @@ function estimate(ev) {
 // Chat renders the active buffer: virtualized scrollback plus composer.
 // completionNicks feeds tab-completion (channel roster, or the query
 // counterpart).
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, composerApi, isHighlight, onSend, onLoadOlder, onRead, onTyping, onRedact, onNick }) {
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
 	const [draft, setDraft] = useState("");
 	// Per-buffer drafts: keep half-typed text with its own buffer so a
 	// switch swaps the composer contents instead of carrying text into —
@@ -223,7 +223,14 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 				onNearTop={nearTop}
 				onPinned={(p) => {
 					pinned.current = p;
-					if (p) markRead();
+					if (!p) return;
+					// Reaching the bottom of a buffer showing a non-tail
+					// window (paged back past the trim point, or a search
+					// jump) reloads the live tail — otherwise live events,
+					// which are suppressed while atTail is false, would never
+					// reappear until a manual re-select.
+					if (msgs?.atTail === false) onReloadTail?.();
+					else markRead();
 				}}
 				renderItem={(ev, i) => (
 					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} />

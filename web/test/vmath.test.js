@@ -97,6 +97,16 @@ test("prependedCount", () => {
 	is(prependedCount(7, []), 0, "emptied");
 });
 
+test("prependedCount anchors on collapsed-run identity", () => {
+	// A lone presence event (id 42) folds into a collapsed run after an
+	// older page prepends events before it: its top-level id changes
+	// (42 -> "clp-42") but its anchor (the run's last underlying event) does
+	// not, so the prepend is still detected and the viewport stays put.
+	const collapsed = { id: "clp-42", collapse: [{ id: 40 }, { id: 41 }, { id: 42 }] };
+	is(prependedCount(42, [{ id: 30 }, collapsed, { id: 50 }]), 1, "lone event folded into a run");
+	is(prependedCount(42, [collapsed, { id: 50 }]), 0, "same run still on top");
+});
+
 test("estimateMsgHeight grows with wrapped length", () => {
 	is(estimateMsgHeight(""), 27);
 	is(estimateMsgHeight("x".repeat(89)), 27);

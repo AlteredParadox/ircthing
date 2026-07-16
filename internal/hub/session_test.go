@@ -1066,6 +1066,46 @@ func TestChatHistoryBackfillFlow(t *testing.T) {
 	}
 }
 
+// Our own CTCP ACTION ("/me"), persisted as a no-msgid placeholder on a
+// no-echo server, must be reconciled — not duplicated — when chathistory
+// later replays it. The placeholder's stored Text is normalized the same
+// way the replay path normalizes (searchText unwraps \x01ACTION…\x01), so
+// AdoptOwnMsgID can match it and stamp the server's msgid onto it.
+func TestOwnActionReplayDedup(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 16), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	s := h.NewSession()
+	defer s.Close()
+
+	// We sent "/me waves" — persistOwn stores the local placeholder.
+	s.persistOwn(ctx, conn, "libera", "#go", "\x01ACTION waves\x01")
+	recv(t, s, "event")
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+	conn.ch <- ev(":srv BATCH +r1 chathistory #go")
+	conn.ch <- ev("@batch=r1;msgid=act1;time=2026-07-15T00:00:06.000Z :AlteredParadox!u@h PRIVMSG #go :\x01ACTION waves\x01")
+	conn.ch <- ev(":srv BATCH -r1")
+	recv(t, s, "history_changed", "event", "members_changed")
+
+	msgs, err := h.store.Latest(ctx, "libera", "#go", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("own action duplicated after replay: %d rows: %+v", len(msgs), msgs)
+	}
+	if msgs[0].MsgID != "act1" {
+		t.Fatalf("placeholder did not adopt the server msgid: %+v", msgs[0])
+	}
+}
+
 func TestReadMarkerBridgeOutbound(t *testing.T) {
 	h := newTestHub(t)
 	conn := &fakeConn{

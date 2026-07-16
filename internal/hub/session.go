@@ -243,7 +243,13 @@ func (s *Session) persistOwn(ctx context.Context, conn Conn, network, target, te
 		Sender:  conn.Nick(),
 		Command: "PRIVMSG",
 		Raw:     msg.String(),
-		Text:    text,
+		// Normalize the same way the event path does (hub.go persistEvent
+		// stores searchText(ev.Msg)): a CTCP ACTION ("/me") is unwrapped to
+		// its bare text so this placeholder's indexed Text matches the
+		// replayed value and AdoptOwnMsgID dedups it after chathistory
+		// backfill on no-echo servers — storing the raw \x01ACTION…\x01
+		// here would never match and leave a duplicate.
+		Text: searchText(msg),
 	})
 	if err != nil {
 		return

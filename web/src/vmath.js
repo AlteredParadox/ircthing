@@ -122,13 +122,25 @@ export function findIndex(offsets, n, y) {
 	return lo;
 }
 
+// anchorId is a shown row's identity that stays stable across
+// collapse/expand transitions: a collapsed run is keyed by its LAST
+// underlying event (which a top-prepend never moves). So a lone presence
+// event that folds into a run after an older page loads still matches its
+// own event id — the row's top-level id changed (e.g. 42 -> "clp-42"), but
+// its anchor did not. Non-collapse rows anchor on their own id.
+export function anchorId(item) {
+	return item.collapse ? item.collapse[item.collapse.length - 1].id : item.id;
+}
+
 // prependedCount: how many items were added in front, detected by where
-// the previous first id landed in the new list. 0 when this wasn't a
-// prepend (fresh load, append, or trim).
-export function prependedCount(prevFirstId, items) {
-	if (prevFirstId == null || items.length === 0 || items[0].id === prevFirstId) return 0;
+// the previously-first row's anchor landed in the new list. 0 when this
+// wasn't a prepend (fresh load, append, or trim). Anchoring (rather than
+// matching the raw top-level id) keeps the scroll compensation correct in
+// collapse mode, where a prepend can change the top row's derived id.
+export function prependedCount(prevAnchor, items) {
+	if (prevAnchor == null || items.length === 0 || anchorId(items[0]) === prevAnchor) return 0;
 	for (let i = 1; i < items.length; i++) {
-		if (items[i].id === prevFirstId) return i;
+		if (anchorId(items[i]) === prevAnchor) return i;
 	}
 	return 0;
 }

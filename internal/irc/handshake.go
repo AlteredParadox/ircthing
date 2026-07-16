@@ -376,6 +376,15 @@ func (h *handshake) handleAuthenticate(m *ircv4.Message) ([]*ircv4.Message, bool
 	// 400) terminates. Reassemble before decoding.
 	arg := m.Param(0)
 	if arg != "+" {
+		// Bound the reassembly: a hostile server can stream 400-byte
+		// chunks forever ("more follows") and exhaust memory. Real SASL
+		// challenges — including SCRAM's server-first message — are well
+		// under 1 KB; cap well above that and tear the connection down on
+		// overflow rather than accumulate unbounded.
+		if len(h.challengeBuf)+len(arg) > maxSASLChallenge {
+			h.challengeBuf = ""
+			return nil, false, fmt.Errorf("SASL: server challenge exceeds %d bytes", maxSASLChallenge)
+		}
 		h.challengeBuf += arg
 	}
 	if len(arg) == 400 {
@@ -440,6 +449,11 @@ func (h *handshake) capsToRequest() []string {
 // streams unbounded '*'-continued capability lines. Real servers
 // advertise a few dozen.
 const maxAdvertisedCaps = 512
+
+// maxSASLChallenge caps the reassembled multi-line SASL challenge. Real
+// challenges (SCRAM server-first included) are under 1 KB; the generous
+// ceiling still bounds a server that streams 400-byte chunks forever.
+const maxSASLChallenge = 8192
 
 func parseCapList(list string, dst map[string]string) {
 	for _, tok := range strings.Fields(list) {

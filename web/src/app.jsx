@@ -20,6 +20,13 @@ const PAGE = 100;
 // virtualized, so these bound JS memory, not DOM size.
 const TRIM_AT = 50000;
 const TRIM_TO = 25000;
+// Live message lists are kept only for the few most-recently-active
+// buffers. A bouncer pushes events for every joined channel, so without
+// this bound the in-memory lists grow one-capped-list-per-buffer across
+// an entire session; an evicted buffer refetches its tail from the store
+// when reopened. Unread/mention counts live in `buffers`, not here, so
+// eviction never loses activity state.
+const KEEP_BUFFERS = 8;
 
 function wsURL() {
 	const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -80,8 +87,13 @@ function dropBufferMsgs(m, key) {
 }
 
 // appendEventMsgs appends a live event, bounding per-buffer memory.
-function appendEventMsgs(m, key, ev) {
+// `keep` is true when this buffer's live list should be retained (it is
+// active or mid-load); for any other buffer we do not start (or grow) a
+// list — the event is persisted server-side and loads from the store when
+// the buffer is opened, which is what bounds cross-buffer memory.
+function appendEventMsgs(m, key, ev, keep) {
 	const cur = m[key];
+	if (!cur && !keep) return m;
 	// A buffer showing a search-jump window (not the live tail) must not
 	// append — that would leave a temporal gap; the message is on disk
 	// and appears when the user returns to the tail.
@@ -437,7 +449,8 @@ export function App() {
 
 		s.on("event", (ev) => {
 			const key = bufKey(ev.network, ev.buffer);
-			setMsgs((m) => appendEventMsgs(m, key, ev));
+			const keep = key === activeKeyRef.current || loadingHistory.current.has(key);
+			setMsgs((m) => appendEventMsgs(m, key, ev, keep));
 			// A message from someone clears their typing indicator.
 			setTypers((t) => clearTyperFor(t, key, ev.sender));
 			const r = renderable(ev);
@@ -682,6 +695,27 @@ export function App() {
 				setLoadTick((t) => t + 1);
 			});
 	}, [activeKey, connected, buffers, msgs, loadTick]);
+
+	// Evict live message lists for buffers outside the KEEP_BUFFERS most
+	// recently active. Runs on every activeKey change so the working set
+	// stays bounded no matter how many channels a bouncer feeds; a mid-load
+	// buffer is never evicted (its in-flight page would have nowhere to
+	// merge). An evicted buffer reloads its tail when reopened.
+	const recentKeys = useRef([]);
+	useEffect(() => {
+		if (!activeKey) return;
+		recentKeys.current = [activeKey, ...recentKeys.current.filter((k) => k !== activeKey)].slice(0, KEEP_BUFFERS);
+		const keep = new Set(recentKeys.current);
+		setMsgs((m) => {
+			let next = m;
+			for (const k of Object.keys(m)) {
+				if (keep.has(k) || loadingHistory.current.has(k)) continue;
+				if (next === m) next = { ...m };
+				delete next[k];
+			}
+			return next;
+		});
+	}, [activeKey]);
 
 	// Default to the first buffer once the sidebar is known. If the
 	// active key came from a hash that names no existing buffer, clear it
@@ -996,6 +1030,13 @@ export function App() {
 			.catch(() => {});
 	}
 
+	// reloadTail drops a non-tail window (paged past the trim point, or a
+	// search jump) so the history-load effect refetches the live tail and
+	// live events flow again.
+	function reloadTail() {
+		setMsgs((m) => (m[activeKey]?.atTail === false ? dropBufferMsgs(m, activeKey) : m));
+	}
+
 	function sendInput(text) {
 		const buf = buffers[activeKey];
 		if (!buf) return;
@@ -1094,7 +1135,7 @@ export function App() {
 							sock.current?.request("redact", {
 								network: activeBuf.network, buffer: activeBuf.buffer, msgid,
 							}).catch((e) => setCmdError(e.message || "delete failed"))}
-						onSend={sendInput} onLoadOlder={loadOlder} onRead={markRead}
+						onSend={sendInput} onLoadOlder={loadOlder} onReloadTail={reloadTail} onRead={markRead}
 						onTyping={(state, net, bufName) =>
 							sock.current?.notify("typing", {
 								network: net ?? activeBuf.network, buffer: bufName ?? activeBuf.buffer, state,

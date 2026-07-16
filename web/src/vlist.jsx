@@ -1,5 +1,5 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
-import { Geometry, prependedCount } from "./vmath.js";
+import { anchorId, Geometry, prependedCount } from "./vmath.js";
 
 // VirtualList: windowed rendering for the message list. Only the rows
 // intersecting the viewport (plus `overscan` px each side) exist in the
@@ -63,7 +63,9 @@ export function VirtualList({
 	const k = prependedCount(prevFirstId.current, items);
 	if (k > 0) pendingPrepend.current = k;
 	const appended = items.length > 0 && prevLastId.current !== items[items.length - 1].id;
-	prevFirstId.current = items.length ? items[0].id : null;
+	// Anchor on the top row's stable identity (collapse-run aware) so the
+	// prepend compensation survives a lone presence event folding into a run.
+	prevFirstId.current = items.length ? anchorId(items[0]) : null;
 	prevLastId.current = items.length ? items[items.length - 1].id : null;
 
 	// Current window from the last known scroll position.

@@ -649,3 +649,36 @@ func TestHandshakeAuthenticateChunkReassembly(t *testing.T) {
 		t.Fatalf("reassembled challenge did not produce a client-final: %v", wire(r))
 	}
 }
+
+// A hostile server that streams 400-byte AUTHENTICATE chunks forever must
+// not grow the reassembly buffer without bound — the handshake tears down
+// once the accumulated challenge exceeds maxSASLChallenge.
+func TestHandshakeAuthenticateChallengeBounded(t *testing.T) {
+	cfg := Config{
+		Addr: "irc.test:6697", Nick: "AlteredParadox", TLS: true,
+		SASL: &SASLConfig{Mechanism: "SCRAM-SHA-256", Login: "AlteredParadox", Password: "pencil"},
+	}
+	hs := newHandshake(&cfg)
+	hs.start()
+	hs.handle(ircv4.MustParseMessage("CAP * LS :sasl=SCRAM-SHA-256"))
+	hs.handle(ircv4.MustParseMessage("CAP AlteredParadox ACK :sasl"))
+	hs.handle(ircv4.MustParseMessage("AUTHENTICATE +")) // client-first
+
+	chunk := strings.Repeat("A", 400)
+	for i := 0; i < maxSASLChallenge/400+2; i++ {
+		_, _, err := hs.handle(ircv4.MustParseMessage("AUTHENTICATE " + chunk))
+		if err != nil {
+			if hs.challengeBuf != "" {
+				t.Fatalf("challengeBuf not cleared after overflow: %d bytes", len(hs.challengeBuf))
+			}
+			if len(hs.challengeBuf) > maxSASLChallenge {
+				t.Fatalf("challengeBuf grew past cap: %d", len(hs.challengeBuf))
+			}
+			return // torn down as expected
+		}
+		if len(hs.challengeBuf) > maxSASLChallenge {
+			t.Fatalf("challengeBuf = %d bytes, exceeds cap %d without erroring", len(hs.challengeBuf), maxSASLChallenge)
+		}
+	}
+	t.Fatalf("streaming chunks never triggered the bound (buf=%d)", len(hs.challengeBuf))
+}
