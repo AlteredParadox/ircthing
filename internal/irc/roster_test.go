@@ -560,3 +560,26 @@ func TestRosterLiveDepartureDuringNames(t *testing.T) {
 		t.Fatalf("NAMES members missing: %v", names)
 	}
 }
+
+// A MODE prefix change arriving mid-NAMES survives the 366 swap.
+func TestRosterModeDuringNames(t *testing.T) {
+	r := testRoster()
+	feed(t, r,
+		"@nick=AlteredParadox :srv 005 AlteredParadox PREFIX=(ov)@+ :are supported",
+		":AlteredParadox JOIN #chan",
+		":srv 353 AlteredParadox = #chan :AlteredParadox alice",
+	)
+	// Op alice mid-NAMES, before 366.
+	feed(t, r, ":srv MODE #chan +o alice")
+	feed(t, r, ":srv 366 AlteredParadox #chan :end")
+
+	for _, m := range members(t, r, "#chan") {
+		if m.Nick == "alice" {
+			if m.Prefix != "@" {
+				t.Fatalf("alice prefix = %q, want @ (MODE survived the swap)", m.Prefix)
+			}
+			return
+		}
+	}
+	t.Fatal("alice missing")
+}

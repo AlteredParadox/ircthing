@@ -119,10 +119,12 @@ func newMsg(cmd string, params ...string) *ircv4.Message {
 // gives SASL room to run; servers without CAP support ignore it and
 // register us directly.
 func (h *handshake) start() []*ircv4.Message {
+	// PASS is deferred (see passLine): the server password is the one
+	// secret in the opening burst, and on an insecure link it must not
+	// go out before the CAP LS reply reveals a pending STS upgrade —
+	// otherwise a passive eavesdropper captures it before STS aborts the
+	// connection to redial over TLS. NICK/USER are public and stay here.
 	out := []*ircv4.Message{newMsg("CAP", "LS", "302")}
-	if h.cfg.Pass != "" {
-		out = append(out, newMsg("PASS", h.cfg.Pass))
-	}
 	username := h.cfg.Username
 	if username == "" {
 		username = h.cfg.Nick
@@ -135,6 +137,15 @@ func (h *handshake) start() []*ircv4.Message {
 		newMsg("NICK", h.nick),
 		newMsg("USER", username, "0", "*", realname),
 	)
+}
+
+// passLine returns the deferred PASS message (empty when no server
+// password is configured), emitted only after the STS upgrade decision.
+func (h *handshake) passLine() []*ircv4.Message {
+	if h.cfg.Pass == "" {
+		return nil
+	}
+	return []*ircv4.Message{newMsg("PASS", h.cfg.Pass)}
 }
 
 // handle processes one server message during registration. It returns the
@@ -259,14 +270,16 @@ func (h *handshake) handleCapLS(m *ircv4.Message) ([]*ircv4.Message, bool, error
 	if err := h.chooseMech(); err != nil {
 		return nil, false, err
 	}
+	// The STS decision is made (no upgrade): now it is safe to send PASS.
+	out := h.passLine()
 	reqs := h.capsToRequest()
 	if len(reqs) == 0 {
 		h.phase = hsAwaitWelcome
-		return []*ircv4.Message{newMsg("CAP", "END")}, false, nil
+		return append(out, newMsg("CAP", "END")), false, nil
 	}
 	h.phase = hsCapAck
 	h.lastReq = reqs
-	return []*ircv4.Message{newMsg("CAP", "REQ", strings.Join(reqs, " "))}, false, nil
+	return append(out, newMsg("CAP", "REQ", strings.Join(reqs, " "))), false, nil
 }
 
 // chooseMech picks and builds the SASL mechanism from the advertised

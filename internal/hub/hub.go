@@ -303,6 +303,12 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	// — an echoed message can carry client-supplied casing, and #Go/#go
 	// must not split into two buffers even under a concurrent send.
 	selfPart := ev.Msg.Command == "PART" && ev.Msg.Prefix != nil && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick())
+	// Our own JOIN reopens a channel: clear any close grace so its
+	// buffer is re-created and live traffic flows again (otherwise a
+	// rejoin within the 10s window would silently drop messages).
+	if ev.Msg.Command == "JOIN" && ev.Msg.Prefix != nil && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick()) {
+		h.unmarkClosed(ev.Network, c.Fold(target))
+	}
 	var stored store.Message
 	var err error
 	if selfPart || h.recentlyClosed(ev.Network, c.Fold(target)) {
@@ -692,6 +698,14 @@ func (h *Hub) markClosed(network, foldedBuffer string, nowMs int64) {
 		}
 	}
 	h.recentClose[network+"\x00"+foldedBuffer] = nowMs
+}
+
+// unmarkClosed clears a buffer's close grace (e.g. on a self-JOIN
+// reopen) so subsequent traffic re-creates it normally.
+func (h *Hub) unmarkClosed(network, foldedBuffer string) {
+	h.mu.Lock()
+	delete(h.recentClose, network+"\x00"+foldedBuffer)
+	h.mu.Unlock()
 }
 
 // recentlyClosed reports whether the folded buffer was closed within the

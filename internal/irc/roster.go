@@ -386,16 +386,26 @@ func (r *roster) applyChannelMode(st *channelState, params []string) {
 // applyStatusMode grants or revokes one status prefix on a member.
 // Caller holds r.mu.
 func (r *roster) applyStatusMode(st *channelState, nick, sym string, adding bool) {
-	mem, ok := st.members[r.isup.Fold(nick)]
-	if !ok {
-		return
+	fk := r.isup.Fold(nick)
+	// Apply to whichever map holds the member: during a NAMES burst the
+	// member is in st.pending (not yet swapped into st.members), so a
+	// MODE between 353 and 366 must land in pending to survive the swap.
+	apply := func(mp map[string]Member) {
+		mem, ok := mp[fk]
+		if !ok {
+			return
+		}
+		if adding {
+			mem.Prefix = addPrefix(r.isup.PrefixSymbols(), mem.Prefix, sym)
+		} else {
+			mem.Prefix = strings.ReplaceAll(mem.Prefix, sym, "")
+		}
+		mp[fk] = mem
 	}
-	if adding {
-		mem.Prefix = addPrefix(r.isup.PrefixSymbols(), mem.Prefix, sym)
-	} else {
-		mem.Prefix = strings.ReplaceAll(mem.Prefix, sym, "")
+	apply(st.members)
+	if st.pending != nil {
+		apply(st.pending)
 	}
-	st.members[r.isup.Fold(nick)] = mem
 }
 
 // addPrefix inserts a status prefix keeping rank order (highest first,

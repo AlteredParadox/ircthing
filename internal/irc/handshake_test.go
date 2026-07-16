@@ -88,9 +88,10 @@ func TestHandshake(t *testing.T) {
 				c.Realname = "Real Name"
 				return c
 			}(),
-			wantStart: []string{"CAP LS 302", "PASS hunter2", "NICK AlteredParadox", "USER u 0 * :Real Name"},
+			wantStart: []string{"CAP LS 302", "NICK AlteredParadox", "USER u 0 * :Real Name"},
 			steps: []step{
-				{in: "CAP * LS :sasl", want: []string{"CAP END"}},
+				// PASS is deferred until the CAP LS reply (post-STS-check).
+				{in: "CAP * LS :sasl", want: []string{"PASS hunter2", "CAP END"}},
 				{in: ":irc.test 001 AlteredParadox :Welcome", done: true},
 			},
 		},

@@ -368,3 +368,71 @@ func TestQuitDoesNotResurrectClosedBuffer(t *testing.T) {
 		t.Fatalf("QUIT resurrected the closed buffer: %+v", bufs)
 	}
 }
+
+// monitor_add for a network that is neither configured nor connected is
+// rejected, so it cannot mint phantom network/monitor rows.
+func TestMonitorRejectsUnknownNetwork(t *testing.T) {
+	h := newTestHub(t)
+	s := h.NewSession()
+	defer s.Close()
+	ctx := context.Background()
+
+	s.Handle(ctx, request(t, "monitor_add", 1, MonitorReq{Network: "ghostnet", Nick: "someone"}))
+	if env := recv(t, s, "error"); env.Seq != 1 {
+		t.Fatalf("unknown-network monitor: got seq %d", env.Seq)
+	}
+	// No networks row was created.
+	bufs, err := h.store.Buffers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bufs) != 0 {
+		t.Fatalf("phantom rows created: %+v", bufs)
+	}
+}
+
+// A self-JOIN within the close grace reopens the buffer (live traffic
+// flows again) instead of being dropped.
+func TestSelfJoinReopensClosedBuffer(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+	conn.ch <- ev(":bob!u@h PRIVMSG #go :hi")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#go", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed not persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	s := h.NewSession()
+	defer s.Close()
+	s.Handle(ctxb, request(t, "close_buffer", 1, BufferRef{Network: "libera", Buffer: "#go"}))
+	recv(t, s, "ok", "buffer_closed", "event")
+
+	// Rejoin within the grace window, then a channel message.
+	conn.ch <- ev(":AlteredParadox!u@h JOIN #go")
+	conn.ch <- ev(":carol!u@h PRIVMSG #go :after rejoin")
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#go", 5); len(b) >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("message after rejoin was dropped (buffer not reopened)")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

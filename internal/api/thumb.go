@@ -28,6 +28,11 @@ const (
 	// bounded transiently and the steady-state RSS target is unaffected.
 	maxDecodeBytes = 36 * 1024 * 1024
 	maxThumbCache   = 128
+	// maxThumbCacheEntry bounds a single cached thumbnail. 128 entries x
+	// 48 KiB ~ 6 MiB worst-case resident cache — a small fraction of the
+	// 72 MiB RSS target — vs ~64 MiB at the old 512 KiB per-entry cap.
+	// Real 400px thumbnails re-encode to well under this.
+	maxThumbCacheEntry = 48 * 1024
 )
 
 type thumbResult struct {
@@ -101,7 +106,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "encode failed", http.StatusInternalServerError)
 		return
 	}
-	if len(res.data) <= 512*1024 { // don't cache pathologically large results
+	if len(res.data) <= maxThumbCacheEntry { // keep worst-case cache residency small
 		s.thumbCache.put(target, res)
 	}
 	writeThumb(w, res)

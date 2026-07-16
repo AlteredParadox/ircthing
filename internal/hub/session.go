@@ -277,6 +277,16 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		s.push(errEnvelope(env.Seq, "bad_request", "monitor needs a network and a valid nick"))
 		return
 	}
+	// Only a real (configured or connected) network may accrue monitors:
+	// AddMonitor creates the networks row on demand, so an unvalidated
+	// name would otherwise mint phantom network/monitor rows.
+	if ok, err := s.hub.knownNetwork(ctx, d.Network); err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "network lookup failed"))
+		return
+	} else if !ok {
+		s.push(errEnvelope(env.Seq, "bad_request", "unknown network"))
+		return
+	}
 	var err error
 	if add {
 		err = s.hub.store.AddMonitor(ctx, d.Network, d.Nick)

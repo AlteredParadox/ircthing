@@ -1028,9 +1028,9 @@ export function App() {
 								network: activeBuf.network, buffer: activeBuf.buffer, msgid,
 							}).catch((e) => setCmdError(e.message || "delete failed"))}
 						onSend={sendInput} onLoadOlder={loadOlder} onRead={markRead}
-						onTyping={(state) =>
+						onTyping={(state, net, bufName) =>
 							sock.current?.notify("typing", {
-								network: activeBuf.network, buffer: activeBuf.buffer, state,
+								network: net ?? activeBuf.network, buffer: bufName ?? activeBuf.buffer, state,
 							})}
 					/>
 				) : (

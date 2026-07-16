@@ -104,6 +104,10 @@ function estimate(ev) {
 // counterpart).
 export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, composerApi, isHighlight, onSend, onLoadOlder, onRead, onTyping, onRedact, onNick }) {
 	const [draft, setDraft] = useState("");
+	// Per-buffer drafts: keep half-typed text with its own buffer so a
+	// switch swaps the composer contents instead of carrying text into —
+	// and letting Enter send it to — the wrong channel.
+	const drafts = useRef({});
 	const pinned = useRef(true);
 	const loadingOlder = useRef(false);
 	// Tab cycles candidates; fresh state per buffer.
@@ -116,6 +120,8 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 	// Expanded collapse-run ids; fresh per buffer.
 	const [expanded, setExpanded] = useState(() => new Set());
 	useEffect(() => setExpanded(new Set()), [buf?.key]);
+	// Swap in this buffer's saved draft (empty if none).
+	useEffect(() => setDraft(drafts.current[buf?.key] || ""), [buf?.key]);
 	const toggleRun = (id) => setExpanded((old) => {
 		const next = new Set(old);
 		if (next.has(id)) next.delete(id);
@@ -133,9 +139,15 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 
 	// Typing notifications, one sender per buffer; the previous buffer's
 	// session ends with "done" when switching away mid-draft.
-	const typing = useMemo(() => new TypingSender((state) => onTypingRef.current(state)), [buf?.key]);
 	const onTypingRef = useRef(onTyping);
 	onTypingRef.current = onTyping;
+	const typing = useMemo(() => {
+		// Capture THIS buffer's identity: the teardown "done" fires after
+		// the active buffer has advanced, so it must carry the buffer it
+		// was created for, not whatever is active when it runs.
+		const net = buf?.network, name = buf?.buffer;
+		return new TypingSender((state) => onTypingRef.current(state, net, name));
+	}, [buf?.key]);
 	const pauseTimer = useRef(null);
 	useEffect(() => () => {
 		clearTimeout(pauseTimer.current);
@@ -162,6 +174,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 
 	function draftChanged(text) {
 		setDraft(text);
+		drafts.current[buf?.key] = text;
 		typing.input(text);
 		clearTimeout(pauseTimer.current);
 		pauseTimer.current = setTimeout(() => typing.pause(text), 5000);
@@ -190,6 +203,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 		if (!text || !connected) return;
 		onSend(text);
 		setDraft("");
+		delete drafts.current[buf?.key];
 		clearTimeout(pauseTimer.current);
 		typing.messageSent();
 	}

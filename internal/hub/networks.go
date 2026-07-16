@@ -382,6 +382,26 @@ func (s *Session) handleCloseBuffer(ctx context.Context, env Envelope) {
 	s.hub.broadcast(envelope("buffer_closed", 0, d))
 }
 
+// knownNetwork reports whether name is a real network — a stored
+// definition or a currently-connected one. Neither is forgeable by a
+// client, so gating monitor operations on it prevents an arbitrary name
+// from minting phantom network/monitor rows via create-on-demand.
+func (h *Hub) knownNetwork(ctx context.Context, name string) (bool, error) {
+	if h.network(name) != nil {
+		return true, nil
+	}
+	configs, err := h.store.NetworkConfigs(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, c := range configs {
+		if c.Name == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // updateAutojoin adds or removes a channel in a stored definition's
 // channels list (case-insensitive dedup).
 func (h *Hub) updateAutojoin(ctx context.Context, network, channel string, add bool, fold func(string) string) error {
