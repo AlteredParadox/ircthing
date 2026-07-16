@@ -138,3 +138,54 @@ func TestAppendExistingAfterDeleteBuffer(t *testing.T) {
 		t.Fatalf("AppendExisting into live buffer = %+v, %v", got, err)
 	}
 }
+
+// A read marker cannot be poisoned with an implausible future
+// timestamp: values past the newest message (or the present) clamp.
+func TestReadMarkerClamped(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+
+	past := time.Now().Add(-time.Hour)
+	stored, err := s.Append(ctx, "net", "#x", Message{
+		Time: past, Sender: "a", Command: "PRIVMSG", Raw: ":a PRIVMSG #x :hi",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Near-MaxInt64 clamps to now (not the message: reading a quiet
+	// buffer "up to now" is legitimate).
+	if err := s.SetReadMarker(ctx, "net", "#x", time.UnixMilli(1<<62)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ReadMarker(ctx, "net", "#x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.After(time.Now().Add(time.Minute)) {
+		t.Fatalf("marker %v not clamped", got)
+	}
+	// The clamp was to "now", so a message arriving later still counts
+	// as unread — the poison attempt bought nothing.
+	if _, err := s.Append(ctx, "net", "#x", Message{
+		Time: time.Now().Add(2 * time.Minute), Sender: "a", Command: "PRIVMSG", Raw: ":a PRIVMSG #x :later",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bufs, err := s.Buffers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bufs) != 1 || bufs[0].Unread != 1 {
+		t.Fatalf("unread = %+v, want 1 (marker not poisoned)", bufs)
+	}
+
+	// Ordinary marker at the message's own time still works.
+	if err := s.SetReadMarker(ctx, "net", "#y", stored.Time); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.ReadMarker(ctx, "net", "#y"); !got.Equal(time.UnixMilli(stored.Time.UnixMilli())) {
+		t.Fatalf("normal marker = %v, want %v", got, stored.Time)
+	}
+}

@@ -350,10 +350,22 @@ func (s *Store) SetReadMarker(ctx context.Context, network, target string, t tim
 	if err != nil {
 		return err
 	}
+	// Clamp to plausibility: a marker only means "read up to here", so
+	// nothing past the newest stored message (or the present, for a
+	// quiet buffer) is meaningful. Without the clamp one buggy or
+	// malicious timestamp near MaxInt64 would suppress unread counts
+	// forever, because markers never regress.
+	var latest int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(ts), 0) FROM messages WHERE buffer_id = ?`,
+		bufID).Scan(&latest); err != nil {
+		return err
+	}
+	ts := min(t.UnixMilli(), max(latest, time.Now().UnixMilli()))
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO read_markers (buffer_id, ts) VALUES (?, ?)
 		 ON CONFLICT (buffer_id) DO UPDATE SET ts = max(ts, excluded.ts)`,
-		bufID, t.UnixMilli())
+		bufID, ts)
 	return err
 }
 
