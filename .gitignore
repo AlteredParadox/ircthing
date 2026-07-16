@@ -21,3 +21,6 @@ web/dist/*
 
 # Node
 web/node_modules/
+
+# Design-tool export artifact
+.thumbnail

@@ -1,0 +1,44 @@
+# ircthing — self-hosted web IRC client.
+#
+# Expects: the binary at /usr/local/bin/ircd-web, config at
+# /etc/ircthing/config.json (with "database": "/var/lib/ircthing/ircthing.db"),
+# and a system user:  useradd --system --home /var/lib/ircthing --create-home ircthing
+
+[Unit]
+Description=ircthing web IRC client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ircthing
+Group=ircthing
+# Keeps the Go heap inside the project's 72 MB RSS target.
+Environment=GOMEMLIMIT=64MiB
+WorkingDirectory=/var/lib/ircthing
+ExecStart=/usr/local/bin/ircd-web -config /etc/ircthing/config.json
+Restart=on-failure
+RestartSec=5
+
+# Hardening: the process needs the network, its state directory, and
+# nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ircthing
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
