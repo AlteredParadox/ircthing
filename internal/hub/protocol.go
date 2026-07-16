@@ -263,7 +263,10 @@ type TypingData struct {
 // render it in the active buffer; it is never persisted.
 type ServerInfoData struct {
 	Network string `json:"network"`
-	Text    string `json:"text"`
+	// Buffer routes the line to a specific buffer (a query nick for WHOIS
+	// output) and switches the client there; empty = the active buffer.
+	Buffer string `json:"buffer,omitempty"`
+	Text   string `json:"text"`
 }
 
 // PrefsData carries the client preferences blob ("prefs" pushes and

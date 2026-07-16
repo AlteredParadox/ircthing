@@ -1369,16 +1369,22 @@ func TestServerInfoFlow(t *testing.T) {
 		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
 	}
 
-	// WHOIS replies are forwarded, with our nick stripped.
+	// WHOIS replies route to the target's query buffer, with both our
+	// nick and the (now redundant) target nick stripped from the text.
 	conn.ch <- ev(":srv 311 AlteredParadox alice ~u example.org * :Alice A.")
 	info := decode[ServerInfoData](t, recv(t, s, "server_info"))
-	if info.Network != "libera" || info.Text != "alice ~u example.org * Alice A." {
-		t.Fatalf("info = %+v", info)
+	if info.Network != "libera" || info.Buffer != "alice" || info.Text != "~u example.org * Alice A." {
+		t.Fatalf("whois info = %+v", info)
 	}
 
-	// Error numerics too.
+	// End of /WHOIS (318) is dropped as noise.
+	conn.ch <- ev(":srv 318 AlteredParadox alice :End of /WHOIS list")
+	expectSilence(t, s)
+
+	// Error numerics stay in the active buffer (no routing) — a failed
+	// /whois shows where it was typed, not in a junk query buffer.
 	conn.ch <- ev(":srv 401 AlteredParadox ghost :No such nick/channel")
-	if info := decode[ServerInfoData](t, recv(t, s, "server_info")); info.Text != "ghost No such nick/channel" {
+	if info := decode[ServerInfoData](t, recv(t, s, "server_info")); info.Buffer != "" || info.Text != "ghost No such nick/channel" {
 		t.Fatalf("error info = %+v", info)
 	}
 

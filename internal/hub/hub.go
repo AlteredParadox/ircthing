@@ -182,8 +182,9 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 	}
 	// Command replies (WHOIS/WHO/LIST/AWAY/...) and error numerics are
 	// pushed as ephemeral "server_info" lines.
-	if txt, ok := h.serverInfo(ev); ok {
-		h.broadcast(envelope("server_info", 0, ServerInfoData{Network: ev.Network, Text: txt}))
+	if info, ok := h.serverInfo(ev); ok {
+		info.Network = ev.Network
+		h.broadcast(envelope("server_info", 0, info))
 		return nil
 	}
 	if ev.Msg.Command == "BATCH" {
@@ -423,7 +424,7 @@ const maxBackfillPages = 10
 // servers also send them unsolicited at every registration.
 var serverInfoNumerics = map[string]bool{
 	"301": true, "305": true, "306": true, "307": true, // away status
-	"311": true, "312": true, "313": true, "317": true, "318": true, // WHOIS
+	"311": true, "312": true, "313": true, "317": true, // WHOIS
 	"319": true, "330": true, "335": true, "338": true, "378": true,
 	"379": true, "671": true,
 	"314": true, "369": true, // WHOWAS
@@ -433,32 +434,53 @@ var serverInfoNumerics = map[string]bool{
 	"341": true, // INVITE ack
 }
 
+// whoisNumerics are the WHOIS reply numerics whose param(1) is the
+// queried nick; their output is routed to that nick's query buffer (and
+// the client jumps there), so /whois does not clutter the channel. 318
+// (end of /WHOIS) is dropped entirely.
+var whoisNumerics = map[string]bool{
+	"311": true, "312": true, "313": true, "317": true,
+	"319": true, "330": true, "335": true, "338": true,
+	"378": true, "379": true, "671": true,
+}
+
 // serverInfo decides whether an event should be pushed as an ephemeral
 // "server_info" line, and formats it: the leading nick parameter is
 // dropped, the rest joined. Error numerics (4xx/5xx) always qualify —
 // "401 no such nick" after a /whois would otherwise vanish.
-func (h *Hub) serverInfo(ev irc.Event) (string, bool) {
+func (h *Hub) serverInfo(ev irc.Event) (ServerInfoData, bool) {
 	cmd := ev.Msg.Command
 	n, err := strconv.Atoi(cmd)
 	if err != nil {
-		return "", false
+		return ServerInfoData{}, false
 	}
 	switch {
 	case cmd == "375" || cmd == "372" || cmd == "376" || cmd == "422":
 		if !h.motdExpected(ev.Network, cmd) {
-			return "", false
+			return ServerInfoData{}, false
 		}
 	case serverInfoNumerics[cmd]:
 	case n >= 400 && n < 600:
 	default:
-		return "", false
+		return ServerInfoData{}, false
+	}
+	// WHOIS output is routed to the target nick's query buffer, dropping
+	// both our nick and the (now redundant) target nick from the text.
+	skip := 1
+	info := ServerInfoData{}
+	if whoisNumerics[cmd] {
+		info.Buffer = ev.Msg.Param(1)
+		skip = 2
 	}
 	params := ev.Msg.Params
-	if len(params) > 1 {
-		params = params[1:] // our own nick
+	if len(params) > skip {
+		params = params[skip:]
 	}
-	txt := strings.TrimSpace(strings.Join(params, " "))
-	return txt, txt != ""
+	info.Text = strings.TrimSpace(strings.Join(params, " "))
+	if info.Text == "" {
+		return ServerInfoData{}, false
+	}
+	return info, true
 }
 
 // expectMOTD opens the MOTD gate for a network: the next MOTD reply is
