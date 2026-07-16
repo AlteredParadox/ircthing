@@ -151,11 +151,12 @@ func (rc *rawClient) waitFor(pred func(*ircv4.Message) bool) *ircv4.Message {
 
 // stack wires store -> hub -> manager the way cmd/ircd-web does.
 type stack struct {
-	t      *testing.T
-	st     *store.Store
-	h      *hub.Hub
-	sess   *hub.Session
-	cancel context.CancelFunc
+	t         *testing.T
+	st        *store.Store
+	h         *hub.Hub
+	sess      *hub.Session
+	cancel    context.CancelFunc
+	rosterSeq int64
 }
 
 func startStack(t *testing.T, st *store.Store, h *hub.Hub, cfg irc.Config) *stack {
@@ -315,4 +316,20 @@ func envelope(t *testing.T, typ string, seq int64, data any) hub.Envelope {
 		t.Fatal(err)
 	}
 	return hub.Envelope{V: hub.ProtocolVersion, Type: typ, Seq: seq, Data: raw}
+}
+
+// channelRoster requests a channel's full member data once.
+func (s *stack) channelRoster(network, buffer string) []hub.MemberData {
+	s.t.Helper()
+	s.rosterSeq++
+	s.sess.Handle(context.Background(), envelope(s.t, "get_channel", 5000+s.rosterSeq, hub.ChannelReq{
+		Network: network, Buffer: buffer,
+	}))
+	env := s.waitEnvelope("channel", func(d json.RawMessage) bool {
+		var cd hub.ChannelData
+		return json.Unmarshal(d, &cd) == nil && cd.Buffer == buffer
+	})
+	var cd hub.ChannelData
+	json.Unmarshal(env.Data, &cd)
+	return cd.Members
 }

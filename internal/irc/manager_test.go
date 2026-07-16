@@ -889,3 +889,58 @@ func TestManagerCTCPAutoReply(t *testing.T) {
 		t.Fatalf("reply = %q, want the PING answer (channel CTCP ignored)", got.String())
 	}
 }
+
+func TestManagerWHOXOnJoin(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	// Without WHOX in ISUPPORT: no query after NAMES. The next command we
+	// read must be the WHO that follows once WHOX IS advertised.
+	s.send(":AlteredParadox!u@h JOIN #go")
+	s.send(":srv 353 AlteredParadox = #go :alice AlteredParadox")
+	s.send(":srv 366 AlteredParadox #go :End of /NAMES list")
+
+	s.send(":srv 005 AlteredParadox WHOX :are supported by this server")
+	s.send(":AlteredParadox!u@h JOIN #rust")
+	s.send(":srv 353 AlteredParadox = #rust :bob AlteredParadox")
+	s.send(":srv 366 AlteredParadox #rust :End of /NAMES list")
+	who := s.readCmd("WHO")
+	if who.Param(0) != "#rust" || who.Param(1) != "%tnfa,"+whoxToken {
+		t.Fatalf("WHO = %q, want #rust %%tnfa,%s", who.String(), whoxToken)
+	}
+
+	// A NAMES refresh does not re-query; the 354 replies land in the
+	// roster (away + account).
+	s.send(":srv 354 AlteredParadox " + whoxToken + " bob G bobacct")
+	s.send(":srv 366 AlteredParadox #rust :End of /NAMES list")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, ms, ok := m.Channel("#rust")
+		if ok && len(ms) == 2 && ms[1].Nick == "bob" && ms[1].Away && ms[1].Account == "bobacct" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("354 never applied: %v", ms)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	// Prove no second WHO was sent for either channel: solicit MONITOR
+	// output and assert nothing WHO-shaped precedes it on the wire.
+	m.MonitorAdd("x")
+	for {
+		got := s.read()
+		if got.Command == "MONITOR" {
+			break
+		}
+		if got.Command == "WHO" {
+			t.Fatalf("unexpected extra WHO before MONITOR: %q", got.String())
+		}
+	}
+}

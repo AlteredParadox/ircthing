@@ -16,8 +16,13 @@ import (
 // multi-prefix (https://ircv3.net/specs/extensions/multi-prefix, fetched
 // 2026-07-15) is negotiated — without it only the highest is known.
 // NAMES entries may be full nick!user@host hostmasks under
-// userhost-in-names (spec fetched 2026-07-15). Away state comes from
-// away-notify AWAY lines (spec fetched 2026-07-15).
+// userhost-in-names (spec fetched 2026-07-15).
+//
+// Away state and accounts come from three sources: the WHOX query the
+// manager issues after each channel's NAMES (354 replies; see
+// maybeWHOX), extended-join for members joining after us, and the
+// away-notify / account-notify change streams (specs fetched
+// 2026-07-16).
 //
 // Prefix ranks, MODE argument consumption and name casemapping all come
 // from the connection's RPL_ISUPPORT values (PREFIX, CHANMODES,
@@ -25,9 +30,10 @@ import (
 
 // Member is one channel occupant.
 type Member struct {
-	Nick   string
-	Prefix string // status prefixes, highest first: e.g. "@+", "" for none
-	Away   bool   // known only when away-notify is negotiated
+	Nick    string
+	Prefix  string // status prefixes, highest first: e.g. "@+", "" for none
+	Away    bool
+	Account string // services account, "" when logged out or unknown
 }
 
 type channelState struct {
@@ -105,6 +111,14 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 
 	case "366": // RPL_ENDOFNAMES: <me> <channel> — pending replaces live
 		if st := r.chans[fold(m.Param(1))]; st != nil && st.pending != nil {
+			// NAMES carries no away/account data; keep what WHOX and the
+			// notify streams already taught us about surviving members.
+			for k, mem := range st.pending {
+				if old, ok := st.members[k]; ok {
+					mem.Away, mem.Account = old.Away, old.Account
+					st.pending[k] = mem
+				}
+			}
 			st.members = st.pending
 			st.pending = nil
 		}
@@ -130,7 +144,13 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 			r.chans[fold(ch)] = &channelState{name: ch, members: make(map[string]Member)}
 		}
 		if st := r.chans[fold(ch)]; st != nil {
-			st.members[fold(sender)] = Member{Nick: sender}
+			mem := Member{Nick: sender}
+			// extended-join (spec fetched 2026-07-16): JOIN carries
+			// <account> <realname>, account "*" when logged out.
+			if acct := m.Param(1); len(m.Params) >= 3 && acct != "*" {
+				mem.Account = acct
+			}
+			st.members[fold(sender)] = mem
 		}
 
 	case "PART":
@@ -169,6 +189,37 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 			if mem, ok := st.members[fold(sender)]; ok {
 				mem.Away = away
 				st.members[fold(sender)] = mem
+			}
+		}
+
+	case "ACCOUNT": // account-notify: <account>, "*" means logged out
+		acct := m.Param(0)
+		if acct == "*" {
+			acct = ""
+		}
+		for _, st := range r.chans {
+			if mem, ok := st.members[fold(sender)]; ok {
+				mem.Account = acct
+				st.members[fold(sender)] = mem
+			}
+		}
+
+	case "354": // RPL_WHOSPCRPL: our WHOX reply — <me> <token> <nick> <flags> <account>
+		if m.Param(1) != whoxToken || len(m.Params) < 5 {
+			return
+		}
+		nick, flags, acct := m.Param(2), m.Param(3), m.Param(4)
+		if acct == "0" { // logged out, per the WHOX spec
+			acct = ""
+		}
+		away := strings.ContainsRune(flags, 'G')
+		// The reply names no channel (we don't request the c field);
+		// away/account are nick-level facts, applied wherever the nick is.
+		for _, st := range r.chans {
+			if mem, ok := st.members[fold(nick)]; ok {
+				mem.Away = away
+				mem.Account = acct
+				st.members[fold(nick)] = mem
 			}
 		}
 

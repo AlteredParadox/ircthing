@@ -355,3 +355,106 @@ func TestRosterClear(t *testing.T) {
 		t.Fatal("state survived clear")
 	}
 }
+
+func TestRosterAccountsAndWHOX(t *testing.T) {
+	cases := []struct {
+		name  string
+		lines []string
+		check func(t *testing.T, r *roster)
+	}{
+		{
+			name: "WHOX 354 sets away and account for existing members",
+			lines: []string{
+				joinGo,
+				":srv 353 AlteredParadox = #go :alice bob AlteredParadox",
+				":srv 366 AlteredParadox #go :End of /NAMES list",
+				":srv 354 AlteredParadox 152 alice G alicerella",
+				":srv 354 AlteredParadox 152 bob H 0", // logged out
+			},
+			check: func(t *testing.T, r *roster) {
+				want := []Member{
+					{Nick: "alice", Away: true, Account: "alicerella"},
+					{Nick: "AlteredParadox"},
+					{Nick: "bob"},
+				}
+				if got := members(t, r, "#go"); !reflect.DeepEqual(got, want) {
+					t.Fatalf("members = %v, want %v", got, want)
+				}
+			},
+		},
+		{
+			name: "354 with a foreign token is ignored",
+			lines: []string{
+				joinGo,
+				":srv 353 AlteredParadox = #go :alice",
+				":srv 366 AlteredParadox #go :x",
+				":srv 354 AlteredParadox 999 alice G someacct",
+			},
+			check: func(t *testing.T, r *roster) {
+				if got := members(t, r, "#go"); got[0].Away || got[0].Account != "" {
+					t.Fatalf("foreign-token 354 applied: %v", got[0])
+				}
+			},
+		},
+		{
+			name: "extended-join carries the account; * means logged out",
+			lines: []string{
+				joinGo,
+				":srv 366 AlteredParadox #go :x",
+				":carol!u@h JOIN #go carolacct :Carol C.",
+				":dave!u@h JOIN #go * :Dave D.",
+			},
+			check: func(t *testing.T, r *roster) {
+				got := members(t, r, "#go")
+				if got[1].Nick != "carol" || got[1].Account != "carolacct" {
+					t.Fatalf("carol = %v", got[1])
+				}
+				if got[2].Nick != "dave" || got[2].Account != "" {
+					t.Fatalf("dave = %v", got[2])
+				}
+			},
+		},
+		{
+			name: "account-notify updates and clears",
+			lines: []string{
+				joinGo,
+				":srv 353 AlteredParadox = #go :alice",
+				":srv 366 AlteredParadox #go :x",
+				":alice!u@h ACCOUNT alicerella",
+			},
+			check: func(t *testing.T, r *roster) {
+				if got := members(t, r, "#go"); got[0].Account != "alicerella" {
+					t.Fatalf("after ACCOUNT: %v", got[0])
+				}
+				feed(t, r, ":alice!u@h ACCOUNT *")
+				if got := members(t, r, "#go"); got[0].Account != "" {
+					t.Fatalf("after logout: %v", got[0])
+				}
+			},
+		},
+		{
+			name: "a NAMES refresh keeps learned away/account state",
+			lines: []string{
+				joinGo,
+				":srv 353 AlteredParadox = #go :alice AlteredParadox",
+				":srv 366 AlteredParadox #go :x",
+				":srv 354 AlteredParadox 152 alice G alicerella",
+				":srv 353 AlteredParadox = #go :@alice AlteredParadox", // refresh, alice opped meanwhile
+				":srv 366 AlteredParadox #go :x",
+			},
+			check: func(t *testing.T, r *roster) {
+				got := members(t, r, "#go")
+				if got[0].Prefix != "@" || !got[0].Away || got[0].Account != "alicerella" {
+					t.Fatalf("after refresh: %v", got[0])
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := testRoster()
+			feed(t, r, tc.lines...)
+			tc.check(t, r)
+		})
+	}
+}

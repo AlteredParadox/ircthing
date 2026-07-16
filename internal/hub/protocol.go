@@ -213,9 +213,10 @@ type ChannelReq struct {
 
 // MemberData is one channel occupant.
 type MemberData struct {
-	Nick   string `json:"nick"`
-	Prefix string `json:"prefix,omitempty"` // status prefixes, highest first ("@+")
-	Away   bool   `json:"away,omitempty"`   // known only with away-notify
+	Nick    string `json:"nick"`
+	Prefix  string `json:"prefix,omitempty"`  // status prefixes, highest first ("@+")
+	Away    bool   `json:"away,omitempty"`    // WHOX on join + away-notify
+	Account string `json:"account,omitempty"` // services account, "" if logged out/unknown
 }
 
 // ChannelData answers "get_channel": topic and membership as currently

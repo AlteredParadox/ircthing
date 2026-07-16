@@ -338,3 +338,39 @@ func TestChathistoryPaginatedBackfill(t *testing.T) {
 		t.Fatalf("last replayed = %d, want 24", prev)
 	}
 }
+
+// TestWHOXAccountDiscovery: a member who is authenticated and away
+// BEFORE we join is discovered through the WHOX query issued after
+// NAMES — neither fact is visible in NAMES, and the notify caps only
+// report changes. Ergo advertises WHOX.
+func TestWHOXAccountDiscovery(t *testing.T) {
+	addr := startErgo(t)
+
+	pal := dialRaw(t, addr, "whoxpal")
+	pal.send("PRIVMSG NickServ :REGISTER whox-pw")
+	pal.waitFor(func(m *ircv4.Message) bool {
+		return m.Command == "NOTICE" && strings.Contains(strings.ToLower(m.Trailing()), "created")
+	})
+	pal.send("JOIN #wx")
+	pal.send("AWAY :brb")
+	pal.waitFor(func(m *ircv4.Message) bool { return m.Command == "306" }) // marked away
+
+	st, h := newStoreAndHub(t)
+	s := startStack(t, st, h, irc.Config{
+		Name: "ergo", Addr: addr, Nick: "webuser", Channels: []string{"#wx"},
+	})
+	s.waitRegistered()
+
+	deadline := time.Now().Add(testTimeout)
+	for {
+		for _, m := range s.channelRoster("ergo", "#wx") {
+			if m.Nick == "whoxpal" && m.Away && m.Account == "whoxpal" {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("whoxpal never showed away+account: %+v", s.channelRoster("ergo", "#wx"))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}

@@ -97,6 +97,10 @@ type Manager struct {
 	namesMu  sync.Mutex
 	namesReq map[string]bool
 
+	// whoxDone tracks channels already WHOX-queried this connection (see
+	// maybeWHOX). Only the read loop touches it.
+	whoxDone map[string]bool
+
 	// stsMu guards the active STS policy (sts.go): connect to stsPort
 	// with TLS until stsUntil (zero stsUntil with a port = session-only
 	// upgrade). stsLastDur is the most recently advertised duration, used
@@ -134,6 +138,7 @@ func NewManager(cfg Config) (*Manager, error) {
 		roster:   newRoster(isup),
 		joined:   make(map[string]string),
 		namesReq: make(map[string]bool),
+		whoxDone: make(map[string]bool),
 	}
 	for _, ch := range cfg.Channels {
 		m.joined[isup.Fold(ch)] = ch
@@ -616,6 +621,7 @@ drain:
 	m.roster.clear()
 	defer m.roster.clear()
 	m.resetNames()
+	m.whoxDone = make(map[string]bool)
 
 	m.nick.Store(hs.nick)
 	m.setCaps(hs.enabled)
@@ -740,9 +746,44 @@ drain:
 			}
 			m.roster.handle(m.Nick(), in)
 			m.trackJoinIntent(in)
+			// End of NAMES: the roster knows who is here but not their
+			// away/account state — WHOX fills that in (see maybeWHOX).
+			if in.Command == "366" {
+				if out := m.maybeWHOX(in.Param(1)); out != nil {
+					if err := send([]*ircv4.Message{out}); err != nil {
+						return err
+					}
+				}
+			}
 		}
 		m.emit(ctx, Event{Kind: EventMessage, Msg: in})
 	}
+}
+
+// whoxToken correlates our WHOX replies (354) with the roster; the spec
+// allows 1–3 digits.
+const whoxToken = "152"
+
+// maybeWHOX returns the WHOX query for a channel whose NAMES just
+// completed — account and away discovery for members who were already
+// there when we joined (https://ircv3.net/specs/extensions/whox, fetched
+// 2026-07-16; ISUPPORT WHOX gates it). Fields: t oken, n ick, f lags
+// (H/G away), a ccount. Members joining later are covered by
+// extended-join; changes by away-notify/account-notify. Once per channel
+// per connection.
+func (m *Manager) maybeWHOX(channel string) *ircv4.Message {
+	if channel == "" {
+		return nil
+	}
+	if _, ok := m.isup.Raw("WHOX"); !ok {
+		return nil
+	}
+	key := m.isup.Fold(channel)
+	if m.whoxDone[key] {
+		return nil
+	}
+	m.whoxDone[key] = true
+	return newMsg("WHO", channel, "%tnfa,"+whoxToken)
 }
 
 // trackJoinIntent keeps the rejoin set in step with our own JOINs and

@@ -374,7 +374,7 @@ var serverInfoNumerics = map[string]bool{
 	"319": true, "330": true, "338": true, "378": true, "379": true,
 	"671": true,
 	"314": true, "369": true, // WHOWAS
-	"352": true, "354": true, "315": true, // WHO
+	"352": true, // WHO (354/315 are our own WHOX traffic — roster data)
 	"321": true, "322": true, "323": true, // LIST
 	"324": true, "329": true, "367": true, "368": true, // MODE queries
 	"341": true, // INVITE ack
@@ -521,7 +521,9 @@ func membersHint(m *ircv4.Message) (buffer string, affected bool) {
 		return m.Param(0), true
 	case "366": // end of NAMES: <me> <channel>
 		return m.Param(1), true
-	case "QUIT", "NICK", "AWAY": // span channels the hub doesn't track
+	case "315": // end of WHO: away/account discovery finished (WHOX)
+		return m.Param(1), true
+	case "QUIT", "NICK", "AWAY", "ACCOUNT": // span channels the hub doesn't track
 		return "", true
 	}
 	return "", false

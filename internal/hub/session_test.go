@@ -843,6 +843,21 @@ func TestHubBroadcastsMembersChanged(t *testing.T) {
 		t.Fatalf("366 hint = %+v", got)
 	}
 
+	// End of WHO (WHOX away/account discovery) hints its channel too,
+	// and the 354 data lines themselves stay silent.
+	conn.ch <- ev(":srv 354 AlteredParadox 152 alice G aliceacct")
+	conn.ch <- ev(":srv 315 AlteredParadox #go :End of WHO list")
+	if got := decode[MembersChangedData](t, recv(t, s, "members_changed")); got.Buffer != "#go" {
+		t.Fatalf("315 hint = %+v", got)
+	}
+	expectSilence(t, s)
+
+	// account-notify hints network-wide.
+	conn.ch <- ev(":alice!u@h ACCOUNT aliceacct")
+	if got := decode[MembersChangedData](t, recv(t, s, "members_changed")); got.Buffer != "" {
+		t.Fatalf("ACCOUNT hint = %+v", got)
+	}
+
 	// Ordinary PRIVMSG does not hint.
 	conn.ch <- ev(":alice!u@h PRIVMSG #go :hi")
 	if env := recv(t, s, "event"); env.Type != "event" {
