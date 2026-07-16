@@ -981,8 +981,8 @@ func TestManagerUTF8Only(t *testing.T) {
 	if err := m.Send(newMsg("PRIVMSG", "#go", "caf\xe9 two")); err != nil {
 		t.Fatal(err)
 	}
-	if got := s.readCmd("PRIVMSG"); got.Trailing() != "caf� two" {
-		t.Fatalf("post-UTF8ONLY trailing = %q, want caf� two", got.Trailing())
+	if got := s.readCmd("PRIVMSG"); got.Trailing() != "caf\uFFFD two" {
+		t.Fatalf("post-UTF8ONLY trailing = %q, want caf\uFFFD two", got.Trailing())
 	}
 }
 

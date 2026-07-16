@@ -950,7 +950,7 @@ func (m *Manager) scrubUTF8(msg *ircv4.Message) *ircv4.Message {
 			cp.Params = append([]string(nil), msg.Params...)
 			cleaned = &cp
 		}
-		cleaned.Params[i] = strings.ToValidUTF8(p, "�")
+		cleaned.Params[i] = strings.ToValidUTF8(p, "\uFFFD")
 	}
 	if cleaned != nil {
 		return cleaned
