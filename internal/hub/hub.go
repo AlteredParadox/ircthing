@@ -9,6 +9,7 @@ package hub
 import (
 	"context"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,20 +53,22 @@ type Conn interface {
 type Hub struct {
 	store *store.Store
 
-	mu       sync.Mutex
-	networks map[string]Conn
-	states   map[string]string          // last known connection state per network
-	presence map[string]map[string]bool // network -> monitored nick -> online (MONITOR)
-	sessions map[*Session]struct{}
+	mu         sync.Mutex
+	networks   map[string]Conn
+	states     map[string]string          // last known connection state per network
+	presence   map[string]map[string]bool // network -> monitored nick -> online (MONITOR)
+	motdWanted map[string]bool            // networks with an explicit /motd pending
+	sessions   map[*Session]struct{}
 }
 
 func New(st *store.Store) *Hub {
 	return &Hub{
-		store:    st,
-		networks: make(map[string]Conn),
-		states:   make(map[string]string),
-		presence: make(map[string]map[string]bool),
-		sessions: make(map[*Session]struct{}),
+		store:      st,
+		networks:   make(map[string]Conn),
+		states:     make(map[string]string),
+		presence:   make(map[string]map[string]bool),
+		motdWanted: make(map[string]bool),
+		sessions:   make(map[*Session]struct{}),
 	}
 }
 
@@ -144,6 +147,12 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					log.Printf("irc[%s]: MONITOR list full: %s", ev.Network, ev.Msg.Trailing())
 					continue
 				case "732", "733": // RPL_MONLIST / end — the store is our source of truth
+					continue
+				}
+				// Command replies (WHOIS/WHO/LIST/AWAY/...) and error
+				// numerics are pushed as ephemeral "server_info" lines.
+				if txt, ok := h.serverInfo(ev); ok {
+					h.broadcast(envelope("server_info", 0, ServerInfoData{Network: ev.Network, Text: txt}))
 					continue
 				}
 				if ev.Msg.Command == "BATCH" {
@@ -354,6 +363,70 @@ type histBatch struct {
 // explicit history paging.
 const maxBackfillPages = 10
 
+// serverInfoNumerics are the reply numerics of user-issued informational
+// commands (WHOIS/WHOWAS/WHO/LIST/AWAY/INVITE/MODE queries), forwarded
+// to clients as ephemeral "server_info" lines. Connect-time floods
+// (ISUPPORT, LUSERS) stay out; MOTD numerics are gated separately since
+// servers also send them unsolicited at every registration.
+var serverInfoNumerics = map[string]bool{
+	"301": true, "305": true, "306": true, "307": true, // away status
+	"311": true, "312": true, "313": true, "317": true, "318": true, // WHOIS
+	"319": true, "330": true, "338": true, "378": true, "379": true,
+	"671": true,
+	"314": true, "369": true, // WHOWAS
+	"352": true, "354": true, "315": true, // WHO
+	"321": true, "322": true, "323": true, // LIST
+	"324": true, "329": true, "367": true, "368": true, // MODE queries
+	"341": true, // INVITE ack
+}
+
+// serverInfo decides whether an event should be pushed as an ephemeral
+// "server_info" line, and formats it: the leading nick parameter is
+// dropped, the rest joined. Error numerics (4xx/5xx) always qualify —
+// "401 no such nick" after a /whois would otherwise vanish.
+func (h *Hub) serverInfo(ev irc.Event) (string, bool) {
+	cmd := ev.Msg.Command
+	n, err := strconv.Atoi(cmd)
+	if err != nil {
+		return "", false
+	}
+	switch {
+	case cmd == "375" || cmd == "372" || cmd == "376" || cmd == "422":
+		if !h.motdExpected(ev.Network, cmd) {
+			return "", false
+		}
+	case serverInfoNumerics[cmd]:
+	case n >= 400 && n < 600:
+	default:
+		return "", false
+	}
+	params := ev.Msg.Params
+	if len(params) > 1 {
+		params = params[1:] // our own nick
+	}
+	txt := strings.TrimSpace(strings.Join(params, " "))
+	return txt, txt != ""
+}
+
+// expectMOTD opens the MOTD gate for a network: the next MOTD reply is
+// user-requested and should be shown. motdExpected consumes the gate at
+// the end-of-MOTD numerics.
+func (h *Hub) expectMOTD(network string) {
+	h.mu.Lock()
+	h.motdWanted[network] = true
+	h.mu.Unlock()
+}
+
+func (h *Hub) motdExpected(network, cmd string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	want := h.motdWanted[network]
+	if cmd == "376" || cmd == "422" { // RPL_ENDOFMOTD / ERR_NOMOTD
+		delete(h.motdWanted, network)
+	}
+	return want
+}
+
 // trackHistoryBatch follows BATCH open/close for chathistory replays.
 // When a replay finishes it announces the affected buffer (so clients
 // drop stale pages and refetch) and — if the batch filled a whole page,
@@ -515,6 +588,13 @@ func eventData(m store.Message) EventData {
 func persistTarget(m *ircv4.Message, ourNick string, isChan func(string) bool) (string, bool) {
 	switch m.Command {
 	case "PRIVMSG", "NOTICE":
+		// Non-ACTION CTCP (VERSION probes, PING, and their reply
+		// NOTICEs) is protocol chatter, not conversation: persisting it
+		// would open unread query buffers for every probe.
+		if body := m.Trailing(); strings.HasPrefix(body, "\x01") &&
+			!strings.HasPrefix(body, "\x01ACTION") {
+			return "", false
+		}
 		t := m.Param(0)
 		if isChan(t) {
 			return t, true

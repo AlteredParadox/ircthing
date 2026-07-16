@@ -6,7 +6,7 @@ const nicks = ["alice", "Alfred", "bob", "alice"]; // dupe on purpose
 
 test("completions: commands only at the start of the line", () => {
 	eq(completions("/pa", 3, {}), { start: 0, options: ["/part "] });
-	eq(completions("/m", 2, {}).options, ["/me ", "/msg "]);
+	eq(completions("/m", 2, {}).options, ["/me ", "/mode ", "/motd ", "/msg "]);
 	is(completions("say /pa", 7, { nicks }), null, "mid-line /pa is not a command");
 	is(completions("/zzz", 4, {}), null);
 });

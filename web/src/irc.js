@@ -140,7 +140,10 @@ export function isChannelName(s, chantypes) {
 
 // COMMANDS lists every slash command parseInput understands, for
 // composer tab-completion. Keep in sync with the switch below.
-export const COMMANDS = ["join", "me", "msg", "nick", "part", "query", "topic"];
+export const COMMANDS = [
+	"away", "invite", "join", "kick", "list", "me", "mode", "motd", "msg",
+	"nick", "notice", "part", "query", "topic", "who", "whois", "whowas",
+];
 
 // bufferOrder returns buffer keys in sidebar order (network, then name),
 // for keyboard prev/next navigation.
@@ -224,6 +227,62 @@ export function parseInput(input, buffer, chantypes) {
 			if (!isChannelName(buffer, chantypes)) return err("/topic: not in a channel");
 			if (!rest) return err("usage: /topic <text>");
 			return { type: "cmd", command: "TOPIC", params: [buffer, rest] };
+
+		case "whois":
+		case "whowas":
+		case "who": {
+			if (!rest || /\s/.test(rest)) return err(`usage: /${cmd} <nick>`);
+			return { type: "cmd", command: cmd.toUpperCase(), params: [rest] };
+		}
+
+		case "list":
+			if (/\s/.test(rest)) return err("usage: /list [pattern]");
+			return { type: "cmd", command: "LIST", params: rest ? [rest] : [] };
+
+		case "motd":
+			if (rest) return err("usage: /motd");
+			return { type: "cmd", command: "MOTD", params: [] };
+
+		case "away":
+			// A message marks us away; none marks us back.
+			return { type: "cmd", command: "AWAY", params: rest ? [rest] : [] };
+
+		case "notice": {
+			const sp = rest.indexOf(" ");
+			if (sp === -1 || !rest.slice(sp + 1).trim()) return err("usage: /notice <target> <text>");
+			return { type: "cmd", command: "NOTICE", params: [rest.slice(0, sp), rest.slice(sp + 1).trim()] };
+		}
+
+		case "mode": {
+			// /mode queries the current buffer; /mode +m sets modes on it;
+			// /mode <target> ... names one explicitly.
+			const parts = rest ? rest.split(/\s+/) : [];
+			let target = buffer;
+			if (parts.length && !/^[+-]/.test(parts[0])) target = parts.shift();
+			if (parts.length > 5) return err("/mode: too many parameters");
+			return { type: "cmd", command: "MODE", params: [target, ...parts] };
+		}
+
+		case "kick": {
+			// /kick <nick> [reason] in a channel; /kick <channel> <nick>
+			// [reason] anywhere.
+			const parts = rest ? rest.split(/\s+/) : [];
+			let chan = buffer;
+			if (parts.length && isChannelName(parts[0], chantypes)) chan = parts.shift();
+			const nick = parts.shift();
+			if (!nick) return err("usage: /kick [channel] <nick> [reason]");
+			if (!isChannelName(chan, chantypes)) return err("/kick: not in a channel");
+			const reason = parts.join(" ");
+			return { type: "cmd", command: "KICK", params: reason ? [chan, nick, reason] : [chan, nick] };
+		}
+
+		case "invite": {
+			const parts = rest ? rest.split(/\s+/) : [];
+			if (!parts.length || parts.length > 2) return err("usage: /invite <nick> [channel]");
+			const chan = parts[1] || buffer;
+			if (!isChannelName(chan, chantypes)) return err("/invite: not in a channel");
+			return { type: "cmd", command: "INVITE", params: [parts[0], chan] };
+		}
 
 		default:
 			return err("unknown command /" + cmd);

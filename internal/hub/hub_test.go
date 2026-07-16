@@ -45,6 +45,9 @@ func TestPersistTarget(t *testing.T) {
 		{"nick change dropped for now", ":alice!u@h NICK alicia", "AlteredParadox", "", false},
 		{"numeric dropped", ":irc.test 001 AlteredParadox :Welcome", "AlteredParadox", "", false},
 		{"ping dropped", "PING :x", "AlteredParadox", "", false},
+		{"ctcp query dropped", ":alice!u@h PRIVMSG AlteredParadox :\x01VERSION\x01", "AlteredParadox", "", false},
+		{"ctcp reply notice dropped", ":alice!u@h NOTICE AlteredParadox :\x01VERSION theirclient\x01", "AlteredParadox", "", false},
+		{"ctcp action persists", ":alice!u@h PRIVMSG #go :\x01ACTION waves\x01", "AlteredParadox", "#go", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

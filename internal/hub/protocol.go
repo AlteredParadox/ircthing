@@ -256,6 +256,14 @@ type TypingData struct {
 	State   string `json:"state"` // "active", "paused" or "done"
 }
 
+// ServerInfoData is an ephemeral informational line ("server_info"):
+// command replies (WHOIS, LIST, AWAY, ...) and error numerics. Clients
+// render it in the active buffer; it is never persisted.
+type ServerInfoData struct {
+	Network string `json:"network"`
+	Text    string `json:"text"`
+}
+
 // PrefsData carries the client preferences blob ("prefs" pushes and
 // responses, and the "set_prefs" request). The server stores it opaquely
 // (clients validate their own settings shape); it exists server-side so

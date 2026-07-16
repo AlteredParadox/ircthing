@@ -864,3 +864,28 @@ func selfSignedCert(t *testing.T) (tls.Certificate, *x509.CertPool) {
 	pool.AddCert(leaf)
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}, pool
 }
+
+func TestManagerCTCPAutoReply(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	s.send(":pal!u@h PRIVMSG AlteredParadox :\x01VERSION\x01")
+	if got := s.readCmd("NOTICE"); got.Param(0) != "pal" || !strings.Contains(got.Trailing(), "VERSION ircthing") {
+		t.Fatalf("CTCP reply = %q", got.String())
+	}
+
+	// Channel-wide CTCP is ignored; the next NOTICE must answer the
+	// direct PING, not the channel VERSION.
+	s.send(":pal!u@h PRIVMSG #go :\x01VERSION\x01")
+	s.send(":pal!u@h PRIVMSG AlteredParadox :\x01PING xyz\x01")
+	if got := s.readCmd("NOTICE"); !strings.Contains(got.Trailing(), "PING xyz") {
+		t.Fatalf("reply = %q, want the PING answer (channel CTCP ignored)", got.String())
+	}
+}

@@ -309,12 +309,23 @@ func (s *Session) handleRedact(ctx context.Context, env Envelope) {
 
 // commandSpec is the allowlist of client-issued IRC commands with their
 // permitted parameter counts. Everything else is rejected — the client
-// does not get raw connection access.
+// does not get raw connection access. Replies to the informational
+// commands flow back as "server_info" pushes (see serverInfo).
 var commandSpec = map[string]struct{ min, max int }{
-	"JOIN":  {1, 2}, // channel [key]
-	"PART":  {1, 2}, // channel [reason]
-	"NICK":  {1, 1},
-	"TOPIC": {1, 2}, // channel [new topic]
+	"JOIN":   {1, 2}, // channel [key]
+	"PART":   {1, 2}, // channel [reason]
+	"NICK":   {1, 1},
+	"TOPIC":  {1, 2}, // channel [new topic]
+	"WHOIS":  {1, 2}, // [server] nick
+	"WHOWAS": {1, 2}, // nick [count]
+	"WHO":    {1, 2}, // mask [flags]
+	"LIST":   {0, 2}, // [channels [server]]
+	"MODE":   {1, 6}, // target [modes [args...]]
+	"KICK":   {2, 3}, // channel nick [reason]
+	"INVITE": {2, 2}, // nick channel
+	"AWAY":   {0, 1}, // [message]; none marks us back
+	"NOTICE": {2, 2}, // target text
+	"MOTD":   {0, 1}, // [server]
 }
 
 func (s *Session) handleCommand(ctx context.Context, env Envelope) {
@@ -353,6 +364,11 @@ func (s *Session) handleCommand(ctx context.Context, env Envelope) {
 	if err := conn.Send(&ircv4.Message{Command: cmd, Params: d.Params}); err != nil {
 		s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
 		return
+	}
+	// MOTD replies also arrive unsolicited at every (re)connect; only an
+	// explicit /motd opens the gate for forwarding them (see serverInfo).
+	if cmd == "MOTD" {
+		s.hub.expectMOTD(d.Network)
 	}
 	s.push(envelope("ok", env.Seq, nil))
 }

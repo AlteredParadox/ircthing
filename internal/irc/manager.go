@@ -721,6 +721,16 @@ drain:
 		playback := in.Tags["batch"] != "" && histBatch[in.Tags["batch"]]
 		m.isup.handle(in) // 005, ignored otherwise
 		if !playback {
+			// CTCP queries addressed directly to us get their auto-reply
+			// (VERSION/PING/TIME/CLIENTINFO — see ctcp.go). Replays are
+			// excluded above: old queries must not be re-answered.
+			if in.Command == "PRIVMSG" && m.isup.FoldEqual(in.Param(0), m.Nick()) {
+				if reply := ctcpReply(in); reply != nil {
+					if err := send([]*ircv4.Message{reply}); err != nil {
+						return err
+					}
+				}
+			}
 			// Track our own nick changes, compared under the server's
 			// casemapping.
 			if in.Command == "NICK" && in.Prefix != nil && m.isup.FoldEqual(in.Prefix.Name, m.Nick()) {

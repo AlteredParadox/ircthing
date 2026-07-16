@@ -279,6 +279,26 @@ export function App() {
 			if (d.prefs) setPrefs(normalizePrefs(d.prefs));
 		});
 
+		// Ephemeral server replies (/whois, /list, error numerics): shown
+		// as system lines in the active buffer, never persisted — a
+		// history refetch drops them.
+		let infoSeq = 0;
+		s.on("server_info", (d) => {
+			const key = activeKeyRef.current;
+			const buf = buffersRef.current[key];
+			if (!buf) return;
+			const text = (buf.network === d.network ? "" : `[${d.network}] `) + d.text;
+			setMsgs((m) => {
+				const cur = m[key];
+				if (cur?.loaded && cur.atTail === false) return m;
+				const ev = {
+					id: `si${++infoSeq}`, network: buf.network, buffer: buf.buffer,
+					time: Date.now(), sender: "", command: "INFO", raw: text,
+				};
+				return { ...m, [key]: { ...(cur || {}), list: [...(cur?.list || []), ev] } };
+			});
+		});
+
 		s.on("presence", (d) => {
 			setMonitors((all) => {
 				const list = all[d.network] || [];

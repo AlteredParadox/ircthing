@@ -1338,3 +1338,94 @@ func TestPaginatedBackfill(t *testing.T) {
 	fullBatch("fresh", 50)
 	waitReqs(maxBackfillPages+1, "after re-registration")
 }
+
+func TestServerInfoFlow(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+
+	// WHOIS replies are forwarded, with our nick stripped.
+	conn.ch <- ev(":srv 311 AlteredParadox alice ~u example.org * :Alice A.")
+	info := decode[ServerInfoData](t, recv(t, s, "server_info"))
+	if info.Network != "libera" || info.Text != "alice ~u example.org * Alice A." {
+		t.Fatalf("info = %+v", info)
+	}
+
+	// Error numerics too.
+	conn.ch <- ev(":srv 401 AlteredParadox ghost :No such nick/channel")
+	if info := decode[ServerInfoData](t, recv(t, s, "server_info")); info.Text != "ghost No such nick/channel" {
+		t.Fatalf("error info = %+v", info)
+	}
+
+	// Connect-time noise (LUSERS, ISUPPORT) is not forwarded, and MOTD is
+	// gated until a client actually asks for it.
+	conn.ch <- ev(":srv 251 AlteredParadox :There are 5 users")
+	conn.ch <- ev(":srv 375 AlteredParadox :- message of the day -")
+	conn.ch <- ev(":srv 372 AlteredParadox :- welcome")
+	conn.ch <- ev(":srv 376 AlteredParadox :End of /MOTD")
+	expectSilence(t, s)
+
+	// /motd opens the gate; the end numeric closes it again.
+	s.Handle(ctx, request(t, "command", 1, CommandData{Network: "libera", Command: "MOTD", Params: nil}))
+	recv(t, s, "ok")
+	conn.ch <- ev(":srv 375 AlteredParadox :- message of the day -")
+	conn.ch <- ev(":srv 372 AlteredParadox :- welcome")
+	conn.ch <- ev(":srv 376 AlteredParadox :End of /MOTD")
+	if info := decode[ServerInfoData](t, recv(t, s, "server_info")); info.Text != "- message of the day -" {
+		t.Fatalf("motd line 1 = %+v", info)
+	}
+	recv(t, s, "server_info")
+	recv(t, s, "server_info")
+	conn.ch <- ev(":srv 372 AlteredParadox :- late line after the gate closed")
+	expectSilence(t, s)
+}
+
+func TestCommandAllowlistAdditions(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	s := h.NewSession()
+	defer s.Close()
+
+	ok := []CommandData{
+		{Network: "libera", Command: "WHOIS", Params: []string{"alice"}},
+		{Network: "libera", Command: "AWAY", Params: nil}, // zero params: back from away
+		{Network: "libera", Command: "AWAY", Params: []string{"gone fishing"}},
+		{Network: "libera", Command: "MODE", Params: []string{"#go", "+o", "alice"}},
+		{Network: "libera", Command: "KICK", Params: []string{"#go", "alice", "spamming the channel"}},
+		{Network: "libera", Command: "NOTICE", Params: []string{"alice", "psst over here"}},
+		{Network: "libera", Command: "LIST", Params: nil},
+	}
+	for i, d := range ok {
+		s.Handle(ctx, request(t, "command", int64(i+1), d))
+		if env := recv(t, s, "ok", "server_info"); env.Seq != int64(i+1) {
+			t.Fatalf("%s: seq = %d", d.Command, env.Seq)
+		}
+	}
+
+	bad := []CommandData{
+		{Network: "libera", Command: "QUIT", Params: nil},                                     // never allowed
+		{Network: "libera", Command: "PRIVMSG", Params: []string{"#go", "x"}},                 // use "send"
+		{Network: "libera", Command: "KICK", Params: []string{"#go"}},                         // too few
+		{Network: "libera", Command: "MODE", Params: []string{"#go", "+o o", "x"}},            // space mid-param
+		{Network: "libera", Command: "WHOIS", Params: []string{"a", "b", "c"}},                // too many
+	}
+	for i, d := range bad {
+		s.Handle(ctx, request(t, "command", int64(100+i), d))
+		if e := decode[ErrorData](t, recv(t, s, "error")); e.Code != "bad_request" {
+			t.Fatalf("%s: error = %+v", d.Command, e)
+		}
+	}
+}

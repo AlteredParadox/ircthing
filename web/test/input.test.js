@@ -85,3 +85,43 @@ test("parseInput: commands follow the network's CHANTYPES", () => {
 	is(parseInput("/join &nope", "#go", "#").type, "error", "& is not a channel here");
 	is(parseInput("/topic new topic", "!weird", "#!").type, "cmd");
 });
+
+test("parseInput: informational commands", () => {
+	eq(parseInput("/whois alice", "#go"), { type: "cmd", command: "WHOIS", params: ["alice"] });
+	eq(parseInput("/whowas ghost", "#go"), { type: "cmd", command: "WHOWAS", params: ["ghost"] });
+	eq(parseInput("/who *.example.org", "#go"), { type: "cmd", command: "WHO", params: ["*.example.org"] });
+	is(parseInput("/whois", "#go").type, "error");
+	is(parseInput("/whois a b", "#go").type, "error");
+	eq(parseInput("/list", "#go"), { type: "cmd", command: "LIST", params: [] });
+	eq(parseInput("/list #go*", "#go"), { type: "cmd", command: "LIST", params: ["#go*"] });
+	eq(parseInput("/motd", "#go"), { type: "cmd", command: "MOTD", params: [] });
+});
+
+test("parseInput: away toggles, notice targets", () => {
+	eq(parseInput("/away gone fishing", "#go"), { type: "cmd", command: "AWAY", params: ["gone fishing"] });
+	eq(parseInput("/away", "#go"), { type: "cmd", command: "AWAY", params: [] });
+	eq(parseInput("/notice alice psst over here", "#go"),
+		{ type: "cmd", command: "NOTICE", params: ["alice", "psst over here"] });
+	is(parseInput("/notice alice", "#go").type, "error");
+});
+
+test("parseInput: mode defaults to the current buffer", () => {
+	eq(parseInput("/mode", "#go"), { type: "cmd", command: "MODE", params: ["#go"] });
+	eq(parseInput("/mode +m", "#go"), { type: "cmd", command: "MODE", params: ["#go", "+m"] });
+	eq(parseInput("/mode #other +o alice", "#go"),
+		{ type: "cmd", command: "MODE", params: ["#other", "+o", "alice"] });
+	eq(parseInput("/mode alice +i", "#go"), { type: "cmd", command: "MODE", params: ["alice", "+i"] });
+	is(parseInput("/mode +o a b c d e f", "#go").type, "error", "too many params");
+});
+
+test("parseInput: kick and invite default to the current channel", () => {
+	eq(parseInput("/kick alice", "#go"), { type: "cmd", command: "KICK", params: ["#go", "alice"] });
+	eq(parseInput("/kick alice being rude", "#go"),
+		{ type: "cmd", command: "KICK", params: ["#go", "alice", "being rude"] });
+	eq(parseInput("/kick #other alice", "#go"), { type: "cmd", command: "KICK", params: ["#other", "alice"] });
+	is(parseInput("/kick", "#go").type, "error");
+	is(parseInput("/kick alice", "bob").type, "error", "kick from a query needs a channel");
+	eq(parseInput("/invite alice", "#go"), { type: "cmd", command: "INVITE", params: ["alice", "#go"] });
+	eq(parseInput("/invite alice #other", "#go"), { type: "cmd", command: "INVITE", params: ["alice", "#other"] });
+	is(parseInput("/invite alice", "bob").type, "error");
+});
