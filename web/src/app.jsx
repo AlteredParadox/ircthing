@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
-import { bufferOrder, bufKey, isChannelName, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
+import { bufferOrder, bufKey, isChannelName, mergeById, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
 import { Login } from "./login.jsx";
 import { applyPrefs, loadPrefs, normalizePrefs, resolveTheme, savePrefs } from "./prefs.js";
@@ -180,12 +180,10 @@ function applyRedaction(m, key, d) {
 // it covers).
 function mergeHistoryPage(m, key, page) {
 	const pageMsgs = page.messages || [];
-	const seen = new Set(pageMsgs.map((e) => e.id));
-	const streamed = (m[key]?.list || []).filter((e) => !seen.has(e.id));
 	return {
 		...m,
 		[key]: {
-			list: [...pageMsgs, ...streamed],
+			list: mergeById(m[key]?.list || [], pageMsgs),
 			loaded: true,
 			reachedTop: pageMsgs.length < PAGE,
 			atTail: true,
@@ -246,6 +244,10 @@ export function App() {
 	// typers: bufKey -> { nick: { state, at } }; ephemeral, never stored.
 	const [typers, setTypers] = useState({});
 	const sock = useRef(null);
+	// Buffers with a get_history request in flight — at most one per
+	// buffer, so a live event arriving mid-load cannot fire a second,
+	// window-slid request that corrupts ordering.
+	const loadingHistory = useRef(new Set());
 
 	// The server is the source of truth for prefs; localStorage is a
 	// write-through cache so the first paint has the right theme. This
@@ -621,11 +623,14 @@ export function App() {
 	useEffect(() => {
 		if (!activeKey || !connected) return;
 		const buf = buffers[activeKey];
-		if (!buf || msgs[activeKey]?.loaded) return;
+		if (!buf || msgs[activeKey]?.loaded || loadingHistory.current.has(activeKey)) return;
+		const key = activeKey;
+		loadingHistory.current.add(key);
 		sock.current
 			.request("get_history", { network: buf.network, buffer: buf.buffer, limit: PAGE })
-			.then((page) => setMsgs((m) => mergeHistoryPage(m, activeKey, page)))
-			.catch(() => {});
+			.then((page) => setMsgs((m) => mergeHistoryPage(m, key, page)))
+			.catch(() => {})
+			.finally(() => loadingHistory.current.delete(key));
 	}, [activeKey, connected, buffers, msgs]);
 
 	// Default to the first buffer once the sidebar is known.
@@ -907,7 +912,7 @@ export function App() {
 					...m,
 					[activeKey]: {
 						...m[activeKey],
-						list: [...older, ...m[activeKey].list],
+						list: mergeById(m[activeKey].list, older),
 						reachedTop: older.length < PAGE,
 					},
 				}));

@@ -862,7 +862,9 @@ func (m *Manager) serveLoop(ctx context.Context, lc *liveConn) error {
 		} else if consumed {
 			continue
 		}
-		trackChathistoryBatch(in, histBatch)
+		if err := trackChathistoryBatch(in, histBatch); err != nil {
+			return err
+		}
 		playback := in.Tags["batch"] != "" && histBatch[in.Tags["batch"]]
 		m.isup.handle(in) // 005, ignored otherwise
 		if in.Command == "005" {
@@ -944,17 +946,27 @@ func (m *Manager) serviceLine(ctx context.Context, lc *liveConn, in *ircv4.Messa
 }
 
 // trackChathistoryBatch follows chathistory BATCH open/close markers.
-func trackChathistoryBatch(in *ircv4.Message, histBatch map[string]bool) {
+// maxOpenHistBatches bounds concurrently open chathistory replay batches
+// a server can hold open, mirroring the multiline batch cap: a malicious
+// server could otherwise stream unclosed "BATCH +ref chathistory" lines
+// and grow this map (and the hub's) without bound.
+const maxOpenHistBatches = 256
+
+func trackChathistoryBatch(in *ircv4.Message, histBatch map[string]bool) error {
 	if in.Command != "BATCH" || len(in.Params) == 0 {
-		return
+		return nil
 	}
 	ref := in.Params[0]
 	switch {
 	case strings.HasPrefix(ref, "+") && strings.Contains(in.Param(1), "chathistory"):
+		if len(histBatch) >= maxOpenHistBatches {
+			return fmt.Errorf("irc: too many open chathistory batches (>%d)", maxOpenHistBatches)
+		}
 		histBatch[ref[1:]] = true
 	case strings.HasPrefix(ref, "-"):
 		delete(histBatch, ref[1:])
 	}
+	return nil
 }
 
 // capNotifySTS stores/refreshes the STS policy a CAP NEW on a secure

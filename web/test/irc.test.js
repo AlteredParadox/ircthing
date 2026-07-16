@@ -2,7 +2,7 @@ import { deepStrictEqual as eq, strictEqual as is } from "node:assert";
 import { test } from "node:test";
 import {
 	bufKey, firstURL, fmtTime, hostOf, linkify, looksLikeImageURL,
-	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash, applyStatusMode,
+	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash, applyStatusMode, mergeById,
 } from "../src/irc.js";
 
 test("parseLine", () => {
@@ -284,4 +284,21 @@ test("applyStatusMode: expanded run keeps the toggle row plus events", () => {
 	eq(out.map((e) => e.id), ["clp-1", 1, 2, 3]);
 	is(out[0].expanded, true);
 	is(out[0].summary, "2 nick changes");
+});
+
+test("mergeById: dedups and sorts by (time, id), order-robust", () => {
+	const m1 = { id: 1, time: 100 }, m2 = { id: 2, time: 200 }, m3 = { id: 3, time: 300 };
+	const held = [m1, m2, m3];
+	const slid = [m2, m3, { id: 4, time: 400 }]; // overlapping, out-of-order page
+	eq(mergeById(held, slid).map((e) => e.id), [1, 2, 3, 4]);
+});
+
+test("mergeById: numeric ids break same-time ties numerically", () => {
+	eq(mergeById([{ id: 10, time: 5 }], [{ id: 9, time: 5 }]).map((e) => e.id), [9, 10]);
+});
+
+test("mergeById: incoming replaces existing by id", () => {
+	const out = mergeById([{ id: 1, time: 1, v: "old" }], [{ id: 1, time: 1, v: "new" }]);
+	is(out.length, 1);
+	is(out[0].v, "new");
 });

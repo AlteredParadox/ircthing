@@ -514,3 +514,24 @@ export function parseHash(hash) {
 export function toHash(network, buffer) {
 	return `#/${encodeURIComponent(network)}/${encodeURIComponent(buffer)}`;
 }
+
+// byTimeId orders messages chronologically; the id breaks a same-time
+// tie (numeric store ids compare numerically, synthetic string ids
+// lexically).
+export function byTimeId(a, b) {
+	if (a.time !== b.time) return a.time - b.time;
+	if (typeof a.id === "number" && typeof b.id === "number") return a.id - b.id;
+	const ai = String(a.id), bi = String(b.id);
+	return ai < bi ? -1 : ai > bi ? 1 : 0;
+}
+
+// mergeById unions two message lists, de-duplicating by id and sorting
+// by (time, id). Robust to overlapping/out-of-order history pages — a
+// get_history window can slide between requests, so a page is not
+// assumed strictly older or newer than what is already held.
+export function mergeById(existing, incoming) {
+	const byId = new Map();
+	for (const e of existing) byId.set(e.id, e);
+	for (const e of incoming) byId.set(e.id, e);
+	return [...byId.values()].sort(byTimeId);
+}

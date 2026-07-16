@@ -339,3 +339,30 @@ func TestMultilineIncomingLimits(t *testing.T) {
 		}
 	})
 }
+
+// A server opening chathistory batches without closing them is torn
+// down rather than growing the tracking map without bound.
+func TestChathistoryBatchCap(t *testing.T) {
+	batches := make(map[string]bool)
+	var err error
+	for i := 0; i <= maxOpenHistBatches; i++ {
+		m := ircv4.MustParseMessage(":srv BATCH +h" + strconv.Itoa(i) + " chathistory #go")
+		if err = trackChathistoryBatch(m, batches); err != nil {
+			break
+		}
+	}
+	if err == nil {
+		t.Fatal("no error after exceeding the chathistory batch cap")
+	}
+	if len(batches) > maxOpenHistBatches {
+		t.Fatalf("map = %d, want <= %d", len(batches), maxOpenHistBatches)
+	}
+	// A close frees a slot.
+	batches2 := map[string]bool{"a": true}
+	if err := trackChathistoryBatch(ircv4.MustParseMessage(":srv BATCH -a"), batches2); err != nil {
+		t.Fatal(err)
+	}
+	if len(batches2) != 0 {
+		t.Fatalf("close did not free the slot: %v", batches2)
+	}
+}

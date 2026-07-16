@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	ircv4 "gopkg.in/irc.v4"
 
@@ -368,6 +369,15 @@ func (s *Session) handleCloseBuffer(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "internal", "closing buffer failed"))
 		return
 	}
+	// Guard against straggler inbound traffic re-creating the buffer we
+	// just deleted (see persistEvent). Fold with the network's
+	// casemapping when it is connected; otherwise a plain key still
+	// matches most cases.
+	fold := func(x string) string { return x }
+	if c := s.hub.network(d.Network); c != nil {
+		fold = c.Fold
+	}
+	s.hub.markClosed(d.Network, fold(d.Buffer), time.Now().UnixMilli())
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcast(envelope("buffer_closed", 0, d))
 }

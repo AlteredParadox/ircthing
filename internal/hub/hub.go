@@ -70,11 +70,17 @@ type Hub struct {
 	motdWanted map[string]bool            // networks with an explicit /motd pending
 	procs      map[string]*netProc        // running network lifecycles
 	sessions   map[*Session]struct{}
+	// recentClose bounds the buffer-resurrection race: a buffer closed
+	// from the UI (close_buffer) must not be re-created by straggler
+	// inbound traffic that was already in flight. Keyed by
+	// network+"\x00"+foldedBuffer -> unix-ms of the close.
+	recentClose map[string]int64
 }
 
 func New(st *store.Store) *Hub {
 	return &Hub{
-		store:      st,
+		store:       st,
+		recentClose: make(map[string]int64),
 		networks:   make(map[string]Conn),
 		states:     make(map[string]string),
 		presence:   make(map[string]map[string]bool),
@@ -283,16 +289,17 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	if !ok {
 		return nil
 	}
-	// Our own PART must not create a buffer: the UI's "Leave channel"
-	// deletes the stored buffer (close_buffer) while our PART echo is
-	// still in flight, and either arrival order must leave it closed.
-	// Every other line resolves to the canonical stored spelling and
-	// appends atomically (AppendFolded): an echoed message can carry
-	// client-supplied casing, and #Go/#go must not split into two
-	// buffers even under a concurrent browser send.
+	// A buffer just closed from the UI must not be re-created by traffic
+	// that was already in flight (our own PART echo, or any straggler
+	// line for the channel): within the grace window, append without
+	// creation so a deleted buffer stays deleted. Otherwise resolve to
+	// the canonical stored spelling and append atomically (AppendFolded)
+	// — an echoed message can carry client-supplied casing, and #Go/#go
+	// must not split into two buffers even under a concurrent send.
+	selfPart := ev.Msg.Command == "PART" && ev.Msg.Prefix != nil && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick())
 	var stored store.Message
 	var err error
-	if ev.Msg.Command == "PART" && ev.Msg.Prefix != nil && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick()) {
+	if selfPart || h.recentlyClosed(ev.Network, c.Fold(target)) {
 		stored, err = h.store.AppendExisting(ctx, ev.Network, target, storeMessage(ev))
 	} else {
 		stored, err = h.store.AppendFolded(ctx, ev.Network, target, c.Fold, storeMessage(ev))
@@ -333,6 +340,18 @@ func (h *Hub) startMonitor(ctx context.Context, c Conn) {
 
 // updatePresence applies a 730/731 reply (comma-separated targets, which
 // may carry nick!user@host masks) and pushes each changed nick.
+// Bounds on server-fed hub maps: a malicious server (or a plaintext
+// MITM) can stream numerics with endlessly varying nicks/refs, so these
+// per-connection maps are capped the way the manager caps its own
+// server-fed structures (multiline batches, line length). Legitimate
+// use stays far below these.
+const (
+	maxPresenceEntries = 1024        // MONITOR online/offline nicks per network
+	maxOpenWhois       = 64          // concurrent WHOIS accumulations
+	maxOpenHistBatches = 256         // concurrent chathistory replay batches
+	closeGraceMs       = 10_000      // buffer stays closed against stragglers this long
+)
+
 func (h *Hub) updatePresence(network string, m *ircv4.Message, online bool) {
 	for _, target := range strings.Split(m.Trailing(), ",") {
 		nick := strings.TrimSpace(target)
@@ -343,10 +362,19 @@ func (h *Hub) updatePresence(network string, m *ircv4.Message, online bool) {
 			continue
 		}
 		h.mu.Lock()
-		if h.presence[network] == nil {
-			h.presence[network] = make(map[string]bool)
+		p := h.presence[network]
+		if p == nil {
+			p = make(map[string]bool)
+			h.presence[network] = p
 		}
-		h.presence[network][nick] = online
+		// Bound the map: a well-behaved server only reports nicks we
+		// monitor, so ignoring unknown nicks past the cap cannot lose
+		// legitimate presence.
+		if _, known := p[nick]; !known && len(p) >= maxPresenceEntries {
+			h.mu.Unlock()
+			continue
+		}
+		p[nick] = online
 		h.mu.Unlock()
 		h.broadcast(envelope("presence", 0, PresenceData{Network: network, Nick: nick, Online: online}))
 	}
@@ -514,6 +542,9 @@ func (h *Hub) accumulateWhois(ev irc.Event, whois map[string]*WhoisData) bool {
 		}
 		w := whois[nick]
 		if w == nil {
+			if len(whois) >= maxOpenWhois {
+				return true // consumed but not tracked: bound the map
+			}
 			w = &WhoisData{Nick: nick}
 			whois[nick] = w
 		}
@@ -619,6 +650,9 @@ func (h *Hub) trackHistoryBatch(ev irc.Event, c Conn, batches map[string]*histBa
 	ref := ev.Msg.Params[0]
 	switch {
 	case strings.HasPrefix(ref, "+") && strings.Contains(ev.Msg.Param(1), "chathistory"):
+		if len(batches) >= maxOpenHistBatches {
+			return // bound the map; the manager tears the connection down at this cap
+		}
 		batches[ref[1:]] = &histBatch{target: ev.Msg.Param(2)}
 	case strings.HasPrefix(ref, "-"):
 		b := batches[ref[1:]]
@@ -635,6 +669,29 @@ func (h *Hub) trackHistoryBatch(ev irc.Event, c Conn, batches map[string]*histBa
 			Network: ev.Network, Buffer: b.target,
 		}))
 	}
+}
+
+// markClosed records that a buffer was just closed, so in-flight inbound
+// traffic cannot resurrect it for closeGraceMs. Expired entries are
+// pruned here (closes are rare user actions).
+func (h *Hub) markClosed(network, foldedBuffer string, nowMs int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for k, t := range h.recentClose {
+		if nowMs-t > closeGraceMs {
+			delete(h.recentClose, k)
+		}
+	}
+	h.recentClose[network+"\x00"+foldedBuffer] = nowMs
+}
+
+// recentlyClosed reports whether the folded buffer was closed within the
+// grace window.
+func (h *Hub) recentlyClosed(network, foldedBuffer string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	t, ok := h.recentClose[network+"\x00"+foldedBuffer]
+	return ok && time.Now().UnixMilli()-t <= closeGraceMs
 }
 
 func (h *Hub) network(name string) Conn {

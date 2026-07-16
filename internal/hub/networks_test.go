@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"strconv"
 	"strings"
 	"context"
 	"encoding/json"
@@ -188,5 +189,82 @@ func TestBufferCanonicalization(t *testing.T) {
 	}
 	if len(bufs) != 2 { // #go and bob[x] — no case-variant duplicates
 		t.Fatalf("buffers = %v, want exactly [#go bob[x]]", names)
+	}
+}
+
+// A buffer closed from the UI is not resurrected by straggler inbound
+// traffic that was already in flight; after the grace window a genuinely
+// new message can reopen it.
+func TestCloseBufferResurrectionGuard(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+	// Seed a channel buffer.
+	conn.ch <- ev(":alice!u@h PRIVMSG #go :first")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#go", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed message never persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Close it (session path), then a straggler arrives with a case
+	// variant of the channel — it must not re-create the buffer.
+	s := h.NewSession()
+	defer s.Close()
+	s.Handle(ctxb, request(t, "close_buffer", 1, BufferRef{Network: "libera", Buffer: "#go"}))
+	recv(t, s, "ok", "buffer_closed")
+	conn.ch <- ev(":bob!u@h PRIVMSG #GO :straggler")
+
+	// Give the event loop time to (not) recreate it.
+	time.Sleep(200 * time.Millisecond)
+	bufs, err := h.store.Buffers(ctxb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bufs) != 0 {
+		t.Fatalf("closed buffer resurrected by straggler: %+v", bufs)
+	}
+}
+
+// The MONITOR presence map is bounded: a server streaming endless unique
+// nicks cannot grow it without limit.
+func TestPresenceMapBounded(t *testing.T) {
+	h := newTestHub(t)
+	for i := 0; i < maxPresenceEntries+500; i++ {
+		m := ircv4.MustParseMessage(":srv 730 AlteredParadox :nick" + strconv.Itoa(i))
+		h.updatePresence("libera", m, true)
+	}
+	h.mu.Lock()
+	n := len(h.presence["libera"])
+	h.mu.Unlock()
+	if n > maxPresenceEntries {
+		t.Fatalf("presence map = %d entries, want <= %d", n, maxPresenceEntries)
+	}
+}
+
+// The WHOIS accumulator is bounded against a server streaming unique
+// nicks that never terminate with 318.
+func TestWhoisMapBounded(t *testing.T) {
+	whois := make(map[string]*WhoisData)
+	for i := 0; i < maxOpenWhois+200; i++ {
+		ev := irc.Event{Network: "libera", Kind: irc.EventMessage,
+			Msg: ircv4.MustParseMessage(":srv 311 AlteredParadox nick" + strconv.Itoa(i) + " u h * :real")}
+		newTestHub(t).accumulateWhois(ev, whois)
+	}
+	if len(whois) > maxOpenWhois {
+		t.Fatalf("whois map = %d entries, want <= %d", len(whois), maxOpenWhois)
 	}
 }
