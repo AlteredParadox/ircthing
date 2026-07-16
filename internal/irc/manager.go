@@ -99,7 +99,14 @@ type Manager struct {
 	// the configured ones plus runtime JOINs, minus runtime PARTs (a KICK
 	// deliberately does not remove the intent — bouncers rejoin). Only
 	// the run goroutine touches it.
-	joined map[string]string // lower(channel) -> original casing
+	// joined is the rejoin set: channels to (re)join on every
+	// registration, seeded from the configured autojoin list and kept
+	// in step with our own JOIN/PART. Keyed by the channel's raw
+	// spelling, NOT a folded name: the server's CASEMAPPING is unknown
+	// at construction (005 arrives only in the read loop), so folding
+	// here would wrongly merge distinct channels like #[x] and #{x} on
+	// an ascii-casemapping server. Only the run goroutine touches it.
+	joined map[string]string // raw channel -> original casing (identity)
 
 	// namesMu guards namesReq: channels for which we have already sent an
 	// explicit NAMES this connection (draft/no-implicit-names). Touched by
@@ -152,7 +159,7 @@ func NewManager(cfg Config) (*Manager, error) {
 		pendingCapVals: make(map[string]string),
 	}
 	for _, ch := range cfg.Channels {
-		m.joined[isup.Fold(ch)] = ch
+		m.joined[ch] = ch // raw key; see the joined field comment
 	}
 	return m, nil
 }
@@ -735,11 +742,13 @@ drain:
 	}
 	m.capVals.Store(vals)
 	m.pendingCapVals = make(map[string]string)
-	m.setRegistered(true)
-	defer m.setRegistered(false)
-	bo.reset()
-	m.emit(ctx, Event{Kind: EventState, State: StateRegistered})
 
+	// connection as send-ready. The writer drains internal ahead of
+	// m.out, so every JOIN is on the wire before the hub's
+	// post-registration backfill/monitor traffic (which enqueues to
+	// m.out on the StateRegistered event) or any user message — without
+	// this, CHATHISTORY or a PRIVMSG could arrive before its JOIN and
+	// draw a failed backfill or "cannot send to channel".
 	rejoin := make([]string, 0, len(m.joined))
 	for _, ch := range m.joined {
 		rejoin = append(rejoin, ch)
@@ -750,6 +759,11 @@ drain:
 			return err
 		}
 	}
+
+	m.setRegistered(true)
+	defer m.setRegistered(false)
+	bo.reset()
+	m.emit(ctx, Event{Kind: EventState, State: StateRegistered})
 
 	return m.serveLoop(ctx, lc)
 }
@@ -1034,10 +1048,17 @@ func (m *Manager) trackJoinIntent(in *ircv4.Message) {
 	switch in.Command {
 	case "JOIN":
 		if ch := in.Param(0); ch != "" {
-			m.joined[m.isup.Fold(ch)] = ch
+			m.joined[ch] = ch
 		}
 	case "PART":
-		delete(m.joined, m.isup.Fold(in.Param(0)))
+		// Remove by the network's casemapping so a PART in any
+		// equivalent casing clears the rejoin intent.
+		part := in.Param(0)
+		for key := range m.joined {
+			if m.isup.FoldEqual(key, part) {
+				delete(m.joined, key)
+			}
+		}
 	}
 }
 
@@ -1049,11 +1070,21 @@ func (m *Manager) writeLoop(ctx context.Context, cancel context.CancelCauseFunc,
 	tb := newTokenBucket(m.cfg.SendBurst, m.cfg.SendInterval)
 	for {
 		var out *ircv4.Message
+		// Internal traffic (handshake, PONG, autojoin rejoins) gets
+		// deterministic priority over user/hub traffic in m.out: a PONG
+		// or a JOIN is never overtaken by a queued user message that
+		// would otherwise reach the server first.
 		select {
 		case <-ctx.Done():
 			return
 		case out = <-internal:
-		case out = <-m.out:
+		default:
+			select {
+			case <-ctx.Done():
+				return
+			case out = <-internal:
+			case out = <-m.out:
+			}
 		}
 		if err := tb.wait(ctx); err != nil {
 			return

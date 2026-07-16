@@ -1086,3 +1086,70 @@ func TestWriterRejectsFramingInHandshake(t *testing.T) {
 		}
 	}
 }
+
+// Distinct channels that rfc1459 would merge but ascii keeps separate
+// are both joined: the configured list must not be folded before the
+// server's CASEMAPPING is known.
+func TestManagerAutojoinPreservesDistinctChannels(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	cfg := testCfg(ln.Addr().String())
+	cfg.Channels = []string{"#[x]", "#{x}"} // rfc1459-equal, ascii-distinct
+	m := startManager(t, cfg)
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	got := map[string]bool{}
+	got[s.readCmd("JOIN").Param(0)] = true
+	got[s.readCmd("JOIN").Param(0)] = true
+	if !got["#[x]"] || !got["#{x}"] {
+		t.Fatalf("joined = %v, want both #[x] and #{x}", got)
+	}
+}
+
+// A user message sent immediately after registration never overtakes
+// the autojoin JOIN on the wire: rejoins are queued (to the priority
+// internal path) before the connection is exposed as send-ready.
+func TestManagerJoinPrecedesUserMessage(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	cfg := testCfg(ln.Addr().String())
+	cfg.Channels = []string{"#go"}
+	m := startManager(t, cfg)
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	// Queue a user PRIVMSG the instant we are send-ready.
+	for {
+		if err := m.Send(newMsg("PRIVMSG", "#go", "hi")); err == nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// The JOIN must reach the server before the PRIVMSG.
+	sawJoin := false
+	for i := 0; i < 10; i++ {
+		msg := s.read()
+		switch msg.Command {
+		case "JOIN":
+			sawJoin = true
+		case "PRIVMSG":
+			if !sawJoin {
+				t.Fatal("PRIVMSG reached the server before its JOIN")
+			}
+			return
+		}
+	}
+	t.Fatal("never saw the PRIVMSG")
+}
