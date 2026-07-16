@@ -48,6 +48,7 @@ function Row({ ev, prev, selfNick, theme, focused, isHighlight, onRedact }) {
 			</span>
 			<div class={"msg-body" + (r.kind === "action" ? " action" : "") + (r.kind === "notice" ? " notice" : "")}>
 				{r.kind === "action" && <span style={{ color, fontWeight: 600 }}>{ev.sender} </span>}
+				{r.bot && !grouped && <span class="bot-chip" title="flagged as a bot">bot</span>}
 				<Body text={r.text} />
 				{link && <LinkPreview url={link} />}
 			</div>

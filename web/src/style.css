@@ -985,6 +985,28 @@ input::placeholder {
 	text-overflow: ellipsis;
 }
 
+/* bot-mode chip, on message rows and in the members panel */
+.bot-chip {
+	display: inline-block;
+	margin-right: 6px;
+	padding: 0 4px;
+	border: 1px solid var(--border);
+	border-radius: 4px;
+	background: var(--elev);
+	color: var(--text-dim);
+	font-family: var(--mono-font);
+	font-size: 0.6429rem;
+	font-weight: 600;
+	letter-spacing: 0.05em;
+	text-transform: uppercase;
+	vertical-align: 1px;
+}
+
+.member-row .bot-chip {
+	margin-right: 0;
+	flex: 0 0 auto;
+}
+
 .cmd-error {
 	padding: 4px 12px 8px;
 	color: var(--away);

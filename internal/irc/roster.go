@@ -34,6 +34,7 @@ type Member struct {
 	Prefix  string // status prefixes, highest first: e.g. "@+", "" for none
 	Away    bool
 	Account string // services account, "" when logged out or unknown
+	Bot     bool   // bot mode set (WHOX flags contain the ISUPPORT BOT letter)
 }
 
 type channelState struct {
@@ -111,11 +112,11 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 
 	case "366": // RPL_ENDOFNAMES: <me> <channel> — pending replaces live
 		if st := r.chans[fold(m.Param(1))]; st != nil && st.pending != nil {
-			// NAMES carries no away/account data; keep what WHOX and the
-			// notify streams already taught us about surviving members.
+			// NAMES carries no away/account/bot data; keep what WHOX and
+			// the notify streams already taught us about surviving members.
 			for k, mem := range st.pending {
 				if old, ok := st.members[k]; ok {
-					mem.Away, mem.Account = old.Away, old.Account
+					mem.Away, mem.Account, mem.Bot = old.Away, old.Account, old.Bot
 					st.pending[k] = mem
 				}
 			}
@@ -213,12 +214,20 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 			acct = ""
 		}
 		away := strings.ContainsRune(flags, 'G')
+		// Bot mode (https://ircv3.net/specs/extensions/bot-mode, fetched
+		// 2026-07-16): the ISUPPORT BOT letter appears in WHO flags.
+		bot := false
+		if letter, ok := r.isup.Raw("BOT"); ok && letter != "" {
+			bot = strings.Contains(flags, letter)
+		}
 		// The reply names no channel (we don't request the c field);
-		// away/account are nick-level facts, applied wherever the nick is.
+		// away/account/bot are nick-level facts, applied wherever the
+		// nick is.
 		for _, st := range r.chans {
 			if mem, ok := st.members[fold(nick)]; ok {
 				mem.Away = away
 				mem.Account = acct
+				mem.Bot = bot
 				st.members[fold(nick)] = mem
 			}
 		}

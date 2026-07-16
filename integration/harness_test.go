@@ -82,6 +82,14 @@ func startErgo(t *testing.T) string {
 		cmd.Process.Kill()
 		cmd.Wait()
 		logf.Close()
+		// A failing test's best witness is the ircd's own log.
+		if t.Failed() {
+			b, _ := os.ReadFile(filepath.Join(dir, "ergo.log"))
+			if len(b) > 8192 {
+				b = b[len(b)-8192:]
+			}
+			t.Logf("ergo log tail:\n%s", b)
+		}
 	})
 
 	deadline := time.Now().Add(15 * time.Second)

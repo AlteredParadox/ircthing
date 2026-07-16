@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	ircv4 "gopkg.in/irc.v4"
 )
@@ -821,11 +822,39 @@ func (m *Manager) writeLoop(ctx context.Context, cancel context.CancelCauseFunc,
 			return
 		}
 		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-		if err := w.WriteMessage(out); err != nil {
+		if err := w.WriteMessage(m.scrubUTF8(out)); err != nil {
 			cancel(fmt.Errorf("write: %w", err))
 			return
 		}
 	}
+}
+
+// scrubUTF8 enforces ISUPPORT UTF8ONLY
+// (https://ircv3.net/specs/extensions/utf8-only, fetched 2026-07-16):
+// once advertised, the client "MUST NOT send non-UTF-8 data to the
+// server". Invalid sequences are replaced with U+FFFD rather than the
+// message dropped; in practice everything we send comes from JSON and is
+// already valid. Copy-on-write: the caller's message is never mutated.
+func (m *Manager) scrubUTF8(msg *ircv4.Message) *ircv4.Message {
+	if _, ok := m.isup.Raw("UTF8ONLY"); !ok {
+		return msg
+	}
+	var cleaned *ircv4.Message
+	for i, p := range msg.Params {
+		if utf8.ValidString(p) {
+			continue
+		}
+		if cleaned == nil {
+			cp := *msg
+			cp.Params = append([]string(nil), msg.Params...)
+			cleaned = &cp
+		}
+		cleaned.Params[i] = strings.ToValidUTF8(p, "�")
+	}
+	if cleaned != nil {
+		return cleaned
+	}
+	return msg
 }
 
 // connError prefers the cause recorded on the connection context (e.g. a

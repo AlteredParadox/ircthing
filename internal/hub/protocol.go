@@ -217,6 +217,7 @@ type MemberData struct {
 	Prefix  string `json:"prefix,omitempty"`  // status prefixes, highest first ("@+")
 	Away    bool   `json:"away,omitempty"`    // WHOX on join + away-notify
 	Account string `json:"account,omitempty"` // services account, "" if logged out/unknown
+	Bot     bool   `json:"bot,omitempty"`     // bot mode (ISUPPORT BOT letter in WHOX flags)
 }
 
 // ChannelData answers "get_channel": topic and membership as currently

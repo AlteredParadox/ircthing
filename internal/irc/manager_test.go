@@ -944,3 +944,44 @@ func TestManagerWHOXOnJoin(t *testing.T) {
 		}
 	}
 }
+
+func TestManagerUTF8Only(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	// Latin-1 é: invalid as UTF-8. Without UTF8ONLY it passes through
+	// untouched (IRC is bytes, historically).
+	if err := m.Send(newMsg("PRIVMSG", "#go", "caf\xe9 one")); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.readCmd("PRIVMSG"); got.Trailing() != "caf\xe9 one" {
+		t.Fatalf("pre-UTF8ONLY trailing = %q", got.Trailing())
+	}
+
+	// Once the server advertises UTF8ONLY, invalid sequences are
+	// replaced (the spec forbids sending non-UTF-8 at all).
+	s.send(":srv 005 AlteredParadox UTF8ONLY :are supported by this server")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := m.isup.Raw("UTF8ONLY"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("005 UTF8ONLY never applied")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if err := m.Send(newMsg("PRIVMSG", "#go", "caf\xe9 two")); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.readCmd("PRIVMSG"); got.Trailing() != "caf� two" {
+		t.Fatalf("post-UTF8ONLY trailing = %q, want caf� two", got.Trailing())
+	}
+}

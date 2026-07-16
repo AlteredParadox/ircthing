@@ -5,8 +5,10 @@ import { groupMembers, nickColor } from "./irc.js";
 // away-notify; the tooltip names the services account (WHOX,
 // extended-join, account-notify).
 function memberTitle(m) {
-	if (!m.account) return m.nick;
-	return m.nick === m.account ? `${m.nick} — identified` : `${m.nick} — identified as ${m.account}`;
+	let t = m.nick;
+	if (m.account) t += m.nick === m.account ? " — identified" : ` — identified as ${m.account}`;
+	if (m.bot) t += " — bot";
+	return t;
 }
 
 export function Members({ info, theme }) {
@@ -30,6 +32,7 @@ export function Members({ info, theme }) {
 								<span class="member-nick" style={{ color: nickColor(m.nick, theme) }}>
 									{m.nick}
 								</span>
+								{m.bot && <span class="bot-chip">bot</span>}
 							</div>
 						))}
 					</div>

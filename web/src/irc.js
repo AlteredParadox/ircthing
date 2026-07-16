@@ -50,9 +50,12 @@ export function renderable(ev) {
 	switch (ev.command) {
 		case "PRIVMSG":
 		case "NOTICE": {
+			// bot-mode: servers tag messages from +B users with a bare
+			// "bot" tag; rows show a chip.
+			const bot = "bot" in line.tags;
 			const m = /^\x01ACTION ([^]*?)\x01?$/.exec(last);
-			if (m) return { kind: "action", text: m[1] };
-			return { kind: ev.command === "NOTICE" ? "notice" : "msg", text: last };
+			if (m) return { kind: "action", text: m[1], bot };
+			return { kind: ev.command === "NOTICE" ? "notice" : "msg", text: last, bot };
 		}
 		case "JOIN":
 			return { kind: "system", mark: "→", markClass: "join", text: `${ev.sender} has joined` };

@@ -215,3 +215,14 @@ test("rankBuffers: mentions, then unread, then match position", () => {
 	eq(rankBuffers(bufs, "libera").map((b) => b.key), ["b", "a", "d"], "network name matches too");
 	eq(rankBuffers(bufs, "nomatch"), []);
 });
+
+test("renderable: bot-mode message tag", () => {
+	const bot = renderable({ command: "PRIVMSG", raw: "@bot;msgid=x :guard!u@h PRIVMSG #go :beep boop" });
+	is(bot.bot, true);
+	is(bot.text, "beep boop");
+	const human = renderable({ command: "PRIVMSG", raw: ":alice!u@h PRIVMSG #go :hi" });
+	is(human.bot, false);
+	const action = renderable({ command: "PRIVMSG", raw: "@bot :guard!u@h PRIVMSG #go :\x01ACTION beeps\x01" });
+	is(action.bot, true);
+	is(action.kind, "action");
+});

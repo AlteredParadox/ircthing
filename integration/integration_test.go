@@ -374,3 +374,33 @@ func TestWHOXAccountDiscovery(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+// TestBotModeDiscovery: a +B user already in the channel is flagged as a
+// bot via the WHOX flags (ISUPPORT BOT letter).
+func TestBotModeDiscovery(t *testing.T) {
+	addr := startErgo(t)
+
+	pal := dialRaw(t, addr, "beepboop")
+	pal.send("MODE beepboop +B")
+	pal.waitFor(func(m *ircv4.Message) bool { return m.Command == "MODE" })
+	pal.send("JOIN #bots")
+
+	st, h := newStoreAndHub(t)
+	s := startStack(t, st, h, irc.Config{
+		Name: "ergo", Addr: addr, Nick: "webuser", Channels: []string{"#bots"},
+	})
+	s.waitRegistered()
+
+	deadline := time.Now().Add(testTimeout)
+	for {
+		for _, m := range s.channelRoster("ergo", "#bots") {
+			if m.Nick == "beepboop" && m.Bot {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("beepboop never flagged as bot: %+v", s.channelRoster("ergo", "#bots"))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}

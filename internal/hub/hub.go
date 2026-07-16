@@ -371,8 +371,8 @@ const maxBackfillPages = 10
 var serverInfoNumerics = map[string]bool{
 	"301": true, "305": true, "306": true, "307": true, // away status
 	"311": true, "312": true, "313": true, "317": true, "318": true, // WHOIS
-	"319": true, "330": true, "338": true, "378": true, "379": true,
-	"671": true,
+	"319": true, "330": true, "335": true, "338": true, "378": true,
+	"379": true, "671": true,
 	"314": true, "369": true, // WHOWAS
 	"352": true, // WHO (354/315 are our own WHOX traffic — roster data)
 	"321": true, "322": true, "323": true, // LIST

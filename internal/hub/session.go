@@ -390,7 +390,10 @@ func (s *Session) handleGetChannel(ctx context.Context, env Envelope) {
 			data.Joined = true
 			data.Topic = topic
 			for _, m := range members {
-				data.Members = append(data.Members, MemberData{Nick: m.Nick, Prefix: m.Prefix, Away: m.Away, Account: m.Account})
+				data.Members = append(data.Members, MemberData{
+					Nick: m.Nick, Prefix: m.Prefix, Away: m.Away,
+					Account: m.Account, Bot: m.Bot,
+				})
 			}
 		}
 	}

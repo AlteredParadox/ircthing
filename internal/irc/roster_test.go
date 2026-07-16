@@ -458,3 +458,33 @@ func TestRosterAccountsAndWHOX(t *testing.T) {
 		})
 	}
 }
+
+func TestRosterBotFlag(t *testing.T) {
+	r := testRoster()
+	feed(t, r,
+		":srv 005 AlteredParadox BOT=B :are supported by this server",
+		joinGo,
+		":srv 353 AlteredParadox = #go :guard alice AlteredParadox",
+		":srv 366 AlteredParadox #go :x",
+		":srv 354 AlteredParadox 152 guard H*B botacct",
+		":srv 354 AlteredParadox 152 alice H 0",
+	)
+	got := members(t, r, "#go") // nick-sorted: alice, AlteredParadox, guard
+	if !got[2].Bot || got[2].Account != "botacct" {
+		t.Fatalf("guard = %+v, want bot with account", got[2])
+	}
+	if got[0].Bot {
+		t.Fatalf("alice flagged as bot: %+v", got[0])
+	}
+	// Without the ISUPPORT BOT letter, flags are not misread.
+	r2 := testRoster()
+	feed(t, r2,
+		joinGo,
+		":srv 353 AlteredParadox = #go :guard AlteredParadox",
+		":srv 366 AlteredParadox #go :x",
+		":srv 354 AlteredParadox 152 guard HB 0",
+	)
+	if got := members(t, r2, "#go"); got[1].Bot {
+		t.Fatalf("bot flagged without ISUPPORT BOT: %+v", got[1])
+	}
+}
