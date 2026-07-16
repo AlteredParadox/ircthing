@@ -22,6 +22,8 @@ import (
 // hub owns the goroutine pair per network (manager read loop + event
 // consumer), consistent with it owning all fan-out.
 
+const errLoadNetworks = "loading networks failed"
+
 type netProc struct {
 	cancel context.CancelFunc
 	done   chan struct{} // closed when both goroutines have exited
@@ -101,7 +103,7 @@ func (h *Hub) StopNetwork(name string) {
 func (s *Session) handleGetNetworks(ctx context.Context, env Envelope) {
 	configs, err := s.hub.store.NetworkConfigs(ctx)
 	if err != nil {
-		s.push(errEnvelope(env.Seq, "internal", "loading networks failed"))
+		s.push(errEnvelope(env.Seq, "internal", errLoadNetworks))
 		return
 	}
 	s.hub.mu.Lock()
@@ -148,7 +150,7 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 
 	stored, err := s.hub.store.NetworkConfigs(ctx)
 	if err != nil {
-		s.push(errEnvelope(env.Seq, "internal", "loading networks failed"))
+		s.push(errEnvelope(env.Seq, "internal", errLoadNetworks))
 		return
 	}
 	if msg := putNetworkConflict(stored, d.OldName, name); msg != "" {
@@ -300,7 +302,7 @@ func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
 	// with its definition intact.
 	stored, err := s.hub.store.NetworkConfigs(ctx)
 	if err != nil {
-		s.push(errEnvelope(env.Seq, "internal", "loading networks failed"))
+		s.push(errEnvelope(env.Seq, "internal", errLoadNetworks))
 		return
 	}
 	prev := findConfig(stored, d.Network, d.Network)

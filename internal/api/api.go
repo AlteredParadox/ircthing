@@ -152,34 +152,67 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
 		return
 	}
-	if !s.login.acquire(r.Context()) {
+	ok, busy := s.authenticate(r.Context(), source, req.Username, req.Password)
+	if busy {
 		http.Error(w, "busy, retry later", http.StatusTooManyRequests)
 		return
 	}
-	// Evaluate both checks unconditionally so a wrong username costs the
-	// same time as a wrong password.
-	userOK := subtle.ConstantTimeCompare([]byte(req.Username), []byte(s.cfg.Username)) == 1
-	passErr := bcrypt.CompareHashAndPassword([]byte(s.cfg.PasswordHash), []byte(req.Password))
-	s.login.release()
-	if !userOK || passErr != nil {
-		s.login.fail(source, time.Now())
+	if !ok {
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
-	s.login.ok(source)
 
-	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
+	token, err := s.issueToken()
+	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(s.cfg.SessionTTL.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		// Secure follows config: on when TLS terminates in front of the
+		// binary (the recommended deployment), off for plain loopback.
+		Secure: s.cfg.SecureCookies,
+	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// authenticate runs the bounded, constant-time credential check for one
+// login attempt and records success/failure for the source's backoff.
+// busy is true when no hashing slot was available.
+func (s *Server) authenticate(ctx context.Context, source, username, password string) (ok, busy bool) {
+	if !s.login.acquire(ctx) {
+		return false, true
+	}
+	// Evaluate both checks unconditionally so a wrong username costs the
+	// same time as a wrong password.
+	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(s.cfg.Username)) == 1
+	passErr := bcrypt.CompareHashAndPassword([]byte(s.cfg.PasswordHash), []byte(password))
+	s.login.release()
+	if !userOK || passErr != nil {
+		s.login.fail(source, time.Now())
+		return false, false
+	}
+	s.login.ok(source)
+	return true, false
+}
+
+// issueToken mints a session token, pruning expired sessions and
+// evicting the oldest once the live set is at capacity, so repeated
+// logins cannot grow the map without bound.
+func (s *Server) issueToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
 	token := hex.EncodeToString(buf)
-	s.mu.Lock()
-	// Housekeeping at issue time: drop expired sessions (otherwise they
-	// only leave when their exact token is presented again), and cap the
-	// live set by evicting the oldest — repeated logins must not grow
-	// the map forever.
 	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for t, exp := range s.tokens {
 		if now.After(exp) {
 			delete(s.tokens, t)
@@ -195,20 +228,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		delete(s.tokens, oldest)
 	}
 	s.tokens[token] = now.Add(s.cfg.SessionTTL)
-	s.mu.Unlock()
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
-		Value:    token,
-		Path:     "/",
-		MaxAge:   int(s.cfg.SessionTTL.Seconds()),
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		// Secure follows config: on when TLS terminates in front of the
-		// binary (the recommended deployment), off for plain loopback.
-		Secure: s.cfg.SecureCookies,
-	})
-	w.WriteHeader(http.StatusNoContent)
+	return token, nil
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -254,6 +274,40 @@ func (s *Server) tokenValid(token string) bool {
 	return ok
 }
 
+// wsWritePump writes the session's outbound envelopes to the socket,
+// periodically re-validating the session token (revoking the socket on
+// logout/expiry) and closing on a slow consumer. Returns when the
+// context is canceled or a write fails.
+func (s *Server) wsWritePump(ctx context.Context, c *websocket.Conn, sess *hub.Session, token string) {
+	revoke := time.NewTicker(sessionRecheckInterval)
+	defer revoke.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-revoke.C:
+			if !s.tokenValid(token) {
+				c.Close(websocket.StatusPolicyViolation, "session ended")
+				return
+			}
+		case <-sess.Done():
+			c.Close(websocket.StatusPolicyViolation, "too slow, reconnect and refetch")
+			return
+		case env := <-sess.Outbound():
+			data, err := json.Marshal(env)
+			if err != nil {
+				continue
+			}
+			wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
+			err = c.Write(wctx, websocket.MessageText, data)
+			wcancel()
+			if err != nil {
+				return
+			}
+		}
+	}
+}
+
 // handleWS upgrades an authenticated request and bridges the connection
 // to a hub.Session: one goroutine writes Outbound envelopes to the
 // socket, the request goroutine reads client envelopes into Handle.
@@ -294,33 +348,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		defer cancel()
-		revoke := time.NewTicker(sessionRecheckInterval)
-		defer revoke.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-revoke.C:
-				if !s.tokenValid(token) {
-					c.Close(websocket.StatusPolicyViolation, "session ended")
-					return
-				}
-			case <-sess.Done():
-				c.Close(websocket.StatusPolicyViolation, "too slow, reconnect and refetch")
-				return
-			case env := <-sess.Outbound():
-				data, err := json.Marshal(env)
-				if err != nil {
-					continue
-				}
-				wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
-				err = c.Write(wctx, websocket.MessageText, data)
-				wcancel()
-				if err != nil {
-					return
-				}
-			}
-		}
+		s.wsWritePump(ctx, c, sess, token)
 	}()
 
 	for {

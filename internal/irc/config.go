@@ -104,14 +104,8 @@ func (c *Config) validate() error {
 	if !c.TLS && !c.AllowPlaintext {
 		return errors.New("irc: config: plaintext connection requires the explicit AllowPlaintext opt-in")
 	}
-	if c.SASL != nil {
-		mech := strings.ToUpper(c.SASL.Mechanism)
-		if mech != "EXTERNAL" && c.SASL.Login == "" {
-			return errors.New("irc: config: SASL requires a login (except EXTERNAL)")
-		}
-		if mech == "EXTERNAL" && !c.TLS {
-			return errors.New("irc: config: SASL EXTERNAL requires a TLS connection with a client certificate")
-		}
+	if err := c.validateSASL(); err != nil {
+		return err
 	}
 	if _, err := fingerprintSet(c.TrustedFingerprints); err != nil {
 		return err
@@ -123,6 +117,21 @@ func (c *Config) validate() error {
 	}
 	if err := c.validateRegistrationLines(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateSASL checks the SASL configuration's internal consistency.
+func (c *Config) validateSASL() error {
+	if c.SASL == nil {
+		return nil
+	}
+	mech := strings.ToUpper(c.SASL.Mechanism)
+	if mech != "EXTERNAL" && c.SASL.Login == "" {
+		return errors.New("irc: config: SASL requires a login (except EXTERNAL)")
+	}
+	if mech == "EXTERNAL" && !c.TLS {
+		return errors.New("irc: config: SASL EXTERNAL requires a TLS connection with a client certificate")
 	}
 	return nil
 }

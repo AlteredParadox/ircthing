@@ -175,9 +175,10 @@ func (h *Hub) onState(ctx context.Context, c Conn, ev irc.Event) {
 // consumed, ephemeral kinds are relayed, everything else persists (and,
 // when live rather than replayed, broadcasts). The only error is a
 // canceled context surfacing through a failed persist.
-func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches map[string]*histBatch, backfillPages map[string]int, whois map[string]*WhoisData) error {
-	// standard-replies: machine-readable server feedback the user should
-	// see ("FAIL * INVALID_UTF8 :..."). FAILs are also logged.
+// handleControlNumeric handles the self-contained standard-reply
+// (FAIL/WARN/NOTE) and MONITOR numerics, returning true when it consumed
+// the message.
+func (h *Hub) handleControlNumeric(ev irc.Event) bool {
 	switch ev.Msg.Command {
 	case "FAIL", "WARN", "NOTE":
 		if ev.Msg.Command == "FAIL" {
@@ -189,17 +190,25 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 				Text:    strings.ToLower(ev.Msg.Command) + ": " + txt,
 			}))
 		}
-		return nil
+		return true
 	case "730": // RPL_MONONLINE
 		h.updatePresence(ev.Network, ev.Msg, true)
-		return nil
+		return true
 	case "731": // RPL_MONOFFLINE
 		h.updatePresence(ev.Network, ev.Msg, false)
-		return nil
+		return true
 	case "734": // ERR_MONLISTFULL
 		log.Printf("irc[%s]: MONITOR list full: %s", ev.Network, ev.Msg.Trailing())
-		return nil
+		return true
 	case "732", "733": // RPL_MONLIST / end — the store is our source of truth
+		return true
+	}
+	return false
+}
+
+func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches map[string]*histBatch, backfillPages map[string]int, whois map[string]*WhoisData) error {
+	// Standard-replies and MONITOR numerics are self-contained.
+	if h.handleControlNumeric(ev) {
 		return nil
 	}
 	// WHOIS replies accumulate into one card (consumed here).

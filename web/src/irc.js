@@ -522,11 +522,16 @@ export function toHash(network, buffer) {
 // byTimeId orders messages chronologically; the id breaks a same-time
 // tie (numeric store ids compare numerically, synthetic string ids
 // lexically).
+function cmpStr(a, b) {
+	if (a < b) return -1;
+	if (a > b) return 1;
+	return 0;
+}
+
 export function byTimeId(a, b) {
 	if (a.time !== b.time) return a.time - b.time;
 	if (typeof a.id === "number" && typeof b.id === "number") return a.id - b.id;
-	const ai = String(a.id), bi = String(b.id);
-	return ai < bi ? -1 : ai > bi ? 1 : 0;
+	return cmpStr(String(a.id), String(b.id));
 }
 
 // mergeById unions two message lists, de-duplicating by id and sorting

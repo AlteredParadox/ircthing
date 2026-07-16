@@ -656,23 +656,61 @@ func (m *Manager) emit(ctx context.Context, ev Event) {
 
 // runOnce performs one connection lifecycle: dial, register, then read
 // until the connection dies or ctx is canceled.
-func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
-	// Drop messages queued for a previous connection so stale lines are
-	// not written into the middle of the new registration. Under the
-	// lifecycle lock: registered is already false (set under the same
-	// lock when the previous connection ended), so no enqueue can slip
-	// in after this drain — anything sent from here until registration
-	// completes is rejected with ErrNotConnected.
+// drainSendQueue drops messages queued for a previous connection so
+// stale lines are not written into the middle of the new registration.
+// Under the lifecycle lock: registered is already false, so no enqueue
+// can slip in after this drain (anything sent until registration
+// completes is rejected with ErrNotConnected).
+func (m *Manager) drainSendQueue() {
 	m.sendMu.Lock()
-drain:
+	defer m.sendMu.Unlock()
 	for {
 		select {
 		case <-m.out:
 		default:
-			break drain
+			return
 		}
 	}
-	m.sendMu.Unlock()
+}
+
+// applyCaps records the enabled capabilities and their advertised values
+// (e.g. multiline's max-bytes/max-lines) for this connection.
+func (m *Manager) applyCaps(hs *handshake) {
+	m.setCaps(hs.enabled)
+	vals := make(map[string]string, len(hs.enabled))
+	for name := range hs.enabled {
+		if v := hs.caps[name]; v != "" {
+			vals[name] = v
+		}
+	}
+	m.capVals.Store(vals)
+	m.pendingCapVals = make(map[string]string)
+}
+
+// rejoinChannels sends a JOIN for every channel in the rejoin set,
+// dropping (rather than fatally failing on) any entry that cannot be
+// sent — mirroring sendAll's graceful rejection so one bad stored
+// channel never bricks the connection.
+func (m *Manager) rejoinChannels(send func([]*ircv4.Message) error) error {
+	rejoin := make([]string, 0, len(m.joined))
+	for _, ch := range m.joined {
+		rejoin = append(rejoin, ch)
+	}
+	sort.Strings(rejoin)
+	for _, ch := range rejoin {
+		if !rejoinable(ch) {
+			delete(m.joined, ch)
+			continue
+		}
+		if err := send([]*ircv4.Message{newMsg("JOIN", ch)}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
+	m.drainSendQueue()
 
 	addr, secure := m.effectiveAddr()
 	conn, err := m.dial(ctx, addr, secure)
@@ -735,40 +773,17 @@ drain:
 	m.whoxDone = make(map[string]bool)
 
 	m.nick.Store(hs.nick)
-	m.setCaps(hs.enabled)
-	// Retain the advertised values of enabled caps (e.g. multiline's
-	// max-bytes/max-lines).
-	vals := make(map[string]string, len(hs.enabled))
-	for name := range hs.enabled {
-		if v := hs.caps[name]; v != "" {
-			vals[name] = v
-		}
-	}
-	m.capVals.Store(vals)
-	m.pendingCapVals = make(map[string]string)
+	m.applyCaps(hs)
 
-	// connection as send-ready. The writer drains internal ahead of
-	// m.out, so every JOIN is on the wire before the hub's
-	// post-registration backfill/monitor traffic (which enqueues to
-	// m.out on the StateRegistered event) or any user message — without
-	// this, CHATHISTORY or a PRIVMSG could arrive before its JOIN and
-	// draw a failed backfill or "cannot send to channel".
-	rejoin := make([]string, 0, len(m.joined))
-	for _, ch := range m.joined {
-		rejoin = append(rejoin, ch)
-	}
-	sort.Strings(rejoin)
-	for _, ch := range rejoin {
-		// Defensive: drop rather than fatally fail on an entry that
-		// somehow cannot be sent (mirrors sendAll's graceful rejection),
-		// so one bad channel never bricks the connection.
-		if !rejoinable(ch) {
-			delete(m.joined, ch)
-			continue
-		}
-		if err := send([]*ircv4.Message{newMsg("JOIN", ch)}); err != nil {
-			return err
-		}
+	// Queue rejoins BEFORE exposing the connection as send-ready. The
+	// writer drains internal ahead of m.out, so every JOIN is on the
+	// wire before the hub's post-registration backfill/monitor traffic
+	// (which enqueues to m.out on the StateRegistered event) or any user
+	// message — without this, CHATHISTORY or a PRIVMSG could arrive
+	// before its JOIN and draw a failed backfill or "cannot send to
+	// channel".
+	if err := m.rejoinChannels(send); err != nil {
+		return err
 	}
 
 	m.setRegistered(true)
@@ -861,35 +876,47 @@ func (m *Manager) serveLoop(ctx context.Context, lc *liveConn) error {
 		if err != nil {
 			return err
 		}
-		if err := m.serviceLine(ctx, lc, in); err != nil {
+		if err := m.processLine(ctx, lc, in, histBatch, ml); err != nil {
 			return err
 		}
-		if consumed, err := m.feedMultiline(ctx, ml, in); err != nil {
-			return err
-		} else if consumed {
-			continue
-		}
-		if err := trackChathistoryBatch(in, histBatch); err != nil {
-			return err
-		}
-		playback := in.Tags["batch"] != "" && histBatch[in.Tags["batch"]]
-		m.isup.handle(in) // 005, ignored otherwise
-		if in.Command == "005" {
-			// A negotiated LINELEN may legally exceed the default cap;
-			// raise the reader's limit (bounded by the hard ceiling) so
-			// long-but-legal lines are not cut off. Add the IRCv3 message
-			// tag budget: LINELEN bounds the message + CRLF only, while
-			// tags ride on top and the reader counts every wire byte.
-			lc.blr.setLimit(m.lineLen() + maxTagBytes)
-		}
-		var affected []string
-		if !playback {
-			if affected, err = m.onLiveLine(in, lc.send); err != nil {
-				return err
-			}
-		}
-		m.emit(ctx, Event{Kind: EventMessage, Msg: in, Affected: affected})
 	}
+}
+
+// processLine handles one server line: protocol housekeeping, multiline
+// reconstruction, chathistory-batch tracking, ISUPPORT, live-line
+// processing, and the event emit. A consumed multiline batch line stops
+// here (returns nil) rather than being emitted.
+func (m *Manager) processLine(ctx context.Context, lc *liveConn, in *ircv4.Message, histBatch map[string]bool, ml *multiline) error {
+	if err := m.serviceLine(ctx, lc, in); err != nil {
+		return err
+	}
+	if consumed, err := m.feedMultiline(ctx, ml, in); err != nil {
+		return err
+	} else if consumed {
+		return nil
+	}
+	if err := trackChathistoryBatch(in, histBatch); err != nil {
+		return err
+	}
+	playback := in.Tags["batch"] != "" && histBatch[in.Tags["batch"]]
+	m.isup.handle(in) // 005, ignored otherwise
+	if in.Command == "005" {
+		// A negotiated LINELEN may legally exceed the default cap; raise
+		// the reader's limit (bounded by the hard ceiling) so long-but-
+		// legal lines are not cut off. Add the IRCv3 message tag budget:
+		// LINELEN bounds the message + CRLF only, while tags ride on top
+		// and the reader counts every wire byte.
+		lc.blr.setLimit(m.lineLen() + maxTagBytes)
+	}
+	var affected []string
+	if !playback {
+		var err error
+		if affected, err = m.onLiveLine(in, lc.send); err != nil {
+			return err
+		}
+	}
+	m.emit(ctx, Event{Kind: EventMessage, Msg: in, Affected: affected})
+	return nil
 }
 
 // readMessage reads the next server line. The read deadline doubles as
