@@ -266,11 +266,19 @@ func (m *Manager) EnsureNames(channel string) {
 	key := m.isup.Fold(channel)
 	m.namesMu.Lock()
 	already := m.namesReq[key]
+	m.namesMu.Unlock()
+	if already {
+		return
+	}
+	// Mark requested only after a successful send: a dropped NAMES
+	// (full send queue) must be retried on the next view, not silently
+	// swallowed leaving the roster empty.
+	if err := m.Send(newMsg("NAMES", channel)); err != nil {
+		return
+	}
+	m.namesMu.Lock()
 	m.namesReq[key] = true
 	m.namesMu.Unlock()
-	if !already {
-		_ = m.Send(newMsg("NAMES", channel))
-	}
 }
 
 func (m *Manager) resetNames() {
@@ -1161,6 +1169,14 @@ func (m *Manager) trackJoinIntent(in *ircv4.Message) error {
 			return fmt.Errorf("irc: joined-channel set exceeded %d", maxJoinedChannels)
 		}
 		m.joined[ch] = ch
+		// A fresh self-JOIN invalidates any prior NAMES fetch: under
+		// no-implicit-names the server sends no membership on JOIN, so
+		// after a part/rejoin (or a forward/cycle) EnsureNames must
+		// re-request when the channel is next viewed — otherwise the
+		// roster is stuck with only ourselves.
+		m.namesMu.Lock()
+		delete(m.namesReq, m.isup.Fold(ch))
+		m.namesMu.Unlock()
 	case "PART":
 		// Remove by the network's casemapping so a PART in any
 		// equivalent casing clears the rejoin intent.

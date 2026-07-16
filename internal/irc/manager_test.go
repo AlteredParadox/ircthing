@@ -1336,3 +1336,77 @@ func TestCapListCap(t *testing.T) {
 		t.Fatalf("cap map = %d, want <= %d", len(dst), maxAdvertisedCaps)
 	}
 }
+
+// Under no-implicit-names, a fresh self-JOIN must re-arm EnsureNames so
+// the roster reloads after a part/rejoin (or channel forward/cycle).
+func TestEnsureNamesReArmedOnRejoin(t *testing.T) {
+	m, err := NewManager(Config{Addr: "x:1", Nick: "AlteredParadox", AllowPlaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.nick.Store("AlteredParadox")
+	m.registered.Store(true)
+	m.setCaps(map[string]bool{"no-implicit-names": true})
+
+	drainNames := func() int {
+		n := 0
+		for {
+			select {
+			case msg := <-m.out:
+				if msg.Command == "NAMES" {
+					n++
+				}
+			default:
+				return n
+			}
+		}
+	}
+
+	m.EnsureNames("#c")
+	if drainNames() != 1 {
+		t.Fatal("first EnsureNames did not send NAMES")
+	}
+	m.EnsureNames("#c") // already requested -> no send
+	if drainNames() != 0 {
+		t.Fatal("EnsureNames re-sent NAMES without a rejoin")
+	}
+	// A self-JOIN (part/rejoin cycle) re-arms it.
+	if err := m.trackJoinIntent(ircv4.MustParseMessage(":AlteredParadox!u@h JOIN #c")); err != nil {
+		t.Fatal(err)
+	}
+	m.EnsureNames("#c")
+	if drainNames() != 1 {
+		t.Fatal("EnsureNames did not re-fetch NAMES after a rejoin")
+	}
+}
+
+// A dropped NAMES (full send queue) is retried on the next view rather
+// than leaving the roster permanently empty.
+func TestEnsureNamesRetriesOnDroppedSend(t *testing.T) {
+	m, err := NewManager(Config{Addr: "x:1", Nick: "AlteredParadox", AllowPlaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.registered.Store(true)
+	m.setCaps(map[string]bool{"no-implicit-names": true})
+
+	// Fill the send queue so the NAMES send is dropped.
+	for len(m.out) < cap(m.out) {
+		m.out <- newMsg("PING", "x")
+	}
+	m.EnsureNames("#c") // dropped; must NOT mark requested
+	// Drain and retry with room available.
+	for len(m.out) > 0 {
+		<-m.out
+	}
+	m.EnsureNames("#c")
+	got := 0
+	for len(m.out) > 0 {
+		if (<-m.out).Command == "NAMES" {
+			got++
+		}
+	}
+	if got != 1 {
+		t.Fatalf("NAMES sends after retry = %d, want 1 (dropped request retried)", got)
+	}
+}
