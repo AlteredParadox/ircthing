@@ -374,7 +374,7 @@ var serverInfoNumerics = map[string]bool{
 	"319": true, "330": true, "335": true, "338": true, "378": true,
 	"379": true, "671": true,
 	"314": true, "369": true, // WHOWAS
-	"352": true, // WHO (354/315 are our own WHOX traffic — roster data)
+	"352": true,                           // WHO (354/315 are our own WHOX traffic — roster data)
 	"321": true, "322": true, "323": true, // LIST
 	"324": true, "329": true, "367": true, "368": true, // MODE queries
 	"341": true, // INVITE ack

@@ -1431,11 +1431,11 @@ func TestCommandAllowlistAdditions(t *testing.T) {
 	}
 
 	bad := []CommandData{
-		{Network: "libera", Command: "QUIT", Params: nil},                                     // never allowed
-		{Network: "libera", Command: "PRIVMSG", Params: []string{"#go", "x"}},                 // use "send"
-		{Network: "libera", Command: "KICK", Params: []string{"#go"}},                         // too few
-		{Network: "libera", Command: "MODE", Params: []string{"#go", "+o o", "x"}},            // space mid-param
-		{Network: "libera", Command: "WHOIS", Params: []string{"a", "b", "c"}},                // too many
+		{Network: "libera", Command: "QUIT", Params: nil},                          // never allowed
+		{Network: "libera", Command: "PRIVMSG", Params: []string{"#go", "x"}},      // use "send"
+		{Network: "libera", Command: "KICK", Params: []string{"#go"}},              // too few
+		{Network: "libera", Command: "MODE", Params: []string{"#go", "+o o", "x"}}, // space mid-param
+		{Network: "libera", Command: "WHOIS", Params: []string{"a", "b", "c"}},     // too many
 	}
 	for i, d := range bad {
 		s.Handle(ctx, request(t, "command", int64(100+i), d))
