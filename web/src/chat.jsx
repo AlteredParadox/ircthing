@@ -1,6 +1,7 @@
 import { Fragment } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Completer } from "./complete.js";
+import { longPress } from "./menu.jsx";
 import { firstURL, fmtTime, linkify, nickColor, renderable, sameGroup, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
@@ -32,7 +33,8 @@ function SysRow({ ev, r, focused }) {
 	);
 }
 
-function Row({ ev, prev, selfNick, theme, focused, isHighlight, onRedact }) {
+function Row({ ev, prev, selfNick, theme, focused, isHighlight, onRedact, onNick }) {
+	const pressFired = { current: false };
 	const r = renderable(ev);
 	if (r.kind === "system" || r.kind === "redacted") {
 		return <SysRow ev={ev} r={r} focused={focused} />;
@@ -53,11 +55,29 @@ function Row({ ev, prev, selfNick, theme, focused, isHighlight, onRedact }) {
 	return (
 		<div class={"msg-row" + (mention ? " mention" : "") + (focused ? " flash" : "")}>
 			<span class="msg-time">{grouped ? "" : fmtTime(ev.time)}</span>
-			<span class="msg-nick" style={{ color }} title={ev.sender}>
+			<span
+				class={"msg-nick" + (ev.sender ? " has-menu" : "")}
+				style={{ color }}
+				title={ev.sender}
+				onContextMenu={ev.sender ? (e) => {
+					e.preventDefault();
+					onNick(ev.sender, e.clientX, e.clientY);
+				} : undefined}
+				{...(ev.sender ? longPress((x, y) => onNick(ev.sender, x, y), pressFired) : {})}
+			>
 				{nickLabel}
 			</span>
 			<div class={"msg-body" + (r.kind === "action" ? " action" : "") + (r.kind === "notice" ? " notice" : "")}>
-				{r.kind === "action" && <span style={{ color, fontWeight: 600 }}>{ev.sender} </span>}
+				{r.kind === "action" && (
+					<span
+						class="has-menu"
+						style={{ color, fontWeight: 600 }}
+						onContextMenu={(e) => {
+							e.preventDefault();
+							onNick(ev.sender, e.clientX, e.clientY);
+						}}
+					>{ev.sender} </span>
+				)}
 				{r.bot && !grouped && <span class="bot-chip" title="flagged as a bot">bot</span>}
 				<Body text={r.text} />
 				{link && <LinkPreview url={link} />}
@@ -76,7 +96,7 @@ function estimate(ev) {
 // Chat renders the active buffer: virtualized scrollback plus composer.
 // completionNicks feeds tab-completion (channel roster, or the query
 // counterpart).
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, isHighlight, onSend, onLoadOlder, onRead, onTyping, onRedact }) {
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, composerApi, isHighlight, onSend, onLoadOlder, onRead, onTyping, onRedact, onNick }) {
 	const [draft, setDraft] = useState("");
 	const pinned = useRef(true);
 	const loadingOlder = useRef(false);
@@ -84,6 +104,14 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 	const completer = useMemo(() => new Completer(), [buf?.key]);
 	const list = msgs?.list || [];
 	const last = list[list.length - 1];
+	// Hide ignored senders from view (they are still stored, so
+	// un-ignoring reveals them live). Zero cost when nobody is ignored.
+	const ignoreKey = (ignoredNicks || []).join("\n");
+	const shown = useMemo(() => {
+		if (!ignoreKey) return list;
+		const set = new Set(ignoreKey.split("\n"));
+		return list.filter((ev) => !ev.sender || !set.has(ev.sender.toLowerCase()));
+	}, [list, ignoreKey]);
 
 	// Typing notifications, one sender per buffer; the previous buffer's
 	// session ends with "done" when switching away mid-draft.
@@ -95,6 +123,24 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 		clearTimeout(pauseTimer.current);
 		typing.done();
 	}, [typing]);
+
+	// Imperative composer prefill (context-menu "edit topic").
+	const taRef = useRef(null);
+	useEffect(() => {
+		if (!composerApi) return;
+		composerApi.current = {
+			prefill: (text) => {
+				setDraft(text);
+				requestAnimationFrame(() => {
+					const el = taRef.current;
+					if (el) {
+						el.focus();
+						el.setSelectionRange(text.length, text.length);
+					}
+				});
+			},
+		};
+	}, [composerApi]);
 
 	function draftChanged(text) {
 		setDraft(text);
@@ -138,7 +184,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 		<>
 			<VirtualList
 				key={buf?.key}
-				items={list}
+				items={shown}
 				estimate={estimate}
 				header={header}
 				focusId={focusId}
@@ -148,7 +194,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 					if (p) markRead();
 				}}
 				renderItem={(ev, i) => (
-					<Row ev={ev} prev={list[i - 1]} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} />
+					<Row ev={ev} prev={shown[i - 1]} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} />
 				)}
 			/>
 			<div class="composer">
@@ -164,6 +210,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 				<form class="compose-box" onSubmit={submit}>
 					<span class="prompt">{selfNick || "…"} ›</span>
 					<textarea
+						ref={taRef}
 						class="compose-input"
 						rows={draft.includes("\n") ? Math.min(draft.split("\n").length, 8) : 1}
 						value={draft}

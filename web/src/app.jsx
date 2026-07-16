@@ -4,6 +4,8 @@ import { bufferOrder, bufKey, isChannelName, parseHash, parseInput, renderable, 
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
 import { Login } from "./login.jsx";
 import { applyPrefs, loadPrefs, normalizePrefs, resolveTheme, savePrefs } from "./prefs.js";
+import { isIgnored, isMuted, loadIgnores, loadMutes, toggleIgnore, toggleMute } from "./local.js";
+import { ContextMenu } from "./menu.jsx";
 import { Members } from "./members.jsx";
 import { SearchOverlay } from "./search.jsx";
 import { Settings } from "./settings.jsx";
@@ -219,6 +221,17 @@ export function App() {
 	const [rules, setRules] = useState(loadRules);
 	const rulesRef = useRef(rules);
 	rulesRef.current = rules;
+	// Client-side ignore (per network) and mute (per buffer) lists.
+	const [ignores, setIgnores] = useState(loadIgnores);
+	const ignoresRef = useRef(ignores);
+	ignoresRef.current = ignores;
+	const [mutes, setMutes] = useState(loadMutes);
+	const mutesRef = useRef(mutes);
+	mutesRef.current = mutes;
+	// Open context menu, or null. { x, y, title, items }.
+	const [menu, setMenu] = useState(null);
+	// Imperative composer handle (prefill for "edit topic").
+	const composerApi = useRef(null);
 	const notifier = useRef();
 	if (!notifier.current) notifier.current = new Notifier();
 	// typers: bufKey -> { nick: { state, at } }; ephemeral, never stored.
@@ -394,12 +407,17 @@ export function App() {
 			const isChan = isChannelName(ev.buffer, networksRef.current[ev.network]?.chantypes);
 			const highlight = isMsg && !mine &&
 				(isChan ? highlightText(r.text, nick, rulesRef.current, ev.network) : true);
+			// Ignored senders never count or alert (and are hidden at
+			// render); muted buffers still count unread but never alert.
+			const ignored = isIgnored(ignoresRef.current, ev.network, ev.sender);
+			const muted = isMuted(mutesRef.current, key);
+			const alert = highlight && !ignored && !muted;
 
-			setBuffers((b) => bumpBufferActivity(b, key, ev, isMsg && !mine, highlight));
+			setBuffers((b) => bumpBufferActivity(b, key, ev, isMsg && !mine && !ignored, alert));
 
-			// Desktop notification when a highlight lands somewhere the user
+			// Desktop notification when an alert lands somewhere the user
 			// isn't looking (tab hidden, or a different buffer active).
-			if (highlight && (document.hidden || key !== activeKeyRef.current)) {
+			if (alert && (document.hidden || key !== activeKeyRef.current)) {
 				const where = isChan ? `${ev.sender} in ${ev.buffer}` : ev.sender;
 				notifier.current.show(where, r.text, key, () => {
 					location.hash = toHash(ev.network, ev.buffer);
@@ -594,6 +612,91 @@ export function App() {
 		if (globalThis.innerWidth < 760) setSideOpen(false);
 	}
 
+	function sendCommand(network, command, params) {
+		sock.current?.request("command", { network, command, params })
+			.catch((e) => setCmdError(e.message || "failed"));
+	}
+
+	// closeBuffer removes a buffer from the client (leave/close); if it was
+	// active, moves to the first remaining buffer.
+	function closeBuffer(network, buffer) {
+		const key = bufKey(network, buffer);
+		setBuffers((b) => {
+			const next = { ...b };
+			delete next[key];
+			return next;
+		});
+		setMsgs((m) => dropBufferMsgs(m, key));
+		if (activeKeyRef.current !== key) return;
+		const rest = Object.values(buffersRef.current)
+			.filter((b) => b.key !== key)
+			.sort((a, b) => (a.network + a.buffer).localeCompare(b.network + b.buffer));
+		if (rest.length) select(rest[0].network, rest[0].buffer);
+		else {
+			setActiveKey(null);
+			location.hash = "";
+		}
+	}
+
+	// editTopic selects the channel and prefills the composer with its
+	// current topic for editing (sent as /topic).
+	function editTopic(network, buffer) {
+		select(network, buffer);
+		const active = activeKeyRef.current === bufKey(network, buffer);
+		const topic = active ? chanInfo?.topic || "" : "";
+		composerApi.current?.prefill(`/topic ${topic}`);
+	}
+
+	// openUserMenu: the right-click menu for a nick (member list, message).
+	function openUserMenu(network, nick, x, y) {
+		if (!nick) return;
+		const ignored = isIgnored(ignoresRef.current, network, nick);
+		setMenu({
+			x, y, title: nick,
+			items: [
+				{ label: "Whois", onClick: () => sendCommand(network, "WHOIS", [nick]) },
+				{ label: "Direct message", onClick: () => select(network, nick) },
+				{
+					label: ignored ? "Unignore" : "Ignore", danger: !ignored,
+					onClick: () => setIgnores((ig) => toggleIgnore(ig, network, nick)),
+				},
+			],
+		});
+	}
+
+	// openBufferMenu: the right-click menu for a sidebar row — channel
+	// actions for channels, DM actions for query buffers.
+	function openBufferMenu(network, buffer, x, y) {
+		const key = bufKey(network, buffer);
+		const muted = isMuted(mutesRef.current, key);
+		const chan = isChannelName(buffer, networksRef.current[network]?.chantypes);
+		const items = [];
+		if (chan) {
+			items.push({ label: "Edit topic", onClick: () => editTopic(network, buffer) });
+		} else {
+			const ig = isIgnored(ignoresRef.current, network, buffer);
+			items.push({ label: "Whois", onClick: () => sendCommand(network, "WHOIS", [buffer]) });
+			items.push({
+				label: ig ? "Unignore" : "Ignore", danger: !ig,
+				onClick: () => setIgnores((x2) => toggleIgnore(x2, network, buffer)),
+			});
+		}
+		items.push({
+			label: muted ? "Unmute" : "Mute",
+			onClick: () => setMutes((m) => toggleMute(m, key)),
+		});
+		items.push(chan
+			? {
+				label: "Leave channel", danger: true,
+				onClick: () => {
+					sendCommand(network, "PART", [buffer]);
+					closeBuffer(network, buffer);
+				},
+			}
+			: { label: "Close", danger: true, onClick: () => closeBuffer(network, buffer) });
+		setMenu({ x, y, title: buffer, items });
+	}
+
 	// jumpTo opens a search result: load a window centered on the message
 	// and highlight it. The window is not the live tail, so incoming
 	// events won't append (see the event handler).
@@ -693,14 +796,17 @@ export function App() {
 	const netState = activeBuf ? networks[activeBuf.network]?.state : "";
 	const isChan = activeBuf && isChannelName(activeBuf.buffer, networks[activeBuf.network]?.chantypes);
 	const topicText = topicFor(activeBuf, netState, chanInfo);
+	const ignoredHere = activeBuf ? ignores[activeBuf.network] || [] : [];
+	const mutedSet = new Set(mutes);
 
 	return (
 		<div class="app">
 			<div class={"sidebar" + (sideOpen ? " open" : "")}>
 				<Sidebar
 					networks={networks} buffers={buffers} activeKey={activeKey}
-					monitors={monitors} theme={theme} onSelect={select}
+					monitors={monitors} theme={theme} mutedSet={mutedSet} onSelect={select}
 					onSettings={() => setSettingsOpen(true)}
+					onBufferMenu={openBufferMenu}
 					onAddMonitor={addMonitor} onRemoveMonitor={removeMonitor}
 				/>
 			</div>
@@ -725,6 +831,9 @@ export function App() {
 						completionNicks={isChan
 							? (chanInfo?.members || []).map((m) => m.nick)
 							: [activeBuf.buffer]}
+						ignoredNicks={ignoredHere}
+						composerApi={composerApi}
+						onNick={(nick, x, y) => openUserMenu(activeBuf.network, nick, x, y)}
 						isHighlight={(t) => highlightText(t, selfNick, rules, activeBuf.network)}
 						onRedact={(msgid) =>
 							sock.current?.request("redact", {
@@ -743,7 +852,10 @@ export function App() {
 			{isChan && rightOpen && <div class="right-scrim" aria-hidden="true" onClick={() => setRightOpen(false)} />}
 			{isChan && (
 				<div class={"rightbar" + (rightOpen ? " open" : "")}>
-					<Members info={chanInfo} theme={theme} />
+					<Members
+							info={chanInfo} theme={theme} ignoredNicks={ignoredHere}
+							onNick={(nick, x, y) => openUserMenu(activeBuf.network, nick, x, y)}
+						/>
 				</div>
 			)}
 			{searchOpen && (
@@ -766,6 +878,7 @@ export function App() {
 					notifier={notifier.current} onClose={() => setSettingsOpen(false)}
 				/>
 			)}
+			<ContextMenu menu={menu} onClose={() => setMenu(null)} />
 		</div>
 	);
 }

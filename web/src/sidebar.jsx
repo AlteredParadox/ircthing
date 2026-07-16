@@ -1,5 +1,6 @@
-import { useState } from "preact/hooks";
+import { useRef, useState } from "preact/hooks";
 import { pressable } from "./a11y.js";
+import { longPress } from "./menu.jsx";
 import { bufKey, nickColor } from "./irc.js";
 
 function stateDot(state) {
@@ -8,7 +9,10 @@ function stateDot(state) {
 	return "offline";
 }
 
-export function Sidebar({ networks, buffers, activeKey, monitors, theme, onSelect, onSettings, onAddMonitor, onRemoveMonitor }) {
+export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSet, onSelect, onSettings, onBufferMenu, onAddMonitor, onRemoveMonitor }) {
+	// One shared flag: a long-press that opened a menu suppresses the tap
+	// that follows it.
+	const pressFired = useRef(false);
 	// Group buffers under their network; networks without buffers still
 	// get a section so a fresh install isn't a blank panel.
 	const names = new Set(Object.keys(networks));
@@ -43,15 +47,37 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, onSelec
 							const key = bufKey(b.network, b.buffer);
 							const active = key === activeKey;
 							const unread = b.unread > 0;
+							const muted = mutedSet?.has(key);
 							const isChan = sec.chantypes.includes(b.buffer[0]);
+							const openMenu = (x, y) => onBufferMenu(b.network, b.buffer, x, y);
 							return (
 								<div
-									class={"chan-row" + (active ? " active" : "") + (unread ? " unread" : "")}
+									class={"chan-row" + (active ? " active" : "") + (unread ? " unread" : "") + (muted ? " muted" : "")}
 									key={key}
-									{...pressable(() => onSelect(b.network, b.buffer))}
+									role="button"
+									tabIndex={0}
+									onClick={() => {
+										if (pressFired.current) {
+											pressFired.current = false;
+											return;
+										}
+										onSelect(b.network, b.buffer);
+									}}
+									onKeyDown={(e) => {
+										if (e.key === "Enter" || e.key === " ") {
+											e.preventDefault();
+											onSelect(b.network, b.buffer);
+										}
+									}}
+									onContextMenu={(e) => {
+										e.preventDefault();
+										openMenu(e.clientX, e.clientY);
+									}}
+									{...longPress(openMenu, pressFired)}
 								>
 									<span class="chan-hash">{isChan ? b.buffer[0] : "@"}</span>
 									<span class="chan-name">{isChan ? b.buffer.slice(1) : b.buffer}</span>
+									{muted && <span class="chan-mute" title="Muted">🔇</span>}
 									{unread && (
 										<span class={"badge" + (b.mention ? " mention" : "")}>
 											{b.unread > 99 ? "99+" : b.unread}

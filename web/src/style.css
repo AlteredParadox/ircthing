@@ -1140,6 +1140,92 @@ input::placeholder {
 	white-space: nowrap;
 }
 
+/* ---- context menu ---- */
+
+.ctx-scrim {
+	position: fixed;
+	inset: 0;
+	z-index: 50;
+}
+
+.ctx-menu {
+	position: fixed;
+	min-width: 168px;
+	padding: 4px;
+	background: var(--elev);
+	border: 1px solid var(--border);
+	border-radius: 9px;
+	box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+	display: flex;
+	flex-direction: column;
+}
+
+.ctx-title {
+	padding: 5px 10px 6px;
+	font-family: var(--mono-font);
+	font-size: 0.7857rem;
+	font-weight: 600;
+	color: var(--text-faint);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	border-bottom: 1px solid var(--border-soft);
+	margin-bottom: 3px;
+}
+
+.ctx-item {
+	display: block;
+	width: 100%;
+	padding: 7px 10px;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
+	color: var(--text);
+	font: inherit;
+	font-size: 0.9286rem;
+	text-align: left;
+	cursor: pointer;
+}
+
+.ctx-item:hover,
+.ctx-item:focus-visible {
+	background: var(--accent-soft);
+	color: var(--accent);
+	outline: none;
+}
+
+.ctx-item.danger:hover,
+.ctx-item.danger:focus-visible {
+	background: rgb(var(--accent-rgb) / 0);
+	background-color: rgba(224, 70, 70, 0.14);
+	color: #e04646;
+}
+
+/* muted buffers and ignored members are dimmed */
+.chan-row.muted .chan-name {
+	color: var(--text-faint);
+}
+
+.chan-mute {
+	font-size: 0.7857rem;
+	flex: 0 0 auto;
+	opacity: 0.7;
+}
+
+.member-row.ignored {
+	opacity: 0.4;
+}
+
+.member-row.ignored .member-nick {
+	text-decoration: line-through;
+}
+
+/* nicks that open a context menu get the right-click affordance */
+.msg-nick.has-menu,
+.msg-body .has-menu {
+	cursor: context-menu;
+}
+
 /* ---- channel switcher palette ---- */
 
 .switch-panel {
