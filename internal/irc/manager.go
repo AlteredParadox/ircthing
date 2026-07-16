@@ -159,6 +159,9 @@ func (m *Manager) IsChannel(target string) bool {
 }
 
 // ChanTypes returns the server's channel prefix characters.
+// Fold lowercases a name per the connection's ISUPPORT CASEMAPPING.
+func (m *Manager) Fold(name string) string { return m.isup.Fold(name) }
+
 func (m *Manager) ChanTypes() string {
 	return m.isup.ChanTypes()
 }

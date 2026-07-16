@@ -522,25 +522,31 @@ func reverse(msgs []Message) {
 	}
 }
 
-// FindBuffer returns the stored buffer whose name matches target
-// case-insensitively (SQLite NOCASE is ASCII-only, which covers nicks in
-// practice), preserving its stored casing. ok is false when no such
-// buffer exists. The hub uses it to route QUIT/NICK lines into an open
-// query buffer.
-func (s *Store) FindBuffer(ctx context.Context, network, target string) (name string, ok bool, err error) {
+// FindBuffer returns the stored buffer whose name matches target under
+// fold (the network's IRC casemapping — SQLite's NOCASE is ASCII-only
+// and would miss the rfc1459 []\^ pairs), preserving its stored casing.
+// ok is false when no such buffer exists. The hub uses it to route
+// QUIT/NICK lines into an open query buffer.
+func (s *Store) FindBuffer(ctx context.Context, network, target string, fold func(string) string) (name string, ok bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	err = s.db.QueryRowContext(ctx, `
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT b.name FROM buffers b
 		JOIN networks n ON n.id = b.network_id
-		WHERE n.user_id = ? AND n.name = ? AND b.name = ? COLLATE NOCASE
-		LIMIT 1`, defaultUserID, network, target).Scan(&name)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
+		WHERE n.user_id = ? AND n.name = ?`, defaultUserID, network)
 	if err != nil {
 		return "", false, err
 	}
-	return name, true, nil
+	defer rows.Close()
+	want := fold(target)
+	for rows.Next() {
+		if err := rows.Scan(&name); err != nil {
+			return "", false, err
+		}
+		if fold(name) == want {
+			return name, true, rows.Err()
+		}
+	}
+	return "", false, rows.Err()
 }

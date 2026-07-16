@@ -30,6 +30,10 @@ type Conn interface {
 	CapEnabled(name string) bool
 	IsChannel(target string) bool // per the network's ISUPPORT CHANTYPES
 	ChanTypes() string
+	// Fold lowercases a name per the network's ISUPPORT CASEMAPPING
+	// (rfc1459 folds []\^ to {}|~ pairs); every nick/channel comparison
+	// must use it — ASCII-only folding misroutes on rfc1459 networks.
+	Fold(name string) string
 	// RequestChatHistory backfills target with messages newer than the
 	// resume point (msgid preferred over sinceMs when non-empty); a
 	// no-op on networks without draft/chathistory.
@@ -234,7 +238,7 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 		h.applyRedaction(ctx, ev, c, replay)
 		return nil
 	case "QUIT", "NICK": // fan out per shared channel
-		h.persistMembership(ctx, ev, replay, batch)
+		h.persistMembership(ctx, c, ev, replay, batch)
 		return nil
 	}
 	return h.persistEvent(ctx, c, ev, replay)
@@ -253,7 +257,7 @@ func (h *Hub) liveHints(ctx context.Context, c Conn, ev irc.Event) {
 	// (both direct invites and invite-notify's third-party ones).
 	if ev.Msg.Command == "INVITE" && ev.Msg.Prefix != nil && len(ev.Msg.Params) >= 2 {
 		who := ev.Msg.Param(0)
-		if strings.EqualFold(who, c.Nick()) {
+		if c.Fold(who) == c.Fold(c.Nick()) {
 			who = "you"
 		}
 		h.broadcast(envelope("server_info", 0, ServerInfoData{
@@ -265,7 +269,7 @@ func (h *Hub) liveHints(ctx context.Context, c Conn, ev irc.Event) {
 	// registration would race the JOIN, and servers may refuse history
 	// for channels we are not in yet.
 	if ev.Msg.Command == "JOIN" && ev.Msg.Prefix != nil &&
-		c.Nick() != "" && strings.EqualFold(ev.Msg.Prefix.Name, c.Nick()) {
+		c.Nick() != "" && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick()) {
 		if ts, msgid := h.lastStored(ctx, ev.Network, ev.Msg.Param(0)); ts > 0 {
 			c.RequestChatHistory(ev.Msg.Param(0), ts, msgid)
 		}
@@ -275,7 +279,7 @@ func (h *Hub) liveHints(ctx context.Context, c Conn, ev irc.Event) {
 // persistEvent stores a message in its buffer and, when live, broadcasts
 // it. Duplicate msgids (overlapping backfill) are silently dropped.
 func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay bool) error {
-	target, ok := persistTarget(ev.Msg, c.Nick(), c.IsChannel)
+	target, ok := persistTarget(ev.Msg, c.Nick(), c.IsChannel, c.Fold)
 	if !ok {
 		return nil
 	}
@@ -665,13 +669,13 @@ func (h *Hub) relayTyping(ev irc.Event, c Conn) {
 		sender = ev.Msg.Prefix.Name
 	}
 	nick := c.Nick()
-	if sender == "" || nick == "" || strings.EqualFold(sender, nick) {
+	if sender == "" || nick == "" || c.Fold(sender) == c.Fold(nick) {
 		return
 	}
 	buffer := ev.Msg.Param(0)
 	if !c.IsChannel(buffer) {
 		// A typing notice addressed to us belongs in the sender's query.
-		if !strings.EqualFold(buffer, nick) {
+		if c.Fold(buffer) != c.Fold(nick) {
 			return
 		}
 		buffer = sender
@@ -719,7 +723,7 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 	// A redaction in a query is addressed to our nick; file it under the
 	// other party's buffer, mirroring persistTarget.
 	buffer := target
-	if !c.IsChannel(target) && ev.Msg.Prefix != nil && strings.EqualFold(target, c.Nick()) {
+	if !c.IsChannel(target) && ev.Msg.Prefix != nil && c.Fold(target) == c.Fold(c.Nick()) {
 		buffer = ev.Msg.Prefix.Name
 	}
 	ok, err := h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason)
@@ -760,8 +764,8 @@ func eventData(m store.Message) EventData {
 // roster forgot them) plus any open query buffer with that nick; a
 // replayed one belongs to its chathistory batch's target. The per-buffer
 // msgid dedup makes the fan-out idempotent under overlapping backfill.
-func (h *Hub) persistMembership(ctx context.Context, ev irc.Event, replay bool, batch *histBatch) {
-	for _, target := range h.membershipTargets(ctx, ev, replay, batch) {
+func (h *Hub) persistMembership(ctx context.Context, c Conn, ev irc.Event, replay bool, batch *histBatch) {
+	for _, target := range h.membershipTargets(ctx, ev, replay, batch, c.Fold) {
 		stored, err := h.store.Append(ctx, ev.Network, target, storeMessage(ev))
 		if err != nil {
 			log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
@@ -779,7 +783,7 @@ func (h *Hub) persistMembership(ctx context.Context, ev irc.Event, replay bool, 
 // membershipTargets collects the buffers a QUIT/NICK line lands in: the
 // replay batch's channel, or — live — the shared channels the manager
 // captured plus any open query buffer with that nick.
-func (h *Hub) membershipTargets(ctx context.Context, ev irc.Event, replay bool, batch *histBatch) []string {
+func (h *Hub) membershipTargets(ctx context.Context, ev irc.Event, replay bool, batch *histBatch, fold func(string) string) []string {
 	if replay {
 		if batch != nil && batch.target != "" {
 			return []string{batch.target}
@@ -788,7 +792,7 @@ func (h *Hub) membershipTargets(ctx context.Context, ev irc.Event, replay bool, 
 	}
 	targets := ev.Affected
 	if ev.Msg.Prefix != nil {
-		if name, ok, err := h.store.FindBuffer(ctx, ev.Network, ev.Msg.Prefix.Name); err == nil && ok {
+		if name, ok, err := h.store.FindBuffer(ctx, ev.Network, ev.Msg.Prefix.Name, fold); err == nil && ok {
 			targets = append(targets, name)
 		}
 	}
@@ -796,11 +800,12 @@ func (h *Hub) membershipTargets(ctx context.Context, ev irc.Event, replay bool, 
 }
 
 // persistTarget decides which buffer a message lands in, or none.
-// isChan is the network's ISUPPORT-driven channel detection.
-func persistTarget(m *ircv4.Message, ourNick string, isChan func(string) bool) (string, bool) {
+// isChan and fold are the network's ISUPPORT-driven channel detection
+// and casemapping.
+func persistTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fold func(string) string) (string, bool) {
 	switch m.Command {
 	case "PRIVMSG", "NOTICE":
-		return directTarget(m, ourNick, isChan)
+		return directTarget(m, ourNick, isChan, fold)
 	case "JOIN", "PART", "TOPIC", "KICK", "MODE":
 		if t := m.Param(0); isChan(t) {
 			return t, true
@@ -813,7 +818,7 @@ func persistTarget(m *ircv4.Message, ourNick string, isChan func(string) bool) (
 // directTarget files a PRIVMSG/NOTICE: channels under themselves,
 // messages addressed to us under the sender (queries, NickServ, server
 // notices), and our own echoes under the recipient.
-func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool) (string, bool) {
+func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fold func(string) string) (string, bool) {
 	// Non-ACTION CTCP (VERSION probes, PING, and their reply NOTICEs) is
 	// protocol chatter, not conversation: persisting it would open
 	// unread query buffers for every probe.
@@ -828,12 +833,12 @@ func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool) (s
 	if m.Prefix == nil || m.Prefix.Name == "" || ourNick == "" {
 		return "", false
 	}
-	if strings.EqualFold(t, ourNick) {
+	if fold(t) == fold(ourNick) {
 		return m.Prefix.Name, true
 	}
 	// echo-message: our own message reflected back — file under the
 	// recipient so sent PMs land in the query buffer.
-	if strings.EqualFold(m.Prefix.Name, ourNick) && t != "" {
+	if fold(m.Prefix.Name) == fold(ourNick) && t != "" {
 		return t, true
 	}
 	return "", false

@@ -317,7 +317,7 @@ func (s *Session) handleJoinChannel(ctx context.Context, env Envelope, join bool
 		s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
 		return
 	}
-	if err := s.hub.updateAutojoin(ctx, d.Network, d.Channel, join); err != nil {
+	if err := s.hub.updateAutojoin(ctx, d.Network, d.Channel, join, c.Fold); err != nil {
 		log.Printf("network %q: updating autojoin for %s: %v", d.Network, d.Channel, err)
 	}
 	s.push(envelope("ok", env.Seq, nil))
@@ -344,7 +344,7 @@ func (s *Session) handleCloseBuffer(ctx context.Context, env Envelope) {
 
 // updateAutojoin adds or removes a channel in a stored definition's
 // channels list (case-insensitive dedup).
-func (h *Hub) updateAutojoin(ctx context.Context, network, channel string, add bool) error {
+func (h *Hub) updateAutojoin(ctx context.Context, network, channel string, add bool, fold func(string) string) error {
 	h.netOps.Lock()
 	defer h.netOps.Unlock()
 
@@ -366,7 +366,7 @@ func (h *Hub) updateAutojoin(ctx context.Context, network, channel string, add b
 	if err != nil {
 		return err
 	}
-	out, changed := editChannelList(nc.Channels, channel, add)
+	out, changed := editChannelList(nc.Channels, channel, add, fold)
 	if !changed {
 		return nil
 	}
@@ -378,13 +378,13 @@ func (h *Hub) updateAutojoin(ctx context.Context, network, channel string, add b
 	return h.store.PutNetworkConfig(ctx, network, string(canonical))
 }
 
-// editChannelList adds or removes a channel (case-insensitive dedup),
-// reporting whether the list changed.
-func editChannelList(chans []string, channel string, add bool) ([]string, bool) {
+// editChannelList adds or removes a channel (deduplicated under the
+// network's casemapping), reporting whether the list changed.
+func editChannelList(chans []string, channel string, add bool, fold func(string) string) ([]string, bool) {
 	out := make([]string, 0, len(chans)+1)
 	found := false
 	for _, ch := range chans {
-		if strings.EqualFold(ch, channel) {
+		if fold(ch) == fold(channel) {
 			found = true
 			if !add {
 				continue

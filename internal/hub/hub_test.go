@@ -57,7 +57,7 @@ func TestPersistTarget(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse %q: %v", tc.line, err)
 			}
-			got, ok := persistTarget(m, tc.ourNick, defaultIsChannel)
+			got, ok := persistTarget(m, tc.ourNick, defaultIsChannel, foldRFC1459)
 			if got != tc.want || ok != tc.ok {
 				t.Fatalf("persistTarget = (%q, %v), want (%q, %v)", got, ok, tc.want, tc.ok)
 			}
@@ -141,6 +141,25 @@ func (f *fakeConn) Nick() string                 { return f.nick }
 func (f *fakeConn) CapEnabled(name string) bool  { return f.caps[name] }
 func (f *fakeConn) IsChannel(target string) bool { return defaultIsChannel(target) }
 func (f *fakeConn) ChanTypes() string            { return "#&" }
+func (f *fakeConn) Fold(name string) string      { return foldRFC1459(name) }
+
+// foldRFC1459 mirrors the default IRC casemapping for test fakes.
+func foldRFC1459(name string) string {
+	b := []byte(strings.ToLower(name))
+	for i, c := range b {
+		switch c {
+		case '[':
+			b[i] = '{'
+		case ']':
+			b[i] = '}'
+		case '\\':
+			b[i] = '|'
+		case '~':
+			b[i] = '^'
+		}
+	}
+	return string(b)
+}
 
 func (f *fakeConn) HistoryPageSize() int {
 	if f.pageSize > 0 {

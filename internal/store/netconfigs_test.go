@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -187,5 +188,39 @@ func TestReadMarkerClamped(t *testing.T) {
 	}
 	if got, _ := s.ReadMarker(ctx, "net", "#y"); !got.Equal(time.UnixMilli(stored.Time.UnixMilli())) {
 		t.Fatalf("normal marker = %v, want %v", got, stored.Time)
+	}
+}
+
+// FindBuffer matches under the supplied IRC casemapping — SQLite NOCASE
+// (ASCII-only) would miss the rfc1459 []{} pairs.
+func TestFindBufferFolds(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+
+	fold := func(name string) string {
+		b := []byte(strings.ToLower(name))
+		for i, c := range b {
+			switch c {
+			case '[':
+				b[i] = '{'
+			case ']':
+				b[i] = '}'
+			case '\\':
+				b[i] = '|'
+			}
+		}
+		return string(b)
+	}
+	msg := Message{Time: time.Now(), Sender: "x", Command: "PRIVMSG", Raw: ":x PRIVMSG a :hi"}
+	if _, err := s.Append(ctx, "net", "Pal{1}", msg); err != nil {
+		t.Fatal(err)
+	}
+	name, ok, err := s.FindBuffer(ctx, "net", "pal[1]", fold)
+	if err != nil || !ok || name != "Pal{1}" {
+		t.Fatalf("FindBuffer = %q, %v, %v; want Pal{1}", name, ok, err)
+	}
+	if _, ok, _ := s.FindBuffer(ctx, "net", "unrelated", fold); ok {
+		t.Fatal("unrelated name matched")
 	}
 }
