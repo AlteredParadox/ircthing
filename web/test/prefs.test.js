@@ -12,11 +12,11 @@ test("normalizePrefs: defaults for missing/garbage input", () => {
 test("normalizePrefs: keeps valid values", () => {
 	const p = normalizePrefs({
 		theme: "light", accent: "rose", textSize: "xl",
-		density: "compact", msgFont: "mono", css: "a { color: red }",
+		density: "compact", msgFont: "mono", statusMsgs: "collapse", css: "a { color: red }",
 	});
 	eq(p, {
 		theme: "light", accent: "rose", textSize: "xl",
-		density: "compact", msgFont: "mono", css: "a { color: red }",
+		density: "compact", msgFont: "mono", statusMsgs: "collapse", css: "a { color: red }",
 	});
 });
 

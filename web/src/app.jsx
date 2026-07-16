@@ -846,6 +846,7 @@ export function App() {
 							? (chanInfo?.members || []).map((m) => m.nick)
 							: [activeBuf.buffer]}
 						ignoredNicks={ignoredHere}
+						statusMode={prefs.statusMsgs}
 						composerApi={composerApi}
 						onNick={(nick, x, y) => openUserMenu(activeBuf.network, nick, x, y)}
 						isHighlight={(t) => highlightText(t, selfNick, rules, activeBuf.network)}

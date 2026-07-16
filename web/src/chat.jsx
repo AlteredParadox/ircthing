@@ -2,7 +2,7 @@ import { Fragment } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Completer } from "./complete.js";
 import { menuTrigger } from "./menu.jsx";
-import { firstURL, fmtTime, linkify, nickColor, renderable, TypingSender, typingText } from "./irc.js";
+import { applyStatusMode, firstURL, fmtTime, linkify, nickColor, renderable, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
 import { WhoisCard } from "./whois.jsx";
@@ -34,8 +34,22 @@ function SysRow({ ev, r, focused }) {
 	);
 }
 
-function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick }) {
+// A folded run of join/part/quit/nick lines; clicking toggles the run.
+function CollapsedRow({ ev, onToggle }) {
+	return (
+		<div class="sys-row">
+			<span class="msg-time">{fmtTime(ev.time)}</span>
+			<span class="sys-mark mode">{ev.expanded ? "▾" : "▸"}</span>
+			<button type="button" class="sys-toggle" onClick={() => onToggle(ev.id)}>
+				{ev.summary}
+			</button>
+		</div>
+	);
+}
+
+function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onToggle }) {
 	if (ev.whois) return <WhoisCard whois={ev.whois} focused={focused} />;
+	if (ev.collapse) return <CollapsedRow ev={ev} onToggle={onToggle} />;
 	const r = renderable(ev);
 	if (r.kind === "system" || r.kind === "redacted") {
 		return <SysRow ev={ev} r={r} focused={focused} />;
@@ -80,13 +94,15 @@ function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick }) {
 }
 
 function estimate(ev) {
-	return ev.whois ? 200 : estimateMsgHeight(ev.raw);
+	if (ev.whois) return 200;
+	if (ev.collapse) return 28;
+	return estimateMsgHeight(ev.raw);
 }
 
 // Chat renders the active buffer: virtualized scrollback plus composer.
 // completionNicks feeds tab-completion (channel roster, or the query
 // counterpart).
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, composerApi, isHighlight, onSend, onLoadOlder, onRead, onTyping, onRedact, onNick }) {
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, composerApi, isHighlight, onSend, onLoadOlder, onRead, onTyping, onRedact, onNick }) {
 	const [draft, setDraft] = useState("");
 	const pinned = useRef(true);
 	const loadingOlder = useRef(false);
@@ -97,11 +113,23 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 	// Hide ignored senders from view (they are still stored, so
 	// un-ignoring reveals them live). Zero cost when nobody is ignored.
 	const ignoreKey = (ignoredNicks || []).join("\n");
+	// Expanded collapse-run ids; fresh per buffer.
+	const [expanded, setExpanded] = useState(() => new Set());
+	useEffect(() => setExpanded(new Set()), [buf?.key]);
+	const toggleRun = (id) => setExpanded((old) => {
+		const next = new Set(old);
+		if (next.has(id)) next.delete(id);
+		else next.add(id);
+		return next;
+	});
 	const shown = useMemo(() => {
-		if (!ignoreKey) return list;
-		const set = new Set(ignoreKey.split("\n"));
-		return list.filter((ev) => !ev.sender || !set.has(ev.sender.toLowerCase()));
-	}, [list, ignoreKey]);
+		let out = list;
+		if (ignoreKey) {
+			const set = new Set(ignoreKey.split("\n"));
+			out = out.filter((ev) => !ev.sender || !set.has(ev.sender.toLowerCase()));
+		}
+		return applyStatusMode(out, statusMode || "show", expanded);
+	}, [list, ignoreKey, statusMode, expanded]);
 
 	// Typing notifications, one sender per buffer; the previous buffer's
 	// session ends with "done" when switching away mid-draft.
@@ -184,7 +212,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 					if (p) markRead();
 				}}
 				renderItem={(ev, i) => (
-					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} />
+					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} />
 				)}
 			/>
 			<div class="composer">

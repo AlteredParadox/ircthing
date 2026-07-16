@@ -603,6 +603,21 @@ input::placeholder {
 	font-size: 0.8929rem;
 }
 
+.sys-toggle {
+	border: none;
+	background: none;
+	padding: 0;
+	font: inherit;
+	color: var(--text-dim);
+	cursor: pointer;
+	text-align: left;
+}
+
+.sys-toggle:hover {
+	color: var(--text);
+	text-decoration: underline;
+}
+
 .sys-mark {
 	font-family: var(--mono-font);
 	flex: 0 0 auto;

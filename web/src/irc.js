@@ -96,6 +96,59 @@ export function renderable(ev) {
 	}
 }
 
+// ---- status-message visibility (The Lounge-style show/collapse/hide) ----
+
+// Presence churn: the lines the statusMsgs pref governs. KICK stays
+// visible always — moderation is signal, not noise.
+const PRESENCE = new Set(["JOIN", "PART", "QUIT", "NICK"]);
+
+export function isPresence(ev) {
+	return PRESENCE.has(ev.command) && !ev.whois;
+}
+
+function collapseSummary(events) {
+	const n = { JOIN: 0, PART: 0, QUIT: 0, NICK: 0 };
+	for (const ev of events) n[ev.command]++;
+	const parts = [];
+	if (n.JOIN) parts.push(`${n.JOIN} joined`);
+	if (n.PART + n.QUIT) parts.push(`${n.PART + n.QUIT} left`);
+	if (n.NICK) parts.push(`${n.NICK} nick change` + (n.NICK > 1 ? "s" : ""));
+	return parts.join(", ");
+}
+
+// applyStatusMode filters/folds presence events per the statusMsgs pref.
+// "collapse" replaces each run of 2+ consecutive presence events with a
+// synthetic toggle row { collapse: [...], expanded }; expanded runs (ids
+// in `expanded`) keep the toggle row and emit their events after it.
+export function applyStatusMode(list, mode, expanded) {
+	if (mode === "show") return list;
+	if (mode === "hide") return list.filter((ev) => !isPresence(ev));
+	const out = [];
+	for (let i = 0; i < list.length; i++) {
+		if (!isPresence(list[i])) {
+			out.push(list[i]);
+			continue;
+		}
+		let j = i;
+		while (j < list.length && isPresence(list[j])) j++;
+		const run = list.slice(i, j);
+		if (run.length === 1) {
+			out.push(run[0]);
+		} else {
+			const id = "clp-" + run[0].id;
+			const isOpen = !!expanded?.has(id);
+			out.push({
+				id, collapse: run, expanded: isOpen,
+				time: run[run.length - 1].time,
+				summary: collapseSummary(run),
+			});
+			if (isOpen) out.push(...run);
+		}
+		i = j - 1;
+	}
+	return out;
+}
+
 // nickColor implements the mockup's deterministic hash:
 // h = (h*31 + charCode) % 360 folded into an oklch color, with lightness/
 // chroma per theme.

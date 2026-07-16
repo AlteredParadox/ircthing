@@ -129,6 +129,15 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 								onPick={(msgFont) => onPrefs({ ...prefs, msgFont })}
 							/>
 						</div>
+						<div class="pref-row">
+							<span class="pref-name">Joins &amp; parts</span>
+							<Seg
+								value={prefs.statusMsgs}
+								options={["show", "collapse", "hide"]}
+								labels={["Show", "Collapse", "Hide"]}
+								onPick={(statusMsgs) => onPrefs({ ...prefs, statusMsgs })}
+							/>
+						</div>
 					</section>
 
 					<section class="settings-section">

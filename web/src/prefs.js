@@ -11,6 +11,10 @@ export const ACCENTS = ["blue", "violet", "teal", "green", "amber", "rose", "sla
 export const TEXT_SIZES = ["sm", "md", "lg", "xl"];
 export const DENSITIES = ["compact", "cozy", "comfortable"];
 export const MSG_FONTS = ["sans", "mono"];
+// How join/part/quit/nick lines appear in the message window (The
+// Lounge's status-message setting): shown, collapsed into one summary
+// row per run, or hidden entirely.
+export const STATUS_MSGS = ["show", "collapse", "hide"];
 
 // Swatch colors shown in settings; must match the data-accent blocks in
 // style.css.
@@ -31,6 +35,7 @@ export const DEFAULTS = {
 	textSize: "md",
 	density: "cozy",
 	msgFont: "sans",
+	statusMsgs: "show",
 	css: "",
 };
 
@@ -45,6 +50,7 @@ export function normalizePrefs(raw) {
 		textSize: pick(p.textSize, TEXT_SIZES, DEFAULTS.textSize),
 		density: pick(p.density, DENSITIES, DEFAULTS.density),
 		msgFont: pick(p.msgFont, MSG_FONTS, DEFAULTS.msgFont),
+		statusMsgs: pick(p.statusMsgs, STATUS_MSGS, DEFAULTS.statusMsgs),
 		css: typeof p.css === "string" ? p.css : DEFAULTS.css,
 	};
 }

@@ -2,7 +2,7 @@ import { deepStrictEqual as eq, strictEqual as is } from "node:assert";
 import { test } from "node:test";
 import {
 	bufKey, firstURL, fmtTime, hostOf, linkify, looksLikeImageURL,
-	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash,
+	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash, applyStatusMode,
 } from "../src/irc.js";
 
 test("parseLine", () => {
@@ -245,4 +245,43 @@ test("parseHash: malformed input returns null, never throws", () => {
 	is(parseHash("#//buffer"), null, "empty network");
 	is(parseHash("#/net/"), null, "empty buffer");
 	is(parseHash("nonsense"), null);
+});
+
+// ---- applyStatusMode ----
+
+function pev(id, command, sender) {
+	return { id, command, sender, time: id * 1000, raw: `:${sender}!u@h ${command} #c` };
+}
+
+test("applyStatusMode: show returns the list untouched", () => {
+	const list = [pev(1, "JOIN", "a"), pev(2, "PRIVMSG", "a")];
+	is(applyStatusMode(list, "show", new Set()), list);
+});
+
+test("applyStatusMode: hide drops presence lines, keeps kicks and messages", () => {
+	const list = [
+		pev(1, "JOIN", "a"), pev(2, "PRIVMSG", "a"), pev(3, "QUIT", "b"),
+		pev(4, "NICK", "c"), pev(5, "KICK", "op"), pev(6, "PART", "d"),
+	];
+	eq(applyStatusMode(list, "hide", new Set()).map((e) => e.id), [2, 5]);
+});
+
+test("applyStatusMode: collapse folds runs of 2+, leaves singles", () => {
+	const list = [
+		pev(1, "JOIN", "a"), pev(2, "JOIN", "b"), pev(3, "QUIT", "c"),
+		pev(4, "PRIVMSG", "a"), pev(5, "PART", "d"), pev(6, "PRIVMSG", "b"),
+	];
+	const out = applyStatusMode(list, "collapse", new Set());
+	eq(out.map((e) => e.id), ["clp-1", 4, 5, 6]);
+	is(out[0].summary, "2 joined, 1 left");
+	is(out[0].expanded, false);
+	is(out[0].time, 3000);
+});
+
+test("applyStatusMode: expanded run keeps the toggle row plus events", () => {
+	const list = [pev(1, "NICK", "a"), pev(2, "NICK", "b"), pev(3, "PRIVMSG", "x")];
+	const out = applyStatusMode(list, "collapse", new Set(["clp-1"]));
+	eq(out.map((e) => e.id), ["clp-1", 1, 2, 3]);
+	is(out[0].expanded, true);
+	is(out[0].summary, "2 nick changes");
 });
