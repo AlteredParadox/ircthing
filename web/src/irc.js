@@ -193,10 +193,14 @@ export function rankBuffers(buffers, query) {
 export function parseInput(input, buffer, chantypes) {
 	if (!input.startsWith("/")) return { type: "text", text: input };
 	if (input.startsWith("//")) return { type: "text", text: input.slice(1) };
-	const m = /^\/(\S+)\s*([^]*)$/.exec(input);
-	const cmd = m[1].toLowerCase();
-	const rest = m[2].trim();
 	const err = (message) => ({ type: "error", message });
+	// Split "/cmd rest" by the first whitespace — no backtracking, and a
+	// bare "/" is an error instead of a crash.
+	const body = input.slice(1);
+	const sp = body.search(/\s/);
+	const cmd = (sp === -1 ? body : body.slice(0, sp)).toLowerCase();
+	if (!cmd) return err("usage: /<command>");
+	const rest = sp === -1 ? "" : body.slice(sp + 1).trim();
 	const parse = CMD_PARSERS[cmd];
 	return parse ? parse(rest, buffer, chantypes, err) : err("unknown command /" + cmd);
 }
@@ -438,9 +442,18 @@ export function bufKey(network, buffer) {
 }
 
 export function parseHash(hash) {
-	const m = /^#\/(.+?)\/(.+)$/.exec(hash);
-	if (!m) return null;
-	return { network: decodeURIComponent(m[1]), buffer: decodeURIComponent(m[2]) };
+	// "#/<network>/<buffer>", split at the first slash; the hash is
+	// attacker-influenceable (links), so no backtracking regex and no
+	// uncaught URIError on malformed percent-escapes.
+	if (!hash.startsWith("#/")) return null;
+	const rest = hash.slice(2);
+	const slash = rest.indexOf("/");
+	if (slash <= 0 || slash === rest.length - 1) return null;
+	try {
+		return { network: decodeURIComponent(rest.slice(0, slash)), buffer: decodeURIComponent(rest.slice(slash + 1)) };
+	} catch {
+		return null;
+	}
 }
 
 export function toHash(network, buffer) {

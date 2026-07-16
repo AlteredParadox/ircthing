@@ -125,3 +125,9 @@ test("parseInput: kick and invite default to the current channel", () => {
 	eq(parseInput("/invite alice #other", "#go"), { type: "cmd", command: "INVITE", params: ["alice", "#other"] });
 	is(parseInput("/invite alice", "bob").type, "error");
 });
+
+test("parseInput: bare and unknown slashes error instead of crashing", () => {
+	is(parseInput("/", "#go").type, "error");
+	is(parseInput("/bogus", "#go").type, "error");
+	eq(parseInput("//join literal", "#go"), { type: "text", text: "/join literal" });
+});

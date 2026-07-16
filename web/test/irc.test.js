@@ -237,3 +237,12 @@ test("renderable: QUIT and NICK system lines", () => {
 	is(nick.kind, "system");
 	is(nick.text, "alice is now known as alicia");
 });
+
+test("parseHash: malformed input returns null, never throws", () => {
+	eq(parseHash("#/libera/%23go"), { network: "libera", buffer: "#go" });
+	is(parseHash("#/x/%"), null, "bad percent-escape");
+	is(parseHash("#/onlynetwork"), null);
+	is(parseHash("#//buffer"), null, "empty network");
+	is(parseHash("#/net/"), null, "empty buffer");
+	is(parseHash("nonsense"), null);
+});

@@ -13,10 +13,12 @@ import { COMMANDS } from "./irc.js";
 // Returns { start, options } (options include their trailing space), or
 // null when there is nothing to complete.
 export function completions(text, caret, { nicks = [] } = {}) {
-	const before = text.slice(0, caret);
-	const token = /\S*$/.exec(before)[0];
+	// Token = the maximal non-whitespace run ending at the caret, found
+	// by a backward scan (the \S*$ regex shape is quadratic on pastes).
+	let start = caret;
+	while (start > 0 && !/\s/.test(text[start - 1])) start--;
+	const token = text.slice(start, caret);
 	if (!token) return null;
-	const start = caret - token.length;
 
 	if (token.startsWith("/") && start === 0) {
 		const q = token.slice(1).toLowerCase();

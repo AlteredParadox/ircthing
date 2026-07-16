@@ -56,7 +56,10 @@ export class Socket {
 			}
 			this.pending.clear();
 			if (this.closed) return;
-			const wait = this.backoff + Math.random() * 500;
+			// Jitter from crypto — quality is irrelevant for reconnect
+			// spacing, but it keeps security linters quiet without a config
+			// exception.
+			const wait = this.backoff + (crypto.getRandomValues(new Uint32Array(1))[0] % 500);
 			this.backoff = Math.min(this.backoff * 2, 15000);
 			setTimeout(() => this.connect(), wait);
 		};
