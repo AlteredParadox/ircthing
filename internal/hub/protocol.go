@@ -263,10 +263,28 @@ type TypingData struct {
 // render it in the active buffer; it is never persisted.
 type ServerInfoData struct {
 	Network string `json:"network"`
-	// Buffer routes the line to a specific buffer (a query nick for WHOIS
-	// output) and switches the client there; empty = the active buffer.
-	Buffer string `json:"buffer,omitempty"`
-	Text   string `json:"text"`
+	Text    string `json:"text"`
+}
+
+// WhoisData is one accumulated WHOIS reply ("whois"), rendered as a card
+// in the target nick's query buffer. Fields are omitted when the server
+// did not report them.
+type WhoisData struct {
+	Network  string `json:"network"`
+	Nick     string `json:"nick"`
+	User     string `json:"user,omitempty"`
+	Host     string `json:"host,omitempty"`
+	Realname string `json:"realname,omitempty"`
+	Account  string `json:"account,omitempty"`
+	Server   string `json:"server,omitempty"`
+	Channels string `json:"channels,omitempty"`
+	Away     string `json:"away,omitempty"`
+	Actual   string `json:"actual,omitempty"` // real host/IP (338/378)
+	Idle     int64  `json:"idle,omitempty"`   // seconds
+	Signon   int64  `json:"signon,omitempty"` // unix seconds
+	Secure   bool   `json:"secure,omitempty"`
+	Bot      bool   `json:"bot,omitempty"`
+	Operator bool   `json:"operator,omitempty"`
 }
 
 // PrefsData carries the client preferences blob ("prefs" pushes and

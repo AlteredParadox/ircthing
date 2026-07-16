@@ -5,6 +5,7 @@ import { longPress } from "./menu.jsx";
 import { firstURL, fmtTime, linkify, nickColor, renderable, sameGroup, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
+import { WhoisCard } from "./whois.jsx";
 import { estimateMsgHeight } from "./vmath.js";
 
 function Body({ text }) {
@@ -35,6 +36,7 @@ function SysRow({ ev, r, focused }) {
 
 function Row({ ev, prev, selfNick, theme, focused, isHighlight, onRedact, onNick }) {
 	const pressFired = { current: false };
+	if (ev.whois) return <WhoisCard whois={ev.whois} focused={focused} />;
 	const r = renderable(ev);
 	if (r.kind === "system" || r.kind === "redacted") {
 		return <SysRow ev={ev} r={r} focused={focused} />;
@@ -90,7 +92,7 @@ function Row({ ev, prev, selfNick, theme, focused, isHighlight, onRedact, onNick
 }
 
 function estimate(ev) {
-	return estimateMsgHeight(ev.raw);
+	return ev.whois ? 200 : estimateMsgHeight(ev.raw);
 }
 
 // Chat renders the active buffer: virtualized scrollback plus composer.

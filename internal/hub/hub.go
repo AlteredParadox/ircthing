@@ -98,6 +98,9 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 	// backfillPages counts follow-up pages per target on the current
 	// connection, bounding paginated backfill (see maxBackfillPages).
 	backfillPages := make(map[string]int)
+	// whois accumulates WHOIS reply numerics into a card, keyed by the
+	// queried nick, until 318 flushes it (see accumulateWhois).
+	whois := make(map[string]*WhoisData)
 
 	for {
 		select {
@@ -111,10 +114,11 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					// every target gets a full pagination budget again.
 					histBatches = make(map[string]*histBatch)
 					backfillPages = make(map[string]int)
+					whois = make(map[string]*WhoisData)
 				}
 				h.onState(ctx, c, ev)
 			case irc.EventMessage:
-				if err := h.onMessage(ctx, c, ev, histBatches, backfillPages); err != nil {
+				if err := h.onMessage(ctx, c, ev, histBatches, backfillPages, whois); err != nil {
 					return err
 				}
 			}
@@ -153,7 +157,7 @@ func (h *Hub) onState(ctx context.Context, c Conn, ev irc.Event) {
 // consumed, ephemeral kinds are relayed, everything else persists (and,
 // when live rather than replayed, broadcasts). The only error is a
 // canceled context surfacing through a failed persist.
-func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches map[string]*histBatch, backfillPages map[string]int) error {
+func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches map[string]*histBatch, backfillPages map[string]int, whois map[string]*WhoisData) error {
 	// standard-replies: machine-readable server feedback the user should
 	// see ("FAIL * INVALID_UTF8 :..."). FAILs are also logged.
 	switch ev.Msg.Command {
@@ -180,8 +184,12 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 	case "732", "733": // RPL_MONLIST / end — the store is our source of truth
 		return nil
 	}
-	// Command replies (WHOIS/WHO/LIST/AWAY/...) and error numerics are
-	// pushed as ephemeral "server_info" lines.
+	// WHOIS replies accumulate into one card (consumed here).
+	if h.accumulateWhois(ev, whois) {
+		return nil
+	}
+	// Other command replies (WHOWAS/WHO/LIST/AWAY/...) and error numerics
+	// are pushed as ephemeral "server_info" lines.
 	if info, ok := h.serverInfo(ev); ok {
 		info.Network = ev.Network
 		h.broadcast(envelope("server_info", 0, info))
@@ -424,9 +432,6 @@ const maxBackfillPages = 10
 // servers also send them unsolicited at every registration.
 var serverInfoNumerics = map[string]bool{
 	"301": true, "305": true, "306": true, "307": true, // away status
-	"311": true, "312": true, "313": true, "317": true, // WHOIS
-	"319": true, "330": true, "335": true, "338": true, "378": true,
-	"379": true, "671": true,
 	"314": true, "369": true, // WHOWAS
 	"352": true,                           // WHO (354/315 are our own WHOX traffic — roster data)
 	"321": true, "322": true, "323": true, // LIST
@@ -434,20 +439,11 @@ var serverInfoNumerics = map[string]bool{
 	"341": true, // INVITE ack
 }
 
-// whoisNumerics are the WHOIS reply numerics whose param(1) is the
-// queried nick; their output is routed to that nick's query buffer (and
-// the client jumps there), so /whois does not clutter the channel. 318
-// (end of /WHOIS) is dropped entirely.
-var whoisNumerics = map[string]bool{
-	"311": true, "312": true, "313": true, "317": true,
-	"319": true, "330": true, "335": true, "338": true,
-	"378": true, "379": true, "671": true,
-}
-
 // serverInfo decides whether an event should be pushed as an ephemeral
 // "server_info" line, and formats it: the leading nick parameter is
 // dropped, the rest joined. Error numerics (4xx/5xx) always qualify —
-// "401 no such nick" after a /whois would otherwise vanish.
+// "401 no such nick" after a /whois would otherwise vanish. WHOIS
+// replies are handled separately (accumulateWhois -> a "whois" card).
 func (h *Hub) serverInfo(ev irc.Event) (ServerInfoData, bool) {
 	cmd := ev.Msg.Command
 	n, err := strconv.Atoi(cmd)
@@ -464,23 +460,106 @@ func (h *Hub) serverInfo(ev irc.Event) (ServerInfoData, bool) {
 	default:
 		return ServerInfoData{}, false
 	}
-	// WHOIS output is routed to the target nick's query buffer, dropping
-	// both our nick and the (now redundant) target nick from the text.
-	skip := 1
-	info := ServerInfoData{}
-	if whoisNumerics[cmd] {
-		info.Buffer = ev.Msg.Param(1)
-		skip = 2
-	}
 	params := ev.Msg.Params
-	if len(params) > skip {
-		params = params[skip:]
+	if len(params) > 1 {
+		params = params[1:] // our own nick
 	}
-	info.Text = strings.TrimSpace(strings.Join(params, " "))
-	if info.Text == "" {
+	txt := strings.TrimSpace(strings.Join(params, " "))
+	if txt == "" {
 		return ServerInfoData{}, false
 	}
-	return info, true
+	return ServerInfoData{Text: txt}, true
+}
+
+// accumulateWhois collects the WHOIS reply numerics into one card,
+// keyed by the queried nick (param 1), and flushes it as a "whois" push
+// on 318 (end of /WHOIS). It returns true when it consumed the message
+// — so whois numerics never reach serverInfo. 301 (away) is folded in
+// only while a whois for that nick is in progress; a standalone away
+// notice falls through to serverInfo. Whois state is per connection
+// (reset on registration in Run).
+func (h *Hub) accumulateWhois(ev irc.Event, whois map[string]*WhoisData) bool {
+	m := ev.Msg
+	switch m.Command {
+	case "311", "312", "313", "317", "319", "330", "335", "338", "378", "379", "671":
+		nick := m.Param(1)
+		if nick == "" {
+			return true
+		}
+		w := whois[nick]
+		if w == nil {
+			w = &WhoisData{Nick: nick}
+			whois[nick] = w
+		}
+		applyWhois(w, m)
+		return true
+	case "301": // away — part of a whois only if one is open
+		if w := whois[m.Param(1)]; w != nil {
+			w.Away = m.Trailing()
+			return true
+		}
+		return false
+	case "318": // end of /WHOIS: flush the card
+		nick := m.Param(1)
+		if w := whois[nick]; w != nil {
+			delete(whois, nick)
+			w.Network = ev.Network
+			h.broadcast(envelope("whois", 0, w))
+		}
+		return true
+	}
+	return false
+}
+
+// applyWhois sets the field one WHOIS numeric carries.
+func applyWhois(w *WhoisData, m *ircv4.Message) {
+	switch m.Command {
+	case "311": // <me> <nick> <user> <host> * :<realname>
+		w.User, w.Host, w.Realname = m.Param(2), m.Param(3), m.Trailing()
+	case "312": // <me> <nick> <server> :<info>
+		w.Server = m.Param(2)
+	case "313": // is an IRC operator
+		w.Operator = true
+	case "317": // <me> <nick> <idle> [<signon>] :seconds idle, signon time
+		w.Idle = atoiOr0(m.Param(2))
+		w.Signon = atoiOr0(m.Param(3))
+	case "319": // :<prefixed channels>
+		w.Channels = m.Trailing()
+	case "330": // <me> <nick> <account> :is logged in as
+		w.Account = m.Param(2)
+	case "335": // is a bot
+		w.Bot = true
+	case "338": // <me> <nick> <host/ip> [...] :actually using host
+		// The IP/host is in the middle params; the trailing is a label.
+		if mid := strings.Join(midParams(m, 2), " "); mid != "" && w.Actual == "" {
+			w.Actual = mid
+		}
+	case "378": // <me> <nick> :is connecting from <user@host> <ip>
+		if w.Actual == "" {
+			w.Actual = strings.TrimPrefix(m.Trailing(), "is connecting from ")
+		}
+	case "671": // is using a secure connection
+		w.Secure = true
+	}
+}
+
+func atoiOr0(s string) int64 {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// midParams returns the parameters from index `from` up to (excluding)
+// the trailing parameter — the fixed args of a numeric, minus its
+// human-readable label.
+func midParams(m *ircv4.Message, from int) []string {
+	end := len(m.Params) - 1 // exclude trailing
+	if end <= from {
+		return nil
+	}
+	return m.Params[from:end]
 }
 
 // expectMOTD opens the MOTD gate for a network: the next MOTD reply is

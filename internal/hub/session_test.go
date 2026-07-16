@@ -1369,22 +1369,10 @@ func TestServerInfoFlow(t *testing.T) {
 		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
 	}
 
-	// WHOIS replies route to the target's query buffer, with both our
-	// nick and the (now redundant) target nick stripped from the text.
-	conn.ch <- ev(":srv 311 AlteredParadox alice ~u example.org * :Alice A.")
-	info := decode[ServerInfoData](t, recv(t, s, "server_info"))
-	if info.Network != "libera" || info.Buffer != "alice" || info.Text != "~u example.org * Alice A." {
-		t.Fatalf("whois info = %+v", info)
-	}
-
-	// End of /WHOIS (318) is dropped as noise.
-	conn.ch <- ev(":srv 318 AlteredParadox alice :End of /WHOIS list")
-	expectSilence(t, s)
-
-	// Error numerics stay in the active buffer (no routing) — a failed
-	// /whois shows where it was typed, not in a junk query buffer.
+	// Error numerics forward as server_info lines (WHOIS itself is tested
+	// separately — it accumulates into a whois card).
 	conn.ch <- ev(":srv 401 AlteredParadox ghost :No such nick/channel")
-	if info := decode[ServerInfoData](t, recv(t, s, "server_info")); info.Buffer != "" || info.Text != "ghost No such nick/channel" {
+	if info := decode[ServerInfoData](t, recv(t, s, "server_info")); info.Text != "ghost No such nick/channel" {
 		t.Fatalf("error info = %+v", info)
 	}
 
@@ -1569,4 +1557,51 @@ func countRaw(msgs []store.Message, sub string) int {
 		}
 	}
 	return n
+}
+
+func TestWhoisAccumulation(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 16), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+
+	// A full WHOIS reply produces nothing until 318, then one card.
+	conn.ch <- ev(":srv 311 AlteredParadox alice ~auser example.org * :Alice A.")
+	conn.ch <- ev(":srv 319 AlteredParadox alice :@#go +#rust")
+	conn.ch <- ev(":srv 312 AlteredParadox alice hub.libera.chat :Libera hub")
+	conn.ch <- ev(":srv 330 AlteredParadox alice alicelogin :is logged in as")
+	conn.ch <- ev(":srv 338 AlteredParadox alice 203.0.113.5 :actually using host")
+	conn.ch <- ev(":srv 671 AlteredParadox alice :is using a secure connection")
+	conn.ch <- ev(":srv 317 AlteredParadox alice 42 1700000000 :seconds idle, signon time")
+	conn.ch <- ev(":srv 301 AlteredParadox alice :gone fishing")
+	conn.ch <- ev(":srv 318 AlteredParadox alice :End of /WHOIS list")
+
+	w := decode[WhoisData](t, recv(t, s, "whois"))
+	want := WhoisData{
+		Network: "libera", Nick: "alice", User: "~auser", Host: "example.org",
+		Realname: "Alice A.", Account: "alicelogin", Server: "hub.libera.chat",
+		Channels: "@#go +#rust", Away: "gone fishing", Actual: "203.0.113.5",
+		Idle: 42, Signon: 1700000000, Secure: true,
+	}
+	if w != want {
+		t.Fatalf("whois card = %+v\n         want %+v", w, want)
+	}
+
+	// A standalone away (no whois open) still forwards as server_info.
+	conn.ch <- ev(":srv 301 AlteredParadox bob :busy")
+	if info := decode[ServerInfoData](t, recv(t, s, "server_info")); info.Text != "bob busy" {
+		t.Fatalf("standalone away = %+v", info)
+	}
+
+	// 318 with no accumulator is silently dropped.
+	conn.ch <- ev(":srv 318 AlteredParadox nobody :End of /WHOIS list")
+	expectSilence(t, s)
 }

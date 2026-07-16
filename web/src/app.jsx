@@ -431,23 +431,11 @@ export function App() {
 			if (d.prefs) setPrefs(normalizePrefs(d.prefs));
 		});
 
-		// Ephemeral server replies (/whois, /list, error numerics): shown
-		// as system lines, never persisted — a history refetch drops them.
-		// WHOIS output carries a target buffer: route it to that user's
-		// query and jump there, so /whois does not clutter the channel.
+		// Ephemeral server replies (/list, error numerics): shown as
+		// system lines in the active buffer, never persisted — a history
+		// refetch drops them.
 		let infoSeq = 0;
 		s.on("server_info", (d) => {
-			if (d.buffer) {
-				const key = bufKey(d.network, d.buffer);
-				setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(d.network, d.buffer) }));
-				const ev = {
-					id: `si${++infoSeq}`, network: d.network, buffer: d.buffer,
-					time: Date.now(), sender: "", command: "INFO", raw: d.text,
-				};
-				setMsgs((m) => appendInfoLine(m, key, ev));
-				if (activeKeyRef.current !== key) select(d.network, d.buffer);
-				return;
-			}
 			const key = activeKeyRef.current;
 			const buf = buffersRef.current[key];
 			if (!buf) return;
@@ -457,6 +445,20 @@ export function App() {
 				time: Date.now(), sender: "", command: "INFO", raw: text,
 			};
 			setMsgs((m) => appendInfoLine(m, key, ev));
+		});
+
+		// A WHOIS card lands in the target's query buffer; jump there, so
+		// /whois does not clutter the channel (The Lounge style).
+		let whoisSeq = 0;
+		s.on("whois", (d) => {
+			const key = bufKey(d.network, d.nick);
+			setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(d.network, d.nick) }));
+			const ev = {
+				id: `wh${++whoisSeq}`, network: d.network, buffer: d.nick,
+				time: Date.now(), sender: "", command: "WHOIS", raw: "", whois: d,
+			};
+			setMsgs((m) => appendInfoLine(m, key, ev));
+			if (activeKeyRef.current !== key) select(d.network, d.nick);
 		});
 
 		s.on("presence", (d) => setMonitors((all) => applyPresenceUpdate(all, d)));
