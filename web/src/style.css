@@ -950,6 +950,7 @@ input::placeholder {
 	gap: 9px;
 	padding: var(--pad-sub) 8px;
 	border-radius: 7px;
+	cursor: pointer;
 }
 
 .member-row:hover {
@@ -1303,7 +1304,12 @@ input::placeholder {
 /* nicks that open a context menu get the right-click affordance */
 .msg-nick.has-menu,
 .msg-body .has-menu {
-	cursor: context-menu;
+	cursor: pointer;
+}
+
+.msg-nick.has-menu:hover,
+.msg-body .has-menu:hover {
+	text-decoration: underline;
 }
 
 /* ---- channel switcher palette ---- */

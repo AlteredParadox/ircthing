@@ -1,7 +1,7 @@
 import { Fragment } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Completer } from "./complete.js";
-import { longPress } from "./menu.jsx";
+import { menuTrigger } from "./menu.jsx";
 import { firstURL, fmtTime, linkify, nickColor, renderable, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
@@ -35,7 +35,6 @@ function SysRow({ ev, r, focused }) {
 }
 
 function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick }) {
-	const pressFired = { current: false };
 	if (ev.whois) return <WhoisCard whois={ev.whois} focused={focused} />;
 	const r = renderable(ev);
 	if (r.kind === "system" || r.kind === "redacted") {
@@ -57,11 +56,7 @@ function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick }) {
 				class={"msg-nick" + (ev.sender ? " has-menu" : "")}
 				style={{ color }}
 				title={ev.sender}
-				onContextMenu={ev.sender ? (e) => {
-					e.preventDefault();
-					onNick(ev.sender, e.clientX, e.clientY);
-				} : undefined}
-				{...(ev.sender ? longPress((x, y) => onNick(ev.sender, x, y), pressFired) : {})}
+				{...(ev.sender ? menuTrigger((x, y) => onNick(ev.sender, x, y)) : {})}
 			>
 				{nickLabel}
 			</span>
@@ -70,10 +65,7 @@ function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick }) {
 					<span
 						class="has-menu"
 						style={{ color, fontWeight: 600 }}
-						onContextMenu={(e) => {
-							e.preventDefault();
-							onNick(ev.sender, e.clientX, e.clientY);
-						}}
+						{...menuTrigger((x, y) => onNick(ev.sender, x, y))}
 					>{ev.sender} </span>
 				)}
 				{r.bot && <span class="bot-chip" title="flagged as a bot">bot</span>}

@@ -59,6 +59,30 @@ export function ContextMenu({ menu, onClose }) {
 	);
 }
 
+// menuTrigger wires an element so left-click, right-click, or
+// Enter/Space all open a context menu via open(x, y). Left/right click
+// open at the cursor; keyboard opens below the element. A tap on touch
+// arrives as a click, so no separate long-press is needed.
+export function menuTrigger(open) {
+	const atCursor = (e) => {
+		e.preventDefault();
+		open(e.clientX, e.clientY);
+	};
+	return {
+		role: "button",
+		tabIndex: 0,
+		onClick: atCursor,
+		onContextMenu: atCursor,
+		onKeyDown: (e) => {
+			if (e.key === "Enter" || e.key === " ") {
+				e.preventDefault();
+				const r = e.currentTarget.getBoundingClientRect();
+				open(r.left, r.bottom);
+			}
+		},
+	};
+}
+
 // longPress returns touch handlers that fire open(x, y) after a ~500ms
 // hold, for touch parity with right-click. It cancels on move or early
 // release and marks the gesture so the element's onClick can ignore the
