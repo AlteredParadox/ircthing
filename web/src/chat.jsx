@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { Completer } from "./complete.js";
 import { firstURL, fmtTime, linkify, nickColor, renderable, sameGroup, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
@@ -62,10 +63,14 @@ function estimate(ev) {
 }
 
 // Chat renders the active buffer: virtualized scrollback plus composer.
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, isHighlight, onSend, onLoadOlder, onRead, onTyping, onRedact }) {
+// completionNicks feeds tab-completion (channel roster, or the query
+// counterpart).
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, isHighlight, onSend, onLoadOlder, onRead, onTyping, onRedact }) {
 	const [draft, setDraft] = useState("");
 	const pinned = useRef(true);
 	const loadingOlder = useRef(false);
+	// Tab cycles candidates; fresh state per buffer.
+	const completer = useMemo(() => new Completer(), [buf?.key]);
 	const list = msgs?.list || [];
 	const last = list[list.length - 1];
 
@@ -153,6 +158,20 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 						value={draft}
 						onInput={(e) => draftChanged(e.currentTarget.value)}
 						onKeyDown={(e) => {
+							// Tab completes commands/emoji/nicks and cycles on
+							// repeat; Shift+Tab cycles backwards.
+							if (e.key === "Tab") {
+								e.preventDefault();
+								const ta = e.currentTarget;
+								const r = completer.next(ta.value, ta.selectionStart, e.shiftKey ? -1 : 1, {
+									nicks: completionNicks || [],
+								});
+								if (r) {
+									draftChanged(r.text);
+									requestAnimationFrame(() => ta.setSelectionRange(r.caret, r.caret));
+								}
+								return;
+							}
 							// Enter sends; Shift+Enter inserts a newline (multiline).
 							if (e.key === "Enter" && !e.shiftKey) {
 								e.preventDefault();

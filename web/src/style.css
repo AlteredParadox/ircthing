@@ -1118,6 +1118,48 @@ input::placeholder {
 	white-space: nowrap;
 }
 
+/* ---- channel switcher palette ---- */
+
+.switch-panel {
+	max-height: 50vh;
+}
+
+.switch-row {
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	padding: 7px 10px;
+	border-radius: 7px;
+	cursor: pointer;
+	font-size: 0.9643rem;
+}
+
+.switch-row.sel {
+	background: var(--accent-soft);
+	box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.switch-row.sel .chan-hash {
+	color: var(--accent);
+}
+
+.switch-name {
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.switch-net {
+	flex: 1;
+	text-align: right;
+	font-family: var(--mono-font);
+	font-size: 0.7857rem;
+	color: var(--text-faint);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
 /* ---- settings modal ---- */
 
 .settings-panel {

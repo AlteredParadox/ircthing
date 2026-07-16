@@ -2,7 +2,7 @@ import { deepStrictEqual as eq, strictEqual as is } from "node:assert";
 import { test } from "node:test";
 import {
 	bufKey, firstURL, fmtTime, hostOf, linkify, looksLikeImageURL,
-	isChannelName, mentionsMe, nickColor, parseHash, parseLine, renderable, sameGroup, toHash,
+	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash,
 } from "../src/irc.js";
 
 test("parseLine", () => {
@@ -192,4 +192,26 @@ test("isChannelName: per-network CHANTYPES", () => {
 	is(isChannelName("", "#"), false);
 	is(isChannelName("&local", "#"), false, "network without & channels");
 	is(isChannelName("!weird", "#!"), true, "unusual prefix honored");
+});
+
+test("bufferOrder: sidebar order (network, then buffer)", () => {
+	const bufs = {
+		b: { key: "b", network: "oftc", buffer: "#a" },
+		a: { key: "a", network: "libera", buffer: "#z" },
+		c: { key: "c", network: "libera", buffer: "#b" },
+	};
+	eq(bufferOrder(bufs), ["c", "a", "b"]);
+});
+
+test("rankBuffers: mentions, then unread, then match position", () => {
+	const bufs = {
+		a: { key: "a", network: "libera", buffer: "#golang", unread: 0, mention: false },
+		b: { key: "b", network: "libera", buffer: "#go", unread: 3, mention: false },
+		c: { key: "c", network: "oftc", buffer: "#gonzo", unread: 1, mention: true },
+		d: { key: "d", network: "libera", buffer: "alice", unread: 0, mention: false },
+	};
+	eq(rankBuffers(bufs, "go").map((b) => b.key), ["c", "b", "a"], "mention > unread > rest");
+	eq(rankBuffers(bufs, "").map((b) => b.key), ["c", "b", "a", "d"], "empty query lists all");
+	eq(rankBuffers(bufs, "libera").map((b) => b.key), ["b", "a", "d"], "network name matches too");
+	eq(rankBuffers(bufs, "nomatch"), []);
 });

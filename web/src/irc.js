@@ -138,6 +138,37 @@ export function isChannelName(s, chantypes) {
 	return !!s && (chantypes || "#&").includes(s[0]);
 }
 
+// COMMANDS lists every slash command parseInput understands, for
+// composer tab-completion. Keep in sync with the switch below.
+export const COMMANDS = ["join", "me", "msg", "nick", "part", "query", "topic"];
+
+// bufferOrder returns buffer keys in sidebar order (network, then name),
+// for keyboard prev/next navigation.
+export function bufferOrder(buffers) {
+	return Object.values(buffers)
+		.sort((a, b) => a.network.localeCompare(b.network) || a.buffer.localeCompare(b.buffer))
+		.map((b) => b.key);
+}
+
+// rankBuffers filters and orders buffers for the switcher palette:
+// substring match on buffer name or network; mentions first, then
+// unread, then earlier match position, then sidebar order.
+export function rankBuffers(buffers, query) {
+	const q = query.trim().toLowerCase();
+	const pos = (b) => {
+		const i = b.buffer.toLowerCase().indexOf(q);
+		return i === -1 ? 1000 : i;
+	};
+	return Object.values(buffers)
+		.filter((b) => !q || b.buffer.toLowerCase().includes(q) || b.network.toLowerCase().includes(q))
+		.sort((a, b) =>
+			(b.mention ? 1 : 0) - (a.mention ? 1 : 0) ||
+			(b.unread > 0 ? 1 : 0) - (a.unread > 0 ? 1 : 0) ||
+			(q ? pos(a) - pos(b) : 0) ||
+			a.network.localeCompare(b.network) ||
+			a.buffer.localeCompare(b.buffer));
+}
+
 // parseInput interprets composer input: plain text, a "//"-escaped
 // literal slash, or a command. `buffer` is the active buffer (default
 // target for /part and /topic); `chantypes` is the network's channel

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
-import { bufKey, isChannelName, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
+import { bufferOrder, bufKey, isChannelName, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
 import { Login } from "./login.jsx";
 import { applyPrefs, loadPrefs, normalizePrefs, resolveTheme, savePrefs } from "./prefs.js";
@@ -8,6 +8,7 @@ import { Members } from "./members.jsx";
 import { SearchOverlay } from "./search.jsx";
 import { Settings } from "./settings.jsx";
 import { Sidebar } from "./sidebar.jsx";
+import { Switcher } from "./switcher.jsx";
 import { Socket } from "./ws.js";
 
 const PAGE = 100;
@@ -43,6 +44,7 @@ export function App() {
 	const [chanTick, setChanTick] = useState(0);
 	const [cmdError, setCmdError] = useState("");
 	const [searchOpen, setSearchOpen] = useState(false);
+	const [switcherOpen, setSwitcherOpen] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const [focusId, setFocusId] = useState(null);
 	// monitors: network -> [{nick, online}]; the MONITOR buddy list.
@@ -101,12 +103,22 @@ export function App() {
 		return () => window.removeEventListener("hashchange", onHash);
 	}, []);
 
-	// Ctrl/Cmd+K opens search.
+	// Global shortcuts: Ctrl/Cmd+K channel switcher, Ctrl/Cmd+Shift+F
+	// search, Alt+↑/↓ previous/next buffer, Alt+Shift+↑/↓ previous/next
+	// unread buffer. Handlers read refs so this registers once.
+	const stepRef = useRef(null);
 	useEffect(() => {
 		const onKey = (e) => {
-			if ((e.ctrlKey || e.metaKey) && e.key === "k") {
+			const mod = e.ctrlKey || e.metaKey;
+			if (mod && !e.shiftKey && e.key.toLowerCase() === "k") {
+				e.preventDefault();
+				setSwitcherOpen(true);
+			} else if (mod && e.shiftKey && e.key.toLowerCase() === "f") {
 				e.preventDefault();
 				setSearchOpen(true);
+			} else if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+				e.preventDefault();
+				stepRef.current?.(e.key === "ArrowDown" ? 1 : -1, e.shiftKey);
 			}
 		};
 		window.addEventListener("keydown", onKey);
@@ -460,6 +472,24 @@ export function App() {
 		sock.current?.request("monitor_remove", { network, nick }).catch(() => {});
 	}
 
+	// stepBuffer moves the active buffer through the sidebar order
+	// (wrapping); unreadOnly skips buffers with nothing new.
+	function stepBuffer(dir, unreadOnly) {
+		const bufs = buffersRef.current;
+		const order = bufferOrder(bufs);
+		if (!order.length) return;
+		const n = order.length;
+		const cur = order.indexOf(activeKeyRef.current); // -1 lands on 0/n-1
+		for (let i = 1; i <= n; i++) {
+			const b = bufs[order[(((cur + dir * i) % n) + n) % n]];
+			if (!unreadOnly || b.unread > 0 || b.mention) {
+				select(b.network, b.buffer);
+				return;
+			}
+		}
+	}
+	stepRef.current = stepBuffer;
+
 	function makeBuffer(network, buffer) {
 		return { key: bufKey(network, buffer), network, buffer, lastTime: 0, marker: 0, unread: 0, mention: false };
 	}
@@ -627,7 +657,7 @@ export function App() {
 					<div class="topic-sep" />
 					<div class="topic-text" title={topicText}>{topicText}</div>
 					<button
-						class="icon-btn" title="Search (Ctrl+K)"
+						class="icon-btn" title="Search (Ctrl+Shift+F)"
 						onClick={() => setSearchOpen(true)}
 					>⌕</button>
 					<button
@@ -650,6 +680,9 @@ export function App() {
 						error={cmdError}
 						typers={Object.keys(typers[activeKey] || {})}
 						focusId={focusId}
+						completionNicks={isChan
+							? (chanInfo?.members || []).map((m) => m.nick)
+							: [activeBuf.buffer]}
 						isHighlight={(t) => highlightText(t, selfNick, rules, activeBuf.network)}
 						onRedact={(msgid) =>
 							sock.current?.request("redact", {
@@ -673,6 +706,16 @@ export function App() {
 			)}
 			{searchOpen && (
 				<SearchOverlay sock={sock} onJump={jumpTo} onClose={() => setSearchOpen(false)} />
+			)}
+			{switcherOpen && (
+				<Switcher
+					buffers={buffers} networks={networks}
+					onSelect={(network, buffer) => {
+						setSwitcherOpen(false);
+						select(network, buffer);
+					}}
+					onClose={() => setSwitcherOpen(false)}
+				/>
 			)}
 			{settingsOpen && (
 				<Settings
