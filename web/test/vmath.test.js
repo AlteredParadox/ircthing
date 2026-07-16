@@ -104,3 +104,15 @@ test("estimateMsgHeight grows with wrapped length", () => {
 	is(estimateMsgHeight("x".repeat(300)), 27 + 3 * 21);
 	is(estimateMsgHeight(null), 27);
 });
+
+test("Geometry: measured is pruned for removed rows (no unbounded growth)", () => {
+	const g = new Geometry(() => 20);
+	const list = items(10);
+	g.setItems(list);
+	for (let i = 0; i < 10; i++) g.measure(list[i].id, 30 + i);
+	is(g.measured.size, 10);
+	// Trim to the newest 3 (a non-append replacement, like a buffer trim).
+	g.setItems(list.slice(7));
+	is(g.measured.size, 3, "measurements for trimmed rows dropped");
+	is(g.measured.get(list[9].id), 39, "survivor keeps its measured height");
+});

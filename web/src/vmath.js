@@ -33,6 +33,14 @@ export class Geometry {
 		} else {
 			this.index = new Map();
 			for (let i = 0; i < items.length; i++) this.index.set(items[i].id, i);
+			// Not an append: rows may have been trimmed/removed. Drop
+			// their cached measurements so `measured` cannot grow without
+			// bound within a single long-lived buffer.
+			if (this.measured.size > this.index.size) {
+				for (const id of this.measured.keys()) {
+					if (!this.index.has(id)) this.measured.delete(id);
+				}
+			}
 		}
 		this.items = items;
 		this.dirty = true;

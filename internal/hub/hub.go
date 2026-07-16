@@ -62,6 +62,13 @@ type Hub struct {
 	rootWG  *sync.WaitGroup
 	// netOps serializes network start/stop/config operations.
 	netOps sync.Mutex
+	// lifecycleGate guards create-on-demand session writes (persistOwn,
+	// AddMonitor) against network teardown: writers take RLock and
+	// re-check the network is still known; delete/rename take Lock, so a
+	// racing write either completes before the delete (and is
+	// cascade-removed) or sees the network gone and skips — never
+	// resurrecting an orphan networks row.
+	lifecycleGate sync.RWMutex
 
 	mu         sync.Mutex
 	networks   map[string]Conn

@@ -192,7 +192,12 @@ func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName 
 	if renamed {
 		oldForReplace = oldName
 	}
-	if err := h.store.ReplaceNetworkConfig(ctx, oldForReplace, name, canonical); err != nil {
+	// A rename moves the networks row, so gate it against session
+	// create-on-demand writes for the same reason as delete.
+	h.lifecycleGate.Lock()
+	err := h.store.ReplaceNetworkConfig(ctx, oldForReplace, name, canonical)
+	h.lifecycleGate.Unlock()
+	if err != nil {
 		// Atomic replace failed = nothing changed; put the previous
 		// definition's connection back.
 		h.restartNetwork(prev)
@@ -308,8 +313,13 @@ func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
 	prev := findConfig(stored, d.Network, d.Network)
 	s.hub.StopNetwork(d.Network)
 	// One transaction: the definition and the stored history (that is
-	// what "delete" means) go together or not at all.
-	if err := s.hub.store.DeleteNetwork(ctx, d.Network); err != nil {
+	// what "delete" means) go together or not at all. Under the
+	// lifecycle gate so no session create-on-demand write interleaves
+	// and resurrects an orphan.
+	s.hub.lifecycleGate.Lock()
+	err = s.hub.store.DeleteNetwork(ctx, d.Network)
+	s.hub.lifecycleGate.Unlock()
+	if err != nil {
 		s.hub.restartNetwork(prev)
 		s.push(errEnvelope(env.Seq, "internal", "deleting network failed"))
 		return

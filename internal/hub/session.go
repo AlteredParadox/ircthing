@@ -159,24 +159,26 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 	// otherwise persist and broadcast ourselves so every device sees
 	// what this one sent.
 	echo := conn.CapEnabled("echo-message")
-	lines := nonEmptyLines(d.Text)
 
 	// A genuine multi-line message goes out as one draft/multiline batch
-	// (reconstructed into a single message on echo); the fallback splits
-	// into one PRIVMSG per line.
-	if len(lines) > 1 && conn.CapEnabled("draft/multiline") {
-		if err := conn.SendMultiline(d.Target, lines); err != nil {
+	// (reconstructed into a single message on echo). The batch preserves
+	// interior blank lines — they are legal, meaningful content (a blank
+	// PRIVMSG line reconstructs to a blank line) — unlike the per-PRIVMSG
+	// fallback below, where an empty PRIVMSG cannot be sent.
+	if full := multilineLines(d.Text); len(full) > 1 && conn.CapEnabled("draft/multiline") {
+		if err := conn.SendMultiline(d.Target, full); err != nil {
 			s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
 			return
 		}
 		if !echo {
-			s.persistOwn(ctx, conn, d.Network, d.Target, strings.Join(lines, "\n"))
+			s.persistOwn(ctx, conn, d.Network, d.Target, strings.Join(full, "\n"))
 		}
 		s.push(envelope("ok", env.Seq, nil))
 		return
 	}
 
-	for _, line := range lines {
+	// Fallback: one PRIVMSG per non-empty line.
+	for _, line := range nonEmptyLines(d.Text) {
 		msg := newPrivmsg(d.Target, line)
 		if err := conn.Send(msg); err != nil {
 			s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
@@ -187,6 +189,17 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 		}
 	}
 	s.push(envelope("ok", env.Seq, nil))
+}
+
+// multilineLines splits text for a draft/multiline batch, preserving
+// interior blank lines and dropping only trailing empty lines (from
+// trailing newlines).
+func multilineLines(text string) []string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	for len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
 }
 
 func nonEmptyLines(text string) []string {
@@ -202,6 +215,14 @@ func nonEmptyLines(text string) []string {
 // persistOwn stores and broadcasts one of our own sent messages, used
 // when echo-message is unavailable to reflect it.
 func (s *Session) persistOwn(ctx context.Context, conn Conn, network, target, text string) {
+	// Under the lifecycle gate: a concurrent delete_network must not be
+	// interleaved, and a network deleted before this write is skipped so
+	// it cannot resurrect an orphan buffer.
+	s.hub.lifecycleGate.RLock()
+	defer s.hub.lifecycleGate.RUnlock()
+	if known, _ := s.hub.knownNetwork(ctx, network); !known {
+		return
+	}
 	// The target is client-supplied: file under the canonical stored
 	// spelling (atomically, so "/msg #Go" cannot race the event
 	// consumer into a second buffer next to #go).
@@ -279,7 +300,11 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 	}
 	// Only a real (configured or connected) network may accrue monitors:
 	// AddMonitor creates the networks row on demand, so an unvalidated
-	// name would otherwise mint phantom network/monitor rows.
+	// name would otherwise mint phantom network/monitor rows. The
+	// check-and-add runs under the lifecycle gate so a concurrent
+	// delete_network cannot slip between them (TOCTOU).
+	s.hub.lifecycleGate.RLock()
+	defer s.hub.lifecycleGate.RUnlock()
 	if ok, err := s.hub.knownNetwork(ctx, d.Network); err != nil {
 		s.push(errEnvelope(env.Seq, "internal", "network lookup failed"))
 		return

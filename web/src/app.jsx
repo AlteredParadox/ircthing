@@ -683,9 +683,18 @@ export function App() {
 			});
 	}, [activeKey, connected, buffers, msgs, loadTick]);
 
-	// Default to the first buffer once the sidebar is known.
+	// Default to the first buffer once the sidebar is known. If the
+	// active key came from a hash that names no existing buffer, clear it
+	// first so this effect can pick a real one (otherwise the app sticks
+	// on the empty state despite having buffers).
 	useEffect(() => {
-		if (activeKey || !Object.keys(buffers).length) return;
+		const keys = Object.keys(buffers);
+		if (!keys.length) return;
+		if (activeKey && !buffers[activeKey]) {
+			setActiveKey(null);
+			return;
+		}
+		if (activeKey) return;
 		const firstBuf = Object.values(buffers).sort((a, b) =>
 			(a.network + a.buffer).localeCompare(b.network + b.buffer))[0];
 		select(firstBuf.network, firstBuf.buffer);
@@ -964,12 +973,22 @@ export function App() {
 					// removal) — don't resurrect a dropped buffer.
 					const prev = m[activeKey];
 					if (!prev) return m;
+					let list = mergeById(prev.list, older);
+					// Bound memory on the paging-back path too: keep the
+					// oldest TRIM_TO (we are scrolled up), dropping the
+					// newest tail — it reloads on scroll-down / new events.
+					let atTail = prev.atTail;
+					if (list.length > TRIM_AT) {
+						list = list.slice(0, TRIM_TO);
+						atTail = false;
+					}
 					return {
 						...m,
 						[activeKey]: {
 							...prev,
-							list: mergeById(prev.list, older),
+							list,
 							reachedTop: older.length < PAGE,
+							atTail,
 						},
 					};
 				});

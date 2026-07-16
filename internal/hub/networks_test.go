@@ -436,3 +436,24 @@ func TestSelfJoinReopensClosedBuffer(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// persistOwn does not create a buffer for a network that is neither
+// configured nor connected (e.g. deleted mid-send), so a racing session
+// write cannot resurrect an orphan.
+func TestPersistOwnSkipsUnknownNetwork(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 4), name: "ghostnet", nick: "AlteredParadox"}
+	s := h.NewSession()
+	defer s.Close()
+	ctx := context.Background()
+
+	// ghostnet has no config and is not connected (not run via h.Run).
+	s.persistOwn(ctx, conn, "ghostnet", "#x", "hi")
+	bufs, err := h.store.Buffers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bufs) != 0 {
+		t.Fatalf("persistOwn created a buffer for an unknown network: %+v", bufs)
+	}
+}
