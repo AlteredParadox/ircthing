@@ -117,3 +117,35 @@ func TestNewMech(t *testing.T) {
 		})
 	}
 }
+
+func TestSCRAMIterationBounds(t *testing.T) {
+	mk := func() *scramClient {
+		c := newSCRAM("", "user", "pencil")
+		c.nonce = func() string { return "rOprNGfwEbeRWgbNEkqO" }
+		c.respond(nil) // client-first
+		return c
+	}
+	sf := func(i string) []byte {
+		return []byte("r=rOprNGfwEbeRWgbNEkqO-srv,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=" + i)
+	}
+	cases := []struct {
+		iter, errSub string
+	}{
+		{"1", "below the minimum"},
+		{"4095", "below the minimum"},
+		{"1000001", "exceeds the maximum"},
+		{"99999999999", "exceeds the maximum"},
+	}
+	for _, tc := range cases {
+		if _, err := mk().respond(sf(tc.iter)); err == nil || !strings.Contains(err.Error(), tc.errSub) {
+			t.Fatalf("i=%s: err = %v, want %q", tc.iter, err, tc.errSub)
+		}
+	}
+	// Boundary values inside the range are accepted (they proceed to
+	// PBKDF2 and produce a client-final, not an error).
+	for _, ok := range []string{"4096", "1000000"} {
+		if _, err := mk().respond(sf(ok)); err != nil {
+			t.Fatalf("i=%s rejected: %v", ok, err)
+		}
+	}
+}

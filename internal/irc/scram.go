@@ -34,6 +34,16 @@ type scramClient struct {
 	step            int
 }
 
+
+// PBKDF2 iteration bounds for the server-supplied SCRAM i= parameter.
+// The minimum is the RFC 5802 baseline (weaker hardening below it); the
+// maximum caps how long an attacker-chosen count can pin the goroutine
+// in PBKDF2, which the handshake timeout cannot interrupt once started.
+const (
+	scramMinIters = 4096
+	scramMaxIters = 1_000_000
+)
+
 func newSCRAM(authzid, authcid, password string) *scramClient {
 	return &scramClient{
 		authcid:  authcid,
@@ -91,6 +101,18 @@ func (c *scramClient) clientFinal(serverFirst string) ([]byte, error) {
 	iters, err := strconv.Atoi(iterStr)
 	if err != nil || iters <= 0 {
 		return nil, fmt.Errorf("scram: bad iteration count %q", iterStr)
+	}
+	// Bound the server-supplied PBKDF2 cost. The count is attacker-
+	// controlled (a hostile server, or an active attacker on an
+	// explicitly-plaintext connection): below the RFC 5802 baseline it
+	// weakens password hardening, and a huge value would pin this
+	// goroutine in an uninterruptible PBKDF2 run past the handshake
+	// timeout. scramMaxIters bounds latency well above any real server.
+	if iters < scramMinIters {
+		return nil, fmt.Errorf("scram: server iteration count %d below the minimum %d", iters, scramMinIters)
+	}
+	if iters > scramMaxIters {
+		return nil, fmt.Errorf("scram: server iteration count %d exceeds the maximum %d", iters, scramMaxIters)
 	}
 
 	saltedPassword := pbkdf2.Key([]byte(c.password), salt, iters, sha256.Size, sha256.New)
