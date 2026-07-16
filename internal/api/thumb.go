@@ -20,9 +20,13 @@ const (
 	maxImageBytes = 10 * 1024 * 1024
 	thumbMaxDim   = 400
 	// maxDecodePixels caps the decoded bitmap to defuse decompression
-	// bombs: a small file can declare enormous dimensions. 25 MP * 4 B ~
-	// 100 MB worst case, gated further by the decode semaphore.
-	maxDecodePixels = 25 * 1000 * 1000
+	// bombs: a small file can declare enormous dimensions. 9 MP covers
+	// ~3000x3000 (most shared content; full-res photos usually exceed
+	// the byte cap anyway) at ~36 MB RGBA. With mediaSlots request-wide
+	// slots the media path's worst case is bounded at roughly
+	// slots x (body + bitmap) ~ 2 x 46 MB transiently — the steady-state
+	// RSS target is unaffected.
+	maxDecodePixels = 9 * 1000 * 1000
 	maxThumbCache   = 128
 )
 
@@ -42,6 +46,15 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// One request-wide slot covers the whole memory-heavy span — the
+	// 10 MiB body fetch, the decode, and the re-encode — so in-flight
+	// bytes and bitmaps are bounded together, not just the decode.
+	if !s.acquireMedia(r.Context()) {
+		http.Error(w, "busy, retry later", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.releaseMedia()
+
 	ct, body, err := s.imageFetcher.get(r.Context(), target)
 	if err != nil {
 		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
@@ -60,10 +73,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Bound concurrent decodes so a burst can't blow the memory target.
-	s.thumbSem <- struct{}{}
 	src, _, err := image.Decode(bytes.NewReader(body))
-	<-s.thumbSem
 	if err != nil {
 		http.Error(w, "decode failed", http.StatusUnsupportedMediaType)
 		return

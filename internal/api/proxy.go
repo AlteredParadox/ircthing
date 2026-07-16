@@ -21,6 +21,34 @@ import (
 
 const proxyUserAgent = "ircthing-media-proxy/1.0 (+https://github.com/ircthing)"
 
+// mediaSlots is the media-path concurrency: each slot admits one whole
+// preview or thumbnail request (fetch through decode/parse and encode),
+// bounding in-flight bodies and decoded bitmaps together.
+const mediaSlots = 2
+
+// mediaAcquireWait bounds how long a request waits for a slot (var for
+// tests).
+var mediaAcquireWait = 5 * time.Second
+
+// acquireMedia takes a media slot, giving up after a short bounded wait
+// (or when the request dies) so waiters cannot pile up.
+func (s *Server) acquireMedia(ctx context.Context) bool {
+	t := time.NewTimer(mediaAcquireWait)
+	defer t.Stop()
+	select {
+	case s.mediaSem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return false
+	}
+}
+
+func (s *Server) releaseMedia() {
+	<-s.mediaSem
+}
+
 var (
 	errBadURL   = errors.New("proxy: url must be an absolute http(s) URL")
 	errTooLarge = errors.New("proxy: response exceeds size cap")

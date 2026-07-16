@@ -42,6 +42,11 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.acquireMedia(r.Context()) {
+		http.Error(w, "busy, retry later", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.releaseMedia()
 	ct, body, err := s.htmlFetcher.get(r.Context(), target)
 	if err != nil {
 		http.Error(w, "preview unavailable", http.StatusBadGateway)

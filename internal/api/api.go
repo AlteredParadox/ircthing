@@ -41,12 +41,13 @@ type Server struct {
 	mux *http.ServeMux
 
 	// Media proxy: separate fetchers (different size caps), result
-	// caches, and a semaphore bounding concurrent image decodes.
+	// caches, and a request-wide semaphore bounding the memory-heavy
+	// span (fetch + decode + encode) of concurrent media requests.
 	htmlFetcher  *fetcher
 	imageFetcher *fetcher
 	previewCache *ttlCache[PreviewData]
 	thumbCache   *ttlCache[thumbResult]
-	thumbSem     chan struct{}
+	mediaSem     chan struct{}
 
 	login *loginLimiter
 
@@ -72,7 +73,7 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		imageFetcher: newFetcher(maxImageBytes),
 		previewCache: newTTLCache[PreviewData](30*time.Minute, 512),
 		thumbCache:   newTTLCache[thumbResult](24*time.Hour, maxThumbCache),
-		thumbSem:     make(chan struct{}, 4),
+		mediaSem:     make(chan struct{}, mediaSlots),
 		login:        newLoginLimiter(),
 		tokens:       make(map[string]time.Time),
 	}

@@ -2,10 +2,13 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"image"
 	"image/color"
 	"image/png"
+	"net/http"
 	"testing"
+	"time"
 )
 
 // makePNG builds an w×h test image (a diagonal gradient) as PNG bytes.
@@ -110,5 +113,43 @@ func TestDecodeConfigRejectsBomb(t *testing.T) {
 	// The cap itself must reject a plausible bomb (e.g. 20000×20000).
 	if 20000*20000 <= maxDecodePixels {
 		t.Fatal("maxDecodePixels too high to stop a 400MP bomb")
+	}
+}
+
+// The media budget is request-wide: with every slot held, a thumbnail
+// request is refused (bounded wait honors context cancellation) instead
+// of fetching and queueing unbounded work.
+func TestMediaBudgetSaturated(t *testing.T) {
+	ts, srv := newTestServerWithRef(t)
+	for i := 0; i < mediaSlots; i++ {
+		srv.mediaSem <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < mediaSlots; i++ {
+			<-srv.mediaSem
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if srv.acquireMedia(ctx) {
+		t.Fatal("acquireMedia succeeded with all slots held")
+	}
+
+	old := mediaAcquireWait
+	mediaAcquireWait = 50 * time.Millisecond
+	defer func() { mediaAcquireWait = old }()
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	rctx, rcancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer rcancel()
+	req, _ := http.NewRequestWithContext(rctx, "GET", ts.URL+"/api/thumb?url=http://example.com/x.png", nil)
+	req.AddCookie(cookie)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
 	}
 }
