@@ -665,17 +665,56 @@ export function App() {
 	function openUserMenu(network, nick, x, y) {
 		if (!nick) return;
 		const ignored = isIgnored(ignoresRef.current, network, nick);
-		setMenu({
-			x, y, title: nick,
-			items: [
-				{ label: "Whois", onClick: () => sendCommand(network, "WHOIS", [nick]) },
-				{ label: "Direct message", onClick: () => select(network, nick) },
-				{
-					label: ignored ? "Unignore" : "Ignore", danger: !ignored,
-					onClick: () => setIgnores((ig) => toggleIgnore(ig, network, nick)),
-				},
-			],
-		});
+		const items = [
+			{ label: "Whois", onClick: () => sendCommand(network, "WHOIS", [nick]) },
+			{ label: "Direct message", onClick: () => select(network, nick) },
+			{
+				label: ignored ? "Unignore" : "Ignore", danger: !ignored,
+				onClick: () => setIgnores((ig) => toggleIgnore(ig, network, nick)),
+			},
+			...modItems(network, nick),
+		];
+		setMenu({ x, y, title: nick, items });
+	}
+
+	// modItems: op/voice/kick/ban entries (The Lounge parity), shown only
+	// when we hold status in the active channel and the target is present.
+	// Halfop (%) can kick and manage voice; @ and above also op and ban.
+	function modItems(network, nick) {
+		const buf = activeBuf;
+		const members = chanInfo?.members;
+		if (!buf || buf.network !== network || !members) return [];
+		const selfN = networks[network]?.nick;
+		if (!selfN || nick === selfN) return [];
+		const me = members.find((m) => m.nick === selfN);
+		const target = members.find((m) => m.nick === nick);
+		if (!me || !target) return [];
+		const isOp = /[~&@]/.test(me.prefix || "");
+		const isHalfop = (me.prefix || "").includes("%");
+		if (!isOp && !isHalfop) return [];
+		const mode = (flag) => () => sendCommand(network, "MODE", [buf.buffer, flag, nick]);
+		const items = [{ divider: true }];
+		if (isOp) {
+			items.push(
+				(target.prefix || "").includes("@")
+					? { label: "Remove op (-o)", onClick: mode("-o") }
+					: { label: "Give op (+o)", onClick: mode("+o") },
+			);
+		}
+		items.push(
+			(target.prefix || "").includes("+")
+				? { label: "Remove voice (-v)", onClick: mode("-v") }
+				: { label: "Give voice (+v)", onClick: mode("+v") },
+		);
+		items.push({ label: "Kick", danger: true, onClick: () => sendCommand(network, "KICK", [buf.buffer, nick]) });
+		if (isOp) {
+			// Ban by nick mask; we do not track member hostnames.
+			items.push({
+				label: "Ban", danger: true,
+				onClick: () => sendCommand(network, "MODE", [buf.buffer, "+b", `${nick}!*@*`]),
+			});
+		}
+		return items;
 	}
 
 	// openBufferMenu: the right-click menu for a sidebar row — channel

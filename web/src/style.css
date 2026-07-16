@@ -1271,6 +1271,12 @@ input::placeholder {
 	margin-bottom: 3px;
 }
 
+.ctx-div {
+	height: 1px;
+	margin: 4px 6px;
+	background: var(--border);
+}
+
 .ctx-item {
 	display: block;
 	width: 100%;
