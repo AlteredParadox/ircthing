@@ -160,37 +160,9 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 		return
 	}
 
-	// Stop before persisting: a rename moves history, and the running
-	// connection must not append rows under the old name mid-move. The
-	// previous definition is captured first so a failure can restore it.
-	prev := findConfig(stored, d.OldName, name)
 	renamed := d.OldName != "" && d.OldName != name
-	if d.OldName != "" {
-		s.hub.StopNetwork(d.OldName)
-	}
-	s.hub.StopNetwork(name)
-	oldForReplace := ""
-	if renamed {
-		oldForReplace = d.OldName
-	}
-	if err := s.hub.store.ReplaceNetworkConfig(ctx, oldForReplace, name, string(canonical)); err != nil {
-		// Atomic replace failed = nothing changed; put the previous
-		// definition's connection back.
-		s.hub.restartNetwork(prev)
-		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
-		return
-	}
-	if err := s.hub.StartNetwork(nc); err != nil {
-		// Validated above, so this is exceptional (e.g. a certificate
-		// file changed on disk since). Restore the previous definition.
-		if prev != nil {
-			if rerr := s.hub.store.ReplaceNetworkConfig(ctx, name, prev.Name, prev.Config); rerr != nil {
-				log.Printf("network %q: rollback failed: %v", name, rerr)
-			}
-			s.hub.restartNetwork(prev)
-		} else if derr := s.hub.store.DeleteNetwork(ctx, name); derr != nil {
-			log.Printf("network %q: rollback failed: %v", name, derr)
-		}
+	prev := findConfig(stored, d.OldName, name)
+	if err := s.hub.applyPutNetwork(ctx, nc, d.OldName, prev, renamed, string(canonical)); err != nil {
 		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
 		return
 	}
@@ -199,6 +171,53 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcast(envelope("networks_changed", 0, nil))
+}
+
+// applyPutNetwork performs the state change of a validated put: stop the
+// old connection, atomically replace the stored definition, start the
+// new one. Both failure points roll back so an error always leaves the
+// previous definition stored and connected. Caller holds netOps.
+func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName string, prev *store.NetworkConfig, renamed bool, canonical string) error {
+	name := nc.EffectiveName()
+	// Stop before persisting: a rename moves history, and the running
+	// connection must not append rows under the old name mid-move.
+	if oldName != "" {
+		h.StopNetwork(oldName)
+	}
+	h.StopNetwork(name)
+	oldForReplace := ""
+	if renamed {
+		oldForReplace = oldName
+	}
+	if err := h.store.ReplaceNetworkConfig(ctx, oldForReplace, name, canonical); err != nil {
+		// Atomic replace failed = nothing changed; put the previous
+		// definition's connection back.
+		h.restartNetwork(prev)
+		return err
+	}
+	if err := h.StartNetwork(nc); err != nil {
+		// Validated by the caller, so this is exceptional (e.g. a
+		// certificate file changed on disk since). Restore the previous
+		// definition.
+		h.rollbackPut(ctx, name, prev)
+		return err
+	}
+	return nil
+}
+
+// rollbackPut undoes a persisted-but-unstartable put: an edit restores
+// (and restarts) the previous definition, an add is deleted.
+func (h *Hub) rollbackPut(ctx context.Context, name string, prev *store.NetworkConfig) {
+	if prev != nil {
+		if err := h.store.ReplaceNetworkConfig(ctx, name, prev.Name, prev.Config); err != nil {
+			log.Printf("network %q: rollback failed: %v", name, err)
+		}
+		h.restartNetwork(prev)
+		return
+	}
+	if err := h.store.DeleteNetwork(ctx, name); err != nil {
+		log.Printf("network %q: rollback failed: %v", name, err)
+	}
 }
 
 // validateNetwork runs the full connect-time validation without
