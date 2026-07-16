@@ -167,17 +167,24 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 	);
 }
 
-// ChannelPrompt: the "Join a channel…" mini-dialog for a network.
-export function ChannelPrompt({ network, error, onJoin, onClose }) {
-	const [name, setName] = useState("#");
+// ChannelPrompt: the "Join a channel…" mini-dialog for a network. The
+// input is NOT prefilled with "#": pasting "#chan" after a prefilled
+// "#" silently made "##chan" — a different (and valid) channel. A
+// missing chantype prefix is added on submit instead.
+export function ChannelPrompt({ network, chantypes, error, onJoin, onClose }) {
+	const [name, setName] = useState("");
+	function submit(e) {
+		e.preventDefault();
+		let n = name.trim();
+		if (!n) return;
+		if (!(chantypes || "#").includes(n[0])) n = "#" + n;
+		if (n.length > 1) onJoin(network, n);
+	}
 	return (
 		<div class="search-scrim" aria-hidden="true" onClick={(e) => e.target === e.currentTarget && onClose()}>
 			<form
 				class="settings-panel chan-prompt"
-				onSubmit={(e) => {
-					e.preventDefault();
-					if (name.trim().length > 1) onJoin(network, name.trim());
-				}}
+				onSubmit={submit}
 			>
 				<div class="settings-head">
 					<div class="settings-title">Join a channel on {network}</div>
@@ -194,7 +201,7 @@ export function ChannelPrompt({ network, error, onJoin, onClose }) {
 					{error && <div class="cmd-error">{error}</div>}
 					<div class="nf-actions">
 						<div class="nf-spacer" />
-						<button type="submit" class="btn-accent" disabled={name.trim().length < 2}>Join</button>
+						<button type="submit" class="btn-accent" disabled={!name.trim()}>Join</button>
 					</div>
 				</div>
 			</form>

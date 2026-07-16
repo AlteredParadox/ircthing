@@ -147,6 +147,19 @@ func (s *Store) Close() error {
 // and the zero Message (ID 0) is returned — callers use that to skip
 // broadcasting.
 func (s *Store) Append(ctx context.Context, network, target string, m Message) (Message, error) {
+	return s.append(ctx, network, target, m, true)
+}
+
+// AppendExisting is Append minus buffer creation: the message is
+// silently dropped (ID 0) when no buffer exists. Used for our own PART
+// echo, which must not resurrect a buffer the user just closed — the
+// close_buffer delete and the PART echo race, and both orders must end
+// with the buffer gone.
+func (s *Store) AppendExisting(ctx context.Context, network, target string, m Message) (Message, error) {
+	return s.append(ctx, network, target, m, false)
+}
+
+func (s *Store) append(ctx context.Context, network, target string, m Message, create bool) (Message, error) {
 	if network == "" || target == "" {
 		return Message{}, errors.New("store: network and target must be non-empty")
 	}
@@ -156,9 +169,12 @@ func (s *Store) Append(ctx context.Context, network, target string, m Message) (
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	bufID, r, err := s.bufferAndRing(ctx, network, target, true)
+	bufID, r, err := s.bufferAndRing(ctx, network, target, create)
 	if err != nil {
 		return Message{}, err
+	}
+	if bufID == 0 {
+		return Message{}, nil // no such buffer and create is off
 	}
 	var msgid, text any
 	if m.MsgID != "" {

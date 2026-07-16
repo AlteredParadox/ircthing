@@ -352,3 +352,10 @@ type ChannelRef struct {
 	Network string `json:"network"`
 	Channel string `json:"channel"`
 }
+
+// BufferRef names a buffer ("close_buffer" request, "buffer_closed"
+// push).
+type BufferRef struct {
+	Network string `json:"network"`
+	Buffer  string `json:"buffer"`
+}

@@ -411,6 +411,15 @@ export function App() {
 			const isMsg = r.kind !== "system";
 			const nick = networksRef.current[ev.network]?.nick;
 			const mine = nick && ev.sender === nick;
+			// A UI-initiated join selects the channel we actually ended up
+			// in — which may differ from the requested one (channel
+			// forwarding, numeric 470) — so selection follows our own JOIN
+			// instead of assuming the requested name.
+			const pj = pendingJoin.current;
+			if (pj && mine && ev.command === "JOIN" && ev.network === pj.network && Date.now() - pj.ts < 15000) {
+				pendingJoin.current = null;
+				select(ev.network, ev.buffer);
+			}
 			// Highlight = a mention/keyword in a channel, or any message in
 			// a query (PM) buffer. PMs always alert.
 			const isChan = isChannelName(ev.buffer, networksRef.current[ev.network]?.chantypes);
@@ -432,6 +441,22 @@ export function App() {
 					location.hash = toHash(ev.network, ev.buffer);
 					setActiveKey(key);
 				});
+			}
+		});
+
+		// Another device closed a buffer; drop it here too.
+		s.on("buffer_closed", (d) => {
+			const key = bufKey(d.network, d.buffer);
+			if (!buffersRef.current[key]) return;
+			setBuffers((b) => {
+				const next = { ...b };
+				delete next[key];
+				return next;
+			});
+			setMsgs((m) => dropBufferMsgs(m, key));
+			if (activeKeyRef.current === key) {
+				setActiveKey(null);
+				location.hash = "";
 			}
 		});
 
@@ -666,9 +691,12 @@ export function App() {
 			.catch((e) => setCmdError(e.message || "failed"));
 	}
 
-	// closeBuffer removes a buffer from the client (leave/close); if it was
-	// active, moves to the first remaining buffer.
+	// closeBuffer removes a buffer everywhere (leave/close): the stored
+	// history goes too — the sidebar is store-driven, so a buffer that
+	// stays in the store resurrects on the next refresh. Other devices
+	// drop it via the buffer_closed push.
 	function closeBuffer(network, buffer) {
+		sock.current?.request("close_buffer", { network, buffer }).catch(() => {});
 		const key = bufKey(network, buffer);
 		setBuffers((b) => {
 			const next = { ...b };
@@ -830,12 +858,16 @@ export function App() {
 			.finally(() => setNetFormBusy(false));
 	}
 
+	const pendingJoin = useRef(null);
 	function joinChannel(network, channel) {
 		sock.current?.request("join_channel", { network, channel })
 			.then(() => {
 				setChanPrompt(null);
 				setChanPromptError("");
-				select(network, channel);
+				// Select once our JOIN arrives (it may be a forward to a
+				// different channel); creating the buffer now would leave a
+				// phantom if the server redirects us.
+				pendingJoin.current = { network, ts: Date.now() };
 			})
 			.catch((e) => setChanPromptError(e.message || "join failed"));
 	}
@@ -1035,6 +1067,7 @@ export function App() {
 			{chanPrompt && (
 				<ChannelPrompt
 					network={chanPrompt.network} error={chanPromptError}
+					chantypes={networks[chanPrompt.network]?.chantypes}
 					onJoin={joinChannel} onClose={() => setChanPrompt(null)}
 				/>
 			)}

@@ -279,7 +279,14 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	if !ok {
 		return nil
 	}
-	stored, err := h.store.Append(ctx, ev.Network, target, storeMessage(ev))
+	// Our own PART must not create a buffer: the UI's "Leave channel"
+	// deletes the stored buffer (close_buffer) while our PART echo is
+	// still in flight, and either arrival order must leave it closed.
+	append := h.store.Append
+	if ev.Msg.Command == "PART" && ev.Msg.Prefix != nil && ev.Msg.Prefix.Name == c.Nick() {
+		append = h.store.AppendExisting
+	}
+	stored, err := append(ctx, ev.Network, target, storeMessage(ev))
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()

@@ -91,3 +91,36 @@ func TestDeleteAndRenameNetworkData(t *testing.T) {
 		t.Fatalf("after re-append: %v, %v", got, err)
 	}
 }
+
+func TestAppendExistingAfterDeleteBuffer(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+
+	msg := Message{Time: time.Now(), Sender: "AlteredParadox", Command: "PART", Raw: ":AlteredParadox PART #x"}
+	if _, err := s.Append(ctx, "net", "#x", msg); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteBuffer(ctx, "net", "#x"); err != nil {
+		t.Fatal(err)
+	}
+	// The PART echo arriving after close must not resurrect the buffer.
+	got, err := s.AppendExisting(ctx, "net", "#x", msg)
+	if err != nil || got.ID != 0 {
+		t.Fatalf("AppendExisting after delete = %+v, %v; want dropped", got, err)
+	}
+	bufs, err := s.Buffers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bufs) != 0 {
+		t.Fatalf("buffer resurrected: %+v", bufs)
+	}
+	// Into an existing buffer it still lands normally.
+	if _, err := s.Append(ctx, "net", "#y", msg); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.AppendExisting(ctx, "net", "#y", msg); err != nil || got.ID == 0 {
+		t.Fatalf("AppendExisting into live buffer = %+v, %v", got, err)
+	}
+}

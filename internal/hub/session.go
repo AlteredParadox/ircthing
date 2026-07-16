@@ -132,6 +132,8 @@ func (s *Session) Handle(ctx context.Context, env Envelope) {
 		s.handleJoinChannel(ctx, env, true)
 	case "part_channel":
 		s.handleJoinChannel(ctx, env, false)
+	case "close_buffer":
+		s.handleCloseBuffer(ctx, env)
 	default:
 		// Unknown message types are ignored, not errored (protocol
 		// forward-compatibility rule).

@@ -104,6 +104,32 @@ func (s *Store) DeleteNetworkData(ctx context.Context, name string) error {
 	return nil
 }
 
+// DeleteBuffer removes one stored buffer and, via cascades, its
+// messages (FTS rows via trigger) and read marker. Used by the
+// close_buffer request: a closed buffer must not resurrect from the
+// store on the next buffer-list refresh.
+func (s *Store) DeleteBuffer(ctx context.Context, network, target string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM buffers WHERE name = ? AND network_id =
+			(SELECT id FROM networks WHERE user_id = ? AND name = ?)`,
+		target, defaultUserID, network)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil // nothing stored: closing a purely client-side buffer
+	}
+	k := bufKey{network: network, target: target}
+	if id, ok := s.buffers[k]; ok {
+		delete(s.rings, id)
+		delete(s.buffers, k)
+	}
+	return nil
+}
+
 // dropNetworkCachesLocked evicts the in-memory id and ring caches for a
 // network whose rows were just deleted or renamed. Caller holds s.mu.
 func (s *Store) dropNetworkCachesLocked(network string) {

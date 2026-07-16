@@ -263,6 +263,24 @@ func (s *Session) handleJoinChannel(ctx context.Context, env Envelope, join bool
 	s.hub.broadcast(envelope("networks_changed", 0, nil))
 }
 
+// handleCloseBuffer deletes a buffer's stored history so it stays
+// closed (the sidebar is store-driven; without this a closed buffer
+// resurrects on the next refresh). Leaving a channel via the UI sends
+// part_channel first, then this.
+func (s *Session) handleCloseBuffer(ctx context.Context, env Envelope) {
+	var d BufferRef
+	if err := json.Unmarshal(env.Data, &d); err != nil || d.Network == "" || d.Buffer == "" {
+		s.push(errEnvelope(env.Seq, "bad_request", "close_buffer needs a network and a buffer"))
+		return
+	}
+	if err := s.hub.store.DeleteBuffer(ctx, d.Network, d.Buffer); err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "closing buffer failed"))
+		return
+	}
+	s.push(envelope("ok", env.Seq, nil))
+	s.hub.broadcast(envelope("buffer_closed", 0, d))
+}
+
 // updateAutojoin adds or removes a channel in a stored definition's
 // channels list (case-insensitive dedup).
 func (h *Hub) updateAutojoin(ctx context.Context, network, channel string, add bool) error {
