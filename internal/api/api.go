@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"strconv"
 	"sync"
 	"time"
@@ -46,6 +47,14 @@ type Config struct {
 	// whenever TLS terminates in front of the binary; off by default
 	// because the default deployment is plain HTTP on loopback.
 	SecureCookies bool
+	// MediaProxy, when non-nil, routes all media-proxy fetches (link
+	// previews, image thumbnails) through the given proxy so they don't
+	// leak the server's real IP. Validated/parsed by the caller.
+	MediaProxy *url.URL
+	// PreviewsDisabled turns the media proxy off: the /api/preview and
+	// /api/thumb endpoints are disabled and the UI is told not to request
+	// them, so the server makes zero outbound fetches for links/images.
+	PreviewsDisabled bool
 }
 
 // Server is the http.Handler for everything: /api/* plus the embedded
@@ -86,8 +95,8 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		cfg:          cfg,
 		hub:          h,
 		mux:          http.NewServeMux(),
-		htmlFetcher:  newFetcher(maxHTMLBytes),
-		imageFetcher: newFetcher(maxImageBytes),
+		htmlFetcher:  newFetcher(maxHTMLBytes, cfg.MediaProxy),
+		imageFetcher: newFetcher(maxImageBytes, cfg.MediaProxy),
 		previewCache: newTTLCache[PreviewData](30*time.Minute, 512),
 		thumbCache:   newTTLCache[thumbResult](24*time.Hour, maxThumbCache),
 		mediaSem:     make(chan struct{}, mediaSlots),
@@ -97,12 +106,27 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 	s.mux.HandleFunc("POST /api/login", s.handleLogin)
 	s.mux.HandleFunc("POST /api/logout", s.handleLogout)
 	s.mux.HandleFunc("GET /api/ws", s.handleWS)
-	s.mux.HandleFunc("GET /api/preview", s.requireAuth(s.handlePreview))
-	s.mux.HandleFunc("GET /api/thumb", s.requireAuth(s.handleThumb))
+	s.mux.HandleFunc("GET /api/config", s.requireAuth(s.handleClientConfig))
+	// With previews disabled the endpoints are simply not registered, so a
+	// request 404s and the server never fetches anything remote.
+	if !cfg.PreviewsDisabled {
+		s.mux.HandleFunc("GET /api/preview", s.requireAuth(s.handlePreview))
+		s.mux.HandleFunc("GET /api/thumb", s.requireAuth(s.handleThumb))
+	}
 	if assets != nil {
 		s.mux.Handle("/", http.FileServerFS(assets))
 	}
 	return s, nil
+}
+
+// handleClientConfig returns the server-set switches the frontend needs at
+// startup (currently just whether link/media previews are enabled), so the
+// UI doesn't request previews the server has turned off.
+func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Previews bool `json:"previews"`
+	}{Previews: !s.cfg.PreviewsDisabled})
 }
 
 // requireAuth wraps a handler so only authenticated sessions reach it —

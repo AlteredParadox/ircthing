@@ -213,6 +213,7 @@ function mergeHistoryPage(m, key, page) {
 
 export function App() {
 	const [phase, setPhase] = useState("checking"); // checking | login | app
+	const [previews, setPreviews] = useState(true); // link/media previews enabled (server switch)
 	const [connected, setConnected] = useState(false);
 	const [networks, setNetworks] = useState({});
 	const [buffers, setBuffers] = useState({});
@@ -322,6 +323,16 @@ export function App() {
 			.then((r) => setPhase(r.status === 401 ? "login" : "app"))
 			.catch(() => setPhase("login"));
 	}, []);
+
+	// Server switches (whether link/media previews are enabled). Fetched
+	// once authed so the UI never requests previews the server disabled.
+	useEffect(() => {
+		if (phase !== "app") return;
+		fetch("/api/config")
+			.then((r) => (r.ok ? r.json() : null))
+			.then((c) => c && typeof c.previews === "boolean" && setPreviews(c.previews))
+			.catch(() => {});
+	}, [phase]);
 
 	useEffect(() => {
 		const onHash = () => {
@@ -1154,7 +1165,7 @@ export function App() {
 							: [activeBuf.buffer]}
 						ignoredNicks={ignoredHere}
 						statusMode={prefs.statusMsgs}
-						timeFmt={timeFmt} nickSep={prefs.nickSep}
+						timeFmt={timeFmt} nickSep={prefs.nickSep} previews={previews}
 						composerApi={composerApi}
 						onNick={(nick, x, y) => openUserMenu(activeBuf.network, nick, x, y)}
 						isHighlight={(t) => highlightText(t, selfNick, rules, activeBuf.network)}

@@ -75,6 +75,8 @@ loudly. See `config.example.json` for a complete example.
 | `user.username`, `user.password_hash` | Web login. Generate the bcrypt hash with `ircd-web -hash-password`. |
 | `session_ttl_days` | Login cookie lifetime. Default 30. |
 | `ring_size` | Hot scrollback kept in memory per buffer. Default 200; older history is read from SQLite. |
+| `media_proxy` | Route the server-side media proxy (link previews, image thumbnails) through a proxy so those fetches don't reveal the server's real IP. Same form as a network `proxy`: `socks5://[user:pass@]host:port` (SOCKS5 with RFC 1929 auth, DNS resolves proxy-side), `socks5h://…`, or `http://[user:pass@]host:port`. Empty = fetch directly. Use this when your networks run over a proxy for anonymity — otherwise a previewed link leaks your egress IP to whoever controls it. |
+| `disable_previews` | `true` turns the media proxy off entirely: `/api/preview` and `/api/thumb` are unregistered and the UI stops requesting them, so the server makes **zero** outbound fetches for links/images. |
 
 Networks are managed from the web UI: the **+** button in the sidebar
 adds one; clicking a network's name offers *Join channel*, *Edit

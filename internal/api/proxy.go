@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"syscall"
 	"time"
+
+	"ircthing/internal/proxydial"
 )
 
 // Server-side fetcher for the media proxy (link previews, image
@@ -59,38 +61,60 @@ var (
 type fetcher struct {
 	client   *http.Client
 	maxBytes int64
+	// proxied is true when fetches tunnel through a configured proxy. Then
+	// the connect-time Control hook can't see the (proxy-resolved) target
+	// IP, so hostAllowed is applied to literal-IP targets in get and on
+	// redirects instead. Direct fetches rely solely on the Control hook.
+	proxied bool
 	// allowIP decides whether a resolved address may be dialed. Field so
 	// tests can permit loopback (httptest listens on 127.0.0.1, which the
 	// real policy blocks).
 	allowIP func(net.IP) bool
 }
 
-func newFetcher(maxBytes int64) *fetcher {
+// newFetcher builds a media fetcher. When proxy is non-nil, every fetch is
+// tunneled through it (SOCKS5/HTTP), so the fetch does not reveal the
+// server's real IP — matching a network's proxy for anonymity. Direct and
+// proxied paths both refuse a literal non-public IP target (hostAllowed);
+// the direct path additionally re-validates the resolved IP at connect
+// time (rebinding-safe), while the proxied path leaves DNS to the proxy.
+func newFetcher(maxBytes int64, proxy *url.URL) *fetcher {
 	f := &fetcher{maxBytes: maxBytes, allowIP: isPublicIP}
-	d := &net.Dialer{Timeout: 8 * time.Second, KeepAlive: -1}
-	// Control runs after DNS resolution with the concrete IP:port, before
-	// the socket connects — the correct, rebinding-safe hook.
-	d.Control = func(_, address string, _ syscall.RawConn) error {
-		host, _, err := net.SplitHostPort(address)
-		if err != nil {
-			return err
+	tr := &http.Transport{
+		Proxy:                 nil, // never honor $HTTP_PROXY implicitly
+		TLSHandshakeTimeout:   8 * time.Second,
+		ResponseHeaderTimeout: 8 * time.Second,
+		DisableKeepAlives:     true,
+		MaxIdleConns:          0,
+	}
+	if proxy != nil {
+		f.proxied = true
+		// The proxy owns egress and DNS. Our local IP allowlist can't see
+		// the proxy-resolved address, so hostAllowed (in get/CheckRedirect)
+		// is the SSRF backstop for literal-IP targets.
+		tr.DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return proxydial.Dial(ctx, proxy, addr, 8*time.Second)
 		}
-		ip := net.ParseIP(host)
-		if ip == nil || !f.allowIP(ip) {
-			return fmt.Errorf("%w: %s", errBlocked, address)
+	} else {
+		d := &net.Dialer{Timeout: 8 * time.Second, KeepAlive: -1}
+		// Control runs after DNS resolution with the concrete IP:port,
+		// before the socket connects — the correct, rebinding-safe hook.
+		d.Control = func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			ip := net.ParseIP(host)
+			if ip == nil || !f.allowIP(ip) {
+				return fmt.Errorf("%w: %s", errBlocked, address)
+			}
+			return nil
 		}
-		return nil
+		tr.DialContext = d.DialContext
 	}
 	f.client = &http.Client{
-		Timeout: 15 * time.Second,
-		Transport: &http.Transport{
-			Proxy:                 nil, // never use an outbound proxy
-			DialContext:           d.DialContext,
-			TLSHandshakeTimeout:   8 * time.Second,
-			ResponseHeaderTimeout: 8 * time.Second,
-			DisableKeepAlives:     true,
-			MaxIdleConns:          0,
-		},
+		Timeout:   15 * time.Second,
+		Transport: tr,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 5 {
 				return errors.New("proxy: too many redirects")
@@ -98,10 +122,21 @@ func newFetcher(maxBytes int64) *fetcher {
 			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
 				return errors.New("proxy: disallowed redirect scheme")
 			}
+			if f.proxied && !f.hostAllowed(req.URL.Hostname()) {
+				return fmt.Errorf("%w: %s", errBlocked, req.URL.Host)
+			}
 			return nil
 		},
 	}
 	return f
+}
+
+// hostAllowed rejects a target whose host is a literal non-public IP. A
+// hostname passes: the direct path re-checks its resolved IP at dial via
+// the Control hook, and the proxied path defers resolution to the proxy.
+func (f *fetcher) hostAllowed(host string) bool {
+	ip := net.ParseIP(host)
+	return ip == nil || f.allowIP(ip)
 }
 
 // get fetches rawURL, returning its content type and body (capped at
@@ -110,6 +145,12 @@ func (f *fetcher) get(ctx context.Context, rawURL string) (contentType string, b
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return "", nil, errBadURL
+	}
+	// Proxied path: refuse a literal non-public IP up front, since the
+	// Control hook can't re-check the proxy-resolved address at dial time.
+	// (Direct fetches are covered by that hook.)
+	if f.proxied && !f.hostAllowed(u.Hostname()) {
+		return "", nil, errBlocked
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {

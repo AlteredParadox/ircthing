@@ -1,14 +1,96 @@
 package api
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
+
+// fakeConnectProxy runs a minimal HTTP CONNECT proxy that tunnels to the
+// requested target, so a proxied fetcher can be exercised end to end. It
+// returns the proxy URL.
+func fakeConnectProxy(t *testing.T) *url.URL {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				line, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				parts := strings.Fields(line)
+				if len(parts) < 2 || parts[0] != "CONNECT" {
+					return
+				}
+				for { // drain headers to the blank line
+					h, err := br.ReadString('\n')
+					if err != nil || strings.TrimSpace(h) == "" {
+						break
+					}
+				}
+				up, err := net.Dial("tcp", parts[1])
+				if err != nil {
+					io.WriteString(c, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+					return
+				}
+				defer up.Close()
+				io.WriteString(c, "HTTP/1.1 200 Connection Established\r\n\r\n")
+				go io.Copy(up, br) // client -> target (br may hold read-ahead)
+				io.Copy(c, up)     // target -> client
+			}()
+		}
+	}()
+	return &url.URL{Scheme: "http", Host: ln.Addr().String()}
+}
+
+// A fetcher configured with a proxy tunnels its fetch through it rather
+// than connecting to the target directly (the anti-IP-leak guarantee).
+func TestFetcherUsesProxy(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("through the proxy"))
+	}))
+	defer target.Close()
+
+	f := newFetcher(maxHTMLBytes, fakeConnectProxy(t))
+	f.allowIP = func(net.IP) bool { return true } // permit the loopback target
+	_, body, err := f.get(context.Background(), target.URL)
+	if err != nil {
+		t.Fatalf("proxied fetch: %v", err)
+	}
+	if string(body) != "through the proxy" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+// The proxied path still refuses a literal non-public IP target up front —
+// the Control hook can't see the proxy-resolved address, so hostAllowed is
+// the SSRF backstop.
+func TestProxiedFetcherBlocksLiteralPrivateIP(t *testing.T) {
+	f := newFetcher(maxHTMLBytes, fakeConnectProxy(t)) // default allowIP = isPublicIP
+	for _, u := range []string{"http://10.0.0.1/x", "http://169.254.169.254/latest", "http://[::1]/"} {
+		if _, _, err := f.get(context.Background(), u); !errors.Is(err, errBlocked) {
+			t.Fatalf("get(%q) = %v, want errBlocked", u, err)
+		}
+	}
+}
 
 func TestIsPublicIP(t *testing.T) {
 	cases := []struct {
@@ -79,7 +161,7 @@ func TestFetcherBlocksLoopbackByDefault(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	f := newFetcher(maxHTMLBytes)
+	f := newFetcher(maxHTMLBytes, nil)
 	_, _, err := f.get(context.Background(), srv.URL)
 	if err == nil {
 		t.Fatal("fetcher connected to loopback")
@@ -93,7 +175,7 @@ func TestFetcherBlocksLoopbackByDefault(t *testing.T) {
 // tested against httptest servers.
 func permissiveFetcher(t *testing.T, maxBytes int64) *fetcher {
 	t.Helper()
-	f := newFetcher(maxBytes)
+	f := newFetcher(maxBytes, nil)
 	f.allowIP = func(net.IP) bool { return true }
 	return f
 }
@@ -147,7 +229,7 @@ func TestFetcherRevalidatesEveryHop(t *testing.T) {
 	}))
 	defer redirector.Close()
 
-	f := newFetcher(maxHTMLBytes)
+	f := newFetcher(maxHTMLBytes, nil)
 	var dials int
 	f.allowIP = func(net.IP) bool {
 		dials++

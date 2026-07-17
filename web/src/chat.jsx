@@ -54,7 +54,7 @@ function CollapsedRow({ ev, onToggle }) {
 	);
 }
 
-function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onToggle, timeFmt, nickSep }) {
+function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onToggle, timeFmt, nickSep, previews }) {
 	if (ev.whois) return <WhoisCard whois={ev.whois} focused={focused} />;
 	if (ev.collapse) return <CollapsedRow ev={ev} onToggle={onToggle} />;
 	const r = renderable(ev);
@@ -100,8 +100,9 @@ function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onTo
 				<button class="msg-redact" title="Delete message" onClick={() => onRedact(ev.msgid)}>⌫</button>
 			)}
 			{/* Previews wrap to their own full-width line, left-aligned under
-			    the timestamp rather than indented into the body column. */}
-			{link && <div class="msg-media"><LinkPreview url={link} /></div>}
+			    the timestamp rather than indented into the body column.
+			    `previews` is the server switch — off means no fetch at all. */}
+			{link && previews !== false && <div class="msg-media"><LinkPreview url={link} /></div>}
 		</div>
 	);
 }
@@ -115,7 +116,7 @@ function estimate(ev) {
 // Chat renders the active buffer: virtualized scrollback plus composer.
 // completionNicks feeds tab-completion (channel roster, or the query
 // counterpart).
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, timeFmt, nickSep, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, timeFmt, nickSep, previews, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
 	const [draft, setDraft] = useState("");
 	// Per-buffer drafts: keep half-typed text with its own buffer so a
 	// switch swaps the composer contents instead of carrying text into —
@@ -265,7 +266,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 					else markRead();
 				}}
 				renderItem={(ev, i) => (
-					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} timeFmt={timeFmt} nickSep={nickSep} />
+					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} timeFmt={timeFmt} nickSep={nickSep} previews={previews} />
 				)}
 			/>
 			<div class="composer">

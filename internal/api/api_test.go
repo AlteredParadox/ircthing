@@ -94,6 +94,84 @@ func sessionCookieOf(t *testing.T, resp *http.Response) *http.Cookie {
 	return nil
 }
 
+func TestClientConfigPreviewsEnabled(t *testing.T) {
+	ts, _ := newTestServer(t)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	var cfg struct{ Previews bool }
+	req, _ := http.NewRequest("GET", ts.URL+"/api/config", nil)
+	req.AddCookie(cookie)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodeJSON(t, resp, &cfg)
+	resp.Body.Close()
+	if !cfg.Previews {
+		t.Fatal("config.previews = false, want true by default")
+	}
+
+	// The endpoint requires auth.
+	resp, err = http.Get(ts.URL + "/api/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauth /api/config = %d, want 401", resp.StatusCode)
+	}
+}
+
+// With previews disabled the media endpoints are not served (zero outbound
+// fetch) and /api/config advertises it so the UI stops requesting them.
+func TestPreviewsDisabledGate(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"), store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	hash, err := bcrypt.GenerateFromPassword([]byte("hunter2"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{Username: "AlteredParadox", PasswordHash: string(hash), PreviewsDisabled: true}, hub.New(st), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	do := func(path string) *http.Response {
+		req, _ := http.NewRequest("GET", ts.URL+path, nil)
+		req.AddCookie(cookie)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	var cfg struct{ Previews bool }
+	resp := do("/api/config")
+	decodeJSON(t, resp, &cfg)
+	resp.Body.Close()
+	if cfg.Previews {
+		t.Fatal("config.previews = true, want false when disabled")
+	}
+
+	resp = do("/api/preview?url=http://example.com")
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("preview endpoint served while disabled: %d", resp.StatusCode)
+	}
+	resp = do("/api/thumb?url=http://example.com/x.png")
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatalf("thumb endpoint served while disabled: %d", resp.StatusCode)
+	}
+}
+
 func TestLogin(t *testing.T) {
 	ts, srv := newTestServerWithRef(t)
 	cases := []struct {

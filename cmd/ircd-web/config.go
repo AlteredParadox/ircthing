@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"time"
 
 	"ircthing/internal/netconf"
+	"ircthing/internal/proxydial"
 )
 
 // Config file: JSON (stdlib, no dependency), parsed strictly — unknown
@@ -37,6 +39,16 @@ type config struct {
 	// only). Turn this on when a TLS-terminating reverse proxy fronts
 	// the binary — i.e. any deployment beyond plain-HTTP loopback.
 	SecureCookies bool `json:"secure_cookies"`
+	// MediaProxy routes the server-side media proxy (link previews, image
+	// thumbnails) through a proxy, so those fetches don't leak the server's
+	// real IP when the IRC connections use one. Same URL form as a network
+	// proxy: socks5://[user:pass@]host:port (SOCKS5 with RFC 1929 auth),
+	// socks5h://…, or http://[user:pass@]host:port. Empty = direct.
+	MediaProxy string `json:"media_proxy"`
+	// DisablePreviews turns the media proxy off entirely: /api/preview and
+	// /api/thumb are disabled and the UI stops requesting them, so the
+	// server makes zero outbound fetches for links/images.
+	DisablePreviews bool `json:"disable_previews"`
 }
 
 type userConfig struct {
@@ -91,6 +103,11 @@ func (c *config) validate() error {
 		}
 		seen[name] = true
 	}
+	if c.MediaProxy != "" {
+		if _, err := proxydial.Parse(c.MediaProxy); err != nil {
+			return fmt.Errorf("media_proxy: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -99,4 +116,13 @@ func (c *config) sessionTTL() time.Duration {
 		return 0 // api applies its default
 	}
 	return time.Duration(c.SessionTTLDays) * 24 * time.Hour
+}
+
+// mediaProxyURL parses the media-proxy setting (nil when unset). validate()
+// has already checked it parses, so this is expected to succeed.
+func (c *config) mediaProxyURL() (*url.URL, error) {
+	if c.MediaProxy == "" {
+		return nil, nil
+	}
+	return proxydial.Parse(c.MediaProxy)
 }

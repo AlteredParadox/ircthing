@@ -36,5 +36,7 @@
       "channels": ["#home"]
     }
   ],
-  "session_ttl_days": 30
+  "session_ttl_days": 30,
+  "media_proxy": "socks5://user:pass@127.0.0.1:9050",
+  "disable_previews": false
 }
