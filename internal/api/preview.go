@@ -52,13 +52,20 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, pv)
 		return
 	}
+	// Fail closed: if we can't confirm the link's network is direct or has a
+	// valid proxy, refuse rather than risk a direct fetch that leaks the IP.
+	proxy, ok := s.proxyForNetwork(r.Context(), net)
+	if !ok {
+		http.Error(w, "preview unavailable", http.StatusBadGateway)
+		return
+	}
 
 	if !s.acquireMedia(r.Context()) {
 		http.Error(w, "busy, retry later", http.StatusServiceUnavailable)
 		return
 	}
 	defer s.releaseMedia()
-	ct, body, err := s.htmlFetcherFor(s.proxyForNetwork(r.Context(), net)).get(r.Context(), target)
+	ct, body, err := s.htmlFetcherFor(proxy).get(r.Context(), target)
 	if err != nil {
 		http.Error(w, "preview unavailable", http.StatusBadGateway)
 		return

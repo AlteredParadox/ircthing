@@ -66,26 +66,40 @@ func proxyString(u *url.URL) string {
 	return u.String()
 }
 
-// proxyForNetwork returns the proxy configured for network name, or nil for
-// a direct fetch (no network, unknown network, or no proxy). The stored
-// config was validated when saved, so the proxy is extracted directly.
-func (s *Server) proxyForNetwork(ctx context.Context, name string) *url.URL {
+// proxyForNetwork resolves the proxy a media fetch for network name must
+// use. It returns (proxy, ok):
+//
+//   - (nil, true)   the network is known and configured for DIRECT access
+//   - (u,   true)   the network is known with a valid proxy
+//   - (nil, false)  cannot determine — no network, unknown/deleted/renamed
+//                   network, store error, malformed stored config, or a
+//                   stored proxy that no longer parses
+//
+// The caller must FAIL CLOSED on ok==false: falling back to a direct fetch
+// there would leak the server's egress IP for a link that belongs to a
+// proxied network (e.g. a UI request racing a network delete/rename, or a
+// transient store error). Only a network known to be direct permits a
+// direct fetch.
+func (s *Server) proxyForNetwork(ctx context.Context, name string) (*url.URL, bool) {
 	if name == "" {
-		return nil
+		return nil, false
 	}
-	nc, ok, err := s.hub.Store().NetworkConfig(ctx, name)
-	if err != nil || !ok {
-		return nil
+	nc, found, err := s.hub.Store().NetworkConfig(ctx, name)
+	if err != nil || !found {
+		return nil, false
 	}
 	var cfg struct {
 		Proxy string `json:"proxy"`
 	}
-	if json.Unmarshal([]byte(nc.Config), &cfg) != nil || cfg.Proxy == "" {
-		return nil
+	if json.Unmarshal([]byte(nc.Config), &cfg) != nil {
+		return nil, false
+	}
+	if cfg.Proxy == "" {
+		return nil, true // known, direct
 	}
 	u, err := proxydial.Parse(cfg.Proxy)
 	if err != nil {
-		return nil
+		return nil, false // configured a proxy, but it no longer parses
 	}
-	return u
+	return u, true
 }

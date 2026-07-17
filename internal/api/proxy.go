@@ -17,10 +17,20 @@ import (
 
 // Server-side fetcher for the media proxy (link previews, image
 // thumbnails). Browsers never fetch remote content directly — this is the
-// single choke point, and it is hardened against SSRF: the dialer
-// re-validates the *resolved* IP of every connection (and every redirect
-// hop) against a public-address policy, which defeats DNS rebinding
-// because the check happens at connect time, not on the hostname.
+// single choke point. SSRF hardening differs by path:
+//
+//   - Direct fetches are fully hardened: the dialer re-validates the
+//     *resolved* IP of every connection (and every redirect hop) against a
+//     public-address policy at connect time, which defeats DNS rebinding
+//     because the check is on the IP, not the hostname.
+//   - Proxied fetches (through a network's proxy) can only refuse literal
+//     non-public IP targets (hostAllowed). The proxy owns DNS, so a hostname
+//     that resolves proxy-side to an internal/loopback/metadata address is
+//     NOT caught here — such a request can reach whatever the proxy can
+//     reach. This is inherent to preserving proxy-side DNS; the mitigation
+//     is the proxy's own egress policy (Tor exits publicly and cannot reach
+//     your LAN; a plain LAN SOCKS proxy can), or disabling previews for a
+//     network whose proxy you don't trust to restrict destinations.
 
 const proxyUserAgent = "ircthing-media-proxy/1.0 (+https://github.com/ircthing)"
 

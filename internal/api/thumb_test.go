@@ -152,7 +152,7 @@ func TestMediaBudgetSaturated(t *testing.T) {
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
 	rctx, rcancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer rcancel()
-	req, _ := http.NewRequestWithContext(rctx, "GET", ts.URL+"/api/thumb?url=http://example.com/x.png", nil)
+	req, _ := http.NewRequestWithContext(rctx, "GET", ts.URL+"/api/thumb?url=http://example.com/x.png&net="+testNet, nil)
 	req.AddCookie(cookie)
 	resp, err := ts.Client().Do(req)
 	if err != nil {

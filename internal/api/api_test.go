@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -60,10 +61,19 @@ func newTestServerWithRef(t *testing.T) (*httptest.Server, *Server) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A known, direct network so media endpoint tests can pass net=testnet
+	// and clear the fail-closed proxy resolution (unresolvable networks are
+	// refused, not fetched directly).
+	if err := st.PutNetworkConfig(context.Background(), testNet,
+		`{"name":"testnet","addr":"x:6667","allow_plaintext":true,"nick":"a"}`); err != nil {
+		t.Fatal(err)
+	}
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 	return ts, srv
 }
+
+const testNet = "testnet"
 
 func decodeJSON(t *testing.T, resp *http.Response, v any) {
 	t.Helper()
@@ -239,23 +249,78 @@ func TestProxyForNetwork(t *testing.T) {
 		`{"name":"direct","addr":"y:6667","allow_plaintext":true,"nick":"a"}`); err != nil {
 		t.Fatal(err)
 	}
-	if p := srv.proxyForNetwork(ctx, "tornet"); p == nil || p.Host != "127.0.0.1:9050" {
-		t.Fatalf("tornet proxy = %v, want 127.0.0.1:9050", p)
+	if err := st.PutNetworkConfig(ctx, "malformed", `{not valid json`); err != nil {
+		t.Fatal(err)
 	}
-	for _, name := range []string{"direct", "nonexistent", ""} {
-		if p := srv.proxyForNetwork(ctx, name); p != nil {
-			t.Fatalf("proxyForNetwork(%q) = %v, want nil", name, p)
+	if err := st.PutNetworkConfig(ctx, "badproxy",
+		`{"name":"badproxy","addr":"z:6667","allow_plaintext":true,"nick":"a","proxy":"ftp://x:1"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	if p, ok := srv.proxyForNetwork(ctx, "tornet"); !ok || p == nil || p.Host != "127.0.0.1:9050" {
+		t.Fatalf("tornet = %v,%v; want (127.0.0.1:9050, true)", p, ok)
+	}
+	// Known direct network: (nil, true) — a direct fetch is intended.
+	if p, ok := srv.proxyForNetwork(ctx, "direct"); !ok || p != nil {
+		t.Fatalf("direct = %v,%v; want (nil, true)", p, ok)
+	}
+	// Everything unresolvable must FAIL CLOSED: (nil, false).
+	for _, name := range []string{"nonexistent", "", "malformed", "badproxy"} {
+		if p, ok := srv.proxyForNetwork(ctx, name); ok || p != nil {
+			t.Fatalf("proxyForNetwork(%q) = %v,%v; want (nil, false)", name, p, ok)
 		}
 	}
-	f1 := srv.htmlFetcherFor(srv.proxyForNetwork(ctx, "tornet"))
+	p, _ := srv.proxyForNetwork(ctx, "tornet")
+	f1 := srv.htmlFetcherFor(p)
 	if !f1.proxied {
 		t.Fatal("tornet fetcher not proxied")
 	}
-	if f2 := srv.htmlFetcherFor(srv.proxyForNetwork(ctx, "tornet")); f2 != f1 {
+	if f2 := srv.htmlFetcherFor(p); f2 != f1 {
 		t.Fatal("per-proxy fetcher not cached/reused")
 	}
 	if fd := srv.htmlFetcherFor(nil); fd.proxied {
 		t.Fatal("direct fetcher must not be proxied")
+	}
+}
+
+// The per-proxy fetcher pool stays bounded across many distinct proxies
+// (proxy rotations over a long-lived process), rather than retaining every
+// obsolete credential-bearing fetcher forever.
+func TestFetcherPoolBounded(t *testing.T) {
+	_, srv := newTestServerWithRef(t)
+	for i := 0; i < maxProxyFetchers+10; i++ {
+		srv.htmlFetcherFor(&url.URL{Scheme: "socks5", Host: "127.0.0.1:" + strconv.Itoa(1000+i)})
+	}
+	srv.mediaMu.RLock()
+	n := len(srv.htmlByProxy)
+	srv.mediaMu.RUnlock()
+	if n > maxProxyFetchers {
+		t.Fatalf("htmlByProxy = %d, want <= %d", n, maxProxyFetchers)
+	}
+}
+
+// A preview/thumb request tagged with a network that can't be resolved to a
+// direct-or-proxied decision is refused, not fetched directly (which would
+// leak the egress IP for a link that belongs to a proxied network).
+func TestMediaFailsClosedOnUnknownNetwork(t *testing.T) {
+	ts, srvObj := newTestServerWithRef(t)
+	permit(srvObj)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	for _, path := range []string{
+		"/api/preview?url=http://example.com&net=ghostnet",
+		"/api/preview?url=http://example.com", // no net at all
+		"/api/thumb?url=http://example.com/x.png&net=ghostnet",
+	} {
+		req, _ := http.NewRequest("GET", ts.URL+path, nil)
+		req.AddCookie(cookie)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("%s = %d, want 502 (fail closed)", path, resp.StatusCode)
+		}
 	}
 }
 

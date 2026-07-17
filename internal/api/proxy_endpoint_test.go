@@ -2,6 +2,8 @@ package api
 
 import (
 	"bytes"
+	"encoding/binary"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/png"
@@ -44,7 +46,7 @@ func TestPreviewEndpoint(t *testing.T) {
 		t.Fatalf("no-auth status = %d", resp.StatusCode)
 	}
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/preview?url="+url.QueryEscape(origin.URL), nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/preview?url="+url.QueryEscape(origin.URL)+"&net="+testNet, nil)
 	req.AddCookie(cookie)
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
@@ -81,7 +83,7 @@ func TestThumbEndpoint(t *testing.T) {
 	permit(srvObj)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/thumb?url="+url.QueryEscape(origin.URL), nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/thumb?url="+url.QueryEscape(origin.URL)+"&net="+testNet, nil)
 	req.AddCookie(cookie)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -114,7 +116,7 @@ func TestThumbRejectsNonImage(t *testing.T) {
 	permit(srvObj)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/thumb?url="+url.QueryEscape(origin.URL), nil)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/thumb?url="+url.QueryEscape(origin.URL)+"&net="+testNet, nil)
 	req.AddCookie(cookie)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -123,6 +125,44 @@ func TestThumbRejectsNonImage(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnsupportedMediaType {
 		t.Fatalf("status = %d, want 415", resp.StatusCode)
+	}
+}
+
+// A PNG declaring huge dimensions is rejected at the header check, not
+// decoded. 100000^2 is accepted by Go's DecodeConfig (its own overflow
+// guard only trips much higher) but far exceeds the decode budget; the
+// dimension cap rejects it before the area math.
+func TestThumbRejectsHugeDimensions(t *testing.T) {
+	// A valid 1x1 RGBA PNG, then patch its IHDR to claim 100000 x 100000 and
+	// fix the IHDR CRC.
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	b := buf.Bytes()
+	binary.BigEndian.PutUint32(b[16:], 100000) // IHDR width
+	binary.BigEndian.PutUint32(b[20:], 100000) // IHDR height
+	binary.BigEndian.PutUint32(b[29:], crc32.ChecksumIEEE(b[12:29]))
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(b)
+	}))
+	defer origin.Close()
+
+	ts, srvObj := newTestServerWithRef(t)
+	permit(srvObj)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	req, _ := http.NewRequest("GET", ts.URL+"/api/thumb?url="+url.QueryEscape(origin.URL)+"&net="+testNet, nil)
+	req.AddCookie(cookie)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d, want 415 (rejected before decode)", resp.StatusCode)
 	}
 }
 

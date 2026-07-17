@@ -27,6 +27,14 @@ const (
 	// mediaSlots request-wide slots the media path's worst case stays
 	// bounded transiently and the steady-state RSS target is unaffected.
 	maxDecodeBytes = 36 * 1024 * 1024
+	// maxImageDim caps each declared dimension. Defense in depth: it keeps
+	// the decoded-size multiplication below (per-dimension <= 65535, x8 bpp
+	// = well under int64) from ever overflowing and wrapping past
+	// maxDecodeBytes. Go's own DecodeConfig already rejects dimensions whose
+	// byte product overflows ("dimension overflow"), so this is belt-and-
+	// suspenders and rejects absurd (but Go-accepted, e.g. 100000^2) dims
+	// before the area math. 65535 admits every realistic image.
+	maxImageDim     = 65535
 	maxThumbCache   = 128
 	// maxThumbCacheEntry bounds a single cached thumbnail. 128 entries x
 	// 48 KiB ~ 6 MiB worst-case resident cache — a small fraction of the
@@ -68,6 +76,12 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		writeThumb(w, t)
 		return
 	}
+	// Fail closed on an unresolvable network (see proxyForNetwork).
+	proxy, ok := s.proxyForNetwork(r.Context(), net)
+	if !ok {
+		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
+		return
+	}
 
 	// One request-wide slot covers the whole memory-heavy span — the
 	// 10 MiB body fetch, the decode, and the re-encode — so in-flight
@@ -78,7 +92,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.releaseMedia()
 
-	ct, body, err := s.imageFetcherFor(s.proxyForNetwork(r.Context(), net)).get(r.Context(), target)
+	ct, body, err := s.imageFetcherFor(proxy).get(r.Context(), target)
 	if err != nil {
 		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
 		return
@@ -94,7 +108,10 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// Gray16), double the assumed 4, so a pixel-only cap would let it
 	// use twice the intended memory.
 	cfg, format, err := image.DecodeConfig(bytes.NewReader(body))
+	// The dimension caps are checked FIRST (short-circuit) so the byte
+	// product below can never overflow int64.
 	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 ||
+		cfg.Width > maxImageDim || cfg.Height > maxImageDim ||
 		int64(cfg.Width)*int64(cfg.Height)*bytesPerPixel(cfg.ColorModel) > maxDecodeBytes {
 		http.Error(w, "unsupported image", http.StatusUnsupportedMediaType)
 		return

@@ -141,6 +141,15 @@ func (s *Server) imageFetcherFor(proxy *url.URL) *fetcher {
 	return s.cachedFetcher(s.imageByProxy, maxImageBytes, proxy)
 }
 
+// maxProxyFetchers bounds a fetcher pool. Real deployments use a handful of
+// distinct proxies (one per network, plus direct); this only bites after
+// many proxy rotations over a long-lived process, at which point the pool
+// is purged so obsolete fetchers — and the credential-bearing URLs keying
+// them — don't accumulate. Fetchers are stateless http.Clients, so a purge
+// costs only a rebuild-on-demand (in-flight requests hold their own
+// fetcher pointer and are unaffected).
+const maxProxyFetchers = 32
+
 func (s *Server) cachedFetcher(pool map[string]*fetcher, maxBytes int64, proxy *url.URL) *fetcher {
 	key := proxyString(proxy)
 	s.mediaMu.RLock()
@@ -152,6 +161,9 @@ func (s *Server) cachedFetcher(pool map[string]*fetcher, maxBytes int64, proxy *
 	s.mediaMu.Lock()
 	defer s.mediaMu.Unlock()
 	if f = pool[key]; f == nil {
+		if len(pool) >= maxProxyFetchers {
+			clear(pool)
+		}
 		f = newFetcher(maxBytes, proxy)
 		pool[key] = f
 	}
