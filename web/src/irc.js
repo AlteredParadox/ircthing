@@ -596,6 +596,35 @@ export function mergeById(existing, incoming) {
 	return [...byId.values()].sort(byTimeId);
 }
 
+// rememberRedaction records a redaction tombstone in the persistent per-buffer
+// set so a later history/search response that re-delivers the pre-scrub row
+// cannot restore its content (see applyTombstones). store is a
+// Map<bufKey, Map<msgid, reason>>.
+export function rememberRedaction(store, key, msgid, reason) {
+	if (!msgid) return;
+	let byId = store.get(key);
+	if (!byId) {
+		byId = new Map();
+		store.set(key, byId);
+	}
+	byId.set(msgid, reason || "");
+}
+
+// applyTombstones re-marks any incoming row whose msgid was redacted while the
+// buffer was unloaded. A history/search page can snapshot a row on the server
+// BEFORE its destructive redaction scrub commits and then arrive AFTER the
+// redact push — and mergeById lets incoming rows win — so without this the
+// deleted content would be restored on screen. tombstones is a
+// Map<msgid, reason> (may be undefined/empty).
+export function applyTombstones(list, tombstones) {
+	if (!tombstones || tombstones.size === 0) return list;
+	return list.map((ev) =>
+		ev.msgid && !ev.redacted && tombstones.has(ev.msgid)
+			? { ...ev, redacted: true, redact_reason: tombstones.get(ev.msgid), raw: "" }
+			: ev,
+	);
+}
+
 // uuid returns a random id. crypto.randomUUID is secure-context-only
 // (HTTPS/localhost) — unavailable over plain HTTP at a LAN address, the
 // "open from my phone" case — so fall back to getRandomValues, which is

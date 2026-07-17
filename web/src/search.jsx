@@ -21,6 +21,28 @@ export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep }) {
 		return () => globalThis.removeEventListener("keydown", onKey);
 	}, []);
 
+	// A redaction arriving while the panel is open must tombstone a matching
+	// result too: an open result set is independent state that a new query
+	// (server-side redacted=0 filter) would exclude, but the already-shown
+	// snippet would otherwise keep displaying deleted content.
+	useEffect(() => {
+		const s = sock.current;
+		if (!s) return undefined;
+		const onRedact = (d) => {
+			setResults((rs) => {
+				let hit = false;
+				const next = rs.map((ev) => {
+					if (ev.msgid !== d.msgid || ev.redacted) return ev;
+					hit = true;
+					return { ...ev, redacted: true, redact_reason: d.reason, raw: "" };
+				});
+				return hit ? next : rs;
+			});
+		};
+		s.on("redact", onRedact);
+		return () => s.off("redact", onRedact);
+	}, []);
+
 	useEffect(() => {
 		const q = query.trim();
 		if (!q) {

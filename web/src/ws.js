@@ -20,6 +20,12 @@ export class Socket {
 		this.handlers.get(type).push(fn);
 	}
 
+	off(type, fn) {
+		const arr = this.handlers.get(type);
+		const i = arr ? arr.indexOf(fn) : -1;
+		if (i !== -1) arr.splice(i, 1);
+	}
+
 	emit(type, data) {
 		for (const fn of this.handlers.get(type) || []) fn(data);
 	}

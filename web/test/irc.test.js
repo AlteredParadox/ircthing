@@ -3,7 +3,35 @@ import { test } from "node:test";
 import {
 	bufKey, firstURL, fmtTime, hostOf, linkify, looksLikeImageURL,
 	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash, applyStatusMode, mergeById, mergeServerBuffers,
+	applyTombstones, rememberRedaction,
 } from "../src/irc.js";
+
+test("rememberRedaction + applyTombstones re-tombstones a re-delivered row", () => {
+	const store = new Map();
+	rememberRedaction(store, "libera\x00#go", "m1", "spam");
+	rememberRedaction(store, "libera\x00#go", "", "ignored"); // empty msgid is a no-op
+
+	const tomb = store.get("libera\x00#go");
+	is(tomb.size, 1);
+
+	// A stale history page re-delivers m1 with full content and redacted=false.
+	const page = [
+		{ id: 1, msgid: "m1", redacted: false, raw: ":bob PRIVMSG #go :deleted text", text: "deleted text" },
+		{ id: 2, msgid: "m2", redacted: false, raw: ":bob PRIVMSG #go :kept", text: "kept" },
+	];
+	const out = applyTombstones(page, tomb);
+	is(out[0].redacted, true);
+	is(out[0].raw, ""); // content scrubbed
+	is(out[0].redact_reason, "spam");
+	is(out[1].redacted, false); // unrelated row untouched
+	is(out[1].raw, ":bob PRIVMSG #go :kept");
+});
+
+test("applyTombstones is a no-op without tombstones", () => {
+	const list = [{ id: 1, msgid: "m1", redacted: false, raw: "x" }];
+	is(applyTombstones(list, undefined), list);
+	is(applyTombstones(list, new Map()), list);
+});
 
 test("mergeServerBuffers", () => {
 	const nets = { libera: {}, oftc: {} };

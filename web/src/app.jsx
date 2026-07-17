@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
-import { bufferOrder, bufKey, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, renderable, SERVER_BUFFER, toHash, typingExpired } from "./irc.js";
+import { applyTombstones, bufferOrder, bufKey, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, rememberRedaction, renderable, SERVER_BUFFER, toHash, typingExpired } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
 import { Login } from "./login.jsx";
 import { applyPrefs, loadPrefs, normalizePrefs, resolveTheme, savePrefs } from "./prefs.js";
@@ -208,7 +208,7 @@ function applyRedaction(m, key, d) {
 // mergeHistoryPage installs a fetched page, keeping events that streamed
 // in while the fetch was in flight (the page is authoritative for what
 // it covers).
-function mergeHistoryPage(m, key, page) {
+function mergeHistoryPage(m, key, page, tombstones) {
 	const cur = m[key];
 	// An installed jump/search window is a non-tail slice (atTail === false).
 	// An initial tail load must not merge into it: that would splice the
@@ -221,7 +221,7 @@ function mergeHistoryPage(m, key, page) {
 	return {
 		...m,
 		[key]: {
-			list: mergeById(cur?.list || [], pageMsgs),
+			list: applyTombstones(mergeById(cur?.list || [], pageMsgs), tombstones),
 			loaded: true,
 			reachedTop: pageMsgs.length < PAGE,
 			atTail: true,
@@ -278,6 +278,11 @@ export function App() {
 	const [menu, setMenu] = useState(null);
 	// Imperative composer handle (prefill for "edit topic").
 	const composerApi = useRef(null);
+	// Persistent redaction tombstones: Map<bufKey, Map<msgid, reason>>. Kept in
+	// a ref (not state) so socket handlers read the live set without a stale
+	// closure; survives buffer eviction so a late history/search page for a
+	// closed-then-reopened buffer still can't restore redacted content.
+	const redactedIds = useRef(new Map());
 	const notifier = useRef();
 	if (!notifier.current) notifier.current = new Notifier();
 	// typers: bufKey -> { nick: { state, at } }; ephemeral, never stored.
@@ -649,7 +654,11 @@ export function App() {
 
 		s.on("presence", (d) => setMonitors((all) => applyPresenceUpdate(all, d)));
 
-		s.on("redact", (d) => setMsgs((m) => applyRedaction(m, bufKey(d.network, d.buffer), d)));
+		s.on("redact", (d) => {
+			const key = bufKey(d.network, d.buffer);
+			rememberRedaction(redactedIds.current, key, d.msgid, d.reason);
+			setMsgs((m) => applyRedaction(m, key, d));
+		});
 
 		s.on("typing", (d) => setTypers((t) => setTypingState(t, bufKey(d.network, d.buffer), d)));
 
@@ -775,7 +784,7 @@ export function App() {
 				// the effect refetches once loadingHistory clears.
 				if ((historyGen.current[key] || 0) !== gen) return;
 				failedHistory.current.delete(key);
-				setMsgs((m) => mergeHistoryPage(m, key, page));
+				setMsgs((m) => mergeHistoryPage(m, key, page, redactedIds.current.get(key)));
 			})
 			.catch(() => {
 				// Record the failure so the effect doesn't immediately refire;
@@ -1090,7 +1099,10 @@ export function App() {
 				setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(ev.network, ev.buffer) }));
 				setMsgs((m) => ({
 					...m,
-					[key]: { list: page.messages || [], loaded: true, reachedTop: false, atTail: false },
+					[key]: {
+						list: applyTombstones(page.messages || [], redactedIds.current.get(key)),
+						loaded: true, reachedTop: false, atTail: false,
+					},
 				}));
 				location.hash = toHash(ev.network, ev.buffer);
 				setActiveKey(key);
@@ -1121,7 +1133,7 @@ export function App() {
 					if ((historyGen.current[key] || 0) !== gen) return m;
 					const prev = m[key];
 					if (!prev) return m;
-					let list = mergeById(prev.list, older);
+					let list = applyTombstones(mergeById(prev.list, older), redactedIds.current.get(key));
 					// Bound memory on the paging-back path too: keep the
 					// oldest TRIM_TO (we are scrolled up), dropping the
 					// newest tail — it reloads on scroll-down / new events.
