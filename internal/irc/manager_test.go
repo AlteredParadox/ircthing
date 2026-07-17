@@ -1387,6 +1387,42 @@ func TestPongSurvivesUTF8ScrubInflation(t *testing.T) {
 	}
 }
 
+// A hostile 366 (end-of-NAMES) with an over-length channel name would build
+// an over-length auto-WHOX that the writer rejects fatally, looping the
+// connection. maybeWHOX drops the doomed WHO instead; the connection lives.
+func TestOversizedWhoxChannelDoesNotTearDown(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	// Advertise WHOX so the auto-WHOX path is active; wait until applied.
+	s.send(":irc.test 005 AlteredParadox WHOX :are supported by this server")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := m.isup.Raw("WHOX"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("WHOX never applied")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// End-of-NAMES for an over-length channel name: the WHO must be dropped.
+	s.send(":irc.test 366 AlteredParadox #" + strings.Repeat("A", 600) + " :End of NAMES")
+	s.send("PING :ok")
+	if p := s.readCmd("PONG"); p.Param(0) != "ok" {
+		t.Fatalf("PONG = %q, want ok (oversized WHOX must not tear the connection down)", p.Param(0))
+	}
+}
+
 // A server spoofing an unbounded stream of self-JOINs is torn down
 // rather than growing the never-reset rejoin set without bound.
 func TestManagerBoundsJoinedSet(t *testing.T) {

@@ -1192,7 +1192,18 @@ func (m *Manager) maybeWHOX(channel string) *ircv4.Message {
 		return nil
 	}
 	m.whoxDone[key] = true
-	return newMsg("WHO", channel, "%tnfa,"+whoxToken)
+	// The channel name is server-supplied and the WHO goes out the internal
+	// priority path, where the writer FATALLY tears the connection down on
+	// an over-length or malframed line (the same trap rejoinable guards the
+	// JOIN against, and boundedPong the PONG). Validate the exact bytes the
+	// writer will emit — framing on the message, length on the UTF8ONLY-
+	// scrubbed form — and drop the WHO rather than let a hostile 366 loop
+	// the connection. whoxDone is already set, so a bad channel won't retry.
+	msg := newMsg("WHO", channel, "%tnfa,"+whoxToken)
+	if checkFraming(msg) != nil || checkLineLen(m.scrubUTF8(msg), m.lineLen()) != nil {
+		return nil
+	}
+	return msg
 }
 
 // rejoinable reports whether a JOIN for ch could be sent at rejoin time
