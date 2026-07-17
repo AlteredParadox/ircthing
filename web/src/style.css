@@ -612,6 +612,13 @@ input::placeholder {
 	font-size: 0.8929rem;
 }
 
+/* The collapsed rollup has no timestamp; indent it past the time gutter so
+   it lines up with the message/mark column instead of jutting to the far
+   left of every timestamp. */
+.collapse-row {
+	padding-left: calc(4px + 3rem + 8px);
+}
+
 .sys-toggle {
 	border: none;
 	background: none;
