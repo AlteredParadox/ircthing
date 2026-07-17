@@ -95,11 +95,13 @@ function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onTo
 				)}
 				{r.bot && <span class="bot-chip" title="flagged as a bot">bot</span>}
 				<Body text={r.text} />
-				{link && <LinkPreview url={link} />}
 			</div>
 			{canRedact && (
 				<button class="msg-redact" title="Delete message" onClick={() => onRedact(ev.msgid)}>⌫</button>
 			)}
+			{/* Previews wrap to their own full-width line, left-aligned under
+			    the timestamp rather than indented into the body column. */}
+			{link && <div class="msg-media"><LinkPreview url={link} /></div>}
 		</div>
 	);
 }

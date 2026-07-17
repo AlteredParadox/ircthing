@@ -603,9 +603,11 @@ input::placeholder {
 
 .sys-row {
 	display: flex;
-	align-items: center;
-	gap: 9px;
-	padding: var(--pad-msg) 16px;
+	align-items: baseline;
+	/* Same gutter as .msg-row so a join/part/nick line's timestamp lines up
+	   with the message timestamps instead of sitting indented. */
+	gap: 8px;
+	padding: var(--pad-msg) 12px var(--pad-msg) 4px;
 	color: var(--text-faint);
 	font-size: 0.8929rem;
 }
@@ -646,9 +648,23 @@ input::placeholder {
 
 .msg-row {
 	display: flex;
+	flex-wrap: wrap;
+	/* Align the time, nick, and body on their text baselines so they sit on
+	   the same line regardless of font size — robust across sans/mono
+	   instead of the per-font padding-top nudging it replaced (which drifted
+	   in mono, where the body and nick sizes match). */
+	align-items: baseline;
 	gap: 8px;
 	padding: var(--pad-msg) 12px var(--pad-msg) 4px;
 	position: relative;
+}
+
+/* Previews/link cards wrap onto their own full-width line (flex-basis
+   100%), so they sit flush-left under the timestamp instead of indented
+   into the body column. */
+.msg-media {
+	flex: 0 0 100%;
+	min-width: 0;
 }
 
 .msg-row.mention {
@@ -666,7 +682,6 @@ input::placeholder {
 	min-width: 3rem;
 	flex: 0 0 auto;
 	text-align: right;
-	padding-top: 2px;
 	white-space: nowrap;
 }
 
@@ -679,7 +694,6 @@ input::placeholder {
 	white-space: nowrap;
 	overflow: hidden;
 	text-overflow: ellipsis;
-	padding-top: 1px;
 }
 
 .msg-body {
@@ -734,8 +748,6 @@ input::placeholder {
 
 .preview-card {
 	display: flex;
-	clear: both;
-	margin-top: 4px;
 	max-width: min(460px, 100%);
 	border: 1px solid var(--border);
 	border-radius: var(--radius);
@@ -797,10 +809,8 @@ input::placeholder {
    the inline text flow so it never tucks up beside the message. */
 .preview-thumb {
 	display: block;
-	clear: both;
 	width: fit-content;
 	max-width: 100%;
-	margin-top: 4px;
 }
 
 .preview-thumb img {
