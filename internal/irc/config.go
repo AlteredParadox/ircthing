@@ -127,6 +127,14 @@ func (c *Config) validateSASL() error {
 		return nil
 	}
 	mech := strings.ToUpper(c.SASL.Mechanism)
+	// Resolve the mechanism newMech will actually pick: an empty mechanism
+	// with no password auto-selects EXTERNAL (cert-based). Validate against
+	// that effective mechanism, or an auto-EXTERNAL config escapes the TLS
+	// requirement below and silently reconnect-loops (the server rejects
+	// AUTHENTICATE EXTERNAL over plaintext with 904/906, forever).
+	if mech == "" && c.SASL.Password == "" {
+		mech = "EXTERNAL"
+	}
 	if mech != "EXTERNAL" && c.SASL.Login == "" {
 		return errors.New("irc: config: SASL requires a login (except EXTERNAL)")
 	}

@@ -881,6 +881,11 @@ func TestNewManagerRejectsBadConfig(t *testing.T) {
 		{"missing nick", Config{Addr: "x:1", AllowPlaintext: true}, "Nick"},
 		{"plaintext without opt-in", Config{Addr: "x:1", Nick: "n"}, "AllowPlaintext"},
 		{"sasl without login", Config{Addr: "x:1", Nick: "n", TLS: true, SASL: &SASLConfig{Password: "p"}}, "login"},
+		{"explicit EXTERNAL without TLS", Config{Addr: "x:1", Nick: "n", AllowPlaintext: true, SASL: &SASLConfig{Mechanism: "EXTERNAL"}}, "EXTERNAL requires"},
+		// Auto-select: empty mechanism + empty password resolves to EXTERNAL,
+		// which must still be caught by the TLS requirement (would otherwise
+		// reconnect-loop against a server rejecting AUTHENTICATE EXTERNAL).
+		{"auto EXTERNAL without TLS", Config{Addr: "x:1", Nick: "n", AllowPlaintext: true, SASL: &SASLConfig{Login: "acct"}}, "EXTERNAL requires"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -889,6 +894,16 @@ func TestNewManagerRejectsBadConfig(t *testing.T) {
 				t.Fatalf("err = %v, want containing %q", err, tc.errSub)
 			}
 		})
+	}
+}
+
+// A SASL config that auto-selects EXTERNAL (empty mechanism + empty
+// password) over TLS is valid.
+func TestAutoExternalOverTLSAccepted(t *testing.T) {
+	if _, err := NewManager(Config{
+		Addr: "x:1", Nick: "n", TLS: true, SASL: &SASLConfig{Login: "acct"},
+	}); err != nil {
+		t.Fatalf("auto-EXTERNAL over TLS rejected: %v", err)
 	}
 }
 

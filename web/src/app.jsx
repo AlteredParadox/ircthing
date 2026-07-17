@@ -1133,11 +1133,19 @@ export function App() {
 	function markRead(time) {
 		const buf = buffers[activeKey];
 		if (!buf || time <= buf.marker || time === readSent.current[activeKey]) return;
-		readSent.current[activeKey] = time;
+		const key = activeKey;
+		readSent.current[key] = time;
 		sock.current
 			.request("set_read_marker", { network: buf.network, buffer: buf.buffer, time })
-			.then((d) => setBuffers((b) => applyMarkerState(b, activeKey, d.time)))
-			.catch(() => {});
+			.then((d) => setBuffers((b) => applyMarkerState(b, key, d.time)))
+			.catch(() => {
+				// The marker never reached the server, so roll back the
+				// optimistic guard — otherwise refocusing or reselecting the
+				// buffer (the natural recovery paths, which re-mark the same
+				// last.time) would short-circuit and the read position would
+				// stay desynced on other devices until a NEW message arrives.
+				if (readSent.current[key] === time) delete readSent.current[key];
+			});
 	}
 
 	if (phase === "checking") return null;
