@@ -45,6 +45,7 @@ export class Socket {
 	}
 
 	connect() {
+		if (this.closed) return; // don't revive a socket closed during backoff
 		this.ws = new WebSocket(this.url);
 		this.ws.onopen = () => {
 			this.backoff = 1000;
@@ -72,7 +73,7 @@ export class Socket {
 			// exception.
 			const wait = this.backoff + (crypto.getRandomValues(new Uint32Array(1))[0] % 500);
 			this.backoff = Math.min(this.backoff * 2, 15000);
-			setTimeout(() => this.connect(), wait);
+			this.reconnectTimer = setTimeout(() => this.connect(), wait);
 		};
 	}
 
@@ -103,6 +104,10 @@ export class Socket {
 
 	close() {
 		this.closed = true;
+		// Cancel any reconnect scheduled by a prior onclose — otherwise it
+		// fires after close() and revives a zombie socket that double-
+		// processes every push once the app reconnects.
+		clearTimeout(this.reconnectTimer);
 		this.ws?.close();
 	}
 }

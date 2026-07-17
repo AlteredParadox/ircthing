@@ -530,14 +530,14 @@ func TestMigrationsIdempotentAndRecorded(t *testing.T) {
 	if err := s2.db.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 9 {
-		t.Fatalf("schema_migrations rows = %d, want 9", n)
+	if n != 10 {
+		t.Fatalf("schema_migrations rows = %d, want 10", n)
 	}
 	var name string
-	if err := s2.db.QueryRow(`SELECT name FROM schema_migrations WHERE version = 9`).Scan(&name); err != nil {
+	if err := s2.db.QueryRow(`SELECT name FROM schema_migrations WHERE version = 10`).Scan(&name); err != nil {
 		t.Fatal(err)
 	}
-	if name != "0009_fts_secure_delete.sql" {
+	if name != "0010_fts_rebuild.sql" {
 		t.Fatalf("recorded name = %q", name)
 	}
 	// WAL mode actually took effect.

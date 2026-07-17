@@ -1,0 +1,14 @@
+-- 0010_fts_rebuild: rewrite the FTS index now that secure-delete is on.
+--
+-- 0008 scrubbed rows redacted under the old non-destructive behavior and
+-- deleted their FTS entries, but FTS5 'secure-delete' was only enabled by
+-- 0009 — and it applies to FUTURE deletes only. So those redacted tokens
+-- were removed as zero-length placeholders whose original bytes could still
+-- linger as live data in the FTS5 segment storage, recoverable from the
+-- database file.
+--
+-- A rebuild reconstructs the whole index from messages.text (NULL for
+-- redacted rows, so their tokens are simply not re-indexed) and rewrites
+-- every segment. The old segments are freed and, with core secure_delete on
+-- (DSN pragma), zeroed. One-time cost on the first open after this upgrade.
+INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
