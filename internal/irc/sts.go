@@ -56,6 +56,16 @@ func parseSTS(value string) stsValue {
 		case "duration":
 			if n, err := strconv.Atoi(val); err == nil && n >= 0 {
 				v.hasDuration = true
+				// Clamp before the multiply: time.Duration is int64 ns, so
+				// n*1e9 overflows past ~9.2e9 seconds and wraps to a garbage
+				// (often negative) duration — which would persist a policy
+				// that expires in the PAST, silently downgrading future
+				// connects to plaintext. Cap at ~100 years (effectively
+				// forever for STS) so a huge advertised value stays in force.
+				const maxSTSSeconds = 100 * 365 * 24 * 60 * 60
+				if n > maxSTSSeconds {
+					n = maxSTSSeconds
+				}
 				v.duration = time.Duration(n) * time.Second
 			}
 		}

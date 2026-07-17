@@ -26,6 +26,9 @@ func TestParseSTS(t *testing.T) {
 		{"port=0", stsValue{}},
 		{"port=70000", stsValue{}},
 		{"duration=-1", stsValue{}},
+		// A huge advertised duration is clamped to the ~100-year max, not
+		// overflowed to a garbage (past-expiring, STS-disabling) value.
+		{"duration=99999999999", stsValue{hasDuration: true, duration: time.Duration(100*365*24*60*60) * time.Second}},
 		{"", stsValue{}},
 	}
 	for _, tc := range cases {

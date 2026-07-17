@@ -1399,14 +1399,17 @@ func (m *Manager) writeLoop(ctx context.Context, cancel context.CancelCauseFunc,
 		}
 		// Final line-length backstop, after UTF-8 scrubbing (which can
 		// grow a line by replacing invalid bytes with U+FFFD): internal
-		// handshake/PONG/rejoin lines never pass through sendAll's
-		// check, so enforce it here too. An overlong line tears the
-		// connection down rather than emitting something the server
-		// would reject or truncate.
+		// handshake/PONG/rejoin lines never pass through sendAll's check, so
+		// enforce it here too. Unlike framing, an over-length line is DROPPED
+		// (not fatal): a message that sendAll accepted can still fail here if
+		// a mid-session 005 lowers LINELEN while it waited in the throttled
+		// queue, and killing the connection over that would lose more than the
+		// one line. The server would reject/truncate an over-length line
+		// anyway, so dropping it is the safe outcome.
 		scrubbed := m.scrubUTF8(out)
 		if err := checkLineLen(scrubbed, m.lineLen()); err != nil {
-			cancel(err)
-			return
+			log.Printf("irc[%s]: dropping over-length %s line: %v", m.cfg.Name, out.Command, err)
+			continue
 		}
 		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		if err := w.WriteMessage(scrubbed); err != nil {
