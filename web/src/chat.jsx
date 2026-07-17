@@ -261,7 +261,8 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 
 	function submit(e) {
 		e.preventDefault();
-		const text = draft.trim();
+		const raw = draft; // untrimmed snapshot — draft state / drafts.current are untrimmed
+		const text = raw.trim();
 		if (!text || !connected) return;
 		const key = buf?.key;
 		clearTimeout(pauseTimer.current);
@@ -270,11 +271,13 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 		// send (parse error, full queue, mid-send disconnect) keeps the typed
 		// text instead of silently dropping it. Clear the buffer we sent from
 		// (a /msg or /join may have switched the active buffer), and guard on
-		// equality so text the user kept typing while waiting isn't clobbered.
+		// equality against the UNTRIMMED snapshot so text the user kept typing
+		// while waiting isn't clobbered — and so a draft with surrounding
+		// whitespace (e.g. "hi " from a mobile keyboard) still clears.
 		Promise.resolve(onSend(text))
 			.then(() => {
-				if (drafts.current[key] === text) delete drafts.current[key];
-				if (buf?.key === key) setDraft((d) => (d === text ? "" : d));
+				if (drafts.current[key] === raw) delete drafts.current[key];
+				if (buf?.key === key) setDraft((d) => (d === raw ? "" : d));
 			})
 			.catch(() => {});
 	}

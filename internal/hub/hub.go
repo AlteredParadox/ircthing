@@ -239,7 +239,7 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 		return nil
 	}
 	if ev.Msg.Command == "BATCH" {
-		h.trackHistoryBatch(ev, c, histBatches, backfillPages)
+		h.trackHistoryBatch(ctx, ev, c, histBatches, backfillPages)
 		return nil
 	}
 	// An empty batch tag must never match: histBatches[""] could exist
@@ -286,8 +286,9 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 // backfill request our own JOIN triggers.
 func (h *Hub) liveHints(ctx context.Context, c Conn, ev irc.Event) {
 	if hint, affected := membersHint(ev.Msg); affected {
+		// Canonical spelling: clients key buffers by it (see history_changed).
 		h.broadcast(envelope("members_changed", 0, MembersChangedData{
-			Network: ev.Network, Buffer: hint,
+			Network: ev.Network, Buffer: h.store.CanonicalBuffer(ctx, ev.Network, hint, c.Fold),
 		}))
 	}
 	// An INVITE has no reply numeric to forward — surface it directly
@@ -307,7 +308,14 @@ func (h *Hub) liveHints(ctx context.Context, c Conn, ev irc.Event) {
 	// for channels we are not in yet.
 	if ev.Msg.Command == "JOIN" && ev.Msg.Prefix != nil &&
 		c.Nick() != "" && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick()) {
-		if ts, msgid := h.lastStored(ctx, ev.Network, ev.Msg.Param(0)); ts > 0 {
+		// Resolve the resume point against the CANONICAL stored spelling: the
+		// JOIN echo's casing can differ from how the buffer was stored (a
+		// UI-typed name, a recreated channel, an rfc1459 fold pair), and an
+		// exact-spelling lastStored would miss and silently skip backfill,
+		// leaving a permanent scrollback gap. RequestChatHistory keeps the
+		// wire spelling (a server-valid name).
+		canon := h.store.CanonicalBuffer(ctx, ev.Network, ev.Msg.Param(0), c.Fold)
+		if ts, msgid := h.lastStored(ctx, ev.Network, canon); ts > 0 {
 			c.RequestChatHistory(ev.Msg.Param(0), ts, msgid)
 		}
 	}
@@ -327,7 +335,11 @@ func (h *Hub) adoptReplayedOwn(ctx context.Context, c Conn, ev irc.Event, target
 		return
 	}
 	since := messageTime(ev).Add(-ownDedupWindow).UnixMilli()
-	if _, aerr := h.store.AdoptOwnMsgID(ctx, ev.Network, target, searchText(ev.Msg), mid, c.Fold, since); aerr != nil {
+	// The replay's prefix is our nick as we sent it — the same sender
+	// persistOwn stored on the placeholder. adoptReplayedOwn only runs for
+	// own+replay, so Prefix is non-nil.
+	sender := ev.Msg.Prefix.Name
+	if _, aerr := h.store.AdoptOwnMsgID(ctx, ev.Network, target, sender, searchText(ev.Msg), mid, c.Fold, since); aerr != nil {
 		log.Printf("irc[%s]: own-message dedup for %q: %v", ev.Network, target, aerr)
 	}
 }
@@ -740,7 +752,7 @@ func (h *Hub) motdExpected(network, cmd string) bool {
 // drop stale pages and refetch) and — if the batch filled a whole page,
 // meaning the gap may extend past it — requests the next page anchored
 // at the batch's own newest message.
-func (h *Hub) trackHistoryBatch(ev irc.Event, c Conn, batches map[string]*histBatch, pages map[string]int) {
+func (h *Hub) trackHistoryBatch(ctx context.Context, ev irc.Event, c Conn, batches map[string]*histBatch, pages map[string]int) {
 	if len(ev.Msg.Params) == 0 {
 		return
 	}
@@ -772,8 +784,11 @@ func (h *Hub) trackHistoryBatch(ev irc.Event, c Conn, batches map[string]*histBa
 			pages[key]++
 			c.RequestChatHistory(b.target, b.lastTS, b.lastID)
 		}
+		// Announce the CANONICAL stored spelling: clients key buffers by it,
+		// so a wire-spelling hint whose casing differs would miss the client's
+		// page-invalidation and leave stale scrollback.
 		h.broadcast(envelope("history_changed", 0, HistoryChangedData{
-			Network: ev.Network, Buffer: b.target,
+			Network: ev.Network, Buffer: h.store.CanonicalBuffer(ctx, ev.Network, b.target, c.Fold),
 		}))
 	}
 }

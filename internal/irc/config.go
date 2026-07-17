@@ -135,6 +135,14 @@ func (c *Config) validateSASL() error {
 	if mech == "" && c.SASL.Password == "" {
 		mech = "EXTERNAL"
 	}
+	// Reject a mechanism we can't actually perform up front, rather than
+	// letting AUTHENTICATE fail at runtime and reconnect-loop the network.
+	// An empty mechanism is allowed: it auto-selects PLAIN/SCRAM by password.
+	switch mech {
+	case "", "PLAIN", "EXTERNAL", "SCRAM-SHA-256":
+	default:
+		return fmt.Errorf("irc: config: unsupported SASL mechanism %q (use PLAIN, EXTERNAL, or SCRAM-SHA-256)", c.SASL.Mechanism)
+	}
 	if mech != "EXTERNAL" && c.SASL.Login == "" {
 		return errors.New("irc: config: SASL requires a login (except EXTERNAL)")
 	}

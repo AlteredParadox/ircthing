@@ -325,7 +325,14 @@ func (m *Manager) SendMultiline(target string, lines []string) error {
 		return err
 	}
 	ref := "ml" + strconv.FormatUint(m.batchSeq.Add(1), 10)
-	return m.sendAll(buildMultilineBatch(ref, target, lines))
+	batch := buildMultilineBatch(ref, target, lines)
+	// A batch bigger than the whole send queue can never be enqueued (even
+	// when idle), so sendAll's ErrSendQueueFull would be a misleading
+	// "retry later". Reject it with a clear, actionable error instead.
+	if len(batch) > cap(m.out) {
+		return fmt.Errorf("irc: multiline message too large to send in one batch (%d lines, local limit %d)", len(lines), cap(m.out)-2)
+	}
+	return m.sendAll(batch)
 }
 
 // SetMonitored replaces the MONITOR list with nicks (MONITOR extension,

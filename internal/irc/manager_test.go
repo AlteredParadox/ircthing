@@ -912,6 +912,7 @@ func TestNewManagerRejectsBadConfig(t *testing.T) {
 		// which must still be caught by the TLS requirement (would otherwise
 		// reconnect-loop against a server rejecting AUTHENTICATE EXTERNAL).
 		{"auto EXTERNAL without TLS", Config{Addr: "x:1", Nick: "n", AllowPlaintext: true, SASL: &SASLConfig{Login: "acct"}}, "EXTERNAL requires"},
+		{"unsupported SASL mechanism", Config{Addr: "x:1", Nick: "n", TLS: true, SASL: &SASLConfig{Mechanism: "OAUTHBEARER", Login: "a", Password: "p"}}, "unsupported SASL mechanism"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

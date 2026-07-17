@@ -181,7 +181,11 @@ export function VirtualList({
 		const sc = scroller.current;
 		if (!sc) return;
 		if (pendingFocus.current && focusIdx !== -1) {
-			// Center the target row in the viewport.
+			// Center the target row in the viewport. A focus jump replaces the
+			// window wholesale, so discard any prepend detected in the same
+			// commit — otherwise it fires on the next commit and scrolls the
+			// view off the focused row.
+			pendingPrepend.current = 0;
 			const hh = headerEl.current?.offsetHeight || 0;
 			const rowH = geo.offsetOf(focusIdx + 1) - geo.offsetOf(focusIdx);
 			sc.scrollTop = hh + geo.offsetOf(focusIdx) - (sc.clientHeight - rowH) / 2;

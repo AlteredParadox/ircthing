@@ -451,7 +451,9 @@ export function App() {
 		const s = new Socket(wsURL());
 		sock.current = s;
 
+		const wsFailures = { n: 0 };
 		s.on("_open", async () => {
+			wsFailures.n = 0;
 			setConnected(true);
 			s.request("get_prefs", null).then(adoptPrefs).catch(() => {});
 			// Drop cached pages up front so every open buffer refetches a
@@ -467,7 +469,25 @@ export function App() {
 				/* sidebar refresh will retry; scrollback already reset above */
 			}
 		});
-		s.on("_close", () => setConnected(false));
+		s.on("_close", () => {
+			setConnected(false);
+			// The WebSocket API can't distinguish a 401 handshake rejection
+			// from a network outage, and Socket retries forever. After a few
+			// closes with no successful open, re-probe auth: if the session is
+			// gone (server restart, TTL expiry, logout/eviction elsewhere),
+			// return to login instead of looping with a dead cookie. A real
+			// outage makes the probe itself fail, so we keep retrying.
+			if (++wsFailures.n >= 3) {
+				fetch("/api/ws")
+					.then((r) => {
+						if (r.status === 401) {
+							wsFailures.n = 0;
+							setPhase("login");
+						}
+					})
+					.catch(() => {});
+			}
+		});
 
 		// Chathistory backfill rewrote a buffer's history: drop cached
 		// pages (the active buffer refetches automatically) and refresh

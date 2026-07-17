@@ -216,14 +216,25 @@ func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName 
 // rollbackPut undoes a persisted-but-unstartable put: an edit restores
 // (and restarts) the previous definition, an add is deleted.
 func (h *Hub) rollbackPut(ctx context.Context, name string, prev *store.NetworkConfig) {
+	// These networks/network_configs writes must hold the lifecycleGate, like
+	// every other one (put at :197, delete at :319): without it a session's
+	// create-on-demand can interleave and resurrect the orphan the rollback
+	// is undoing. The caller holds netOps, so the netOps->lifecycleGate order
+	// matches those sites (no deadlock).
 	if prev != nil {
-		if err := h.store.ReplaceNetworkConfig(ctx, name, prev.Name, prev.Config); err != nil {
+		h.lifecycleGate.Lock()
+		err := h.store.ReplaceNetworkConfig(ctx, name, prev.Name, prev.Config)
+		h.lifecycleGate.Unlock()
+		if err != nil {
 			log.Printf("network %q: rollback failed: %v", name, err)
 		}
 		h.restartNetwork(prev)
 		return
 	}
-	if err := h.store.DeleteNetwork(ctx, name); err != nil {
+	h.lifecycleGate.Lock()
+	err := h.store.DeleteNetwork(ctx, name)
+	h.lifecycleGate.Unlock()
+	if err != nil {
 		log.Printf("network %q: rollback failed: %v", name, err)
 	}
 }

@@ -1167,7 +1167,7 @@ func TestBackfillTargetsCap(t *testing.T) {
 		// A full-page batch with a resume point qualifies for a follow-up.
 		batches[ref] = &histBatch{target: "#c" + strconv.Itoa(i), count: ps, lastTS: 1}
 		ev := irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage("BATCH -" + ref)}
-		h.trackHistoryBatch(ev, c, batches, pages)
+		h.trackHistoryBatch(context.Background(), ev, c, batches, pages)
 	}
 	if len(pages) > maxBackfillTargets {
 		t.Fatalf("backfillPages = %d keys, want <= %d", len(pages), maxBackfillTargets)

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver (approved; CGO-free)
 )
@@ -26,7 +27,28 @@ const (
 	DefaultRingSize = 200
 	DefaultPageSize = 100
 	MaxPageSize     = 500
+	// maxStoredMessageBytes caps a single message's Raw/Text. Generous over
+	// any legitimate IRC line (512 B content + ~8 KiB tags), it bounds the
+	// pathological case of a hostile server raising LINELEN and streaming
+	// huge lines into the hot rings.
+	maxStoredMessageBytes = 16384
 )
+
+// clampUTF8 truncates s to at most max bytes, trimming a trailing partial
+// rune so the result stays valid UTF-8.
+func clampUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	s = s[:max]
+	for len(s) > 0 {
+		if r, size := utf8.DecodeLastRuneInString(s); r != utf8.RuneError || size != 1 {
+			break // last rune is complete (a real U+FFFD decodes with size 3)
+		}
+		s = s[:len(s)-1]
+	}
+	return s
+}
 
 // Message is one stored IRC message. ID and Network/Target are assigned
 // by the store on append.
@@ -363,6 +385,13 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 	if m.Time.IsZero() {
 		m.Time = time.Now()
 	}
+	// Bound a single message's stored bytes. The incoming-line reader admits
+	// up to ~64 KiB once a server raises LINELEN, and each buffer's hot ring
+	// keeps the newest rows in memory; a hostile server sending huge lines
+	// could otherwise blow the RSS target. Legitimate IRC content is well
+	// under this (512 B + up to ~8 KiB tags), so real messages are untouched.
+	m.Raw = clampUTF8(m.Raw, maxStoredMessageBytes)
+	m.Text = clampUTF8(m.Text, maxStoredMessageBytes)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -496,8 +525,8 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 // casing than the buffer's stored spelling still finds the placeholder —
 // otherwise the adopt misses, the insert lands with its own msgid, and the
 // own message duplicates.
-func (s *Store) AdoptOwnMsgID(ctx context.Context, network, target, text, msgid string, fold func(string) string, sinceMs int64) (bool, error) {
-	if msgid == "" || text == "" {
+func (s *Store) AdoptOwnMsgID(ctx context.Context, network, target, sender, text, msgid string, fold func(string) string, sinceMs int64) (bool, error) {
+	if msgid == "" || text == "" || sender == "" {
 		return false, nil
 	}
 	s.mu.Lock()
@@ -521,11 +550,14 @@ func (s *Store) AdoptOwnMsgID(ctx context.Context, network, target, text, msgid 
 	case !errors.Is(err, sql.ErrNoRows):
 		return false, err
 	}
+	// Match on sender too: on a no-msgid server another user's message with
+	// identical text is also a msgid-less candidate, and stamping our msgid
+	// onto their row would mis-attribute (and mis-redact) it.
 	var id int64
 	err = s.db.QueryRowContext(ctx,
 		`SELECT id FROM messages
-		 WHERE buffer_id = ? AND msgid IS NULL AND text = ? AND ts >= ?
-		 ORDER BY ts ASC, id ASC LIMIT 1`, bufID, text, sinceMs).Scan(&id)
+		 WHERE buffer_id = ? AND msgid IS NULL AND sender = ? AND text = ? AND ts >= ?
+		 ORDER BY ts ASC, id ASC LIMIT 1`, bufID, sender, text, sinceMs).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
