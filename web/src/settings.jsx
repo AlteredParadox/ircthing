@@ -222,6 +222,19 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 						<div class="settings-note">
 							Shown after the nick before each message — e.g. a colon renders “AlteredParadox: hello”.
 						</div>
+						<div class="pref-row">
+							<span class="pref-name">Highlight names in messages</span>
+							<Seg
+								value={prefs.highlightNames ? "on" : "off"}
+								options={["off", "on"]}
+								labels={["Off", "On"]}
+								onPick={(v) => onPrefs({ ...prefs, highlightNames: v === "on" })}
+							/>
+						</div>
+						<div class="settings-note">
+							Colors and links nicknames mentioned inside message text (right-click for
+							the user menu). The sender’s name is always highlighted.
+						</div>
 					</section>
 
 					<section class="settings-section">

@@ -50,6 +50,7 @@ export const DEFAULTS = {
 	seconds: false,
 	ampm: true,
 	nickSep: "",
+	highlightNames: true,
 	css: "",
 };
 
@@ -70,6 +71,7 @@ export function normalizePrefs(raw) {
 		seconds: typeof p.seconds === "boolean" ? p.seconds : DEFAULTS.seconds,
 		ampm: typeof p.ampm === "boolean" ? p.ampm : DEFAULTS.ampm,
 		nickSep: typeof p.nickSep === "string" ? p.nickSep.slice(0, MAX_NICK_SEP) : DEFAULTS.nickSep,
+		highlightNames: typeof p.highlightNames === "boolean" ? p.highlightNames : DEFAULTS.highlightNames,
 		css: typeof p.css === "string" ? p.css : DEFAULTS.css,
 	};
 }

@@ -3,14 +3,33 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Completer } from "./complete.js";
 import { isEditable, modalScrimOpen } from "./dom.js";
 import { menuTrigger } from "./menu.jsx";
-import { applyStatusMode, firstURL, fmtTime, linkify, nickColor, renderable, SERVER_BUFFER, TypingSender, typingText } from "./irc.js";
+import { applyStatusMode, firstURL, fmtTime, highlightNicks, linkify, nickColor, nickSet, renderable, SERVER_BUFFER, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
 import { WhoisCard } from "./whois.jsx";
 import { estimateMsgHeight } from "./vmath.js";
 
 
-function Body({ text }) {
+// bodyText renders one non-link text segment: plain text unless nick
+// highlighting is on (nicks map present), in which case known nicks mentioned
+// in the text become colored, clickable spans with the user menu.
+function bodyText(text, nicks, theme, onNick, keyBase) {
+	if (!nicks) return text;
+	return highlightNicks(text, nicks).map((p, i) =>
+		p.nick
+			? (
+				<span
+					key={keyBase + "n" + i}
+					class="body-nick has-menu"
+					style={{ color: nickColor(p.nick, theme) }}
+					{...menuTrigger((x, y) => onNick(p.nick, x, y))}
+				>{p.text}</span>
+			)
+			: p.text,
+	);
+}
+
+function Body({ text, nicks, theme, onNick }) {
 	// draft/multiline messages carry embedded newlines; render each line
 	// on its own row, linkifying within each.
 	const lines = text.split("\n");
@@ -20,7 +39,7 @@ function Body({ text }) {
 			{linkify(line).map((seg, si) =>
 				seg.link
 					? <a key={si} href={seg.text} target="_blank" rel="noopener noreferrer">{seg.text}</a>
-					: seg.text,
+					: bodyText(seg.text, nicks, theme, onNick, li + "-" + si + "-"),
 			)}
 		</Fragment>
 	));
@@ -50,7 +69,7 @@ function CollapsedRow({ ev, onToggle }) {
 }
 
 // Row dispatches by event kind; a real message renders via MsgRow.
-function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onToggle, timeFmt, nickSep, previews }) {
+function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onToggle, nicks, timeFmt, nickSep, previews }) {
 	if (ev.whois) return <WhoisCard whois={ev.whois} focused={focused} />;
 	if (ev.collapse) return <CollapsedRow ev={ev} onToggle={onToggle} />;
 	const r = renderable(ev);
@@ -60,7 +79,7 @@ function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onTo
 	return (
 		<MsgRow
 			ev={ev} r={r} selfNick={selfNick} theme={theme} focused={focused}
-			isHighlight={isHighlight} onRedact={onRedact} onNick={onNick}
+			isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} nicks={nicks}
 			timeFmt={timeFmt} nickSep={nickSep} previews={previews}
 		/>
 	);
@@ -81,19 +100,19 @@ function RowNick({ sender, color, label, sep, onNick }) {
 
 // RowBody is the message text column: an action leads with the sender, a
 // bot chip, then the (multiline-aware) body.
-function RowBody({ r, color, sender, onNick }) {
+function RowBody({ r, color, sender, onNick, nicks, theme }) {
 	return (
 		<div class={"msg-body" + (r.kind === "action" ? " action" : "") + (r.kind === "notice" ? " notice" : "")}>
 			{r.kind === "action" && (
 				<span class="has-menu" style={{ color, fontWeight: 600 }} {...menuTrigger((x, y) => onNick(sender, x, y))}>{sender} </span>
 			)}
 			{r.bot && <span class="bot-chip" title="flagged as a bot">bot</span>}
-			<Body text={r.text} />
+			<Body text={r.text} nicks={nicks} theme={theme} onNick={onNick} />
 		</div>
 	);
 }
 
-function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick, timeFmt, nickSep, previews }) {
+function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick, nicks, timeFmt, nickSep, previews }) {
 	const self = selfNick && ev.sender === selfNick;
 	const mention = !self && isHighlight(r.text);
 	// One preview per message (the first link), only for real messages.
@@ -110,7 +129,7 @@ function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick
 		<div class={"msg-row" + (mention ? " mention" : "") + (focused ? " flash" : "")}>
 			<span class="msg-time">{fmtTime(ev.time, timeFmt)}</span>
 			<RowNick sender={ev.sender} color={color} label={nickLabel} sep={sep} onNick={onNick} />
-			<RowBody r={r} color={color} sender={ev.sender} onNick={onNick} />
+			<RowBody r={r} color={color} sender={ev.sender} onNick={onNick} nicks={nicks} theme={theme} />
 			{canRedact && (
 				<button class="msg-redact" title="Delete message" onClick={() => onRedact(ev.msgid)}>⌫</button>
 			)}
@@ -131,8 +150,14 @@ function estimate(ev) {
 // Chat renders the active buffer: virtualized scrollback plus composer.
 // completionNicks feeds tab-completion (channel roster, or the query
 // counterpart).
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, timeFmt, nickSep, previews, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, timeFmt, nickSep, previews, highlightNames, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
 	const [draft, setDraft] = useState("");
+	// Lookup for in-body nick highlighting (Settings toggle): channel roster
+	// minus our own nick. Null when off, so the row renderer skips the scan.
+	const nickHi = useMemo(
+		() => (highlightNames ? nickSet(completionNicks, selfNick) : null),
+		[highlightNames, completionNicks, selfNick],
+	);
 	// Per-buffer drafts: keep half-typed text with its own buffer so a
 	// switch swaps the composer contents instead of carrying text into —
 	// and letting Enter send it to — the wrong channel.
@@ -307,7 +332,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 					else markRead();
 				}}
 				renderItem={(ev, i) => (
-					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} timeFmt={timeFmt} nickSep={nickSep} previews={previews} />
+					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} nicks={nickHi} timeFmt={timeFmt} nickSep={nickSep} previews={previews} />
 				)}
 			/>
 			<div class="composer">

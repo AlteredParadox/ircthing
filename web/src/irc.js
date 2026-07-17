@@ -229,6 +229,49 @@ export function linkify(text) {
 	return out;
 }
 
+// nickSet builds the lookup for in-body nick highlighting: lowercased nick ->
+// canonical nick (used for a stable color and the user menu). The own nick is
+// excluded — it already highlights the whole row as a mention.
+export function nickSet(nicks, exclude) {
+	const m = new Map();
+	for (const n of nicks || []) {
+		if (n && n !== exclude) m.set(n.toLowerCase(), n);
+	}
+	return m;
+}
+
+// A run of nick-legal characters (letters, digits, and the RFC 2812 "special"
+// set) — used to tokenize body text so a nick matches as a WHOLE token, never
+// a substring.
+const NICK_SPLIT_RE = /([\w\-[\]\\{}|^`~]+)/;
+
+// highlightNicks splits body text into plain and nick segments given the map
+// from nickSet(). A token becomes a nick only when the whole token is a known
+// nick ("bob" inside "bobby" stays plain). Returns [{nick, text}] where nick
+// is the canonical nick (null for plain text) and text is the text as typed.
+export function highlightNicks(text, nickMap) {
+	if (!nickMap || nickMap.size === 0) return [{ nick: null, text }];
+	const parts = text.split(NICK_SPLIT_RE);
+	const out = [];
+	const pushPlain = (t) => {
+		if (out.length && out[out.length - 1].nick === null) out[out.length - 1].text += t;
+		else out.push({ nick: null, text: t });
+	};
+	for (let i = 0; i < parts.length; i++) {
+		const seg = parts[i];
+		if (seg === "") continue;
+		if (i % 2 === 1) { // odd indices are the captured nick-candidate tokens
+			const canon = nickMap.get(seg.toLowerCase());
+			if (canon) {
+				out.push({ nick: canon, text: seg });
+				continue;
+			}
+		}
+		pushPlain(seg);
+	}
+	return out;
+}
+
 // isChannelName follows the network's ISUPPORT CHANTYPES (sent with the
 // buffer list); "#&" is the RFC 1459 default for networks we have not
 // heard from yet.

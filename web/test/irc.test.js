@@ -3,8 +3,31 @@ import { test } from "node:test";
 import {
 	bufKey, firstURL, fmtTime, hostOf, linkify, looksLikeImageURL,
 	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash, applyStatusMode, mergeById, mergeServerBuffers,
-	applyTombstones, rememberRedaction,
+	applyTombstones, rememberRedaction, nickSet, highlightNicks,
 } from "../src/irc.js";
+
+test("highlightNicks matches whole tokens, not substrings", () => {
+	const m = nickSet(["bob", "Alice", "me"], "me"); // own nick excluded
+	is(m.has("me"), false);
+
+	// A mention mid-sentence, bounded by punctuation.
+	eq(highlightNicks("hey bob, ping Alice!", m), [
+		{ nick: null, text: "hey " },
+		{ nick: "bob", text: "bob" },
+		{ nick: null, text: ", ping " },
+		{ nick: "Alice", text: "Alice" }, // canonical casing preserved for color/menu
+		{ nick: null, text: "!" },
+	]);
+
+	// Substrings never match; the typed casing is shown but maps to canonical.
+	eq(highlightNicks("bobby BOB", m), [
+		{ nick: null, text: "bobby " },
+		{ nick: "bob", text: "BOB" },
+	]);
+
+	// No map / empty map -> single plain segment.
+	eq(highlightNicks("bob", null), [{ nick: null, text: "bob" }]);
+});
 
 test("rememberRedaction + applyTombstones re-tombstones a re-delivered row", () => {
 	const store = new Map();

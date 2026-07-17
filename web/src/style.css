@@ -1442,6 +1442,13 @@ input::placeholder {
 	text-decoration: underline;
 }
 
+/* Nicks highlighted inside message text (Settings → Highlight names). Colored
+   inline (nickColor) + weighted so a mention reads as a name; cursor and hover
+   underline come from the .msg-body .has-menu rules above. */
+.body-nick {
+	font-weight: 600;
+}
+
 /* ---- channel switcher palette ---- */
 
 .switch-panel {

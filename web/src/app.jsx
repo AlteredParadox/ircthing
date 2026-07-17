@@ -1276,6 +1276,7 @@ export function App() {
 						ignoredNicks={ignoredHere}
 						statusMode={prefs.statusMsgs}
 						timeFmt={timeFmt} nickSep={prefs.nickSep} previews={previews}
+						highlightNames={prefs.highlightNames}
 						composerApi={composerApi}
 						onNick={(nick, x, y) => openUserMenu(activeBuf.network, nick, x, y)}
 						isHighlight={(t) => highlightText(t, selfNick, rules, activeBuf.network)}

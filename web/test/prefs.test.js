@@ -13,7 +13,7 @@ test("normalizePrefs: keeps valid values", () => {
 	const full = {
 		theme: "light", accent: "rose", textSize: "xl",
 		density: "compact", sidebarWidth: "wide", msgFont: "mono", statusMsgs: "collapse",
-		clock: "12", seconds: true, ampm: false, nickSep: ":", css: "a { color: red }",
+		clock: "12", seconds: true, ampm: false, nickSep: ":", highlightNames: false, css: "a { color: red }",
 	};
 	eq(normalizePrefs(full), full);
 });
