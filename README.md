@@ -132,11 +132,15 @@ that matters depends on **where the proxy runs**:
 
 The listen address stays on loopback by design: put a TLS-terminating
 reverse proxy (Caddy, nginx) in front for anything beyond localhost,
-and set `"secure_cookies": true` so the session cookie is only ever
-sent over HTTPS. WebSocket upgrade for `/api/ws` must be allowed
-through the proxy (Caddy does this automatically); rate-limiting
-`/api/login` at the proxy is also recommended (the binary applies its
-own per-source backoff as a second layer).
+and set `"secure_cookies": true` (as in the example config) so the
+session cookie is only ever sent over HTTPS — leave it `false` only for
+plain-HTTP localhost testing, where a secure cookie would never be sent.
+Also enable HSTS at the proxy (e.g. `Strict-Transport-Security:
+max-age=63072000; includeSubDomains`) so browsers refuse to downgrade.
+WebSocket upgrade for `/api/ws` must be allowed through the proxy (Caddy
+does this automatically); rate-limiting `/api/login` at the proxy is also
+recommended (the binary applies its own per-source backoff as a second
+layer).
 
 A hardened systemd unit ships in [`deploy/ircthing.service`](deploy/ircthing.service).
 It uses `DynamicUser=yes` — no service account to create — and hands the

@@ -66,14 +66,23 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 			.catch(() => {});
 	}, []);
 
-	function togglePreviews(on) {
+	async function togglePreviews(on) {
+		// Only reflect the new state once the server confirms the write.
+		// A failed/non-2xx save must leave the toggle where it was, so
+		// this session and other devices do not diverge (and previews are
+		// not silently left enabled).
+		try {
+			const r = await fetch("/api/config", {
+				method: "PUT",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ previews: on }),
+			});
+			if (!r.ok) return;
+		} catch {
+			return;
+		}
 		setPreviewsOn(on);
-		onPreviews?.(on); // reflect in the live UI immediately
-		fetch("/api/config", {
-			method: "PUT",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ previews: on }),
-		}).catch(() => {});
+		onPreviews?.(on);
 	}
 
 	async function enableNotif() {

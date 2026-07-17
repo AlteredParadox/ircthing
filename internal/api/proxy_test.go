@@ -178,6 +178,23 @@ func TestFetcherBlocksLoopbackByDefault(t *testing.T) {
 	}
 }
 
+// A redirect must not carry Go's auto-generated Referer, which would leak
+// the full (possibly signed) preview URL into the target's logs.
+func TestCheckRedirectStripsReferer(t *testing.T) {
+	f := newFetcher(maxHTMLBytes, nil)
+	req, err := http.NewRequest("GET", "https://example.com/next", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Referer", "https://host.internal/api/link?url=https%3A%2F%2Fsecret%2Fpage")
+	if err := f.checkRedirect(req, []*http.Request{{}}); err != nil {
+		t.Fatalf("checkRedirect: %v", err)
+	}
+	if got := req.Header.Get("Referer"); got != "" {
+		t.Fatalf("Referer not stripped: %q", got)
+	}
+}
+
 // permissiveFetcher allows loopback so the fetch/parse paths can be
 // tested against httptest servers.
 func permissiveFetcher(t *testing.T, maxBytes int64) *fetcher {

@@ -37,5 +37,6 @@
     }
   ],
   "session_ttl_days": 30,
+  "secure_cookies": true,
   "disable_previews": false
 }

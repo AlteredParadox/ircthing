@@ -142,6 +142,10 @@ func (f *fetcher) checkRedirect(req *http.Request, via []*http.Request) error {
 	if f.proxied && !f.hostAllowed(req.URL.Hostname()) {
 		return fmt.Errorf("%w: %s", errBlocked, req.URL.Host)
 	}
+	// Go's client sets a Referer on redirects; strip it so the full
+	// (possibly signed/private) preview URL does not leak into the
+	// redirect target's or an intermediary's logs.
+	req.Header.Del("Referer")
 	return nil
 }
 

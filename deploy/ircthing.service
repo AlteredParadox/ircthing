@@ -25,8 +25,12 @@ WorkingDirectory=%S/ircthing
 # "config.json"; the binary prefers that path when the env var is set.
 LoadCredential=config.json:/etc/ircthing/config.json
 
-# Keeps the Go heap inside the project's 72 MB RSS target.
+# Keeps the Go heap inside the project's 72 MB RSS target. GOMEMLIMIT is a
+# soft limit the runtime aims for; MemoryMax is the kernel's hard ceiling
+# that actually contains the process (OOM-kills it) if something runs away.
+# Headroom over the 72 MB target absorbs non-heap RSS and transient spikes.
 Environment=GOMEMLIMIT=64MiB
+MemoryMax=128M
 
 ExecStart=/usr/local/bin/ircd-web
 Restart=on-failure
