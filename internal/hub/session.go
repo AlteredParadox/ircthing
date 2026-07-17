@@ -161,6 +161,12 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", "send needs network, target and text"))
 		return
 	}
+	if isServerBuffer(d.Target) {
+		// The synthetic server buffer is read-only; a PRIVMSG * would leak the
+		// placeholder name onto the wire.
+		s.push(errEnvelope(env.Seq, "bad_request", "the server buffer is read-only"))
+		return
+	}
 	conn, ok := s.conn(env.Seq, d.Network)
 	if !ok {
 		return
@@ -272,7 +278,7 @@ func (s *Session) handleTyping(ctx context.Context, env Envelope) {
 	if err := json.Unmarshal(env.Data, &d); err != nil {
 		return
 	}
-	ok := d.Network != "" && d.Buffer != "" &&
+	ok := d.Network != "" && d.Buffer != "" && !isServerBuffer(d.Buffer) &&
 		(d.State == "active" || d.State == "paused" || d.State == "done")
 	if ok {
 		if conn := s.hub.network(d.Network); conn != nil && conn.CapEnabled("message-tags") {

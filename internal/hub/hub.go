@@ -27,6 +27,12 @@ import (
 // channel or real nick, so it can't collide with a conversation buffer.
 const serverBufferTarget = "*"
 
+// isServerBuffer reports whether target is the synthetic per-network server
+// buffer. It collects service/server NOTICEs but is NOT a real IRC target, so
+// outbound conversation operations (PRIVMSG/TAGMSG typing) and upstream
+// history sync (CHATHISTORY/MARKREAD) must never address it.
+func isServerBuffer(target string) bool { return target == serverBufferTarget }
+
 // Conn is the slice of *irc.Manager the hub consumes.
 type Conn interface {
 	Name() string
@@ -529,8 +535,11 @@ func (h *Hub) backfill(ctx context.Context, c Conn) {
 	}
 	markers := c.CapEnabled("draft/read-marker")
 	for _, b := range infos {
-		if b.Network != c.Name() || c.IsChannel(b.Target) {
-			continue // channels resume on their own JOIN echo (+ MARKREAD from the server)
+		if b.Network != c.Name() || c.IsChannel(b.Target) || isServerBuffer(b.Target) {
+			// Channels resume on their own JOIN echo (+ MARKREAD from the
+			// server); the synthetic server buffer is local-only and must never
+			// emit CHATHISTORY */MARKREAD * upstream.
+			continue
 		}
 		if b.LastTS > 0 {
 			_, msgid := h.lastStored(ctx, b.Network, b.Target)
@@ -925,8 +934,9 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 	}
 	// A redaction in a query is addressed to our nick; file it under the
 	// other party's buffer, mirroring persistTarget.
+	addressedToUs := !c.IsChannel(target) && ev.Msg.Prefix != nil && c.Fold(target) == c.Fold(c.Nick())
 	buffer := target
-	if !c.IsChannel(target) && ev.Msg.Prefix != nil && c.Fold(target) == c.Fold(c.Nick()) {
+	if addressedToUs {
 		buffer = ev.Msg.Prefix.Name
 	}
 	buffer = h.store.CanonicalBuffer(ctx, ev.Network, buffer, c.Fold)
@@ -934,6 +944,16 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 	if err != nil {
 		log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)
 		return
+	}
+	if !ok && addressedToUs {
+		// A private NOTICE addressed to us is filed in the server buffer (see
+		// noticeTarget), not the sender's query — retry there so a service's
+		// redaction of a stored private NOTICE actually scrubs it.
+		buffer = serverBufferTarget
+		if ok, err = h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason); err != nil {
+			log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)
+			return
+		}
 	}
 	if !ok || replay {
 		return

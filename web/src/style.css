@@ -921,6 +921,14 @@ input::placeholder {
 	padding: 4px 5px 4px 12px;
 }
 
+.compose-readonly {
+	color: var(--text-faint);
+	font-size: 0.9286rem;
+	font-style: italic;
+	padding: 10px 12px;
+	justify-content: center;
+}
+
 .prompt {
 	font-family: var(--mono-font);
 	font-size: 1rem;

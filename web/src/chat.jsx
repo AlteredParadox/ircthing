@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Completer } from "./complete.js";
 import { isEditable, modalScrimOpen } from "./dom.js";
 import { menuTrigger } from "./menu.jsx";
-import { applyStatusMode, firstURL, fmtTime, linkify, nickColor, renderable, TypingSender, typingText } from "./irc.js";
+import { applyStatusMode, firstURL, fmtTime, linkify, nickColor, renderable, SERVER_BUFFER, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
 import { WhoisCard } from "./whois.jsx";
@@ -320,6 +320,11 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 					</div>
 				)}
 				{error && <div class="cmd-error">{error}</div>}
+				{buf?.buffer === SERVER_BUFFER ? (
+					<div class="compose-box compose-readonly">
+						Server and service notices appear here. This buffer is read-only.
+					</div>
+				) : (
 				<form class="compose-box" onSubmit={submit}>
 					<span class="prompt">{selfNick || "…"} ›</span>
 					<textarea
@@ -354,6 +359,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 					/>
 					<button class="btn-accent" type="submit" disabled={!connected}>Send</button>
 				</form>
+				)}
 			</div>
 		</>
 	);

@@ -356,6 +356,17 @@ func TestSessionSend(t *testing.T) {
 	if got := decode[ErrorData](t, recv(t, a, "error")); got.Code != "unknown_network" {
 		t.Fatalf("error code = %q", got.Code)
 	}
+
+	// The synthetic server buffer is read-only: a send to "*" is refused and
+	// never reaches the wire.
+	before := len(conn.sentMsgs())
+	a.Handle(ctx, request(t, "send", 7, SendData{Network: "libera", Target: "*", Text: "x"}))
+	if got := decode[ErrorData](t, recv(t, a, "error")); got.Code != "bad_request" {
+		t.Fatalf("send to server buffer: error code = %q, want bad_request", got.Code)
+	}
+	if after := len(conn.sentMsgs()); after != before {
+		t.Fatalf("send to server buffer put %d messages on the wire", after-before)
+	}
 }
 
 // A STATUSMSG send ("/msg @#chan") on a no-echo-message network must be
