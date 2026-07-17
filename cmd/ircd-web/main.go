@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,7 +32,7 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "config.json", "path to the JSON config file")
+	configFlag := flag.String("config", "config.json", "path to the JSON config file")
 	hashPassword := flag.Bool("hash-password", false,
 		"read a password from stdin, print its bcrypt hash for user.password_hash, and exit")
 	flag.Parse()
@@ -43,13 +44,39 @@ func main() {
 		return
 	}
 
-	cfg, err := loadConfig(*configPath)
+	configPath := resolveConfigPath(*configFlag, flagPassed("config"), os.Getenv("CREDENTIALS_DIRECTORY"))
+	cfg, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
 	if err := run(cfg); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// resolveConfigPath picks the config file location. Under systemd
+// DynamicUser with `LoadCredential=config.json:/etc/ircthing/config.json`,
+// systemd copies the file into a private, service-only directory and
+// exports its path as $CREDENTIALS_DIRECTORY (passed here as credDir); the
+// binary reads it from there so the unit needs no world-readable /etc file
+// and no -config flag. An explicit -config always wins.
+func resolveConfigPath(flagVal string, flagSet bool, credDir string) string {
+	if credDir != "" && !flagSet {
+		return filepath.Join(credDir, "config.json")
+	}
+	return flagVal
+}
+
+// flagPassed reports whether the named flag was set explicitly on the
+// command line (as opposed to left at its default).
+func flagPassed(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }
 
 func run(cfg *config) error {

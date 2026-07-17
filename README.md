@@ -107,13 +107,17 @@ through the proxy (Caddy does this automatically); rate-limiting
 `/api/login` at the proxy is also recommended (the binary applies its
 own per-source backoff as a second layer).
 
-A hardened systemd unit ships in [`deploy/ircthing.service`](deploy/ircthing.service):
+A hardened systemd unit ships in [`deploy/ircthing.service`](deploy/ircthing.service).
+It uses `DynamicUser=yes` — no service account to create — and hands the
+config to the process as a systemd credential, so `/etc/ircthing/config.json`
+stays root-owned and the app reads a private, service-only copy from
+`$CREDENTIALS_DIRECTORY`. `StateDirectory=` creates `/var/lib/ircthing`
+with the right ownership, so set `"database": "/var/lib/ircthing/ircthing.db"`.
 
 ```sh
-sudo useradd --system --home /var/lib/ircthing --create-home ircthing
 sudo cp bin/ircd-web /usr/local/bin/
 sudo mkdir -p /etc/ircthing && sudo cp config.json /etc/ircthing/
-sudo chown root:ircthing /etc/ircthing/config.json && sudo chmod 640 /etc/ircthing/config.json
+sudo chown root:root /etc/ircthing/config.json && sudo chmod 600 /etc/ircthing/config.json
 sudo cp deploy/ircthing.service /etc/systemd/system/
 sudo systemctl enable --now ircthing
 ```

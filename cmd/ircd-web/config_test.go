@@ -143,3 +143,25 @@ func TestExampleConfigParses(t *testing.T) {
 		t.Fatalf("config.example.json: %v", err)
 	}
 }
+
+func TestResolveConfigPath(t *testing.T) {
+	cases := []struct {
+		name    string
+		flagVal string
+		flagSet bool
+		credDir string
+		want    string
+	}{
+		{"no credential falls back to flag default", "config.json", false, "", "config.json"},
+		{"credential used when flag unset", "config.json", false, "/run/creds/ircthing.service", "/run/creds/ircthing.service/config.json"},
+		{"explicit flag wins over credential", "/etc/custom.json", true, "/run/creds/ircthing.service", "/etc/custom.json"},
+		{"explicit flag with no credential", "/etc/custom.json", true, "", "/etc/custom.json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveConfigPath(tc.flagVal, tc.flagSet, tc.credDir); got != tc.want {
+				t.Fatalf("resolveConfigPath(%q, %v, %q) = %q, want %q", tc.flagVal, tc.flagSet, tc.credDir, got, tc.want)
+			}
+		})
+	}
+}
