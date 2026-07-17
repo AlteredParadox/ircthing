@@ -1,0 +1,11 @@
+-- 0009_fts_secure_delete: enable FTS5 secure-delete (privacy).
+--
+-- Core secure_delete (a connection pragma, set in the DSN) zeroes freed
+-- content in the main tables, but FTS5 keeps its own segment storage and
+-- overwrites deleted entries with zero-length placeholders that can leave
+-- the original tokens recoverable in the index. The 'secure-delete' option
+-- makes FTS5 actually rewrite the affected segments so a redacted message's
+-- search tokens are removed, not just hidden. This is a persistent config
+-- option (stored in the FTS5 %_config shadow table), so setting it once here
+-- applies to all future deletes.
+INSERT INTO messages_fts(messages_fts, rank) VALUES('secure-delete', 1);

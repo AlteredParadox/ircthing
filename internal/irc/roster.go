@@ -10,12 +10,17 @@ import (
 
 // Channel membership and topic tracking for one connection.
 //
-// maxRosterChannels and maxChannelMembers bound roster growth against a
-// hostile server spoofing self-JOINs or flooding NAMES. Legitimate use
-// (real channel membership) stays far below these.
-const (
+// These bound roster growth against a hostile server spoofing self-JOINs
+// or flooding NAMES; legitimate use stays far below them. The per-channel
+// caps alone don't bound aggregate memory (a server could fill many
+// channels), so maxRosterMembers is a connection-wide budget across every
+// channel's members + pending — the real ceiling. At ~150 B/member, 100k
+// members is ~15 MB, comfortably under the process memory limit.
+// var (not const) so tests can exercise the bounds at small scale.
+var (
 	maxRosterChannels = 4096
-	maxChannelMembers = 100_000
+	maxChannelMembers = 25_000
+	maxRosterMembers  = 100_000
 )
 
 // Sources: NAMES on join (353 accumulated until 366), then live
@@ -192,6 +197,18 @@ func (r *roster) memberLeft(channel, nick string, ours bool) {
 	}
 }
 
+// totalMembers is the connection-wide count of held members (every
+// channel's members plus in-flight NAMES pending). Computed on demand at
+// the two growth sites — O(channels), so no drift-prone counter to
+// maintain. Caller holds r.mu.
+func (r *roster) totalMembers() int {
+	n := 0
+	for _, st := range r.chans {
+		n += len(st.members) + len(st.pending)
+	}
+	return n
+}
+
 // namesReply accumulates one 353 line: <me> <symbol> <channel>
 // :<prefixed nicks>. Caller holds r.mu.
 func (r *roster) namesReply(m *ircv4.Message) {
@@ -202,12 +219,17 @@ func (r *roster) namesReply(m *ircv4.Message) {
 	if st.pending == nil {
 		st.pending = make(map[string]Member)
 	}
+	budget := maxRosterMembers - r.totalMembers() // remaining aggregate room
 	for _, raw := range strings.Fields(m.Param(3)) {
-		if len(st.pending) >= maxChannelMembers {
-			break // bound NAMES flood from a hostile server
+		if len(st.pending) >= maxChannelMembers || budget <= 0 {
+			break // bound a NAMES flood: per-channel and connection-wide
 		}
 		prefix, nick := splitNamesPrefix(r.isup.PrefixSymbols(), raw)
-		st.pending[r.isup.Fold(nick)] = Member{Nick: nick, Prefix: prefix}
+		fk := r.isup.Fold(nick)
+		if _, exists := st.pending[fk]; !exists {
+			budget-- // only a new nick consumes the aggregate budget
+		}
+		st.pending[fk] = Member{Nick: nick, Prefix: prefix}
 	}
 }
 
@@ -251,7 +273,8 @@ func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
 		return
 	}
 	k := r.isup.Fold(sender)
-	if _, known := st.members[k]; !known && len(st.members) >= maxChannelMembers {
+	if _, known := st.members[k]; !known &&
+		(len(st.members) >= maxChannelMembers || r.totalMembers() >= maxRosterMembers) {
 		return
 	}
 	mem := Member{Nick: sender}

@@ -31,6 +31,32 @@ func members(t *testing.T, r *roster, ch string) []Member {
 // join sets up our own membership of #go.
 var joinGo = ":AlteredParadox!u@h JOIN #go"
 
+// The connection-wide member budget bounds total roster memory even when a
+// hostile server fills many channels — a new member is refused once the
+// aggregate is spent, regardless of per-channel room.
+func TestRosterAggregateBudget(t *testing.T) {
+	defer func(ch, ag int) { maxChannelMembers, maxRosterMembers = ch, ag }(maxChannelMembers, maxRosterMembers)
+	maxChannelMembers = 10 // large, so the aggregate budget is the binding limit
+	maxRosterMembers = 3
+
+	r := testRoster()
+	feed(t, r, ":AlteredParadox!u@h JOIN #a")                  // our own join: 1 member
+	feed(t, r, ":u1!u@h JOIN #a", ":u2!u@h JOIN #a") // -> 3 members (aggregate cap)
+	if got := r.totalMembers(); got != 3 {
+		t.Fatalf("totalMembers = %d, want 3", got)
+	}
+	// Further members are refused once the budget is spent — in this channel
+	// (room under its per-channel cap) and in a new one.
+	feed(t, r, ":u3!u@h JOIN #a")
+	feed(t, r, ":AlteredParadox!u@h JOIN #b", ":x!u@h JOIN #b")
+	if got := r.totalMembers(); got > maxRosterMembers {
+		t.Fatalf("totalMembers = %d, want <= %d (budget must hold)", got, maxRosterMembers)
+	}
+	if n := len(members(t, r, "#a")); n != 3 {
+		t.Fatalf("#a has %d members, want 3", n)
+	}
+}
+
 func TestRoster(t *testing.T) {
 	cases := []struct {
 		name  string

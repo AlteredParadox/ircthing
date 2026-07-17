@@ -195,6 +195,10 @@ func Open(path string, opts Options) (*Store, error) {
 		"&_pragma=synchronous(NORMAL)" +
 		"&_pragma=busy_timeout(5000)" +
 		"&_pragma=foreign_keys(1)" +
+		// secure_delete zeroes freed content on delete/update rather than
+		// leaving it in free pages, so a redaction (destructive scrub) or a
+		// retention delete does not leave recoverable bytes in the file.
+		"&_pragma=secure_delete(on)" +
 		// INCREMENTAL auto_vacuum on a fresh database; existing ones are
 		// converted below. Freed pages (retention/redaction deletes) then go
 		// to the freelist and are returned to the OS by incremental_vacuum
