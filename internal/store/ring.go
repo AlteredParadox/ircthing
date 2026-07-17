@@ -98,6 +98,10 @@ func (r *ring) redact(msgid, reason string) {
 		if r.msgs[i].MsgID == msgid {
 			r.msgs[i].Redacted = true
 			r.msgs[i].RedactReason = reason
+			// Scrub the hot copy in step with the destructive DB update, so
+			// pages served from memory do not leak the redacted body.
+			r.msgs[i].Raw = ""
+			r.msgs[i].Text = ""
 			return
 		}
 	}

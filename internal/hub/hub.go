@@ -902,6 +902,14 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 }
 
 func eventData(m store.Message) EventData {
+	// The store scrubs a redacted message's body on redaction, so m.Raw is
+	// already empty here; blank it defensively regardless, so a redacted
+	// message's content is never sent to a client (the UI renders the
+	// tombstone from the Redacted flag + reason alone).
+	raw := m.Raw
+	if m.Redacted {
+		raw = ""
+	}
 	return EventData{
 		Network:      m.Network,
 		Buffer:       m.Target,
@@ -910,7 +918,7 @@ func eventData(m store.Message) EventData {
 		MsgID:        m.MsgID,
 		Sender:       m.Sender,
 		Command:      m.Command,
-		Raw:          m.Raw,
+		Raw:          raw,
 		Redacted:     m.Redacted,
 		RedactReason: m.RedactReason,
 	}

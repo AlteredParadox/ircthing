@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
@@ -228,6 +229,84 @@ func TestSetRedacted(t *testing.T) {
 	// Redacted messages drop out of search.
 	if got := searchTexts(t, s, SearchOptions{Query: "secret"}); len(got) != 6 {
 		t.Fatalf("search returned %d, want 6 (2 redacted excluded)", len(got))
+	}
+
+	// Redaction is destructive, not just a flag: the body is scrubbed on
+	// both the ring-served and disk-served paths.
+	if last.Raw != "" || last.Text != "" {
+		t.Fatalf("ring redacted message kept its body: raw=%q text=%q", last.Raw, last.Text)
+	}
+	if page[0].Raw != "" || page[0].Text != "" {
+		t.Fatalf("disk redacted message kept its body: raw=%q text=%q", page[0].Raw, page[0].Text)
+	}
+	// The content is gone from the messages table...
+	var raw string
+	var text sql.NullString
+	if err := s.db.QueryRow(`SELECT raw, text FROM messages WHERE msgid = 'm8'`).Scan(&raw, &text); err != nil {
+		t.Fatal(err)
+	}
+	if raw != "" || text.Valid {
+		t.Fatalf("stored body not scrubbed: raw=%q text=%v", raw, text)
+	}
+	// ...and from the FTS index, so it cannot be recovered by a raw match.
+	var ftsHits int
+	if err := s.db.QueryRow(`SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?`,
+		`"secret 8"`).Scan(&ftsHits); err != nil {
+		t.Fatal(err)
+	}
+	if ftsHits != 0 {
+		t.Fatalf("redacted text still recoverable from FTS index: %d hits", ftsHits)
+	}
+}
+
+// The 0008 migration must scrub rows that were redacted under the old
+// non-destructive behavior (body + FTS entry retained).
+func TestRedactionScrubMigration(t *testing.T) {
+	s, _ := openTest(t, 10)
+	m, err := s.Append(ctx, "libera", "#go", Message{
+		Time: time.UnixMilli(1000), MsgID: "old1", Sender: "a", Command: "PRIVMSG",
+		Raw: ":a!u@h PRIVMSG #go :leaked secret", Text: "leaked secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the pre-0008 state: flagged redacted, but body and FTS entry
+	// still present (only the flag was set, no scrub).
+	if _, err := s.db.Exec(`UPDATE messages SET redacted = 1, redact_reason = 'x' WHERE id = ?`, m.ID); err != nil {
+		t.Fatal(err)
+	}
+	var hits int
+	if err := s.db.QueryRow(`SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?`,
+		`"leaked secret"`).Scan(&hits); err != nil {
+		t.Fatal(err)
+	}
+	if hits != 1 {
+		t.Fatalf("precondition: expected the old row indexed, got %d hits", hits)
+	}
+
+	// Re-run the migration SQL; it must scrub the already-redacted row.
+	sqlText, err := migrationsFS.ReadFile("migrations/0008_redaction_scrub.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(string(sqlText)); err != nil {
+		t.Fatal(err)
+	}
+
+	var raw string
+	var text sql.NullString
+	if err := s.db.QueryRow(`SELECT raw, text FROM messages WHERE id = ?`, m.ID).Scan(&raw, &text); err != nil {
+		t.Fatal(err)
+	}
+	if raw != "" || text.Valid {
+		t.Fatalf("migration did not scrub the body: raw=%q text=%v", raw, text)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?`,
+		`"leaked secret"`).Scan(&hits); err != nil {
+		t.Fatal(err)
+	}
+	if hits != 0 {
+		t.Fatalf("migration did not purge the FTS entry: %d hits", hits)
 	}
 }
 

@@ -364,14 +364,44 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 	if reason != "" {
 		reasonArg = reason
 	}
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE messages SET redacted = 1, redact_reason = ?
-		 WHERE buffer_id = ? AND msgid = ? AND redacted = 0`,
-		reasonArg, bufID, msgid)
+	// Redaction is destructive: locate the row and its indexed body, purge
+	// the FTS entry, then scrub raw/text — keeping only the tombstone
+	// (sender/time/command + redacted flag + reason). This prevents deleted
+	// content from lingering in the database, backups, or search.
+	var id int64
+	var text sql.NullString
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id, text FROM messages
+		 WHERE buffer_id = ? AND msgid = ? AND redacted = 0
+		 ORDER BY id DESC LIMIT 1`, bufID, msgid).Scan(&id, &text)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
-	if n, err := res.RowsAffected(); err != nil || n == 0 {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	// External-content FTS has no update trigger, so it must be told the
+	// old text explicitly before we blank it (see 0003_fts / 0008).
+	if text.Valid && text.String != "" {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO messages_fts (messages_fts, rowid, text) VALUES ('delete', ?, ?)`,
+			id, text.String); err != nil {
+			tx.Rollback()
+			return false, err
+		}
+	}
+	// raw is NOT NULL, so blank it rather than nulling; text is nullable.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE messages SET raw = '', text = NULL, redacted = 1, redact_reason = ?
+		 WHERE id = ?`, reasonArg, id); err != nil {
+		tx.Rollback()
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 	if r, ok := s.rings[bufID]; ok {
