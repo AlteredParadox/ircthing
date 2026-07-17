@@ -298,7 +298,11 @@ export function App() {
 		clearTimeout(prefsPush.current);
 		prefsPush.current = setTimeout(() => {
 			sock.current?.request("set_prefs", { prefs: next })
-				.then(() => { prefsDirty.current = false; })
+				// Only clear the dirty flag if no newer edit landed while this
+				// request was in flight (prefs still === the pushed snapshot);
+				// otherwise the queued newer edit would look synced and a
+				// reconnect would adopt the server's now-stale copy over it.
+				.then(() => { if (prefsRef.current === next) prefsDirty.current = false; })
 				.catch(() => {});
 		}, 400);
 	}
@@ -540,8 +544,12 @@ export function App() {
 			}
 		});
 
-		// Another device changed prefs; adopt without echoing back.
+		// Another device changed prefs; adopt without echoing back — but not
+		// over an unsynced local edit still in the debounce window, or its
+		// pending set_prefs would clobber this device's change server-side
+		// (mirrors adoptPrefs's dirty guard).
 		s.on("prefs", (d) => {
+			if (prefsDirty.current) return;
 			if (d.prefs) setPrefs(normalizePrefs(d.prefs));
 		});
 

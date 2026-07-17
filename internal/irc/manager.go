@@ -702,26 +702,23 @@ func (m *Manager) applyCaps(hs *handshake) {
 	m.pendingCapVals = make(map[string]string)
 }
 
-// rejoinChannels sends a JOIN for every channel in the rejoin set,
-// dropping (rather than fatally failing on) any entry that cannot be
-// sent — mirroring sendAll's graceful rejection so one bad stored
-// channel never bricks the connection.
-func (m *Manager) rejoinChannels(send func([]*ircv4.Message) error) error {
+// rejoinList snapshots the rejoin set into a sorted slice, pruning entries
+// that could never be sent (bad framing / over the line limit) from
+// m.joined so one bad stored channel never wedges every reconnect. It must
+// run BEFORE serveLoop starts, which is the only other writer of m.joined
+// (trackJoinIntent) — the caller then sends the JOINs from the returned
+// snapshot, concurrently with the read loop, touching no shared state.
+func (m *Manager) rejoinList() []string {
 	rejoin := make([]string, 0, len(m.joined))
 	for _, ch := range m.joined {
-		rejoin = append(rejoin, ch)
-	}
-	sort.Strings(rejoin)
-	for _, ch := range rejoin {
 		if !rejoinable(ch) {
 			delete(m.joined, ch)
 			continue
 		}
-		if err := send([]*ircv4.Message{newMsg("JOIN", ch)}); err != nil {
-			return err
-		}
+		rejoin = append(rejoin, ch)
 	}
-	return nil
+	sort.Strings(rejoin)
+	return rejoin
 }
 
 func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
@@ -796,23 +793,43 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	m.nick.Store(hs.nick)
 	m.applyCaps(hs)
 
-	// Queue rejoins BEFORE exposing the connection as send-ready. The
-	// writer drains internal ahead of m.out, so every JOIN is on the
-	// wire before the hub's post-registration backfill/monitor traffic
-	// (which enqueues to m.out on the StateRegistered event) or any user
-	// message — without this, CHATHISTORY or a PRIVMSG could arrive
-	// before its JOIN and draw a failed backfill or "cannot send to
-	// channel".
-	if err := m.rejoinChannels(send); err != nil {
-		return err
-	}
+	// Read and rejoin concurrently. rejoins are paced by the flood token
+	// bucket (~1 JOIN / 2s after the burst); doing them inline before
+	// serveLoop — as this used to — blocked the read loop for a many-channel
+	// reconnect, freezing all input (PINGs, MOTD, NAMES, new messages) for
+	// up to minutes and risking the server's SendQ limit for exactly the
+	// 50-channel load this bouncer targets. Snapshot the rejoin set first
+	// (serveLoop's trackJoinIntent is the only other writer of m.joined),
+	// then read while the JOINs trickle out from this goroutine.
+	rejoins := m.rejoinList()
+	readDone := make(chan error, 1)
+	go func() { readDone <- m.serveLoop(ctx, lc) }()
 
-	m.setRegistered(true)
+	// Queue the JOINs on the priority `internal` path and expose
+	// send-readiness as soon as the first one is queued: the writer drains
+	// `internal` ahead of `m.out`, and this loop keeps `internal` fed, so
+	// every JOIN still precedes any user message or the hub's backfill/
+	// monitor traffic (enqueued to m.out on StateRegistered) — without
+	// waiting the full throttled drain to become send-ready.
 	defer m.setRegistered(false)
-	bo.reset()
-	m.emit(ctx, Event{Kind: EventState, State: StateRegistered})
-
-	return m.serveLoop(ctx, lc)
+	markRegistered := func() {
+		m.setRegistered(true)
+		bo.reset()
+		m.emit(ctx, Event{Kind: EventState, State: StateRegistered})
+	}
+	for i, ch := range rejoins {
+		if err := send([]*ircv4.Message{newMsg("JOIN", ch)}); err != nil {
+			cancel(err) // writer gone; serveLoop's read fails too
+			return <-readDone
+		}
+		if i == 0 {
+			markRegistered()
+		}
+	}
+	if len(rejoins) == 0 {
+		markRegistered()
+	}
+	return <-readDone
 }
 
 // liveConn bundles one established connection's plumbing for the

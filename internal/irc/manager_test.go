@@ -1191,6 +1191,49 @@ func TestManagerJoinPrecedesUserMessage(t *testing.T) {
 	t.Fatal("never saw the PRIVMSG")
 }
 
+// The read loop must service server traffic concurrently with a throttled
+// many-channel rejoin, not block behind it: queueing all JOINs inline
+// before reading froze input for minutes at the 50-channel load this
+// bouncer targets (missing PINGs, stalling every buffer). Here a slow
+// writer + 40 channels means an inline rejoin would take ~0.5s+; the live
+// PRIVMSG must still be serviced promptly.
+func TestReadLoopNotBlockedDuringRejoin(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	cfg := testCfg(ln.Addr().String())
+	cfg.SendBurst = 1                     // no burst: JOINs pace one at a time
+	cfg.SendInterval = 25 * time.Millisecond
+	chans := make([]string, 40)
+	for i := range chans {
+		chans[i] = "#c" + strconv.Itoa(i)
+	}
+	cfg.Channels = chans
+	m := startManager(t, cfg)
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	// Live traffic arrives while the JOINs are still trickling out.
+	s.send(":bob!u@h PRIVMSG #c0 :live")
+
+	got := make(chan struct{})
+	go func() {
+		for ev := range m.Events() {
+			if ev.Kind == EventMessage && ev.Msg.Command == "PRIVMSG" && ev.Msg.Trailing() == "live" {
+				close(got)
+				return
+			}
+		}
+	}()
+	select {
+	case <-got:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("read loop blocked behind the throttled rejoin: live PRIVMSG not serviced")
+	}
+}
+
 // A server streaming an oversized incoming multiline batch is
 // disconnected rather than allowed to grow memory without bound.
 func TestManagerDisconnectsOversizedBatch(t *testing.T) {
