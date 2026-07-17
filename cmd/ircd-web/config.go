@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"ircthing/internal/netconf"
@@ -107,9 +108,39 @@ func loadConfig(path string) (*config, error) {
 	return &cfg, nil
 }
 
+// Conservative upper bounds on numeric knobs. These sit far below the points
+// where the downstream arithmetic misbehaves — a retention_days that overflows
+// the time.Duration cutoff (~106752) flips it into the FUTURE and deletes all
+// history; a huge ring_size overflows the ringSize+1 query LIMIT into a
+// negative that SQLite treats as unbounded. 100 years is longer than any real
+// retention/session and well clear of those edges.
+const (
+	maxConfigDays     = 36500     // ~100 years
+	maxConfigRingSize = 1_000_000 // per-buffer hot messages; far over any sane value
+)
+
 func (c *config) validate() error {
 	if c.User.Username == "" || c.User.PasswordHash == "" {
 		return errors.New("user.username and user.password_hash are required (generate the hash with -hash-password)")
+	}
+	// A '?' or '#' in the database path would terminate the path component of
+	// the file: URI the store builds, so SQLite would open a DIFFERENT file
+	// than the one secureDBFile chmods to 0600 — the real database (holding
+	// plaintext credentials) could then be created under the umask.
+	if strings.ContainsAny(c.Database, "?#\n\r\x00") {
+		return fmt.Errorf("database path %q must not contain '?', '#', or control characters", c.Database)
+	}
+	if c.RingSize < 0 || c.RingSize > maxConfigRingSize {
+		return fmt.Errorf("ring_size %d out of range (0..%d)", c.RingSize, maxConfigRingSize)
+	}
+	if c.RetentionDays < 0 || c.RetentionDays > maxConfigDays {
+		return fmt.Errorf("retention_days %d out of range (0..%d)", c.RetentionDays, maxConfigDays)
+	}
+	if c.RetentionMaxMessages < 0 {
+		return fmt.Errorf("retention_max_messages %d must not be negative", c.RetentionMaxMessages)
+	}
+	if c.SessionTTLDays < 0 || c.SessionTTLDays > maxConfigDays {
+		return fmt.Errorf("session_ttl_days %d out of range (0..%d)", c.SessionTTLDays, maxConfigDays)
 	}
 	seen := make(map[string]bool)
 	for i, n := range c.Networks {

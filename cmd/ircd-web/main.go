@@ -84,6 +84,9 @@ func run(cfg *config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if cfg.RetentionDays == 0 && cfg.RetentionMaxMessages == 0 {
+		log.Print("retention: disabled (retention_days and retention_max_messages both 0) — stored history grows without bound; set a limit or place the database on a quota'd filesystem")
+	}
 	st, err := store.Open(cfg.Database, store.Options{
 		RingSize:             cfg.RingSize,
 		RetentionDays:        cfg.RetentionDays,

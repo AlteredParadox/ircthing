@@ -32,6 +32,12 @@ const (
 	// pathological case of a hostile server raising LINELEN and streaming
 	// huge lines into the hot rings.
 	maxStoredMessageBytes = 16384
+	// maxStoredFieldBytes caps a single server-controlled identifier field
+	// (Sender/MsgID/redaction reason and the buffer target). Real nicks,
+	// channel names and msgids are far under this; the cap plus a detaching
+	// copy (see append) stops an oversized field from a hostile server
+	// pinning a whole 64 KiB parsed line alive in a hot ring.
+	maxStoredFieldBytes = 512
 )
 
 // clampUTF8 truncates s to at most max bytes, trimming a trailing partial
@@ -385,13 +391,19 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 	if m.Time.IsZero() {
 		m.Time = time.Now()
 	}
-	// Bound a single message's stored bytes. The incoming-line reader admits
-	// up to ~64 KiB once a server raises LINELEN, and each buffer's hot ring
-	// keeps the newest rows in memory; a hostile server sending huge lines
-	// could otherwise blow the RSS target. Legitimate IRC content is well
-	// under this (512 B + up to ~8 KiB tags), so real messages are untouched.
-	m.Raw = clampUTF8(m.Raw, maxStoredMessageBytes)
-	m.Text = clampUTF8(m.Text, maxStoredMessageBytes)
+	// Bound a single message's stored bytes AND detach every retained string
+	// from its backing array. irc.v4 slices each field out of one per-line
+	// buffer (up to ~64 KiB once a server raises LINELEN), so a short Sender
+	// or MsgID would otherwise pin the whole line alive in the hot ring —
+	// strings.Clone copies just the bounded bytes and lets the line be GC'd.
+	// Legitimate IRC content is well under these caps, so real messages are
+	// untouched.
+	m.Raw = strings.Clone(clampUTF8(m.Raw, maxStoredMessageBytes))
+	m.Text = strings.Clone(clampUTF8(m.Text, maxStoredMessageBytes))
+	m.Sender = strings.Clone(clampUTF8(m.Sender, maxStoredFieldBytes))
+	m.MsgID = strings.Clone(clampUTF8(m.MsgID, maxStoredFieldBytes))
+	m.RedactReason = strings.Clone(clampUTF8(m.RedactReason, maxStoredFieldBytes))
+	target = strings.Clone(clampUTF8(target, maxStoredFieldBytes))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
