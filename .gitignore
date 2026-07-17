@@ -1,5 +1,7 @@
 # Built binary
 /bin/
+# Stray root-level build output (go build with no -o lands here)
+/ircd-web
 
 # Local config (contains credentials); config.example.json is the template
 /config.json
