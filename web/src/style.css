@@ -264,6 +264,26 @@ input::placeholder {
 	color: var(--text-dim);
 }
 
+/* The network header IS the server buffer: it selects, highlights when
+   active, and carries an unread badge like a channel row. */
+.net-name {
+	flex: 1;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
+.net-head.unread {
+	color: var(--text);
+}
+
+.net-head.active {
+	background: var(--accent-soft);
+	color: var(--text);
+	border-radius: 7px;
+	box-shadow: inset 2px 0 0 var(--accent);
+}
+
 .dot {
 	width: 6px;
 	height: 6px;

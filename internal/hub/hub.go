@@ -20,6 +20,13 @@ import (
 	ircv4 "gopkg.in/irc.v4"
 )
 
+// serverBufferTarget is the per-network "server buffer" (The Lounge lobby):
+// server/service NOTICEs and server-info lines collect here instead of
+// scattering into per-sender query buffers. "*" is the IRC placeholder the
+// server itself uses for our nick before registration, and is never a valid
+// channel or real nick, so it can't collide with a conversation buffer.
+const serverBufferTarget = "*"
+
 // Conn is the slice of *irc.Manager the hub consumes.
 type Conn interface {
 	Name() string
@@ -1062,6 +1069,25 @@ func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fo
 	t := stripStatusPrefix(m.Param(0), statusPrefixes, isChan)
 	if isChan(t) {
 		return t, true
+	}
+	// NOTICEs that aren't to a channel collect in the network server buffer
+	// (The Lounge lobby): server "***" notices, and services (NickServ,
+	// ChanServ, SaslServ) whose per-sender query buffers would otherwise
+	// clutter the sidebar. A genuine PRIVMSG still opens its own query below.
+	if m.Command == "NOTICE" {
+		own := m.Prefix != nil && ourNick != "" && fold(m.Prefix.Name) == fold(ourNick)
+		if own {
+			// Our own echoed notice -> the recipient's buffer.
+			if t != "" && fold(t) != fold(ourNick) {
+				return t, true
+			}
+			return "", false
+		}
+		// Addressed to us (t == our nick) or the pre-registration "*".
+		if t == serverBufferTarget || ourNick == "" || fold(t) == fold(ourNick) {
+			return serverBufferTarget, true
+		}
+		return "", false
 	}
 	if m.Prefix == nil || m.Prefix.Name == "" || ourNick == "" {
 		return "", false

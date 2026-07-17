@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "preact/hooks";
-import { rankBuffers } from "./irc.js";
+import { rankBuffers, SERVER_BUFFER } from "./irc.js";
 import { BufIcon } from "./icons.jsx";
 
 // Channel switcher palette (Ctrl+K): type to filter buffers, arrows to
@@ -53,6 +53,7 @@ export function Switcher({ buffers, networks, onSelect, onClose }) {
 				<div class="search-results scroll">
 					{list.length === 0 && <div class="search-note">no matching buffers</div>}
 					{list.map((b, i) => {
+						const isServer = b.buffer === SERVER_BUFFER;
 						const isChan = (networks?.[b.network]?.chantypes || "#&").includes(b.buffer[0]);
 						return (
 							<button
@@ -63,8 +64,8 @@ export function Switcher({ buffers, networks, onSelect, onClose }) {
 								onFocus={() => setIdx(i)}
 								onClick={() => onSelect(b.network, b.buffer)}
 							>
-								<BufIcon chan={isChan} />
-								<span class="switch-name">{b.buffer}</span>
+								<BufIcon chan={isChan} server={isServer} />
+								<span class="switch-name">{isServer ? "server" : b.buffer}</span>
 								<span class="switch-net">{b.network}</span>
 								{b.unread > 0 && (
 									<span class={"badge" + (b.mention ? " mention" : "")}>

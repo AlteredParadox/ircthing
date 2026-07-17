@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
-import { bufferOrder, bufKey, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
+import { bufferOrder, bufKey, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, renderable, SERVER_BUFFER, toHash, typingExpired } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
 import { Login } from "./login.jsx";
 import { applyPrefs, loadPrefs, normalizePrefs, resolveTheme, savePrefs } from "./prefs.js";
@@ -51,8 +51,8 @@ function TopBar({ activeBuf, isChan, topicText, sideOpen, rightOpen, theme, onSi
 			>◧</button>
 			{activeBuf && (
 				<span class="topic-name">
-					<BufIcon chan={isChan} />
-					{activeBuf.buffer}
+					<BufIcon chan={isChan} server={activeBuf.buffer === SERVER_BUFFER} />
+					{activeBuf.buffer === SERVER_BUFFER ? activeBuf.network : activeBuf.buffer}
 				</span>
 			)}
 			<div class="topic-sep" />
@@ -622,13 +622,13 @@ export function App() {
 		// refetch drops them.
 		let infoSeq = 0;
 		s.on("server_info", (d) => {
-			const key = activeKeyRef.current;
-			const buf = buffersRef.current[key];
-			if (!buf) return;
-			const text = (buf.network === d.network ? "" : `[${d.network}] `) + d.text;
+			// Server info (MOTD, connect numerics) lands in the network's own
+			// server buffer, not whatever buffer happens to be active.
+			const key = bufKey(d.network, SERVER_BUFFER);
+			setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(d.network, SERVER_BUFFER) }));
 			const ev = {
-				id: `si${++infoSeq}`, network: buf.network, buffer: buf.buffer,
-				time: Date.now(), sender: "", command: "INFO", raw: text,
+				id: `si${++infoSeq}`, network: d.network, buffer: SERVER_BUFFER,
+				time: Date.now(), sender: "", command: "INFO", raw: d.text,
 			};
 			setMsgs((m) => appendInfoLine(m, key, ev));
 		});
@@ -1015,6 +1015,7 @@ export function App() {
 				{ label: "Join channel…", onClick: () => { setChanPromptError(""); setChanPrompt({ network }); } },
 				{ label: "Edit network…", onClick: () => editNetwork(network) },
 				{ label: "Add network…", onClick: () => { setNetFormError(""); setNetForm({ initial: null, oldName: "" }); } },
+				{ label: "Remove network…", danger: true, onClick: () => deleteNetwork(network) },
 			],
 		});
 	}

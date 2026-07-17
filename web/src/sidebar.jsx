@@ -1,7 +1,7 @@
 import { useRef, useState } from "preact/hooks";
 import { pressable } from "./a11y.js";
-import { longPress, menuTrigger } from "./menu.jsx";
-import { bufKey, nickColor } from "./irc.js";
+import { longPress } from "./menu.jsx";
+import { bufKey, nickColor, SERVER_BUFFER } from "./irc.js";
 import { BufIcon } from "./icons.jsx";
 
 function stateDot(state) {
@@ -23,9 +23,11 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSe
 		state: networks[name]?.state || "disconnected",
 		nick: networks[name]?.nick || "",
 		chantypes: networks[name]?.chantypes || "#&",
+		// The server buffer ("*") is the network header itself, not a row.
 		buffers: Object.values(buffers)
-			.filter((b) => b.network === name)
+			.filter((b) => b.network === name && b.buffer !== SERVER_BUFFER)
 			.sort((a, b) => a.buffer.localeCompare(b.buffer)),
+		server: buffers[bufKey(name, SERVER_BUFFER)],
 	}));
 	const me = sections.map((s) => s.nick).find(Boolean) || "";
 	const online = Object.values(networks).some((n) => n.state === "registered");
@@ -41,10 +43,47 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSe
 			<div class="side-list scroll">
 				{sections.map((sec) => (
 					<div class="net-group" key={sec.name}>
-						<div class="net-head has-menu" {...menuTrigger((x, y) => onNetworkMenu(sec.name, x, y))}>
-							<span class={"dot " + stateDot(sec.state)} />
-							<span>{sec.name}</span>
-						</div>
+						{(() => {
+							// The network header IS the server buffer (lobby): left-click
+							// opens it, right-click / long-press opens the management menu.
+							const srvKey = bufKey(sec.name, SERVER_BUFFER);
+							const srvActive = srvKey === activeKey;
+							const srvUnread = (sec.server?.unread || 0) > 0;
+							const openMenu = (x, y) => onNetworkMenu(sec.name, x, y);
+							return (
+								<div
+									class={"net-head has-menu" + (srvActive ? " active" : "") + (srvUnread ? " unread" : "")}
+									role="button"
+									tabIndex={0}
+									onClick={() => {
+										if (pressFired.current) {
+											pressFired.current = false;
+											return;
+										}
+										onSelect(sec.name, SERVER_BUFFER);
+									}}
+									onContextMenu={(e) => {
+										e.preventDefault();
+										openMenu(e.clientX, e.clientY);
+									}}
+									onKeyDown={(e) => {
+										if (e.key === "Enter" || e.key === " ") {
+											e.preventDefault();
+											onSelect(sec.name, SERVER_BUFFER);
+										}
+									}}
+									{...longPress(openMenu, pressFired)}
+								>
+									<span class={"dot " + stateDot(sec.state)} />
+									<span class="net-name">{sec.name}</span>
+									{srvUnread && (
+										<span class={"badge" + (sec.server?.mention ? " mention" : "")}>
+											{sec.server.unread > 99 ? "99+" : sec.server.unread}
+										</span>
+									)}
+								</div>
+							);
+						})()}
 						{sec.buffers.map((b) => {
 							const key = bufKey(b.network, b.buffer);
 							const active = key === activeKey;

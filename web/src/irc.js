@@ -518,6 +518,11 @@ export function hostOf(u) {
 	}
 }
 
+// SERVER_BUFFER is the per-network "server buffer" target (must match the
+// hub's serverBufferTarget): server/service notices and server-info lines
+// live here, surfaced as the sidebar's network header (The Lounge lobby).
+export const SERVER_BUFFER = "*";
+
 export function bufKey(network, buffer) {
 	return network + "\n" + buffer;
 }
