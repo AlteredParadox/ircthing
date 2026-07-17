@@ -1423,6 +1423,67 @@ func TestOversizedWhoxChannelDoesNotTearDown(t *testing.T) {
 	}
 }
 
+// A CTCP query from a hostile, invalid-UTF-8 nick under UTF8ONLY: the reply
+// NOTICE names that nick, and scrubbing inflates it past LINELEN. sendAll
+// must reject the reply (which m.Send then drops) rather than let it reach
+// the writer's fatal post-scrub length check and loop the connection.
+func TestCTCPReplySurvivesUTF8ScrubInflation(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	s.send(":irc.test 005 AlteredParadox UTF8ONLY :are supported by this server")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := m.isup.Raw("UTF8ONLY"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("UTF8ONLY never applied")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// A nick of invalid bytes that fits unscrubbed but ~doubles once scrubbed.
+	badNick := strings.Repeat("a\xff", 200)
+	s.send(":" + badNick + "!u@h PRIVMSG AlteredParadox :\x01VERSION\x01")
+	s.send("PING :ok")
+	if p := s.readCmd("PONG"); p.Param(0) != "ok" {
+		t.Fatalf("PONG = %q, want ok (oversized CTCP reply must not tear the connection down)", p.Param(0))
+	}
+}
+
+// rejoinable must reject an invalid-UTF-8 channel whose scrubbed form
+// overflows LINELEN under UTF8ONLY, so it is never stored in the rejoin set
+// (which would fatally fail the writer on every reconnect and brick the
+// network).
+func TestRejoinableRejectsUTF8Inflation(t *testing.T) {
+	m, err := NewManager(Config{Addr: "x:1", Nick: "AlteredParadox", AllowPlaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := "#" + strings.Repeat("a\xff", 200) // ~401 raw bytes, ~801 scrubbed
+	// Without UTF8ONLY there is no inflation, so it fits and is rejoinable.
+	if !m.rejoinable(bad) {
+		t.Fatal("pre-UTF8ONLY: channel fits unscrubbed, want rejoinable")
+	}
+	// Under UTF8ONLY the scrubbed form overflows, so it must be rejected.
+	m.isup.applyToken("UTF8ONLY", "")
+	if m.rejoinable(bad) {
+		t.Fatal("UTF8ONLY: invalid-UTF-8 channel must not be rejoinable")
+	}
+	if !m.rejoinable("#go") {
+		t.Fatal("normal channel must remain rejoinable")
+	}
+}
+
 // A server spoofing an unbounded stream of self-JOINs is torn down
 // rather than growing the never-reset rejoin set without bound.
 func TestManagerBoundsJoinedSet(t *testing.T) {

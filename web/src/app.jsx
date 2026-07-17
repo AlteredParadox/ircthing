@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
-import { bufferOrder, bufKey, isChannelName, mergeById, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
+import { bufferOrder, bufKey, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, renderable, toHash, typingExpired } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
 import { Login } from "./login.jsx";
 import { applyPrefs, loadPrefs, normalizePrefs, resolveTheme, savePrefs } from "./prefs.js";
@@ -72,8 +72,14 @@ function TopBar({ activeBuf, isChan, topicText, sideOpen, rightOpen, theme, onSi
 	);
 }
 
+// makeBuffer creates a client-only buffer (a just-opened query/DM, a whois
+// card, or one implied by an incoming event before the server list catches
+// up). ephemeral marks it as not-yet-server-persisted, so applyBuffers
+// preserves it across a refresh but never resurrects a real server buffer
+// the server has intentionally dropped. The flag clears once the buffer
+// appears in a get_buffers response (rebuilt without it).
 function makeBuffer(network, buffer) {
-	return { key: bufKey(network, buffer), network, buffer, lastTime: 0, marker: 0, unread: 0, mention: false };
+	return { key: bufKey(network, buffer), network, buffer, lastTime: 0, marker: 0, unread: 0, mention: false, ephemeral: true };
 }
 
 // Pure state transitions for the socket handlers, hoisted so the
@@ -394,26 +400,25 @@ export function App() {
 		}
 		setNetworks(nets);
 		for (const name of Object.keys(nets)) loadMonitors(name);
-		setBuffers((prev) => {
-			const bufs = {};
-			for (const b of data.buffers || []) {
-				const key = bufKey(b.network, b.buffer);
-				bufs[key] = {
-					key, network: b.network, buffer: b.buffer,
-					lastTime: b.last_time, marker: b.marker,
-					unread: b.unread,
-					mention: prev[key]?.mention || false,
-				};
+
+		// mergeServerBuffers preserves client-only ephemeral buffers but never
+		// resurrects a real server buffer the server intentionally dropped
+		// (e.g. closed on another device while we were offline).
+		const bufs = mergeServerBuffers(data.buffers, buffersRef.current, nets);
+		setBuffers(bufs);
+
+		// If the active buffer was one the server dropped, don't leave the
+		// view pointing at it — fall back to another buffer (or none).
+		const active = activeKeyRef.current;
+		if (active && !bufs[active]) {
+			const rest = Object.values(bufs).sort((a, b) =>
+				(a.network + a.buffer).localeCompare(b.network + b.buffer));
+			if (rest.length) select(rest[0].network, rest[0].buffer);
+			else {
+				setActiveKey(null);
+				location.hash = "";
 			}
-			// Preserve client-only open buffers the server list omits — a
-			// just-opened query/DM or a whois card buffer with no stored
-			// messages — so a refresh does not orphan the active key.
-			// Closed buffers are already removed from prev.
-			for (const key of Object.keys(prev)) {
-				if (!bufs[key] && prev[key].network in nets) bufs[key] = prev[key];
-			}
-			return bufs;
-		});
+		}
 	}
 
 	function refreshBuffers() {

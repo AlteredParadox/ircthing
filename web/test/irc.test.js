@@ -2,8 +2,32 @@ import { deepStrictEqual as eq, strictEqual as is } from "node:assert";
 import { test } from "node:test";
 import {
 	bufKey, firstURL, fmtTime, hostOf, linkify, looksLikeImageURL,
-	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash, applyStatusMode, mergeById,
+	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash, applyStatusMode, mergeById, mergeServerBuffers,
 } from "../src/irc.js";
+
+test("mergeServerBuffers", () => {
+	const nets = { libera: {}, oftc: {} };
+	// A server buffer, a client-only ephemeral buffer, a non-ephemeral buffer
+	// the server no longer lists (closed elsewhere), and one on a gone network.
+	const prev = {
+		[bufKey("libera", "#go")]: { key: bufKey("libera", "#go"), network: "libera", buffer: "#go", mention: true },
+		[bufKey("libera", "query")]: { key: bufKey("libera", "query"), network: "libera", buffer: "query", ephemeral: true },
+		[bufKey("libera", "#closed")]: { key: bufKey("libera", "#closed"), network: "libera", buffer: "#closed" },
+		[bufKey("dead", "#x")]: { key: bufKey("dead", "#x"), network: "dead", buffer: "#x", ephemeral: true },
+	};
+	const data = [{ network: "libera", buffer: "#go", last_time: 5, marker: 2, unread: 1 }];
+	const out = mergeServerBuffers(data, prev, nets);
+
+	// Server buffer present, keeps client-side mention flag.
+	is(out[bufKey("libera", "#go")].unread, 1);
+	is(out[bufKey("libera", "#go")].mention, true);
+	// Ephemeral client-only buffer is preserved.
+	is(!!out[bufKey("libera", "query")], true);
+	// A non-ephemeral buffer the server dropped is NOT resurrected.
+	is(out[bufKey("libera", "#closed")], undefined);
+	// An ephemeral buffer on a no-longer-known network is dropped too.
+	is(out[bufKey("dead", "#x")], undefined);
+});
 
 test("parseLine", () => {
 	const cases = [

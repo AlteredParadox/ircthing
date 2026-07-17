@@ -522,6 +522,30 @@ export function bufKey(network, buffer) {
 	return network + "\n" + buffer;
 }
 
+// mergeServerBuffers builds the sidebar buffer map from an authoritative
+// get_buffers response. It carries over the client-side mention flag and
+// preserves client-only buffers the server omits — but ONLY those still
+// flagged `ephemeral` (a just-opened query/DM or whois card not yet
+// persisted). A non-ephemeral buffer the server omits was a real server
+// buffer the server has intentionally dropped (e.g. closed on another
+// device while this client was offline); it must not be resurrected. Pure,
+// so it can be unit tested.
+export function mergeServerBuffers(dataBuffers, prev, nets) {
+	const bufs = {};
+	for (const b of dataBuffers || []) {
+		const key = bufKey(b.network, b.buffer);
+		bufs[key] = {
+			key, network: b.network, buffer: b.buffer,
+			lastTime: b.last_time, marker: b.marker, unread: b.unread,
+			mention: prev[key]?.mention || false,
+		};
+	}
+	for (const key of Object.keys(prev)) {
+		if (!bufs[key] && prev[key].ephemeral && prev[key].network in nets) bufs[key] = prev[key];
+	}
+	return bufs;
+}
+
 export function parseHash(hash) {
 	// "#/<network>/<buffer>", split at the first slash; the hash is
 	// attacker-influenceable (links), so no backtracking regex and no

@@ -360,8 +360,13 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	var stored store.Message
 	var err error
 	if selfPart {
-		// Our own PART echo must never create a buffer.
-		stored, err = h.store.AppendExisting(ctx, ev.Network, target, storeMessage(ev))
+		// Our own PART echo must never create a buffer, but must still find
+		// the existing one under casemapping: the echo can carry different
+		// casing than the stored buffer spelling (#Go vs #go), and an
+		// unfolded exact-name lookup would miss and drop the PART. Fold the
+		// target and veto creation unconditionally.
+		stored, err = h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
+			func() bool { return true }, storeMessage(ev))
 	} else {
 		// The close-grace check is evaluated inside the store, atomically
 		// with buffer creation, so a straggler in flight when the user

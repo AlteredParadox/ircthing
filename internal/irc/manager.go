@@ -534,7 +534,13 @@ func (m *Manager) sendAll(msgs []*ircv4.Message) error {
 		if err := checkFraming(msg); err != nil {
 			return err
 		}
-		if err := checkLineLen(msg, limit); err != nil {
+		// Length-check the exact bytes the writer will emit: the
+		// UTF8ONLY-scrubbed form, since invalid bytes inflate to U+FFFD (3x)
+		// and the writer's post-scrub length check FATALLY tears the
+		// connection down. A server-derived echo (e.g. a CTCP auto-reply
+		// whose target is a hostile, invalid-UTF-8 nick) must be rejected
+		// here rather than reach that fatal guard and loop the connection.
+		if err := checkLineLen(m.scrubUTF8(msg), limit); err != nil {
 			return err
 		}
 	}
@@ -733,7 +739,7 @@ func (m *Manager) applyCaps(hs *handshake) {
 func (m *Manager) rejoinList() []string {
 	rejoin := make([]string, 0, len(m.joined))
 	for _, ch := range m.joined {
-		if !rejoinable(ch) {
+		if !m.rejoinable(ch) {
 			delete(m.joined, ch)
 			continue
 		}
@@ -1228,12 +1234,17 @@ func (m *Manager) maybeWHOX(channel string) *ircv4.Message {
 	return msg
 }
 
-// rejoinable reports whether a JOIN for ch could be sent at rejoin time
-// (no framing bytes, fits the default line length) — so a stored rejoin
-// intent can never fatally fail the writer.
-func rejoinable(ch string) bool {
+// rejoinable reports whether a JOIN for ch could be sent at rejoin time —
+// so a stored rejoin intent can never fatally fail the writer. It checks
+// the exact bytes the writer emits: framing on the message, and length on
+// the UTF8ONLY-scrubbed form (invalid bytes inflate to U+FFFD, 3x). Without
+// the scrub, an invalid-UTF-8 channel name passes here but overflows the
+// writer's fatal post-scrub check under UTF8ONLY, bricking the network on
+// every reconnect. Against the default limit, since isup resets before
+// rejoin.
+func (m *Manager) rejoinable(ch string) bool {
 	msg := newMsg("JOIN", ch)
-	return checkFraming(msg) == nil && checkLineLen(msg, defaultLineLen) == nil
+	return checkFraming(msg) == nil && checkLineLen(m.scrubUTF8(msg), defaultLineLen) == nil
 }
 
 // trackJoinIntent keeps the rejoin set in step with our own JOINs and
@@ -1253,7 +1264,7 @@ func (m *Manager) trackJoinIntent(in *ircv4.Message) error {
 		// length/framing guard, it would brick the network on every
 		// reconnect. Validate against the registration-time line limit
 		// (isup is reset before rejoin, so lineLen is the default there).
-		if ch == "" || !m.isup.IsChannel(ch) || !rejoinable(ch) {
+		if ch == "" || !m.isup.IsChannel(ch) || !m.rejoinable(ch) {
 			return nil
 		}
 		if _, known := m.joined[ch]; !known && len(m.joined) >= maxJoinedChannels {

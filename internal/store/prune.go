@@ -54,14 +54,32 @@ func (s *Store) pruneOnce(ctx context.Context, now time.Time) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Reconcile the hot rings with EXACTLY the criteria that actually landed
+	// on disk — via defer, so it runs even if a later DELETE errors out. A
+	// ring can be `complete` (holds a buffer's entire history) and is then
+	// served authoritatively without touching the DB, so a dormant buffer
+	// whose rows were deleted would otherwise keep serving them from memory
+	// until process restart. appliedCutoff/appliedMax are set only after
+	// their DELETE succeeds, so a failed dimension never trims the rings out
+	// of step with disk. Filtering in place keeps the cache warm.
 	var total int64
-	var cutoff int64
+	var appliedCutoff int64
+	var appliedMax int
+	defer func() {
+		if appliedCutoff > 0 || appliedMax > 0 {
+			for _, r := range s.rings {
+				r.applyRetention(appliedCutoff, appliedMax)
+			}
+		}
+	}()
+
 	if s.retention.days > 0 {
-		cutoff = now.Add(-time.Duration(s.retention.days) * 24 * time.Hour).UnixMilli()
+		cutoff := now.Add(-time.Duration(s.retention.days) * 24 * time.Hour).UnixMilli()
 		res, err := s.db.ExecContext(ctx, `DELETE FROM messages WHERE ts < ?`, cutoff)
 		if err != nil {
 			return total, err
 		}
+		appliedCutoff = cutoff
 		if n, err := res.RowsAffected(); err == nil {
 			total += n
 		}
@@ -81,20 +99,9 @@ func (s *Store) pruneOnce(ctx context.Context, now time.Time) (int64, error) {
 		if err != nil {
 			return total, err
 		}
+		appliedMax = s.retention.maxPerBuffer
 		if n, err := res.RowsAffected(); err == nil {
 			total += n
-		}
-	}
-	// Reconcile the hot rings with the same criteria we just applied to
-	// disk. This is required for correctness, not just tidiness: a ring can
-	// be `complete` (holds a buffer's entire history) and is then served
-	// authoritatively without touching the DB, so a dormant buffer whose
-	// messages all aged out would otherwise keep serving the deleted rows
-	// from memory until process restart. Filtering each ring in step keeps
-	// the cache warm and truthful.
-	if total > 0 {
-		for _, r := range s.rings {
-			r.applyRetention(cutoff, s.retention.maxPerBuffer)
 		}
 	}
 	return total, nil
