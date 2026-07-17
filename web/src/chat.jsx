@@ -204,20 +204,23 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 		return () => window.removeEventListener("focus", markRead);
 	}, [last?.id, buf?.key]);
 
-	// Returning to the window/tab drops the cursor back in the composer so
-	// the user can type immediately — unless they were already in another
-	// field (search, a network form) that the browser restored focus to, or
-	// the composer is disabled (disconnected).
+	// Type-anywhere (The Lounge behaviour): a printable keystroke while
+	// focus isn't in a text field routes into the composer, so the user can
+	// click around the UI — or return to the tab — and just start typing
+	// without clicking the box first. The triggering key is not consumed
+	// (no preventDefault), so it lands in the now-focused textarea.
 	useEffect(() => {
-		const refocus = () => {
+		const onKey = (e) => {
+			if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return; // shortcuts / IME
+			if (e.key.length !== 1) return; // Tab/Enter/Escape/arrows/F-keys: ignore
 			const el = taRef.current;
 			if (!el || el.disabled) return;
 			const active = document.activeElement;
-			if (active && active !== document.body && isEditable(active)) return;
+			if (active === el || (active && active !== document.body && isEditable(active))) return;
 			el.focus();
 		};
-		window.addEventListener("focus", refocus);
-		return () => window.removeEventListener("focus", refocus);
+		document.addEventListener("keydown", onKey);
+		return () => document.removeEventListener("keydown", onKey);
 	}, []);
 
 	function submit(e) {
