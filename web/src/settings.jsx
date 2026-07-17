@@ -1,5 +1,5 @@
 import { useEffect, useState } from "preact/hooks";
-import { ACCENT_RGB, ACCENTS } from "./prefs.js";
+import { ACCENT_RGB, ACCENTS, CLOCKS, MAX_NICK_SEP } from "./prefs.js";
 import { uuid } from "./irc.js";
 
 // NotifControl renders the notification section for the current
@@ -138,6 +138,51 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 								labels={["Show", "Collapse", "Hide"]}
 								onPick={(statusMsgs) => onPrefs({ ...prefs, statusMsgs })}
 							/>
+						</div>
+					</section>
+
+					<section class="settings-section">
+						<div class="settings-label">Timestamps &amp; names</div>
+						<div class="pref-row">
+							<span class="pref-name">Clock</span>
+							<Seg
+								value={prefs.clock}
+								options={CLOCKS}
+								labels={["24-hour", "12-hour"]}
+								onPick={(clock) => onPrefs({ ...prefs, clock })}
+							/>
+						</div>
+						<div class="pref-row">
+							<span class="pref-name">Seconds</span>
+							<Seg
+								value={prefs.seconds ? "on" : "off"}
+								options={["off", "on"]}
+								labels={["Hide", "Show"]}
+								onPick={(v) => onPrefs({ ...prefs, seconds: v === "on" })}
+							/>
+						</div>
+						<div class="pref-row">
+							<span class="pref-name">AM/PM {prefs.clock === "24" && <span class="pref-hint">(12-hour only)</span>}</span>
+							<Seg
+								value={prefs.ampm ? "on" : "off"}
+								options={["off", "on"]}
+								labels={["Hide", "Show"]}
+								onPick={(v) => onPrefs({ ...prefs, ampm: v === "on" })}
+							/>
+						</div>
+						<div class="pref-row">
+							<span class="pref-name">Nick separator</span>
+							<input
+								class="pref-input"
+								value={prefs.nickSep}
+								maxLength={MAX_NICK_SEP}
+								placeholder="none"
+								aria-label="Character shown after a nick (e.g. a colon)"
+								onInput={(e) => onPrefs({ ...prefs, nickSep: e.currentTarget.value })}
+							/>
+						</div>
+						<div class="settings-note">
+							Shown after the nick before each message — e.g. a colon renders “AlteredParadox: hello”.
 						</div>
 					</section>
 

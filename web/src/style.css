@@ -660,10 +660,14 @@ input::placeholder {
 	font-family: var(--mono-font);
 	font-size: 0.7857rem;
 	color: var(--text-faint);
-	width: 3rem;
+	/* Sizes to its content so 12-hour / seconds / AM/PM formats all fit;
+	   the mono font + zero-padded values keep every row the same width, so
+	   the column stays aligned. min-width preserves the gutter for HH:MM. */
+	min-width: 3rem;
 	flex: 0 0 auto;
 	text-align: right;
 	padding-top: 2px;
+	white-space: nowrap;
 }
 
 .msg-nick {
@@ -1552,6 +1556,30 @@ input::placeholder {
 .pref-name {
 	font-size: 0.9643rem;
 	color: var(--text);
+}
+
+.pref-hint {
+	color: var(--text-faint);
+	font-size: 0.8571rem;
+}
+
+/* Compact single-line pref input (e.g. the nick separator character). */
+.pref-input {
+	width: 5rem;
+	height: 32px;
+	padding: 0 10px;
+	border: 1px solid var(--border);
+	border-radius: 7px;
+	background: var(--panel-2);
+	color: var(--text);
+	font-family: var(--mono-font);
+	font-size: 0.9643rem;
+	text-align: center;
+	outline: none;
+}
+
+.pref-input:focus {
+	border-color: var(--accent-line);
 }
 
 .seg {

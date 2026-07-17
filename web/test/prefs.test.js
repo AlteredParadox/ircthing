@@ -10,14 +10,20 @@ test("normalizePrefs: defaults for missing/garbage input", () => {
 });
 
 test("normalizePrefs: keeps valid values", () => {
-	const p = normalizePrefs({
+	const full = {
 		theme: "light", accent: "rose", textSize: "xl",
-		density: "compact", msgFont: "mono", statusMsgs: "collapse", css: "a { color: red }",
-	});
-	eq(p, {
-		theme: "light", accent: "rose", textSize: "xl",
-		density: "compact", msgFont: "mono", statusMsgs: "collapse", css: "a { color: red }",
-	});
+		density: "compact", msgFont: "mono", statusMsgs: "collapse",
+		clock: "12", seconds: true, ampm: false, nickSep: ":", css: "a { color: red }",
+	};
+	eq(normalizePrefs(full), full);
+});
+
+test("normalizePrefs: clamps timestamp/separator prefs", () => {
+	const p = normalizePrefs({ clock: "13", seconds: "yes", ampm: 1, nickSep: "::::::" });
+	is(p.clock, DEFAULTS.clock); // unknown clock -> default
+	is(p.seconds, DEFAULTS.seconds); // non-boolean -> default
+	is(p.ampm, DEFAULTS.ampm);
+	is(p.nickSep, ":::"); // clamped to MAX_NICK_SEP (3)
 });
 
 test("normalizePrefs: clamps unknown values field by field", () => {

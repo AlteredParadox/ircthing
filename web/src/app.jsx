@@ -1109,6 +1109,7 @@ export function App() {
 	const topicText = topicFor(activeBuf, netState, chanInfo);
 	const ignoredHere = activeBuf ? ignores[activeBuf.network] || [] : [];
 	const mutedSet = new Set(mutes);
+	const timeFmt = { clock: prefs.clock, seconds: prefs.seconds, ampm: prefs.ampm };
 
 	return (
 		<div class="app">
@@ -1145,6 +1146,7 @@ export function App() {
 							: [activeBuf.buffer]}
 						ignoredNicks={ignoredHere}
 						statusMode={prefs.statusMsgs}
+						timeFmt={timeFmt} nickSep={prefs.nickSep}
 						composerApi={composerApi}
 						onNick={(nick, x, y) => openUserMenu(activeBuf.network, nick, x, y)}
 						isHighlight={(t) => highlightText(t, selfNick, rules, activeBuf.network)}
@@ -1172,7 +1174,7 @@ export function App() {
 				</div>
 			)}
 			{searchOpen && (
-				<SearchOverlay sock={sock} onJump={jumpTo} onClose={() => setSearchOpen(false)} />
+				<SearchOverlay sock={sock} onJump={jumpTo} onClose={() => setSearchOpen(false)} timeFmt={timeFmt} nickSep={prefs.nickSep} />
 			)}
 			{switcherOpen && (
 				<Switcher

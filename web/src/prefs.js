@@ -15,6 +15,12 @@ export const MSG_FONTS = ["sans", "mono"];
 // Lounge's status-message setting): shown, collapsed into one summary
 // row per run, or hidden entirely.
 export const STATUS_MSGS = ["show", "collapse", "hide"];
+// Clock style for message timestamps: 24-hour ("14:05") or 12-hour
+// ("02:05 PM"). Seconds and the AM/PM suffix are separate toggles.
+export const CLOCKS = ["24", "12"];
+// Longest allowed nick/message separator (e.g. ":"); a few chars is plenty
+// and bounds a hand-edited pref.
+export const MAX_NICK_SEP = 3;
 
 // Swatch colors shown in settings; must match the data-accent blocks in
 // style.css.
@@ -36,6 +42,10 @@ export const DEFAULTS = {
 	density: "cozy",
 	msgFont: "sans",
 	statusMsgs: "show",
+	clock: "24",
+	seconds: false,
+	ampm: true,
+	nickSep: "",
 	css: "",
 };
 
@@ -51,6 +61,10 @@ export function normalizePrefs(raw) {
 		density: pick(p.density, DENSITIES, DEFAULTS.density),
 		msgFont: pick(p.msgFont, MSG_FONTS, DEFAULTS.msgFont),
 		statusMsgs: pick(p.statusMsgs, STATUS_MSGS, DEFAULTS.statusMsgs),
+		clock: pick(p.clock, CLOCKS, DEFAULTS.clock),
+		seconds: typeof p.seconds === "boolean" ? p.seconds : DEFAULTS.seconds,
+		ampm: typeof p.ampm === "boolean" ? p.ampm : DEFAULTS.ampm,
+		nickSep: typeof p.nickSep === "string" ? p.nickSep.slice(0, MAX_NICK_SEP) : DEFAULTS.nickSep,
 		css: typeof p.css === "string" ? p.css : DEFAULTS.css,
 	};
 }

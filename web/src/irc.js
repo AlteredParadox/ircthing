@@ -165,9 +165,25 @@ export function nickColor(nick, theme) {
 	return `oklch(${light ? 0.5 : 0.74} ${light ? 0.15 : 0.13} ${h})`;
 }
 
-export function fmtTime(ms) {
+// fmtTime renders a timestamp per the user's clock prefs. opts:
+//   clock:   "24" (default) or "12"
+//   seconds: append ":SS" when true
+//   ampm:    append " AM"/" PM" in 12-hour mode when true
+// Hours are zero-padded in both modes so the mono column stays aligned.
+// With no opts it yields the historical "HH:MM" 24-hour form.
+export function fmtTime(ms, opts) {
+	const o = opts || {};
 	const d = new Date(ms);
-	return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+	let h = d.getHours();
+	let suffix = "";
+	if (o.clock === "12") {
+		const pm = h >= 12;
+		h = h % 12 || 12;
+		if (o.ampm) suffix = pm ? " PM" : " AM";
+	}
+	let out = String(h).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+	if (o.seconds) out += ":" + String(d.getSeconds()).padStart(2, "0");
+	return out + suffix;
 }
 
 // sameGroup: consecutive-message grouping — hide the nick on runs of

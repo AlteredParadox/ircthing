@@ -159,6 +159,23 @@ test("fmtTime pads", () => {
 	is(fmtTime(d.getTime()), "09:05");
 });
 
+test("fmtTime honours clock/seconds/ampm options", () => {
+	const at = (h, m, s) => {
+		const d = new Date();
+		d.setHours(h, m, s, 0);
+		return d.getTime();
+	};
+	// 24-hour (default) with and without seconds.
+	is(fmtTime(at(14, 5, 9)), "14:05");
+	is(fmtTime(at(14, 5, 9), { clock: "24", seconds: true }), "14:05:09");
+	// 12-hour: zero-padded hour, AM/PM toggle, midnight/noon edge cases.
+	is(fmtTime(at(14, 5, 9), { clock: "12", ampm: true }), "02:05 PM");
+	is(fmtTime(at(14, 5, 9), { clock: "12", ampm: false }), "02:05");
+	is(fmtTime(at(14, 5, 9), { clock: "12", seconds: true, ampm: true }), "02:05:09 PM");
+	is(fmtTime(at(0, 0, 0), { clock: "12", ampm: true }), "12:00 AM");
+	is(fmtTime(at(12, 0, 0), { clock: "12", ampm: true }), "12:00 PM");
+});
+
 test("bufKey separates network and buffer", () => {
 	is(bufKey("libera", "#go"), "libera\n#go");
 	is(bufKey("ab", "#c") !== bufKey("a", "b#c"), true);

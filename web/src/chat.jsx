@@ -31,10 +31,10 @@ function Body({ text }) {
 	));
 }
 
-function SysRow({ ev, r, focused }) {
+function SysRow({ ev, r, focused, timeFmt }) {
 	return (
 		<div class={"sys-row" + (r.kind === "redacted" ? " redacted" : "") + (focused ? " flash" : "")}>
-			<span class="msg-time">{fmtTime(ev.time)}</span>
+			<span class="msg-time">{fmtTime(ev.time, timeFmt)}</span>
 			<span class={"sys-mark " + r.markClass}>{r.mark}</span>
 			<span>{r.text}</span>
 		</div>
@@ -54,12 +54,12 @@ function CollapsedRow({ ev, onToggle }) {
 	);
 }
 
-function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onToggle }) {
+function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onToggle, timeFmt, nickSep }) {
 	if (ev.whois) return <WhoisCard whois={ev.whois} focused={focused} />;
 	if (ev.collapse) return <CollapsedRow ev={ev} onToggle={onToggle} />;
 	const r = renderable(ev);
 	if (r.kind === "system" || r.kind === "redacted") {
-		return <SysRow ev={ev} r={r} focused={focused} />;
+		return <SysRow ev={ev} r={r} focused={focused} timeFmt={timeFmt} />;
 	}
 	const self = selfNick && ev.sender === selfNick;
 	const mention = !self && isHighlight(r.text);
@@ -68,18 +68,22 @@ function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onTo
 	const color = self ? "var(--accent)" : nickColor(ev.sender, theme);
 	// Own messages can be deleted (server decides authorization).
 	const canRedact = self && ev.msgid && onRedact;
-	// Actions show "*" in the nick column (the sender leads the body).
-	const nickLabel = r.kind === "action" ? "*" : ev.sender;
+	// Actions show "*" in the nick column (the sender leads the body); a
+	// real nick can carry a user-chosen separator ("AlteredParadox:"), colored with
+	// the nick.
+	const isAction = r.kind === "action";
+	const nickLabel = isAction ? "*" : ev.sender;
+	const sep = !isAction && ev.sender ? (nickSep || "") : "";
 	return (
 		<div class={"msg-row" + (mention ? " mention" : "") + (focused ? " flash" : "")}>
-			<span class="msg-time">{fmtTime(ev.time)}</span>
+			<span class="msg-time">{fmtTime(ev.time, timeFmt)}</span>
 			<span
 				class={"msg-nick" + (ev.sender ? " has-menu" : "")}
 				style={{ color }}
 				title={ev.sender}
 				{...(ev.sender ? menuTrigger((x, y) => onNick(ev.sender, x, y)) : {})}
 			>
-				{nickLabel}
+				{nickLabel}{sep}
 			</span>
 			<div class={"msg-body" + (r.kind === "action" ? " action" : "") + (r.kind === "notice" ? " notice" : "")}>
 				{r.kind === "action" && (
@@ -109,7 +113,7 @@ function estimate(ev) {
 // Chat renders the active buffer: virtualized scrollback plus composer.
 // completionNicks feeds tab-completion (channel roster, or the query
 // counterpart).
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, timeFmt, nickSep, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
 	const [draft, setDraft] = useState("");
 	// Per-buffer drafts: keep half-typed text with its own buffer so a
 	// switch swaps the composer contents instead of carrying text into —
@@ -259,7 +263,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 					else markRead();
 				}}
 				renderItem={(ev, i) => (
-					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} />
+					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} timeFmt={timeFmt} nickSep={nickSep} />
 				)}
 			/>
 			<div class="composer">

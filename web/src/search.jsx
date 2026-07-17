@@ -5,7 +5,7 @@ import { fmtTime, renderable } from "./irc.js";
 // Full-text search overlay. Debounced queries hit the server FTS index;
 // each result renders like a message line (via the shared renderer) and,
 // when clicked, jumps to that message in its buffer.
-export function SearchOverlay({ sock, onJump, onClose }) {
+export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep }) {
 	const [query, setQuery] = useState("");
 	const [results, setResults] = useState([]);
 	const [state, setState] = useState("idle"); // idle | loading | done
@@ -70,10 +70,10 @@ export function SearchOverlay({ sock, onJump, onClose }) {
 							>
 								<div class="search-result-meta">
 									<span class="search-result-buf">{ev.network}/{ev.buffer}</span>
-									<span class="search-result-time">{fmtTime(ev.time)}</span>
+									<span class="search-result-time">{fmtTime(ev.time, timeFmt)}</span>
 								</div>
 								<div class="search-result-line">
-									<span class="search-result-nick">{ev.sender}</span>
+									<span class="search-result-nick">{ev.sender}{ev.sender ? (nickSep || "") : ""}</span>
 									<span class="search-result-text">{r.text}</span>
 								</div>
 							</div>
