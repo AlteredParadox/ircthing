@@ -216,25 +216,31 @@ func checkFraming(msg *ircv4.Message) error {
 	if hasFramingBytes(msg.Command) || strings.IndexByte(msg.Command, ' ') != -1 {
 		return ErrUnsafeFraming
 	}
-	for i, p := range msg.Params {
+	if err := checkParamFraming(msg.Params); err != nil {
+		return err
+	}
+	if msg.Prefix != nil &&
+		(hasFramingBytes(msg.Prefix.Name) || hasFramingBytes(msg.Prefix.User) || hasFramingBytes(msg.Prefix.Host)) {
+		return ErrUnsafeFraming
+	}
+	for k, v := range msg.Tags {
+		if hasFramingBytes(k) || hasFramingBytes(string(v)) {
+			return ErrUnsafeFraming
+		}
+	}
+	return nil
+}
+
+func checkParamFraming(params []string) error {
+	for i, p := range params {
 		if hasFramingBytes(p) {
 			return ErrUnsafeFraming
 		}
 		// A space in a non-trailing parameter would be re-parsed by the
-		// receiver as a parameter boundary — intra-line injection. Only
-		// the last parameter is serialized as trailing (":...") and may
+		// receiver as a parameter boundary — intra-line injection. Only the
+		// last parameter is serialized as trailing (":...") and may
 		// legitimately contain spaces.
-		if i < len(msg.Params)-1 && strings.IndexByte(p, ' ') != -1 {
-			return ErrUnsafeFraming
-		}
-	}
-	if msg.Prefix != nil {
-		if hasFramingBytes(msg.Prefix.Name) || hasFramingBytes(msg.Prefix.User) || hasFramingBytes(msg.Prefix.Host) {
-			return ErrUnsafeFraming
-		}
-	}
-	for k, v := range msg.Tags {
-		if hasFramingBytes(k) || hasFramingBytes(string(v)) {
+		if i < len(params)-1 && strings.IndexByte(p, ' ') != -1 {
 			return ErrUnsafeFraming
 		}
 	}

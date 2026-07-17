@@ -271,6 +271,27 @@ func (s *Store) AppendFolded(ctx context.Context, network, target string, fold f
 	return s.append(ctx, network, target, m, true, fold, nil)
 }
 
+// nullString maps "" to a SQL NULL (an empty text/msgid must not be
+// stored or indexed) and any other value to itself.
+func nullString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// createVetoed reports whether a would-be-new buffer must NOT be created:
+// the buffer doesn't exist and the caller's guard vetoes re-creation. The
+// existence check and the veto happen together under s.mu (the caller holds
+// it) so a concurrent DeleteBuffer can't be undone by an in-flight append.
+func (s *Store) createVetoed(ctx context.Context, network, target string, guard func() bool) (bool, error) {
+	id, err := s.bufferID(ctx, network, target, false)
+	if err != nil {
+		return false, err
+	}
+	return id == 0 && guard(), nil
+}
+
 func (s *Store) append(ctx context.Context, network, target string, m Message, create bool, fold func(string) string, guardCreate func() bool) (Message, error) {
 	if network == "" || target == "" {
 		return Message{}, errors.New("store: network and target must be non-empty")
@@ -285,13 +306,11 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 		target, _ = s.canonicalLocked(ctx, network, target, fold)
 	}
 	if create && guardCreate != nil {
-		// Would this create a fresh buffer? Decide create-vs-skip atomically
-		// with the existence check (both under s.mu) so a concurrent
-		// DeleteBuffer cannot be undone by an in-flight append: if the buffer
-		// is already gone and the guard vetoes re-creation, drop the message.
-		if id, err := s.bufferID(ctx, network, target, false); err != nil {
+		blocked, err := s.createVetoed(ctx, network, target, guardCreate)
+		if err != nil {
 			return Message{}, err
-		} else if id == 0 && guardCreate() {
+		}
+		if blocked {
 			return Message{}, nil
 		}
 	}
@@ -302,16 +321,9 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 	if bufID == 0 {
 		return Message{}, nil // no such buffer and create is off
 	}
-	var msgid, text any
-	if m.MsgID != "" {
-		msgid = m.MsgID
-	}
-	if m.Text != "" {
-		text = m.Text // NULL otherwise: not indexed for search
-	}
 	res, err := s.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO messages (buffer_id, ts, msgid, sender, command, raw, text) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		bufID, m.Time.UnixMilli(), msgid, m.Sender, m.Command, m.Raw, text)
+		bufID, m.Time.UnixMilli(), nullString(m.MsgID), m.Sender, m.Command, m.Raw, nullString(m.Text))
 	if err != nil {
 		return Message{}, fmt.Errorf("store: append: %w", err)
 	}

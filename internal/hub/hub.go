@@ -309,6 +309,25 @@ func (h *Hub) liveHints(ctx context.Context, c Conn, ev irc.Event) {
 	}
 }
 
+// adoptReplayedOwn handles a chathistory replay of one of our own messages
+// (no echo-message, so persistOwn stored a no-msgid placeholder): it stamps
+// the server's msgid onto the placeholder so the subsequent insert dedups
+// against it instead of duplicating. Caller has already confirmed the
+// message is ours and replayed.
+func (h *Hub) adoptReplayedOwn(ctx context.Context, c Conn, ev irc.Event, target string) {
+	if ev.Msg.Command != "PRIVMSG" && ev.Msg.Command != "NOTICE" {
+		return
+	}
+	mid := ev.Msg.Tags["msgid"]
+	if mid == "" {
+		return
+	}
+	since := messageTime(ev).Add(-ownDedupWindow).UnixMilli()
+	if _, aerr := h.store.AdoptOwnMsgID(ctx, ev.Network, target, searchText(ev.Msg), mid, c.Fold, since); aerr != nil {
+		log.Printf("irc[%s]: own-message dedup for %q: %v", ev.Network, target, aerr)
+	}
+}
+
 // persistEvent stores a message in its buffer and, when live, broadcasts
 // it. Duplicate msgids (overlapping backfill) are silently dropped.
 func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay bool) error {
@@ -323,25 +342,16 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	// the canonical stored spelling and append atomically (AppendFolded)
 	// — an echoed message can carry client-supplied casing, and #Go/#go
 	// must not split into two buffers even under a concurrent send.
-	selfPart := ev.Msg.Command == "PART" && ev.Msg.Prefix != nil && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick())
+	own := ev.Msg.Prefix != nil && c.Nick() != "" && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick())
+	selfPart := own && ev.Msg.Command == "PART"
 	// Our own JOIN reopens a channel: clear any close grace so its
 	// buffer is re-created and live traffic flows again (otherwise a
 	// rejoin within the 10s window would silently drop messages).
-	if ev.Msg.Command == "JOIN" && ev.Msg.Prefix != nil && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick()) {
+	if own && ev.Msg.Command == "JOIN" {
 		h.unmarkClosed(ev.Network, c.Fold(target))
 	}
-	// A chathistory replay of one of our own messages (no echo-message,
-	// so persistOwn stored a no-msgid placeholder) must not duplicate:
-	// stamp the server's msgid onto the placeholder first, so the insert
-	// below dedups against it.
-	if replay && (ev.Msg.Command == "PRIVMSG" || ev.Msg.Command == "NOTICE") &&
-		ev.Msg.Prefix != nil && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick()) {
-		if mid := ev.Msg.Tags["msgid"]; mid != "" {
-			since := messageTime(ev).Add(-ownDedupWindow).UnixMilli()
-			if _, aerr := h.store.AdoptOwnMsgID(ctx, ev.Network, target, searchText(ev.Msg), mid, c.Fold, since); aerr != nil {
-				log.Printf("irc[%s]: own-message dedup for %q: %v", ev.Network, target, aerr)
-			}
-		}
+	if replay && own {
+		h.adoptReplayedOwn(ctx, c, ev, target)
 	}
 	var stored store.Message
 	var err error

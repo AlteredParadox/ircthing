@@ -90,55 +90,59 @@ type fetcher struct {
 // time (rebinding-safe), while the proxied path leaves DNS to the proxy.
 func newFetcher(maxBytes int64, proxy *url.URL) *fetcher {
 	f := &fetcher{maxBytes: maxBytes, allowIP: isPublicIP}
-	tr := &http.Transport{
-		Proxy:                 nil, // never honor $HTTP_PROXY implicitly
-		TLSHandshakeTimeout:   8 * time.Second,
-		ResponseHeaderTimeout: 8 * time.Second,
-		DisableKeepAlives:     true,
-		MaxIdleConns:          0,
-	}
-	if proxy != nil {
-		f.proxied = true
-		// The proxy owns egress and DNS. Our local IP allowlist can't see
-		// the proxy-resolved address, so hostAllowed (in get/CheckRedirect)
-		// is the SSRF backstop for literal-IP targets.
-		tr.DialContext = func(ctx context.Context, _, addr string) (net.Conn, error) {
-			return proxydial.Dial(ctx, proxy, addr, 8*time.Second)
-		}
-	} else {
-		d := &net.Dialer{Timeout: 8 * time.Second, KeepAlive: -1}
-		// Control runs after DNS resolution with the concrete IP:port,
-		// before the socket connects — the correct, rebinding-safe hook.
-		d.Control = func(_, address string, _ syscall.RawConn) error {
-			host, _, err := net.SplitHostPort(address)
-			if err != nil {
-				return err
-			}
-			ip := net.ParseIP(host)
-			if ip == nil || !f.allowIP(ip) {
-				return fmt.Errorf("%w: %s", errBlocked, address)
-			}
-			return nil
-		}
-		tr.DialContext = d.DialContext
-	}
 	f.client = &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: tr,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return errors.New("proxy: too many redirects")
-			}
-			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
-				return errors.New("proxy: disallowed redirect scheme")
-			}
-			if f.proxied && !f.hostAllowed(req.URL.Hostname()) {
-				return fmt.Errorf("%w: %s", errBlocked, req.URL.Host)
-			}
-			return nil
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			Proxy:                 nil, // never honor $HTTP_PROXY implicitly
+			DialContext:           f.dialContext(proxy),
+			TLSHandshakeTimeout:   8 * time.Second,
+			ResponseHeaderTimeout: 8 * time.Second,
+			DisableKeepAlives:     true,
+			MaxIdleConns:          0,
 		},
+		CheckRedirect: f.checkRedirect,
 	}
 	return f
+}
+
+// dialContext returns the transport dialer. Proxied: tunnel through the
+// proxy (which owns egress + DNS); direct: a plain dialer whose Control
+// hook re-validates the resolved IP at connect time (rebinding-safe).
+func (f *fetcher) dialContext(proxy *url.URL) func(context.Context, string, string) (net.Conn, error) {
+	if proxy != nil {
+		f.proxied = true
+		return func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return proxydial.Dial(ctx, proxy, addr, 8*time.Second)
+		}
+	}
+	d := &net.Dialer{Timeout: 8 * time.Second, KeepAlive: -1}
+	d.Control = func(_, address string, _ syscall.RawConn) error {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return err
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !f.allowIP(ip) {
+			return fmt.Errorf("%w: %s", errBlocked, address)
+		}
+		return nil
+	}
+	return d.DialContext
+}
+
+func (f *fetcher) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 5 {
+		return errors.New("proxy: too many redirects")
+	}
+	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+		return errors.New("proxy: disallowed redirect scheme")
+	}
+	// The proxied path has no connect-time IP check, so re-apply the literal
+	// non-public-IP block on each redirect target.
+	if f.proxied && !f.hostAllowed(req.URL.Hostname()) {
+		return fmt.Errorf("%w: %s", errBlocked, req.URL.Host)
+	}
+	return nil
 }
 
 // hostAllowed rejects a target whose host is a literal non-public IP. A

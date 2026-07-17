@@ -101,7 +101,24 @@ func extractMeta(doc, pageURL string, pv *PreviewData) {
 	if loc := reHead.FindStringIndex(doc); loc != nil {
 		doc = doc[:loc[0]] // scanning the head is enough and bounds the work
 	}
+	meta := parseHeadMeta(doc)
+	pv.Title = clip(firstNonEmpty(meta["og:title"], meta["twitter:title"], titleElement(doc)), previewMaxTitle)
+	pv.Description = clip(firstNonEmpty(meta["og:description"], meta["twitter:description"], meta["description"]), previewMaxDesc)
+	pv.SiteName = clip(meta["og:site_name"], previewMaxTitle)
+	if img := firstNonEmpty(meta["og:image"], meta["og:image:url"], meta["twitter:image"]); img != "" {
+		// Drop an over-length image URL rather than cache it: /api/thumb
+		// rejects URLs past this bound anyway, and the raw og:image can
+		// be ~500 KB (bounded only by the HTML fetch cap), which would
+		// bloat the preview cache past the RSS target.
+		if abs := resolveURL(pageURL, img); len(abs) <= maxImageURL {
+			pv.Image = abs
+		}
+	}
+}
 
+// parseHeadMeta collects <meta property|name=… content=…> pairs (first
+// value wins), unescaped.
+func parseHeadMeta(doc string) map[string]string {
 	meta := map[string]string{}
 	for _, tag := range reMeta.FindAllString(doc, -1) {
 		var key, content string
@@ -121,19 +138,7 @@ func extractMeta(doc, pageURL string, pv *PreviewData) {
 			}
 		}
 	}
-
-	pv.Title = clip(firstNonEmpty(meta["og:title"], meta["twitter:title"], titleElement(doc)), previewMaxTitle)
-	pv.Description = clip(firstNonEmpty(meta["og:description"], meta["twitter:description"], meta["description"]), previewMaxDesc)
-	pv.SiteName = clip(meta["og:site_name"], previewMaxTitle)
-	if img := firstNonEmpty(meta["og:image"], meta["og:image:url"], meta["twitter:image"]); img != "" {
-		// Drop an over-length image URL rather than cache it: /api/thumb
-		// rejects URLs past this bound anyway, and the raw og:image can
-		// be ~500 KB (bounded only by the HTML fetch cap), which would
-		// bloat the preview cache past the RSS target.
-		if abs := resolveURL(pageURL, img); len(abs) <= maxImageURL {
-			pv.Image = abs
-		}
-	}
+	return meta
 }
 
 func titleElement(doc string) string {

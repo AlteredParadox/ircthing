@@ -8,6 +8,17 @@
 // is one O(n) pass over ~50k floats (well under a millisecond), which
 // beats maintaining an incremental structure nobody can read at 2 a.m.
 
+// isAppendOf reports whether `items` is `old` with only rows appended at
+// the end (same head, same old tail) — the fast path for a new message.
+function isAppendOf(old, items) {
+	return (
+		old.length > 0 &&
+		items.length >= old.length &&
+		items[0] === old[0] &&
+		items[old.length - 1] === old.at(-1)
+	);
+}
+
 export class Geometry {
 	constructor(estimate) {
 		this.estimate = estimate;
@@ -23,27 +34,26 @@ export class Geometry {
 		if (old === items) return;
 		// Append fast path: the common case is one message arriving at the
 		// end of a 50k list — extend the index instead of rebuilding it.
-		const appended =
-			old.length > 0 &&
-			items.length >= old.length &&
-			items[0] === old[0] &&
-			items[old.length - 1] === old.at(-1);
-		if (appended) {
+		if (isAppendOf(old, items)) {
 			for (let i = old.length; i < items.length; i++) this.index.set(items[i].id, i);
 		} else {
-			this.index = new Map();
-			for (let i = 0; i < items.length; i++) this.index.set(items[i].id, i);
-			// Not an append: rows may have been trimmed/removed. Drop
-			// their cached measurements so `measured` cannot grow without
-			// bound within a single long-lived buffer.
-			if (this.measured.size > this.index.size) {
-				for (const id of this.measured.keys()) {
-					if (!this.index.has(id)) this.measured.delete(id);
-				}
-			}
+			this.rebuildIndex(items);
 		}
 		this.items = items;
 		this.dirty = true;
+	}
+
+	// rebuildIndex rebuilds the id->index map from scratch and, since rows
+	// may have been trimmed/removed, drops cached measurements for ids no
+	// longer present so `measured` cannot grow without bound.
+	rebuildIndex(items) {
+		this.index = new Map();
+		for (let i = 0; i < items.length; i++) this.index.set(items[i].id, i);
+		if (this.measured.size > this.index.size) {
+			for (const id of this.measured.keys()) {
+				if (!this.index.has(id)) this.measured.delete(id);
+			}
+		}
 	}
 
 	// clearMeasured drops all measurements (container width changed, so

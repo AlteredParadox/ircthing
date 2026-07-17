@@ -54,6 +54,7 @@ function CollapsedRow({ ev, onToggle }) {
 	);
 }
 
+// Row dispatches by event kind; a real message renders via MsgRow.
 function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onToggle, timeFmt, nickSep, previews }) {
 	if (ev.whois) return <WhoisCard whois={ev.whois} focused={focused} />;
 	if (ev.collapse) return <CollapsedRow ev={ev} onToggle={onToggle} />;
@@ -61,6 +62,43 @@ function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onTo
 	if (r.kind === "system" || r.kind === "redacted") {
 		return <SysRow ev={ev} r={r} focused={focused} timeFmt={timeFmt} />;
 	}
+	return (
+		<MsgRow
+			ev={ev} r={r} selfNick={selfNick} theme={theme} focused={focused}
+			isHighlight={isHighlight} onRedact={onRedact} onNick={onNick}
+			timeFmt={timeFmt} nickSep={nickSep} previews={previews}
+		/>
+	);
+}
+
+// RowNick is the nick column: colored, right-click menu, optional trailing
+// separator ("AlteredParadox:").
+function RowNick({ sender, color, label, sep, onNick }) {
+	return (
+		<span
+			class={"msg-nick" + (sender ? " has-menu" : "")}
+			style={{ color }}
+			title={sender}
+			{...(sender ? menuTrigger((x, y) => onNick(sender, x, y)) : {})}
+		>{label}{sep}</span>
+	);
+}
+
+// RowBody is the message text column: an action leads with the sender, a
+// bot chip, then the (multiline-aware) body.
+function RowBody({ r, color, sender, onNick }) {
+	return (
+		<div class={"msg-body" + (r.kind === "action" ? " action" : "") + (r.kind === "notice" ? " notice" : "")}>
+			{r.kind === "action" && (
+				<span class="has-menu" style={{ color, fontWeight: 600 }} {...menuTrigger((x, y) => onNick(sender, x, y))}>{sender} </span>
+			)}
+			{r.bot && <span class="bot-chip" title="flagged as a bot">bot</span>}
+			<Body text={r.text} />
+		</div>
+	);
+}
+
+function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick, timeFmt, nickSep, previews }) {
 	const self = selfNick && ev.sender === selfNick;
 	const mention = !self && isHighlight(r.text);
 	// One preview per message (the first link), only for real messages.
@@ -69,33 +107,15 @@ function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onTo
 	// Own messages can be deleted (server decides authorization).
 	const canRedact = self && ev.msgid && onRedact;
 	// Actions show "*" in the nick column (the sender leads the body); a
-	// real nick can carry a user-chosen separator ("AlteredParadox:"), colored with
-	// the nick.
+	// real nick can carry a user-chosen separator ("AlteredParadox:").
 	const isAction = r.kind === "action";
 	const nickLabel = isAction ? "*" : ev.sender;
 	const sep = !isAction && ev.sender ? (nickSep || "") : "";
 	return (
 		<div class={"msg-row" + (mention ? " mention" : "") + (focused ? " flash" : "")}>
 			<span class="msg-time">{fmtTime(ev.time, timeFmt)}</span>
-			<span
-				class={"msg-nick" + (ev.sender ? " has-menu" : "")}
-				style={{ color }}
-				title={ev.sender}
-				{...(ev.sender ? menuTrigger((x, y) => onNick(ev.sender, x, y)) : {})}
-			>
-				{nickLabel}{sep}
-			</span>
-			<div class={"msg-body" + (r.kind === "action" ? " action" : "") + (r.kind === "notice" ? " notice" : "")}>
-				{r.kind === "action" && (
-					<span
-						class="has-menu"
-						style={{ color, fontWeight: 600 }}
-						{...menuTrigger((x, y) => onNick(ev.sender, x, y))}
-					>{ev.sender} </span>
-				)}
-				{r.bot && <span class="bot-chip" title="flagged as a bot">bot</span>}
-				<Body text={r.text} />
-			</div>
+			<RowNick sender={ev.sender} color={color} label={nickLabel} sep={sep} onNick={onNick} />
+			<RowBody r={r} color={color} sender={ev.sender} onNick={onNick} />
 			{canRedact && (
 				<button class="msg-redact" title="Delete message" onClick={() => onRedact(ev.msgid)}>⌫</button>
 			)}
