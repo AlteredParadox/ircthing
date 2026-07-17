@@ -443,20 +443,36 @@ func (m *Manager) handleCapNotify(in *ircv4.Message) []*ircv4.Message {
 	switch strings.ToUpper(in.Params[1]) {
 	case "NEW":
 		var req []string
+		seen := make(map[string]bool)
 		for _, tok := range strings.Fields(list) {
 			name, value, _ := strings.Cut(tok, "=")
-			if wantedCapSet[name] && !m.CapEnabled(name) {
-				req = append(req, name)
-				if value != "" {
-					m.pendingCapVals[name] = value
-				}
+			// Dedup: m.caps is only updated on the later ACK, so CapEnabled
+			// can't suppress a name repeated within one CAP NEW. Without this,
+			// a hostile server repeating a wanted cap hundreds of times builds
+			// a multi-kilobyte CAP REQ that trips the writer's FATAL length
+			// guard (the internal path has no sendAll check), looping the
+			// connection.
+			if !wantedCapSet[name] || m.CapEnabled(name) || seen[name] {
+				continue
+			}
+			seen[name] = true
+			req = append(req, name)
+			if value != "" {
+				m.pendingCapVals[name] = value
 			}
 		}
 		if len(req) == 0 {
 			return nil
 		}
 		sort.Strings(req)
-		return []*ircv4.Message{newMsg("CAP", "REQ", strings.Join(req, " "))}
+		reqMsg := newMsg("CAP", "REQ", strings.Join(req, " "))
+		// Dedup bounds this to the finite wanted set (well under LINELEN), but
+		// validate anyway: this line takes the internal priority path, whose
+		// writer length check is fatal — never feed it an over-length line.
+		if checkLineLen(reqMsg, m.lineLen()) != nil {
+			return nil
+		}
+		return []*ircv4.Message{reqMsg}
 	case "ACK", "DEL":
 		m.applyCapChange(strings.ToUpper(in.Params[1]) == "ACK", list)
 	}

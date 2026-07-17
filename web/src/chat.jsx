@@ -163,10 +163,14 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 		let out = list;
 		if (ignoreKey) {
 			const set = new Set(ignoreKey.split("\n"));
-			out = out.filter((ev) => !ev.sender || !set.has(ev.sender.toLowerCase()));
+			// Always keep the jump target (a search result can be from an
+			// ignored sender — ignores are client-only, FTS is not). Filtering
+			// it out would leave the jump with no row to scroll to, so the
+			// buffer silently snaps back to its live tail.
+			out = out.filter((ev) => ev.id === focusId || !ev.sender || !set.has(ev.sender.toLowerCase()));
 		}
 		return applyStatusMode(out, statusMode || "show", expanded);
-	}, [list, ignoreKey, statusMode, expanded]);
+	}, [list, ignoreKey, statusMode, expanded, focusId]);
 
 	// Typing notifications, one sender per buffer; the previous buffer's
 	// session ends with "done" when switching away mid-draft.

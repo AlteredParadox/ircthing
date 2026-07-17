@@ -178,3 +178,25 @@ func TestCapNotifyACKRejectsUnrequested(t *testing.T) {
 		t.Fatal("DEL did not remove away-notify")
 	}
 }
+
+// A CAP NEW that repeats a wanted cap many times must not build an
+// over-length CAP REQ: without dedup the assembled line trips the writer's
+// fatal length guard (the internal path has no sendAll check), looping the
+// connection.
+func TestCapNotifyNEWDedupsRepeatedCaps(t *testing.T) {
+	m, err := NewManager(Config{Addr: "irc.test:6667", Nick: "AlteredParadox", AllowPlaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep := strings.Repeat("multi-prefix ", 1000)
+	out := m.handleCapNotify(ircv4.MustParseMessage(":srv CAP AlteredParadox NEW :" + rep))
+	if len(out) != 1 {
+		t.Fatalf("handleCapNotify returned %d messages, want 1", len(out))
+	}
+	if got := out[0].Param(1); got != "multi-prefix" {
+		t.Fatalf("CAP REQ = %q, want a single 'multi-prefix'", got)
+	}
+	if err := checkLineLen(out[0], defaultLineLen); err != nil {
+		t.Fatalf("assembled CAP REQ exceeds the line limit: %v", err)
+	}
+}
