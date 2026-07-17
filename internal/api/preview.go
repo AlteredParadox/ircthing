@@ -65,6 +65,12 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.releaseMedia()
+	// Re-check after the (up to 5s) slot wait: previews may have been disabled
+	// while this request was parked, and it must not fetch after that.
+	if !s.previewsEnabled() {
+		http.Error(w, "previews disabled", http.StatusForbidden)
+		return
+	}
 	ct, body, err := s.htmlFetcherFor(proxy).get(r.Context(), target)
 	if err != nil {
 		http.Error(w, "preview unavailable", http.StatusBadGateway)

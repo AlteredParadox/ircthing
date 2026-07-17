@@ -117,7 +117,7 @@ function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick
 			{/* Previews wrap to their own full-width line, left-aligned under
 			    the timestamp rather than indented into the body column.
 			    `previews` is the server switch — off means no fetch at all. */}
-			{link && previews !== false && <div class="msg-media"><LinkPreview url={link} net={ev.network} /></div>}
+			{link && previews === true && <div class="msg-media"><LinkPreview url={link} net={ev.network} /></div>}
 		</div>
 	);
 }

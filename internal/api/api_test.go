@@ -96,7 +96,7 @@ func login(t *testing.T, ts *httptest.Server, username, password string) *http.R
 func sessionCookieOf(t *testing.T, resp *http.Response) *http.Cookie {
 	t.Helper()
 	for _, c := range resp.Cookies() {
-		if c.Name == sessionCookie {
+		if c.Name == sessionCookie || c.Name == "__Host-"+sessionCookie {
 			return c
 		}
 	}
@@ -663,6 +663,11 @@ func TestSecureCookieFlag(t *testing.T) {
 	c := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
 	if !c.Secure || c.SameSite != http.SameSiteStrictMode {
 		t.Fatalf("session cookie = %+v, want Secure + SameSite=Strict", c)
+	}
+	// Under SecureCookies the cookie carries the __Host- prefix (defeats
+	// sibling-subdomain cookie-tossing).
+	if c.Name != "__Host-"+sessionCookie {
+		t.Fatalf("session cookie name = %q, want __Host- prefix", c.Name)
 	}
 	// Logout's deletion cookie carries matching attributes.
 	req, _ := http.NewRequest("POST", ts.URL+"/api/logout", nil)

@@ -18,6 +18,18 @@ func TestParseRedactsCredentials(t *testing.T) {
 	if !strings.Contains(err.Error(), "<redacted>@host:1080") {
 		t.Fatalf("error should retain the redacted host: %v", err)
 	}
+
+	// A value that fails url.Parse must not leak the raw credential via a
+	// wrapped *url.Error (which embeds the original string).
+	if _, err := Parse("socks5://bob:s3cr3t%zz@host:1080"); err == nil || strings.Contains(err.Error(), "s3cr3t") {
+		t.Fatalf("invalid-escape URL leaked or did not error: %v", err)
+	}
+
+	// A scheme-less credential form (bypasses the scheme masker's "://" split)
+	// must still be redacted in the error.
+	if _, err := Parse("carol:hunter2@host:1080"); err == nil || strings.Contains(err.Error(), "hunter2") || strings.Contains(err.Error(), "carol") {
+		t.Fatalf("scheme-less URL leaked credentials: %v", err)
+	}
 }
 
 func TestParse(t *testing.T) {

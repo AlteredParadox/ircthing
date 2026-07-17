@@ -141,7 +141,7 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 
 					<section class="settings-section">
 						<Field label="Proxy">
-							<input class="rule-input" value={cfg.proxy || ""} onInput={(e) => set({ proxy: e.currentTarget.value })} placeholder="socks5://127.0.0.1:9050 (optional)" />
+							<input type="password" autocomplete="off" class="rule-input" value={cfg.proxy || ""} onInput={(e) => set({ proxy: e.currentTarget.value })} placeholder="socks5://127.0.0.1:9050 (optional)" />
 						</Field>
 					</section>
 

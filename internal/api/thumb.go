@@ -172,6 +172,12 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.releaseMedia()
+	// Re-check after the slot wait: previews may have been disabled while this
+	// request was parked, and it must not fetch after that.
+	if !s.previewsEnabled() {
+		http.Error(w, "previews disabled", http.StatusForbidden)
+		return
+	}
 
 	ct, body, err := s.imageFetcherFor(proxy).get(r.Context(), target)
 	if err != nil {

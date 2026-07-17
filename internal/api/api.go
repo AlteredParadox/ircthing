@@ -186,22 +186,52 @@ func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// cookieName is the session cookie's name. Under SecureCookies (the
+// TLS-fronted deployment) it carries the __Host- prefix, which the browser
+// enforces to require Secure + Path=/ + NO Domain — so a sibling subdomain
+// cannot inject a parent-domain cookie of the same name to shadow the
+// victim's session (a login/session denial of service). The plain-loopback
+// deferral (Secure off) can't use the prefix, so it keeps the bare name.
+func (s *Server) cookieName() string {
+	if s.cfg.SecureCookies {
+		return "__Host-" + sessionCookie
+	}
+	return sessionCookie
+}
+
 // sameSiteOnly refuses a definitively cross-origin request via the
 // Sec-Fetch-Site fetch-metadata header. SameSite=Strict cookies stop true
 // cross-site requests but still treat SIBLING subdomains as same-site, so a
 // hostile sibling could form-POST /api/logout or embed authenticated media
 // GETs; requiring same-origin (rejecting "same-site"/"cross-site") closes
-// that. "none" (direct navigation) and an absent header (older browsers) are
-// allowed — the app itself only ever issues same-origin requests.
+// that. When the header is ABSENT (older browsers, a header-stripping proxy)
+// we fall back to an Origin check so a sibling isn't a free pass — a present
+// Origin must match this request's host; an absent Origin (typical for a
+// top-level GET navigation) is allowed, since the app only ever issues
+// same-origin requests.
 func (s *Server) sameSiteOnly(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Header.Get("Sec-Fetch-Site") {
 		case "cross-site", "same-site":
 			http.Error(w, "cross-site request refused", http.StatusForbidden)
 			return
+		case "same-origin", "none":
+			// Trusted: a same-origin fetch or a direct navigation.
+		default: // absent/unknown: fall back to Origin
+			if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
+				http.Error(w, "cross-origin request refused", http.StatusForbidden)
+				return
+			}
 		}
 		h(w, r)
 	}
+}
+
+// sameOrigin reports whether an Origin header's host matches the request's
+// own Host (scheme/port included in Host comparison via the URL authority).
+func sameOrigin(origin, host string) bool {
+	u, err := url.Parse(origin)
+	return err == nil && u.Host == host
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -255,7 +285,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
+		Name:     s.cookieName(),
 		Value:    token,
 		Path:     "/",
 		MaxAge:   int(s.cfg.SessionTTL.Seconds()),
@@ -319,7 +349,7 @@ func (s *Server) issueToken() (string, error) {
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie(sessionCookie); err == nil {
+	if c, err := r.Cookie(s.cookieName()); err == nil {
 		s.mu.Lock()
 		delete(s.tokens, c.Value)
 		s.mu.Unlock()
@@ -327,14 +357,14 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// The deletion cookie carries the same attributes as the session
 	// cookie so every browser treats it as the same cookie.
 	http.SetCookie(w, &http.Cookie{
-		Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true,
+		Name: s.cookieName(), Value: "", Path: "/", MaxAge: -1, HttpOnly: true,
 		SameSite: http.SameSiteStrictMode, Secure: s.cfg.SecureCookies,
 	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) authed(r *http.Request) bool {
-	c, err := r.Cookie(sessionCookie)
+	c, err := r.Cookie(s.cookieName())
 	if err != nil {
 		return false
 	}
@@ -430,7 +460,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// user logs out or the token expires (auth is otherwise only checked
 	// once, at upgrade).
 	var token string
-	if ck, err := r.Cookie(sessionCookie); err == nil {
+	if ck, err := r.Cookie(s.cookieName()); err == nil {
 		token = ck.Value
 	}
 

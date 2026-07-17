@@ -18,9 +18,11 @@ import { Socket } from "./ws.js";
 const PAGE = 100;
 // Memory bound per buffer: trim to TRIM_TO once past TRIM_AT. Older pages
 // are always refetchable, so trimming loses nothing durable. The list is
-// virtualized, so these bound JS memory, not DOM size.
-const TRIM_AT = 50000;
-const TRIM_TO = 25000;
+// virtualized, so these bound JS memory, not DOM size. Kept deliberately low
+// — a hostile/high-traffic stream would otherwise let one buffer's event
+// array grow to hundreds of MB, and each live append copies the array.
+const TRIM_AT = 5000;
+const TRIM_TO = 2500;
 // Live message lists are kept only for the few most-recently-active
 // buffers. A bouncer pushes events for every joined channel, so without
 // this bound the in-memory lists grow one-capped-list-per-buffer across
@@ -231,7 +233,11 @@ function mergeHistoryPage(m, key, page, tombstones) {
 
 export function App() {
 	const [phase, setPhase] = useState("checking"); // checking | login | app
-	const [previews, setPreviews] = useState(true); // link/media previews enabled (server switch)
+	// Fail closed: previews start OFF until /api/config confirms they are on,
+	// so a slow or failed config load never issues a /api/preview or /api/thumb
+	// request (which would put the full target URL in the reverse-proxy access
+	// log even while previews are disabled). The render gate requires === true.
+	const [previews, setPreviews] = useState(false); // link/media previews enabled (server switch)
 	const [connected, setConnected] = useState(false);
 	const [networks, setNetworks] = useState({});
 	const [buffers, setBuffers] = useState({});

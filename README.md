@@ -128,7 +128,8 @@ that matters depends on **where the proxy runs**:
   `ssh -D`, a local daemon) — **the case to watch.** There `127.0.0.1` and
   `192.168.x/10.x` resolve to *your* host/network, so a malicious preview
   link could probe internal services. Use a proxy whose egress you trust, or
-  turn previews off for that network.
+  turn previews off (the previews switch in **Settings → Link previews** is
+  global — there is no per-network preview toggle).
 
 ## Deployment
 

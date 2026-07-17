@@ -50,13 +50,16 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 	if body.Previews {
 		val = "1"
 	}
+	// Persist and update the in-memory flag under one lock so two concurrent
+	// PUTs cannot interleave into disagreeing persisted/live states (last
+	// writer wins for BOTH). previewsEnabled takes the same RWMutex to read.
+	s.mediaMu.Lock()
+	defer s.mediaMu.Unlock()
 	if err := s.hub.Store().SetSetting(r.Context(), previewsKey, val); err != nil {
 		http.Error(w, "storing config failed", http.StatusInternalServerError)
 		return
 	}
-	s.mediaMu.Lock()
 	s.previewsOn = body.Previews
-	s.mediaMu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
 

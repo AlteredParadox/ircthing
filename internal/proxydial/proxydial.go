@@ -27,12 +27,19 @@ import (
 )
 
 // redactProxy masks any userinfo (user:pass@) in a proxy URL string so
-// SOCKS5/HTTP proxy credentials never reach error messages or logs.
+// SOCKS5/HTTP proxy credentials never reach error messages or logs. It
+// handles both the scheme form ("socks5://user:pass@host") and a scheme-less
+// value ("user:pass@host") that bypassed the scheme check, so a malformed
+// config can't echo credentials back through a validation error.
 func redactProxy(s string) string {
 	if i := strings.Index(s, "://"); i != -1 {
 		if at := strings.IndexByte(s[i+3:], '@'); at != -1 {
 			return s[:i+3] + "<redacted>@" + s[i+3+at+1:]
 		}
+		return s
+	}
+	if at := strings.LastIndexByte(s, '@'); at != -1 {
+		return "<redacted>@" + s[at+1:]
 	}
 	return s
 }
@@ -41,7 +48,9 @@ func redactProxy(s string) string {
 func Parse(s string) (*url.URL, error) {
 	u, err := url.Parse(s)
 	if err != nil {
-		return nil, fmt.Errorf("proxy %q: %w", redactProxy(s), err)
+		// Do NOT wrap the url.Parse error: *url.Error embeds the raw input,
+		// which can carry proxy credentials. Report only the redacted form.
+		return nil, fmt.Errorf("proxy %q: invalid proxy URL", redactProxy(s))
 	}
 	switch u.Scheme {
 	case "socks5", "socks5h", "http":
