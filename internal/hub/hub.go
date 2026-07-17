@@ -364,9 +364,14 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 		// the existing one under casemapping: the echo can carry different
 		// casing than the stored buffer spelling (#Go vs #go), and an
 		// unfolded exact-name lookup would miss and drop the PART. Fold the
-		// target and veto creation unconditionally.
+		// target, veto creation, AND drop within the close grace — a PART
+		// echo is a straggler too, so if it lands after markClosed but before
+		// DeleteBuffer (buffer still exists) it must be dropped rather than
+		// broadcast as a live event that resurrects the buffer, matching the
+		// general channel branch and persistMembership below.
 		stored, err = h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
-			func(exists bool) bool { return !exists }, storeMessage(ev))
+			func(exists bool) bool { return !exists || h.recentlyClosed(ev.Network, c.Fold(target)) },
+			storeMessage(ev))
 	} else {
 		// The close-grace check is evaluated inside the store, atomically
 		// with the buffer existence check, so a straggler in flight when the

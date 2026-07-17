@@ -268,6 +268,11 @@ func TestSendRejectsFramingBytes(t *testing.T) {
 		// A space in a non-trailing param would be re-parsed as a boundary.
 		{Command: "MODE", Params: []string{"#chan +o victim\r\nJOIN #evil", "x"}},
 		{Command: "MODE", Params: []string{"#chan +o extra-arg", "final"}},
+		// A non-trailing param that begins with ':' (or is empty) would be
+		// re-parsed by the receiver as the trailing arg, swallowing the rest.
+		{Command: "NOTICE", Params: []string{":evil", "\x01VERSION x\x01"}},
+		{Command: "WHO", Params: []string{":#chan", "%tnfa,1"}},
+		{Command: "PRIVMSG", Params: []string{"", "hi"}},
 	}
 	for i, msg := range cases {
 		if err := m.Send(msg); err != ErrUnsafeFraming {

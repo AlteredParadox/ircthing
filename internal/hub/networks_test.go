@@ -573,6 +573,53 @@ func TestStragglerToClosedChannelDropped(t *testing.T) {
 	}
 }
 
+// Our own PART echo is a straggler too: landing in the close grace (marked
+// closed, buffer not yet deleted) it must be dropped, not appended and
+// broadcast as a live event that resurrects the buffer.
+func TestSelfPartStragglerToClosedChannelDropped(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox",
+		chans: map[string][]irc.Member{"#go": {{Nick: "AlteredParadox"}}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+			Msg: ircv4.MustParseMessage(line)}
+	}
+	conn.ch <- ev(":bob!u@h PRIVMSG #go :hi")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#go", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed not persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	h.markClosed("libera", conn.Fold("#go"), time.Now().UnixMilli())
+
+	conn.ch <- ev(":AlteredParadox!u@h PART #go :bye") // our own PART echo, in the grace
+	conn.ch <- ev(":bob!u@h PRIVMSG #other :hello")
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#other", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("barrier message not persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if b, _ := h.store.Latest(ctxb, "libera", "#go", 5); len(b) != 1 {
+		t.Fatalf("self-PART echo to a closed channel was appended: #go has %d rows, want 1", len(b))
+	}
+}
+
 // The close grace is channel-only: an inbound PM to a just-closed query
 // must reopen the conversation, not be dropped as a straggler.
 func TestInboundPMReopensClosedQuery(t *testing.T) {

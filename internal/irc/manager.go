@@ -242,11 +242,13 @@ func checkParamFraming(params []string) error {
 		if hasFramingBytes(p) {
 			return ErrUnsafeFraming
 		}
-		// A space in a non-trailing parameter would be re-parsed by the
-		// receiver as a parameter boundary — intra-line injection. Only the
-		// last parameter is serialized as trailing (":...") and may
-		// legitimately contain spaces.
-		if i < len(params)-1 && strings.IndexByte(p, ' ') != -1 {
+		// A non-trailing parameter that contains a space, is empty, or begins
+		// with ':' would be re-parsed by the receiver as a different boundary
+		// (the serializer writes middle params verbatim, and a receiver reads
+		// the first ':'-led token as the trailing arg, silently swallowing
+		// the intended target and everything after it). Only the last
+		// parameter is serialized as trailing and may take those forms.
+		if i < len(params)-1 && (p == "" || p[0] == ':' || strings.IndexByte(p, ' ') != -1) {
 			return ErrUnsafeFraming
 		}
 	}
