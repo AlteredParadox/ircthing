@@ -222,6 +222,10 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 			if (e.key.length !== 1) return; // Tab/Enter/Escape/arrows/F-keys: ignore
 			const el = taRef.current;
 			if (!el || el.disabled) return;
+			// A modal overlay (settings, search, switcher, network form,
+			// context menu, mobile panel) is open — don't yank focus into the
+			// composer behind it and silently accumulate a hidden draft.
+			if (document.querySelector(".search-scrim, .ctx-scrim, .side-scrim, .right-scrim")) return;
 			const active = document.activeElement;
 			if (active === el || (active && active !== document.body && isEditable(active))) return;
 			el.focus();

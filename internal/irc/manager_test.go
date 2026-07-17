@@ -1344,6 +1344,49 @@ func TestOversizedPingAnsweredWithBoundedPong(t *testing.T) {
 	}
 }
 
+// Under UTF8ONLY the writer scrubs invalid bytes to U+FFFD (3 bytes) before
+// its length check, so a PONG token near the line limit would inflate past
+// it and fatally tear the connection down. boundedPong's tighter budget
+// keeps the scrubbed PONG within LINELEN; the connection survives.
+func TestPongSurvivesUTF8ScrubInflation(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	// Advertise UTF8ONLY so scrubUTF8 activates; wait until applied.
+	s.send(":irc.test 005 AlteredParadox UTF8ONLY :are supported by this server")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := m.isup.Raw("UTF8ONLY"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("UTF8ONLY never applied")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// A PING whose token is invalid bytes interleaved with valid ones, so
+	// scrubbing roughly doubles its length.
+	s.send("PING :" + strings.Repeat("a\xff", 250))
+	pong := s.readCmd("PONG") // sent, not a teardown
+	if len(pong.Param(0)) == 0 {
+		t.Fatal("empty PONG")
+	}
+	// Still up: a normal ping round-trips.
+	s.send("PING :ok")
+	if p := s.readCmd("PONG"); p.Param(0) != "ok" {
+		t.Fatalf("PONG = %q, want ok (connection survived)", p.Param(0))
+	}
+}
+
 // A server spoofing an unbounded stream of self-JOINs is torn down
 // rather than growing the never-reset rejoin set without bound.
 func TestManagerBoundsJoinedSet(t *testing.T) {

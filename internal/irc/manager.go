@@ -1015,12 +1015,19 @@ func (m *Manager) feedMultiline(ctx context.Context, ml *multiline, in *ircv4.Me
 // over-length PONG that the writer rejects fatally — a remote
 // reconnect-loop DoS (mirrors maxCTCPPingToken; the reader admits PING
 // lines far larger than LINELEN, so the cap must live here).
+//
+// The budget divides by 3 to leave headroom for UTF8ONLY scrubbing, which
+// the writer applies BEFORE its final length check: an invalid byte becomes
+// U+FFFD (3 bytes), so a token of invalid bytes can inflate up to 3x. A cap
+// near the full limit would let a scrubbed PONG exceed it and re-trigger the
+// very teardown this guards. Real PONG tokens (a timestamp/cookie) are tiny,
+// so the tighter cap never truncates a legitimate one.
 func boundedPong(in *ircv4.Message, limit int) *ircv4.Message {
 	token := ""
 	if n := len(in.Params); n > 0 {
 		token = in.Params[n-1]
 	}
-	budget := limit - len("PONG :\r\n")
+	budget := (limit - len("PONG :\r\n")) / 3
 	if budget < 0 {
 		budget = 0
 	}
