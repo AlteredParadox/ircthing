@@ -287,6 +287,12 @@ export function App() {
 	// buffer, so a live event arriving mid-load cannot fire a second,
 	// window-slid request that corrupts ordering.
 	const loadingHistory = useRef(new Set());
+	// Buffers whose initial history load errored/timed out. Without this the
+	// load effect would immediately refire (loadTick bumps, `loaded` still
+	// false) and hammer the server at WS-RTT rate. Cleared when the buffer is
+	// (re)visited, on reconnect, and on an explicit tail reload — so a retry
+	// is user- or reconnect-driven, not a tight loop.
+	const failedHistory = useRef(new Set());
 	// Per-buffer load generation: a history_changed (backfill) bumps it,
 	// so an in-flight get_history whose generation is stale on resolve is
 	// discarded and refetched instead of installing pre-backfill data.
@@ -454,6 +460,7 @@ export function App() {
 		const wsFailures = { n: 0 };
 		s.on("_open", async () => {
 			wsFailures.n = 0;
+			failedHistory.current.clear(); // fresh connection: let loads retry
 			setConnected(true);
 			s.request("get_prefs", null).then(adoptPrefs).catch(() => {});
 			// Drop cached pages up front so every open buffer refetches a
@@ -745,11 +752,18 @@ export function App() {
 		};
 	}, [activeKey, connected, chanTick]);
 
+	// Visiting a buffer clears any prior load failure so it retries once (runs
+	// before the load effect below, so the retry fires this same commit).
+	useEffect(() => {
+		failedHistory.current.delete(activeKey);
+	}, [activeKey]);
+
 	// Load history when a buffer becomes active and has none.
 	useEffect(() => {
 		if (!activeKey || !connected) return;
 		const buf = buffers[activeKey];
-		if (!buf || msgs[activeKey]?.loaded || loadingHistory.current.has(activeKey)) return;
+		if (!buf || msgs[activeKey]?.loaded || loadingHistory.current.has(activeKey) ||
+			failedHistory.current.has(activeKey)) return;
 		const key = activeKey;
 		const gen = historyGen.current[key] || 0;
 		loadingHistory.current.add(key);
@@ -760,9 +774,14 @@ export function App() {
 				// request was in flight — discard the pre-backfill page;
 				// the effect refetches once loadingHistory clears.
 				if ((historyGen.current[key] || 0) !== gen) return;
+				failedHistory.current.delete(key);
 				setMsgs((m) => mergeHistoryPage(m, key, page));
 			})
-			.catch(() => {})
+			.catch(() => {
+				// Record the failure so the effect doesn't immediately refire;
+				// a (re)visit, reconnect, or reloadTail clears it to retry.
+				failedHistory.current.add(key);
+			})
 			.finally(() => {
 				loadingHistory.current.delete(key);
 				setLoadTick((t) => t + 1);
@@ -1056,12 +1075,17 @@ export function App() {
 		// of merging the live tail into — and flipping atTail true on — the
 		// around-window we install below, which would leave a temporal gap.
 		historyGen.current[key] = (historyGen.current[key] || 0) + 1;
+		const gen = historyGen.current[key];
 		sock.current
 			?.request("get_history", {
 				network: ev.network, buffer: ev.buffer,
 				around: { ts: ev.time, id: ev.id }, limit: PAGE,
 			})
 			.then((page) => {
+				// The buffer was closed/invalidated (e.g. buffer_closed from
+				// another device) while this was in flight — don't recreate a
+				// ghost buffer, mirroring the initial load and loadOlder guards.
+				if ((historyGen.current[key] || 0) !== gen) return;
 				setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(ev.network, ev.buffer) }));
 				setMsgs((m) => ({
 					...m,
@@ -1123,6 +1147,7 @@ export function App() {
 	// search jump) so the history-load effect refetches the live tail and
 	// live events flow again.
 	function reloadTail() {
+		failedHistory.current.delete(activeKey); // explicit reload: allow a retry
 		setMsgs((m) => (m[activeKey]?.atTail === false ? dropBufferMsgs(m, activeKey) : m));
 	}
 
