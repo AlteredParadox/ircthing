@@ -151,6 +151,15 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 							/>
 						</div>
 						<div class="pref-row">
+							<span class="pref-name">Sidebar width</span>
+							<Seg
+								value={prefs.sidebarWidth}
+								options={["compact", "comfortable", "wide"]}
+								labels={["Compact", "Comfortable", "Wide"]}
+								onPick={(sidebarWidth) => onPrefs({ ...prefs, sidebarWidth })}
+							/>
+						</div>
+						<div class="pref-row">
 							<span class="pref-name">Message font</span>
 							<Seg
 								value={prefs.msgFont}

@@ -195,15 +195,22 @@ input::placeholder {
 }
 
 .sidebar.open {
-	width: 256px;
+	width: var(--sidebar-width, 224px);
 }
 
 .side-inner {
-	width: 256px;
+	/* Fixed to the target width so content doesn't reflow during the
+	   open/close width transition. */
+	width: var(--sidebar-width, 224px);
 	height: 100%;
 	display: flex;
 	flex-direction: column;
 }
+
+/* User-configurable sidebar width (Settings → Appearance). */
+:root[data-sidebar="compact"] { --sidebar-width: 192px; }
+:root[data-sidebar="comfortable"] { --sidebar-width: 224px; }
+:root[data-sidebar="wide"] { --sidebar-width: 272px; }
 
 .side-head {
 	height: 42px;

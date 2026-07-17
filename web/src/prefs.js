@@ -11,6 +11,9 @@ export const ACCENTS = ["blue", "violet", "teal", "green", "amber", "rose", "sla
 export const TEXT_SIZES = ["sm", "md", "lg", "xl"];
 export const DENSITIES = ["compact", "cozy", "comfortable"];
 export const MSG_FONTS = ["sans", "mono"];
+// Left sidebar width — the channel/network list. Maps to --sidebar-width in
+// the stylesheet (see the [data-sidebar] rules).
+export const SIDEBAR_WIDTHS = ["compact", "comfortable", "wide"];
 // How join/part/quit/nick lines appear in the message window (The
 // Lounge's status-message setting): shown, collapsed into one summary
 // row per run, or hidden entirely.
@@ -40,6 +43,7 @@ export const DEFAULTS = {
 	accent: "blue",
 	textSize: "md",
 	density: "cozy",
+	sidebarWidth: "comfortable",
 	msgFont: "sans",
 	statusMsgs: "show",
 	clock: "24",
@@ -59,6 +63,7 @@ export function normalizePrefs(raw) {
 		accent: pick(p.accent, ACCENTS, DEFAULTS.accent),
 		textSize: pick(p.textSize, TEXT_SIZES, DEFAULTS.textSize),
 		density: pick(p.density, DENSITIES, DEFAULTS.density),
+		sidebarWidth: pick(p.sidebarWidth, SIDEBAR_WIDTHS, DEFAULTS.sidebarWidth),
 		msgFont: pick(p.msgFont, MSG_FONTS, DEFAULTS.msgFont),
 		statusMsgs: pick(p.statusMsgs, STATUS_MSGS, DEFAULTS.statusMsgs),
 		clock: pick(p.clock, CLOCKS, DEFAULTS.clock),
@@ -105,6 +110,7 @@ export function applyPrefs(p, resolvedTheme) {
 	root.dataset.accent = p.accent;
 	root.dataset.textsize = p.textSize;
 	root.dataset.density = p.density;
+	root.dataset.sidebar = p.sidebarWidth;
 	root.dataset.msgfont = p.msgFont;
 	let el = document.getElementById("user-css");
 	if (!el) {
