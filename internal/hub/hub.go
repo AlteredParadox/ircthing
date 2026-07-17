@@ -354,8 +354,13 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 		// closes the buffer cannot resurrect it (the recentlyClosed check
 		// and the append used to be a check-then-act split across h.mu and
 		// store.mu — a two-lock TOCTOU).
+		//
+		// The grace is CHANNEL-only: channels have stragglers (QUIT/NICK,
+		// our own PART echo, late lines) that must not reopen a just-closed
+		// buffer. A query has none — an inbound PM is a new conversation and
+		// must reopen the query, not be dropped for the 10s window.
 		stored, err = h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
-			func() bool { return h.recentlyClosed(ev.Network, c.Fold(target)) },
+			func() bool { return c.IsChannel(target) && h.recentlyClosed(ev.Network, c.Fold(target)) },
 			storeMessage(ev))
 	}
 	if err != nil {

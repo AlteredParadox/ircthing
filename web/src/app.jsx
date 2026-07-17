@@ -110,11 +110,19 @@ function appendEventMsgs(m, key, ev, keep) {
 	return { ...m, [key]: { ...cur, list, reachedTop } };
 }
 
-// appendInfoLine appends an ephemeral server_info system line.
+// appendInfoLine appends an ephemeral server_info system line, bounded the
+// same way appendEventMsgs is: a flood (e.g. /list streaming one line per
+// channel on a huge network) must not grow the buffer without limit.
 function appendInfoLine(m, key, ev) {
 	const cur = m[key];
 	if (cur?.loaded && cur.atTail === false) return m;
-	return { ...m, [key]: { ...cur, list: [...(cur?.list || []), ev] } };
+	let list = [...(cur?.list || []), ev];
+	let reachedTop = cur?.reachedTop;
+	if (list.length > TRIM_AT) {
+		list = list.slice(list.length - TRIM_TO);
+		reachedTop = false;
+	}
+	return { ...m, [key]: { ...cur, list, reachedTop } };
 }
 
 // clearTyperFor drops one nick's typing state (they just spoke).

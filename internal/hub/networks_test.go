@@ -470,6 +470,57 @@ func TestQuitFoldsToExistingChannelBuffer(t *testing.T) {
 	}
 }
 
+// The close grace is channel-only: an inbound PM to a just-closed query
+// must reopen the conversation, not be dropped as a straggler.
+func TestInboundPMReopensClosedQuery(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+			Msg: ircv4.MustParseMessage(line)}
+	}
+	// Open the query 'bob' with an inbound PM.
+	conn.ch <- ev(":bob!u@h PRIVMSG AlteredParadox :hi")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "bob", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed PM not persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Close the query, then bob PMs again within the grace window.
+	s := h.NewSession()
+	defer s.Close()
+	s.Handle(ctxb, request(t, "close_buffer", 1, BufferRef{Network: "libera", Buffer: "bob"}))
+	recv(t, s, "ok", "buffer_closed", "event")
+	conn.ch <- ev(":bob!u@h PRIVMSG AlteredParadox :you there?")
+
+	// The new PM reopens the query and is delivered + persisted.
+	got := decode[EventData](t, recv(t, s, "event", "buffer_closed"))
+	if got.Buffer != "bob" {
+		t.Fatalf("reopened PM buffer = %q, want bob", got.Buffer)
+	}
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "bob", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reopened PM not persisted (dropped by the close grace)")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // monitor_add for a network that is neither configured nor connected is
 // rejected, so it cannot mint phantom network/monitor rows.
 func TestMonitorRejectsUnknownNetwork(t *testing.T) {
