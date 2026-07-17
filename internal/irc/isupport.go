@@ -241,6 +241,41 @@ func (s *isupport) ChanModeType(mode byte) byte {
 	return 0
 }
 
+// modeClassifier is a byte-indexed snapshot of the ISUPPORT PREFIX/CHANMODES
+// tables. Building it takes the ISUPPORT lock once; classifying each MODE byte
+// is then an O(1) array lookup — so a hostile 64 KiB MODE line no longer costs
+// a mutex cycle plus a linear ISUPPORT scan per byte (see applyChannelMode).
+type modeClassifier struct {
+	class [256]byte // mode letter -> 'A'/'B'/'C'/'D' or 'P' (status); 0 unknown
+	sym   [256]byte // status letter -> its prefix symbol; 0 if not a status mode
+}
+
+func (c *modeClassifier) chanModeType(mode byte) byte { return c.class[mode] }
+func (c *modeClassifier) symbolForMode(mode byte) byte { return c.sym[mode] }
+
+// modeClassifier returns a lock-free byte-table snapshot mirroring the
+// precedence of ChanModeType/SymbolForMode: PREFIX status modes win 'P' (and
+// carry a symbol), and among CHANMODES sets the earliest (A<B<C<D) wins.
+func (s *isupport) modeClassifier() modeClassifier {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var mc modeClassifier
+	for i := 0; i < len(s.prefixModes); i++ {
+		mc.class[s.prefixModes[i]] = 'P'
+		if i < len(s.prefixSymbols) {
+			mc.sym[s.prefixModes[i]] = s.prefixSymbols[i]
+		}
+	}
+	for i, set := range s.chanModes {
+		for j := 0; j < len(set); j++ {
+			if mc.class[set[j]] == 0 { // don't override a status ('P') mode
+				mc.class[set[j]] = byte('A' + i)
+			}
+		}
+	}
+	return mc
+}
+
 // Fold lowercases a name per CASEMAPPING for comparison: rfc1459 treats
 // {}|^ as the lowercase of []\~ (RFC 2812 §2.2), rfc1459-strict omits
 // the ^~ pair, ascii maps A-Z only.

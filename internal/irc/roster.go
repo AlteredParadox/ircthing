@@ -229,7 +229,10 @@ func (r *roster) namesReply(m *ircv4.Message) {
 		if _, exists := st.pending[fk]; !exists {
 			budget-- // only a new nick consumes the aggregate budget
 		}
-		st.pending[fk] = Member{Nick: nick, Prefix: prefix}
+		// Clone so the stored Member does not alias the parsed 353 line
+		// (irc.v4 slices every field out of one per-line buffer, which a
+		// short nick would otherwise pin alive in the roster).
+		st.pending[fk] = Member{Nick: strings.Clone(nick), Prefix: strings.Clone(prefix)}
 	}
 }
 
@@ -277,16 +280,22 @@ func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
 		(len(st.members) >= maxChannelMembers || r.totalMembers() >= maxRosterMembers) {
 		return
 	}
-	mem := Member{Nick: sender}
+	// Clone so the Member doesn't alias the parsed JOIN line's backing buffer.
+	mem := Member{Nick: strings.Clone(sender)}
 	if acct := m.Param(1); len(m.Params) >= 3 && acct != "*" {
-		mem.Account = acct
+		mem.Account = strings.Clone(acct)
 	}
 	st.members[k] = mem
-	// If a NAMES accumulation is in flight for this channel, apply the
-	// live join to the pending snapshot too, so the 366 swap does not
-	// revert it (leaving a ghost/missing member).
+	// If a NAMES accumulation is in flight for this channel, apply the live
+	// join to the pending snapshot too, so the 366 swap does not revert it
+	// (leaving a ghost/missing member). But a JOIN for an ALREADY-KNOWN member
+	// skips the aggregate guard above, so only grow `pending` with a new key
+	// while under the connection-wide budget — otherwise a flood of re-JOINs
+	// for known members could grow the in-flight snapshot unbounded.
 	if st.pending != nil {
-		st.pending[k] = mem
+		if _, inPending := st.pending[k]; inPending || r.totalMembers() < maxRosterMembers {
+			st.pending[k] = mem
+		}
 	}
 }
 
@@ -300,7 +309,7 @@ func (r *roster) rename(from, to string) {
 		}
 		if mem, ok := mp[fold(from)]; ok {
 			delete(mp, fold(from))
-			mem.Nick = to
+			mem.Nick = strings.Clone(to) // don't retain a slice of the NICK line
 			mp[fold(to)] = mem
 		}
 	}
@@ -333,6 +342,7 @@ func (r *roster) whoxReply(m *ircv4.Message) {
 	if acct == "0" { // logged out, per the WHOX spec
 		acct = ""
 	}
+	acct = strings.Clone(acct) // don't retain a slice of the 354 line
 	away := strings.ContainsRune(flags, 'G')
 	// Bot mode (https://ircv3.net/specs/extensions/bot-mode, fetched
 	// 2026-07-16): the ISUPPORT BOT letter appears in WHO flags.
@@ -373,6 +383,7 @@ func (r *roster) applyChannelMode(st *channelState, params []string) {
 	if len(params) < 2 {
 		return
 	}
+	cls := r.isup.modeClassifier() // one ISUPPORT lock for the whole line
 	arg := 2
 	takeArg := func() string {
 		if arg < len(params) {
@@ -391,9 +402,9 @@ func (r *roster) applyChannelMode(st *channelState, params []string) {
 		case '-':
 			adding = false
 		default:
-			switch r.isup.ChanModeType(c) {
+			switch cls.chanModeType(c) {
 			case 'P': // status mode
-				r.applyStatusMode(st, takeArg(), r.isup.SymbolForMode(c), adding)
+				r.applyStatusMode(st, takeArg(), string(cls.symbolForMode(c)), adding)
 			case 'A', 'B': // always take an argument
 				takeArg()
 			case 'C': // argument only when setting

@@ -1261,18 +1261,19 @@ func (m *Manager) maybeWHOX(channel string) *ircv4.Message {
 	if len(m.whoxDone) >= maxJoinedChannels {
 		return nil
 	}
-	m.whoxDone[key] = true
 	// The channel name is server-supplied and the WHO goes out the internal
 	// priority path, where the writer FATALLY tears the connection down on
 	// an over-length or malframed line (the same trap rejoinable guards the
 	// JOIN against, and boundedPong the PONG). Validate the exact bytes the
 	// writer will emit — framing on the message, length on the UTF8ONLY-
-	// scrubbed form — and drop the WHO rather than let a hostile 366 loop
-	// the connection. whoxDone is already set, so a bad channel won't retry.
+	// scrubbed form — BEFORE recording the channel: a stream of oversized
+	// fake 366 names must neither loop the connection nor fill whoxDone with
+	// keys for WHOs that are never emitted.
 	msg := newMsg("WHO", channel, "%tnfa,"+whoxToken)
 	if checkFraming(msg) != nil || checkLineLen(m.scrubUTF8(msg), m.lineLen()) != nil {
 		return nil
 	}
+	m.whoxDone[key] = true
 	return msg
 }
 
