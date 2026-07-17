@@ -261,6 +261,29 @@ func TestSetRedacted(t *testing.T) {
 
 // The 0008 migration must scrub rows that were redacted under the old
 // non-destructive behavior (body + FTS entry retained).
+// The FTS index tracks only text-bearing rows — no tokenless %_docsize
+// entries for system messages (JOIN/PART/...), which would otherwise leak
+// as those rows are pruned/cascaded. This is the invariant 0011 restores.
+func TestFTSNoNullTextOrphans(t *testing.T) {
+	s, _ := openTest(t, 10)
+	if _, err := s.Append(ctx, "net", "#c", Message{Sender: "a", Command: "PRIVMSG", Raw: ":a PRIVMSG #c :hi", Text: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(ctx, "net", "#c", Message{Sender: "a", Command: "JOIN", Raw: ":a JOIN #c", Text: ""}); err != nil {
+		t.Fatal(err)
+	}
+	var docsize, textRows int
+	if err := s.db.QueryRow(`SELECT count(*) FROM messages_fts_docsize`).Scan(&docsize); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM messages WHERE text IS NOT NULL AND text <> ''`).Scan(&textRows); err != nil {
+		t.Fatal(err)
+	}
+	if docsize != textRows {
+		t.Fatalf("FTS docsize = %d, text-bearing messages = %d; want equal (no NULL-text orphans)", docsize, textRows)
+	}
+}
+
 func TestRedactionScrubMigration(t *testing.T) {
 	s, _ := openTest(t, 10)
 	m, err := s.Append(ctx, "libera", "#go", Message{
