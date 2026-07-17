@@ -83,7 +83,11 @@ func run(cfg *config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.Open(cfg.Database, store.Options{RingSize: cfg.RingSize})
+	st, err := store.Open(cfg.Database, store.Options{
+		RingSize:             cfg.RingSize,
+		RetentionDays:        cfg.RetentionDays,
+		RetentionMaxMessages: cfg.RetentionMaxMessages,
+	})
 	if err != nil {
 		return fmt.Errorf("store: %w", err)
 	}

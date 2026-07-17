@@ -92,20 +92,30 @@ type Options struct {
 	// RingSize bounds the per-buffer in-memory scrollback.
 	// 0 means DefaultRingSize.
 	RingSize int
+	// RetentionDays prunes messages older than this many days; 0 disables
+	// age-based pruning. RetentionMaxMessages keeps only the newest N
+	// messages per buffer; 0 disables count-based pruning. When either is
+	// set, Open starts an hourly background pruner (stopped by Close).
+	RetentionDays        int
+	RetentionMaxMessages int
 }
 
 // Store is safe for concurrent use. One coarse mutex guards the rings and
 // caches; at IRC message rates lock contention is a non-issue and this
 // keeps the invariants easy to reason about.
 type Store struct {
-	db       *sql.DB
-	ringSize int
+	db        *sql.DB
+	ringSize  int
+	retention retentionPolicy
 
 	mu       sync.Mutex
 	networks map[string]int64
 	buffers  map[bufKey]int64
 	rings    map[int64]*ring
 	stats    struct{ ringPages, dbPages int } // observability for tests
+
+	stopPruner chan struct{}  // closed by Close to end the pruner
+	prunerDone sync.WaitGroup // waits for the pruner goroutine to exit
 }
 
 // secureDBFile ensures the database file (and any pre-existing WAL/SHM
@@ -212,16 +222,26 @@ func Open(path string, opts Options) (*Store, error) {
 			return nil, err
 		}
 	}
-	return &Store{
-		db:       db,
-		ringSize: opts.RingSize,
-		networks: make(map[string]int64),
-		buffers:  make(map[bufKey]int64),
-		rings:    make(map[int64]*ring),
-	}, nil
+	s := &Store{
+		db:        db,
+		ringSize:  opts.RingSize,
+		retention: retentionPolicy{days: opts.RetentionDays, maxPerBuffer: opts.RetentionMaxMessages},
+		networks:  make(map[string]int64),
+		buffers:   make(map[bufKey]int64),
+		rings:     make(map[int64]*ring),
+	}
+	if s.retention.enabled() {
+		s.startPruner(pruneInterval)
+	}
+	return s, nil
 }
 
 func (s *Store) Close() error {
+	if s.stopPruner != nil {
+		close(s.stopPruner)
+		s.prunerDone.Wait()
+		s.stopPruner = nil
+	}
 	return s.db.Close()
 }
 

@@ -75,6 +75,8 @@ loudly. See `config.example.json` for a complete example.
 | `user.username`, `user.password_hash` | Web login. Generate the bcrypt hash with `ircd-web -hash-password`. |
 | `session_ttl_days` | Login cookie lifetime. Default 30. |
 | `ring_size` | Hot scrollback kept in memory per buffer. Default 200; older history is read from SQLite. |
+| `retention_days` | Prune stored messages older than this many days. Default 0 (keep forever). Pruning runs hourly and keeps the search index in step. A hot buffer's in-memory ring may briefly still show just-pruned messages until they evict. |
+| `retention_max_messages` | Keep at most this many messages per buffer; older ones are pruned. Default 0 (unlimited). |
 | `disable_previews` | **Initial default** for the previews switch (tri-state). **Omit it and previews start OFF** — the privacy-first default, since an auto-fetched preview is a tracking beacon (a poster learns when a buffer is viewed) and the server makes **zero** outbound fetches. Set it to `false` to start with previews **on**, or `true` to be explicit about off. Toggle it live in **Settings → Link previews** (the saved value wins over this). Previews are fetched through **each link's own network proxy** — see [Preview fetches & the proxy SSRF caveat](#preview-fetches--the-proxy-ssrf-caveat). |
 
 Networks are managed from the web UI: the **+** button in the sidebar

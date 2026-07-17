@@ -31,6 +31,14 @@ type config struct {
 	// RingSize overrides the per-buffer hot scrollback bound (messages
 	// kept in memory per channel/query). 0 = default.
 	RingSize int `json:"ring_size"`
+	// RetentionDays prunes stored messages older than this many days.
+	// 0 = keep forever (the default). Pruning runs hourly in the
+	// background and keeps the search index in step.
+	RetentionDays int `json:"retention_days"`
+	// RetentionMaxMessages caps how many messages are kept per buffer
+	// (channel/query); older ones beyond the newest N are pruned.
+	// 0 = unlimited (the default).
+	RetentionMaxMessages int `json:"retention_max_messages"`
 	// SessionTTLDays is how long login cookies stay valid. 0 = 30 days.
 	SessionTTLDays int `json:"session_ttl_days"`
 	// SecureCookies marks the session cookie Secure (sent over HTTPS
