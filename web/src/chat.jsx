@@ -1,6 +1,7 @@
 import { Fragment } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Completer } from "./complete.js";
+import { isEditable, modalScrimOpen } from "./dom.js";
 import { menuTrigger } from "./menu.jsx";
 import { applyStatusMode, firstURL, fmtTime, linkify, nickColor, renderable, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
@@ -8,12 +9,6 @@ import { VirtualList } from "./vlist.jsx";
 import { WhoisCard } from "./whois.jsx";
 import { estimateMsgHeight } from "./vmath.js";
 
-// isEditable reports whether an element is a text field the user may be
-// typing in, so window-refocus doesn't yank the cursor out of it.
-function isEditable(el) {
-	const tag = el.tagName;
-	return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
-}
 
 function Body({ text }) {
 	// draft/multiline messages carry embedded newlines; render each line
@@ -245,9 +240,13 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 			const el = taRef.current;
 			if (!el || el.disabled) return;
 			// A modal overlay (settings, search, switcher, network form,
-			// context menu, mobile panel) is open — don't yank focus into the
-			// composer behind it and silently accumulate a hidden draft.
-			if (document.querySelector(".search-scrim, .ctx-scrim, .side-scrim, .right-scrim")) return;
+			// context menu, mobile drawer) is open — don't yank focus into the
+			// composer behind it and silently accumulate a hidden draft. Test
+			// actual visibility, not mere DOM presence: the side/right scrims
+			// are always rendered on desktop but display:none there (they are
+			// modal only at mobile breakpoints), and querySelector ignores CSS
+			// display — matching them would kill type-anywhere on desktop.
+			if (modalScrimOpen()) return;
 			const active = document.activeElement;
 			if (active === el || (active && active !== document.body && isEditable(active))) return;
 			el.focus();
