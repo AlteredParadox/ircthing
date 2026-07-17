@@ -1,6 +1,24 @@
 package proxydial
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+// A rejected proxy URL must not leak its credentials in the error message.
+func TestParseRedactsCredentials(t *testing.T) {
+	// Password chosen so it is unambiguous in the error text.
+	_, err := Parse("socks5://alice:sup3rSecret@host:1080/nope") // path -> rejected
+	if err == nil {
+		t.Fatal("expected an error for a proxy URL with a path")
+	}
+	if strings.Contains(err.Error(), "sup3rSecret") || strings.Contains(err.Error(), "alice") {
+		t.Fatalf("error leaked credentials: %v", err)
+	}
+	if !strings.Contains(err.Error(), "<redacted>@host:1080") {
+		t.Fatalf("error should retain the redacted host: %v", err)
+	}
+}
 
 func TestParse(t *testing.T) {
 	ok := []string{

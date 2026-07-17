@@ -10,6 +10,30 @@ func feed005(s *isupport, tokens string) {
 	s.handle(ircv4.MustParseMessage(":srv 005 AlteredParadox " + tokens + " :are supported by this server"))
 }
 
+// An implausibly large ISUPPORT value (a hostile 005 can be up to the
+// 16 KiB incoming-line limit) must be ignored so it can't drive a quadratic
+// MODE scan; real values are tens of bytes.
+func TestISupportValueLengthBounded(t *testing.T) {
+	s := newISupport()
+	huge := ""
+	for i := 0; i < maxISupportValue+100; i++ {
+		huge += "b"
+	}
+	feed005(s, "CHANMODES="+huge)
+	if v, ok := s.Raw("CHANMODES"); ok {
+		t.Fatalf("oversized CHANMODES stored (%d bytes), want ignored", len(v))
+	}
+	// The default classification still applies (the huge value was dropped).
+	if s.ChanModeType('b') != 'A' {
+		t.Fatal("default CHANMODES classification lost after dropping oversized value")
+	}
+	// A normal-sized value is still accepted.
+	feed005(s, "CHANMODES=eIb,k,l,imnpst")
+	if v, ok := s.Raw("CHANMODES"); !ok || v != "eIb,k,l,imnpst" {
+		t.Fatalf("normal CHANMODES = %q, %v; want accepted", v, ok)
+	}
+}
+
 func TestISupportDefaults(t *testing.T) {
 	s := newISupport()
 	if !s.IsChannel("#go") || !s.IsChannel("&local") || s.IsChannel("alice") {

@@ -26,22 +26,33 @@ import (
 	"time"
 )
 
+// redactProxy masks any userinfo (user:pass@) in a proxy URL string so
+// SOCKS5/HTTP proxy credentials never reach error messages or logs.
+func redactProxy(s string) string {
+	if i := strings.Index(s, "://"); i != -1 {
+		if at := strings.IndexByte(s[i+3:], '@'); at != -1 {
+			return s[:i+3] + "<redacted>@" + s[i+3+at+1:]
+		}
+	}
+	return s
+}
+
 // Parse validates a proxy configuration string and returns the parsed URL.
 func Parse(s string) (*url.URL, error) {
 	u, err := url.Parse(s)
 	if err != nil {
-		return nil, fmt.Errorf("proxy %q: %w", s, err)
+		return nil, fmt.Errorf("proxy %q: %w", redactProxy(s), err)
 	}
 	switch u.Scheme {
 	case "socks5", "socks5h", "http":
 	default:
-		return nil, fmt.Errorf("proxy %q: scheme must be socks5 or http", s)
+		return nil, fmt.Errorf("proxy %q: scheme must be socks5 or http", redactProxy(s))
 	}
 	if u.Host == "" || u.Port() == "" {
-		return nil, fmt.Errorf("proxy %q: host:port required", s)
+		return nil, fmt.Errorf("proxy %q: host:port required", redactProxy(s))
 	}
 	if u.Path != "" && u.Path != "/" {
-		return nil, fmt.Errorf("proxy %q: unexpected path", s)
+		return nil, fmt.Errorf("proxy %q: unexpected path", redactProxy(s))
 	}
 	return u, nil
 }

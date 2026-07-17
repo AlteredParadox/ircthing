@@ -388,10 +388,14 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 	if reason != "" {
 		reasonArg = reason
 	}
-	// Redaction is destructive: locate the row and its indexed body, purge
-	// the FTS entry, then scrub raw/text — keeping only the tombstone
-	// (sender/time/command + redacted flag + reason). This prevents deleted
-	// content from lingering in the database, backups, or search.
+	// Redaction is destructive at the application layer: locate the row and
+	// its indexed body, purge the FTS entry, then scrub raw/text — keeping
+	// only the tombstone (sender/time/command + redacted flag + reason). The
+	// content is then gone from queries, search, the hot ring, and the wire.
+	// This is NOT forensic erasure: freed bytes/tokens may still persist in
+	// SQLite free pages, FTS segments, and WAL frames until a vacuum, and in
+	// any existing backups (enable PRAGMA secure_delete / FTS5 'secure-delete'
+	// if that matters for the deployment).
 	var id int64
 	var text sql.NullString
 	err = s.db.QueryRowContext(ctx,

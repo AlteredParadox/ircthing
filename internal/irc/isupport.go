@@ -96,7 +96,16 @@ func (s *isupport) handle(m *ircv4.Message) {
 // endless distinct 005 tokens. Real servers advertise well under 50.
 const maxISupportKeys = 256
 
+// maxISupportValue bounds a single token's value length. The incoming line
+// reader admits up to 16 KiB, so without this a hostile 005 could set an
+// enormous PREFIX/CHANMODES that every MODE character then linearly scans
+// (quadratic CPU). Real values are tens of bytes; 512 is generous.
+const maxISupportValue = 512
+
 func (s *isupport) applyToken(name, value string) {
+	if len(value) > maxISupportValue {
+		return // implausibly large — ignore, falling back to defaults
+	}
 	if _, known := s.raw[name]; !known && len(s.raw) >= maxISupportKeys {
 		return // bound the map; ignore further new keys
 	}

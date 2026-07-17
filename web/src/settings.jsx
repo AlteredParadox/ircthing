@@ -218,7 +218,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 					<section class="settings-section">
 						<div class="settings-label">Custom CSS</div>
 						<div class="settings-note">
-							Applied live, on top of the theme. Saved in this browser.
+							Applied live, on top of the theme. Synced across your devices.
 						</div>
 						<textarea
 							class="css-input"
