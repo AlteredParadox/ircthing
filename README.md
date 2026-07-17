@@ -154,10 +154,12 @@ with the right ownership, so set `"database": "/var/lib/ircthing/ircthing.db"`.
 If you use **SASL EXTERNAL** (client-certificate auth), the transient
 `DynamicUser` account cannot read a root-owned `/etc/ircthing/*.pem` key.
 Deliver the cert and key as additional systemd credentials — add
-`LoadCredential=` lines for them and point `cert_file`/`key_file` at
-`$CREDENTIALS_DIRECTORY` — or place them under the service-owned
-`StateDirectory` with appropriate ownership. A world-readable key is not an
-acceptable workaround.
+`LoadCredential=` lines for them and set the JSON values to the env-var form
+`"cert_file": "$CREDENTIALS_DIRECTORY/client-cert.pem"` /
+`"key_file": "$CREDENTIALS_DIRECTORY/client-key.pem"` (ircthing expands
+`$VAR`/`${VAR}` in these two paths at load time) — or place them under the
+service-owned `StateDirectory` with appropriate ownership. A world-readable
+key is not an acceptable workaround.
 
 ```sh
 sudo cp bin/ircd-web /usr/local/bin/

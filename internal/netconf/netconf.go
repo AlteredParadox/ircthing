@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	"ircthing/internal/irc"
@@ -105,6 +106,14 @@ func (n *Network) Validate() error {
 			return fmt.Errorf("channels[%d] must not contain spaces, CR, LF, or NUL", i)
 		}
 	}
+	// SASL EXTERNAL authenticates purely with a client certificate, so a
+	// config that selects it but omits the keypair would connect presenting
+	// no certificate and fail authentication on every attempt (a permanent
+	// backoff loop). Require both files explicitly.
+	if n.SASL != nil && strings.EqualFold(n.SASL.Mechanism, "EXTERNAL") &&
+		(n.SASL.CertFile == "" || n.SASL.KeyFile == "") {
+		return errors.New("sasl EXTERNAL requires both cert_file and key_file")
+	}
 	return nil
 }
 
@@ -150,9 +159,12 @@ func (n *Network) IRCConfig() (irc.Config, error) {
 			Password:  n.SASL.Password,
 		}
 		// A client certificate (SASL EXTERNAL) is presented during the
-		// TLS handshake.
+		// TLS handshake. Expand env references so a systemd unit can point
+		// cert_file/key_file at "$CREDENTIALS_DIRECTORY/..." (LoadCredential),
+		// as the README documents, rather than the literal string failing to
+		// open on every connect.
 		if n.SASL.CertFile != "" {
-			cert, err := tls.LoadX509KeyPair(n.SASL.CertFile, n.SASL.KeyFile)
+			cert, err := tls.LoadX509KeyPair(os.ExpandEnv(n.SASL.CertFile), os.ExpandEnv(n.SASL.KeyFile))
 			if err != nil {
 				return irc.Config{}, fmt.Errorf("network %q: loading client certificate: %w", n.EffectiveName(), err)
 			}

@@ -125,6 +125,12 @@ func (s *isupport) applyToken(name, value string) {
 		}
 		s.chanModes = cm
 	case "CASEMAPPING":
+		// Known limitation (deliberate): a CASEMAPPING that CHANGES after the
+		// roster/NAMES/WHOX maps are already populated is not re-keyed, so
+		// existing entries keyed under the old mapping could become
+		// unreachable. Real servers fix CASEMAPPING at registration and never
+		// flip it mid-session; re-keying every folded map on a hostile flip is
+		// disproportionate to that non-threat. Left as-is intentionally.
 		switch value {
 		case "rfc1459", "rfc1459-strict", "ascii":
 			s.caseMapping = value

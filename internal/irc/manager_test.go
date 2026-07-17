@@ -1141,9 +1141,29 @@ func TestWriterRejectsFramingInHandshake(t *testing.T) {
 	conns := listen(t, ln)
 
 	cfg := testCfg(ln.Addr().String())
-	cfg.Realname = "evil\r\nOPER admin secret" // injected extra command
-	m := startManager(t, cfg)
-	_ = m
+	m, err := NewManager(cfg)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	// Taint AFTER construction: validateRegistrationLines now rejects a
+	// framing-tainted registration line up front, so inject past it to
+	// exercise the writer's FATAL framing guard as the defense-in-depth
+	// backstop for a line that reaches the writer some other way.
+	m.cfg.Realname = "evil\r\nOPER admin secret" // injected extra command
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("Run did not return after cancel")
+		}
+	})
 
 	s := accept(t, conns)
 	// CAP LS and NICK precede USER and are clean; the USER line is the

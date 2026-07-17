@@ -178,6 +178,13 @@ func (c *Config) validateRegistrationLines() error {
 		msgs = append(msgs, newMsg("JOIN", ch))
 	}
 	for _, m := range msgs {
+		// Framing before length: a non-trailing parameter that is empty,
+		// contains a space, or begins with ':' (e.g. username ":foo") passes
+		// the length check but trips the writer's FATAL framing guard on every
+		// handshake, wedging the network in a reconnect loop. Catch it here.
+		if err := checkFraming(m); err != nil {
+			return fmt.Errorf("irc: config: registration %s is unsendable: %w", m.Command, err)
+		}
 		if err := checkLineLen(m, defaultLineLen); err != nil {
 			return fmt.Errorf("irc: config: registration %s too long: %w", m.Command, err)
 		}

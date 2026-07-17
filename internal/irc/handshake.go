@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	ircv4 "gopkg.in/irc.v4"
 )
@@ -282,6 +283,15 @@ func (h *handshake) handleNickInUse() (out []*ircv4.Message, done bool, err erro
 	base := h.cfg.Nick
 	if max := maxFallbackNick - h.nickTries; len(base) > max {
 		base = base[:max]
+		// Trim a trailing partial rune so a multibyte nick isn't cut mid-rune
+		// into an invalid NICK. (max already reserves room for the trailing
+		// underscores, so base+underscores stays within the ceiling.)
+		for len(base) > 0 {
+			if r, size := utf8.DecodeLastRuneInString(base); r != utf8.RuneError || size != 1 {
+				break
+			}
+			base = base[:len(base)-1]
+		}
 	}
 	h.nick = base + strings.Repeat("_", h.nickTries)
 	return []*ircv4.Message{newMsg("NICK", h.nick)}, false, nil

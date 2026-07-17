@@ -24,6 +24,9 @@ func TestParse(t *testing.T) {
 		{"space in nick", `{"addr": "a:1", "nick": "John Doe"}`, "nick must not contain spaces"},
 		{"space in username", `{"addr": "a:1", "nick": "me", "username": "John Doe"}`, "username must not contain spaces"},
 		{"CRLF in sasl password", `{"addr": "a:1", "nick": "me", "sasl": {"login": "u", "password": "p\r\nx"}}`, "CR, LF, or NUL"},
+		{"EXTERNAL without keypair", `{"addr": "a:1", "nick": "me", "sasl": {"mechanism": "EXTERNAL"}}`, "cert_file and key_file"},
+		{"EXTERNAL missing key", `{"addr": "a:1", "nick": "me", "sasl": {"mechanism": "EXTERNAL", "cert_file": "/c.pem"}}`, "cert_file and key_file"},
+		{"EXTERNAL with keypair", `{"addr": "a:1", "nick": "me", "sasl": {"mechanism": "EXTERNAL", "cert_file": "/c.pem", "key_file": "/k.pem"}}`, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
