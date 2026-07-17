@@ -263,11 +263,20 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 		e.preventDefault();
 		const text = draft.trim();
 		if (!text || !connected) return;
-		onSend(text);
-		setDraft("");
-		delete drafts.current[buf?.key];
+		const key = buf?.key;
 		clearTimeout(pauseTimer.current);
 		typing.messageSent();
+		// Clear the composer only once the send is ACCEPTED, so a rejected
+		// send (parse error, full queue, mid-send disconnect) keeps the typed
+		// text instead of silently dropping it. Clear the buffer we sent from
+		// (a /msg or /join may have switched the active buffer), and guard on
+		// equality so text the user kept typing while waiting isn't clobbered.
+		Promise.resolve(onSend(text))
+			.then(() => {
+				if (drafts.current[key] === text) delete drafts.current[key];
+				if (buf?.key === key) setDraft((d) => (d === text ? "" : d));
+			})
+			.catch(() => {});
 	}
 
 	const header = msgs?.loaded

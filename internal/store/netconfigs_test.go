@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"strconv"
 	"context"
 	"os"
@@ -439,6 +440,61 @@ func TestAdoptOwnMsgID(t *testing.T) {
 	// No matching placeholder -> no adoption.
 	if adopted, _ := s.AdoptOwnMsgID(ctx, "net", "#c", "different", "x", nil, 0); adopted {
 		t.Fatal("adopted a non-matching row")
+	}
+}
+
+// Identical repeated own messages must adopt msgids in send order, not
+// reversed. Chathistory replays oldest-first and placeholders were stored
+// oldest-first, so the earliest replay must pair with the earliest
+// placeholder; a newest-first match swapped them, and — redaction being
+// destructive — a later REDACT then scrubbed the wrong row.
+func TestAdoptOwnMsgIDPairsInOrder(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+	base := time.UnixMilli(1_700_000_000_000)
+	p1, err := s.Append(ctx, "net", "#c", Message{Time: base, Sender: "me", Command: "PRIVMSG", Raw: ":me PRIVMSG #c :ok", Text: "ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := s.Append(ctx, "net", "#c", Message{Time: base.Add(5 * time.Second), Sender: "me", Command: "PRIVMSG", Raw: ":me PRIVMSG #c :ok", Text: "ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	since := base.Add(-time.Minute).UnixMilli()
+	// Replay oldest-first: m1 then m2.
+	if ok, _ := s.AdoptOwnMsgID(ctx, "net", "#c", "ok", "m1", nil, since); !ok {
+		t.Fatal("adopt m1")
+	}
+	if ok, _ := s.AdoptOwnMsgID(ctx, "net", "#c", "ok", "m2", nil, since); !ok {
+		t.Fatal("adopt m2")
+	}
+	var mid1, mid2 sql.NullString
+	if err := s.db.QueryRow(`SELECT msgid FROM messages WHERE id=?`, p1.ID).Scan(&mid1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT msgid FROM messages WHERE id=?`, p2.ID).Scan(&mid2); err != nil {
+		t.Fatal(err)
+	}
+	if mid1.String != "m1" || mid2.String != "m2" {
+		t.Fatalf("msgids paired in reverse: p1(older)=%q p2(newer)=%q, want m1/m2", mid1.String, mid2.String)
+	}
+	// Redacting m2 must destructively scrub the NEWER message (p2), not p1.
+	if ok, _ := s.SetRedacted(ctx, "net", "#c", "m2", ""); !ok {
+		t.Fatal("redact m2")
+	}
+	var raw1, raw2 string
+	s.db.QueryRow(`SELECT raw FROM messages WHERE id=?`, p1.ID).Scan(&raw1)
+	s.db.QueryRow(`SELECT raw FROM messages WHERE id=?`, p2.ID).Scan(&raw2)
+	if raw2 != "" {
+		t.Fatalf("REDACT m2 did not scrub p2 (raw=%q)", raw2)
+	}
+	if raw1 == "" {
+		t.Fatal("REDACT m2 wrongly scrubbed p1 (the earlier message)")
+	}
+	// An overlapping replay re-delivering m1 is a no-op, not a UNIQUE error.
+	if ok, err := s.AdoptOwnMsgID(ctx, "net", "#c", "ok", "m1", nil, since); ok || err != nil {
+		t.Fatalf("re-adopt of an already-stamped msgid = (%v, %v), want (false, nil)", ok, err)
 	}
 }
 

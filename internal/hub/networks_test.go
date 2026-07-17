@@ -419,6 +419,88 @@ func TestReplayedQuitDoesNotResurrectClosedBuffer(t *testing.T) {
 	}
 }
 
+// A REPLAYED (event-playback) self-JOIN must NOT clear the close grace or
+// resurrect a just-closed channel — only a live rejoin carries that intent.
+func TestReplayedSelfJoinDoesNotResurrectClosedChannel(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox",
+		chans: map[string][]irc.Member{"#foo": {{Nick: "AlteredParadox"}}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+			Msg: ircv4.MustParseMessage(line)}
+	}
+	conn.ch <- ev(":bob!u@h PRIVMSG #foo :hi")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#foo", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed not persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	s := h.NewSession()
+	defer s.Close()
+	s.Handle(ctxb, request(t, "close_buffer", 1, BufferRef{Network: "libera", Buffer: "#foo"}))
+	recv(t, s, "ok", "buffer_closed", "event")
+
+	conn.ch <- ev(":srv BATCH +r1 chathistory #foo")
+	conn.ch <- ev("@batch=r1;time=2026-07-15T00:00:06.000Z :AlteredParadox!u@h JOIN #foo")
+	conn.ch <- ev(":srv BATCH -r1")
+	time.Sleep(200 * time.Millisecond)
+	if bufs, _ := h.store.Buffers(ctxb); len(bufs) != 0 {
+		t.Fatalf("replayed self-JOIN resurrected the closed channel: %+v", bufs)
+	}
+}
+
+// A REPLAYED PM to a just-closed query must be dropped too: backfill is a
+// straggler regardless of target type. (A LIVE PM still reopens the query —
+// see TestInboundPMReopensClosedQuery.)
+func TestReplayedPMToClosedQueryDropped(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+			Msg: ircv4.MustParseMessage(line)}
+	}
+	conn.ch <- ev(":bob!u@h PRIVMSG AlteredParadox :hi")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "bob", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("query seed not persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	s := h.NewSession()
+	defer s.Close()
+	s.Handle(ctxb, request(t, "close_buffer", 1, BufferRef{Network: "libera", Buffer: "bob"}))
+	recv(t, s, "ok", "buffer_closed", "event")
+
+	conn.ch <- ev(":srv BATCH +r1 chathistory bob")
+	conn.ch <- ev("@batch=r1;time=2026-07-15T00:00:06.000Z :bob!u@h PRIVMSG AlteredParadox :old")
+	conn.ch <- ev(":srv BATCH -r1")
+	time.Sleep(200 * time.Millisecond)
+	if bufs, _ := h.store.Buffers(ctxb); len(bufs) != 0 {
+		t.Fatalf("replayed PM resurrected the closed query: %+v", bufs)
+	}
+}
+
 // A QUIT/NICK fan-out target comes from the roster's raw wire spelling,
 // which can differ in case from the stored buffer. It must be canonicalized
 // so the system line lands in the existing buffer instead of splitting off

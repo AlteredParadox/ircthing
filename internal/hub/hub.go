@@ -348,10 +348,13 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	// must not split into two buffers even under a concurrent send.
 	own := ev.Msg.Prefix != nil && c.Nick() != "" && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick())
 	selfPart := own && ev.Msg.Command == "PART"
-	// Our own JOIN reopens a channel: clear any close grace so its
+	// A LIVE self-JOIN reopens a channel: clear any close grace so its
 	// buffer is re-created and live traffic flows again (otherwise a
-	// rejoin within the 10s window would silently drop messages).
-	if own && ev.Msg.Command == "JOIN" {
+	// rejoin within the 10s window would silently drop messages). A
+	// REPLAYED (event-playback) self-JOIN carries no rejoin intent — it is
+	// a straggler like any other backfill line — so it must NOT clear the
+	// grace, or it would resurrect a buffer the user just closed.
+	if own && !replay && ev.Msg.Command == "JOIN" {
 		h.unmarkClosed(ev.Network, c.Fold(target))
 	}
 	if replay && own {
@@ -383,12 +386,17 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 		// broadcasts a live event that re-creates the buffer on clients (and
 		// races the buffer_closed push).
 		//
-		// The grace is CHANNEL-only: channels have stragglers (QUIT/NICK,
-		// our own PART echo, late lines) that must not reopen a just-closed
-		// buffer. A query has none — an inbound PM is a new conversation and
-		// must reopen the query, not be dropped for the 10s window.
+		// For LIVE traffic the grace is CHANNEL-only: channels have stragglers
+		// (QUIT/NICK, our own PART echo, late lines) that must not reopen a
+		// just-closed buffer, but a live PM is a NEW conversation and must
+		// reopen its query rather than be dropped for the 10s window. REPLAYED
+		// (event-playback / chathistory) traffic is always a straggler,
+		// including a backfilled PM: it must never undo a close, so the grace
+		// applies to a replayed query too.
 		stored, err = h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
-			func(bool) bool { return c.IsChannel(target) && h.recentlyClosed(ev.Network, c.Fold(target)) },
+			func(bool) bool {
+				return (replay || c.IsChannel(target)) && h.recentlyClosed(ev.Network, c.Fold(target))
+			},
 			storeMessage(ev))
 	}
 	if err != nil {

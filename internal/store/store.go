@@ -436,11 +436,16 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 
 // AdoptOwnMsgID reconciles a chathistory-replayed copy of one of our own
 // messages with the local no-msgid placeholder persistOwn stored: it
-// finds the newest msgid-less row in the buffer with matching text
-// (newer than sinceMs) and stamps the server's msgid onto it. The caller
-// then relies on the normal (buffer_id, msgid) dedup to drop the
-// replayed insert, so a no-echo-message + chathistory server does not
-// duplicate own messages after a reconnect. Reports whether it adopted.
+// finds the OLDEST msgid-less row in the buffer with matching text (newer
+// than sinceMs) and stamps the server's msgid onto it. Chathistory replays
+// oldest-first, and placeholders were stored in send order, so pairing the
+// earliest replay with the earliest unstamped placeholder keeps identical
+// repeated messages in order — a newest-first match would stamp N identical
+// sends in REVERSE, and (since redaction is destructive) a later REDACT
+// would then scrub the wrong row. The caller then relies on the normal
+// (buffer_id, msgid) dedup to drop the replayed insert, so a no-echo-message
+// + chathistory server does not duplicate own messages after a reconnect.
+// Reports whether it adopted.
 //
 // target is resolved to its canonical stored spelling under fold (as
 // AppendFolded does), so a replay carrying different-but-case-equivalent
@@ -461,11 +466,22 @@ func (s *Store) AdoptOwnMsgID(ctx context.Context, network, target, text, msgid 
 	if err != nil || bufID == 0 {
 		return false, err
 	}
+	// An overlapping chathistory range can re-deliver a msgid we already
+	// stamped; adopting again would hit the (buffer_id, msgid) unique index.
+	// Treat that as a no-op.
+	var seen int
+	switch err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM messages WHERE buffer_id = ? AND msgid = ? LIMIT 1`, bufID, msgid).Scan(&seen); {
+	case err == nil:
+		return false, nil
+	case !errors.Is(err, sql.ErrNoRows):
+		return false, err
+	}
 	var id int64
 	err = s.db.QueryRowContext(ctx,
 		`SELECT id FROM messages
 		 WHERE buffer_id = ? AND msgid IS NULL AND text = ? AND ts >= ?
-		 ORDER BY ts DESC, id DESC LIMIT 1`, bufID, text, sinceMs).Scan(&id)
+		 ORDER BY ts ASC, id ASC LIMIT 1`, bufID, text, sinceMs).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}

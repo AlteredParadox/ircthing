@@ -1103,35 +1103,40 @@ export function App() {
 		setMsgs((m) => (m[activeKey]?.atTail === false ? dropBufferMsgs(m, activeKey) : m));
 	}
 
+	// sendInput returns a promise that resolves when the send is accepted and
+	// rejects on a parse error or a rejected request, so the composer can
+	// keep the user's text on failure instead of dropping it.
 	function sendInput(text) {
 		const buf = buffers[activeKey];
-		if (!buf) return;
+		if (!buf) return Promise.reject(new Error("no active buffer"));
 		setCmdError("");
 		const p = parseInput(text, buf.buffer, networks[buf.network]?.chantypes);
-		const oops = (e) => setCmdError(e.message || "failed");
+		const oops = (e) => {
+			setCmdError(e.message || "failed");
+			throw e; // propagate so submit keeps the draft
+		};
 		switch (p.type) {
 			case "error":
 				setCmdError(p.message);
-				break;
+				return Promise.reject(new Error(p.message));
 			case "text":
-				sock.current
+				return sock.current
 					.request("send", { network: buf.network, target: buf.buffer, text: p.text })
 					.catch(oops);
-				break;
 			case "msg":
-				sock.current
+				return sock.current
 					.request("send", { network: buf.network, target: p.target, text: p.text })
 					.then(() => select(buf.network, p.target))
 					.catch(oops);
-				break;
 			case "cmd":
-				sock.current
+				return sock.current
 					.request("command", { network: buf.network, command: p.command, params: p.params })
 					.then(() => {
 						if (p.switchTo) select(buf.network, p.switchTo);
 					})
 					.catch(oops);
-				break;
+			default:
+				return Promise.reject(new Error("unknown input"));
 		}
 	}
 

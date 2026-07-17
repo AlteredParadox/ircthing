@@ -1385,6 +1385,27 @@ func TestOversizedPingAnsweredWithBoundedPong(t *testing.T) {
 	}
 }
 
+// boundedPong echoes the server's PING token on the internal priority lane,
+// which bypasses sendAll and hits the writer's FATAL checkFraming. A token
+// carrying NUL or an embedded CR (irc.v4 trims only the trailing CRLF) must
+// be stripped so it can never tear the connection down.
+func TestBoundedPongStripsFraming(t *testing.T) {
+	cases := []struct{ token, want string }{
+		{"x\x00y", "xy"},
+		{"a\rb\nc", "abc"},
+		{"clean-token", "clean-token"},
+	}
+	for _, tc := range cases {
+		out := boundedPong(&ircv4.Message{Command: "PING", Params: []string{tc.token}}, defaultLineLen)
+		if got := out.Param(0); got != tc.want {
+			t.Fatalf("boundedPong(%q) token = %q, want %q", tc.token, got, tc.want)
+		}
+		if err := checkFraming(out); err != nil {
+			t.Fatalf("boundedPong(%q) produced a framing-unsafe PONG: %v", tc.token, err)
+		}
+	}
+}
+
 // Under UTF8ONLY the writer scrubs invalid bytes to U+FFFD (3 bytes) before
 // its length check, so a PONG token near the line limit would inflate past
 // it and fatally tear the connection down. boundedPong's tighter budget

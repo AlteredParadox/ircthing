@@ -216,6 +216,11 @@ func hasFramingBytes(s string) bool {
 	return strings.ContainsAny(s, "\r\n\x00")
 }
 
+// framingStripper removes the bytes that frame IRC lines. Used to sanitize a
+// server-derived value before it goes out on the internal priority lane,
+// which bypasses sendAll and hits the writer's FATAL checkFraming.
+var framingStripper = strings.NewReplacer("\r", "", "\n", "", "\x00", "")
+
 // checkFraming rejects a message whose command, parameters, prefix, or
 // tags contain framing bytes.
 func checkFraming(msg *ircv4.Message) error {
@@ -1079,6 +1084,12 @@ func boundedPong(in *ircv4.Message, limit int) *ircv4.Message {
 	if n := len(in.Params); n > 0 {
 		token = in.Params[n-1]
 	}
+	// Strip framing bytes first: the PONG takes the internal priority lane,
+	// which bypasses sendAll and reaches the writer's FATAL checkFraming.
+	// irc.v4 trims only the trailing CRLF, so a PING token can still carry a
+	// NUL or an embedded CR — unstripped, it would tear the connection down
+	// and pin the network in a reconnect loop.
+	token = framingStripper.Replace(token)
 	budget := (limit - len("PONG :\r\n")) / 3
 	if budget < 0 {
 		budget = 0
