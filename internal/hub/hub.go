@@ -30,6 +30,10 @@ type Conn interface {
 	CapEnabled(name string) bool
 	IsChannel(target string) bool // per the network's ISUPPORT CHANTYPES
 	ChanTypes() string
+	// StatusPrefixes is the ISUPPORT STATUSMSG set (e.g. "~&@%+"): a
+	// PRIVMSG/NOTICE to "@#chan" targets ops of #chan. Empty when
+	// unadvertised.
+	StatusPrefixes() string
 	// Fold lowercases a name per the network's ISUPPORT CASEMAPPING
 	// (rfc1459 folds []\^ to {}|~ pairs); every nick/channel comparison
 	// must use it — ASCII-only folding misroutes on rfc1459 networks.
@@ -331,7 +335,7 @@ func (h *Hub) adoptReplayedOwn(ctx context.Context, c Conn, ev irc.Event, target
 // persistEvent stores a message in its buffer and, when live, broadcasts
 // it. Duplicate msgids (overlapping backfill) are silently dropped.
 func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay bool) error {
-	target, ok := persistTarget(ev.Msg, c.Nick(), c.IsChannel, c.Fold)
+	target, ok := persistTarget(ev.Msg, c.Nick(), c.IsChannel, c.Fold, c.StatusPrefixes())
 	if !ok {
 		return nil
 	}
@@ -970,10 +974,10 @@ func (h *Hub) membershipTargets(ctx context.Context, ev irc.Event, replay bool, 
 // persistTarget decides which buffer a message lands in, or none.
 // isChan and fold are the network's ISUPPORT-driven channel detection
 // and casemapping.
-func persistTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fold func(string) string) (string, bool) {
+func persistTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fold func(string) string, statusPrefixes string) (string, bool) {
 	switch m.Command {
 	case "PRIVMSG", "NOTICE":
-		return directTarget(m, ourNick, isChan, fold)
+		return directTarget(m, ourNick, isChan, fold, statusPrefixes)
 	case "JOIN", "PART", "TOPIC", "KICK", "MODE":
 		if t := m.Param(0); isChan(t) {
 			return t, true
@@ -986,7 +990,7 @@ func persistTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, f
 // directTarget files a PRIVMSG/NOTICE: channels under themselves,
 // messages addressed to us under the sender (queries, NickServ, server
 // notices), and our own echoes under the recipient.
-func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fold func(string) string) (string, bool) {
+func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fold func(string) string, statusPrefixes string) (string, bool) {
 	// Non-ACTION CTCP (VERSION probes, PING, and their reply NOTICEs) is
 	// protocol chatter, not conversation: persisting it would open
 	// unread query buffers for every probe.
@@ -997,6 +1001,11 @@ func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fo
 	t := m.Param(0)
 	if isChan(t) {
 		return t, true
+	}
+	// STATUSMSG: "@#chan"/"+#chan" addresses a subset of #chan's members.
+	// Strip the status prefix and file under the bare channel buffer.
+	if len(t) > 1 && strings.IndexByte(statusPrefixes, t[0]) != -1 && isChan(t[1:]) {
+		return t[1:], true
 	}
 	if m.Prefix == nil || m.Prefix.Name == "" || ourNick == "" {
 		return "", false

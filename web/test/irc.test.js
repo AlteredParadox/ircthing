@@ -299,10 +299,22 @@ test("applyStatusMode: collapse folds runs of 2+, leaves singles", () => {
 
 test("applyStatusMode: expanded run keeps the toggle row plus events", () => {
 	const list = [pev(1, "NICK", "a"), pev(2, "NICK", "b"), pev(3, "PRIVMSG", "x")];
-	const out = applyStatusMode(list, "collapse", new Set(["clp-2"]));
+	// Expand state is keyed on a run MEMBER id (here the anchor, event 2).
+	const out = applyStatusMode(list, "collapse", new Set([2]));
 	eq(out.map((e) => e.id), ["clp-2", 1, 2, 3]);
 	is(out[0].expanded, true);
 	is(out[0].summary, "2 nick changes");
+});
+
+test("applyStatusMode: an expanded run stays open when it grows at the tail", () => {
+	const expanded = new Set([2]); // opened when the run was [1,2]
+	// A live join extends the run to [1,2,3]; membership keying keeps it open
+	// even though the last event (and the derived id) changed from 2 to 3.
+	const list = [pev(1, "JOIN", "a"), pev(2, "JOIN", "b"), pev(3, "JOIN", "c")];
+	const out = applyStatusMode(list, "collapse", expanded);
+	is(out[0].id, "clp-3");
+	is(out[0].expanded, true, "run must stay expanded after tail growth");
+	eq(out.map((e) => e.id), ["clp-3", 1, 2, 3]);
 });
 
 test("mergeById: dedups and sorts by (time, id), order-robust", () => {

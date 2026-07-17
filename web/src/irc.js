@@ -140,9 +140,15 @@ export function applyStatusMode(list, mode, expanded) {
 			// Anchor the collapse-row id on the run's LAST event: a
 			// prepended older page can extend the run at its top (moving
 			// run[0]), which would change the id and break the virtual
-			// list's prepend scroll anchor / lose the expand state.
+			// list's prepend scroll anchor.
 			const id = "clp-" + run[run.length - 1].id;
-			const isOpen = !!expanded?.has(id);
+			// Expand state is keyed on run MEMBERSHIP, not the derived id:
+			// the run can grow at the top (prepend) or the tail (a live
+			// join/part), moving both run[0] and run[last]. `expanded` holds
+			// an event id from the run at toggle time, so the run stays open
+			// as long as it still contains that event — surviving growth at
+			// either end (an id-based key re-collapsed on tail extension).
+			const isOpen = run.some((e) => expanded?.has(e.id));
 			out.push({
 				id, collapse: run, expanded: isOpen,
 				time: run[run.length - 1].time,

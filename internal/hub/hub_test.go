@@ -50,6 +50,8 @@ func TestPersistTarget(t *testing.T) {
 		{"ctcp query dropped", ":alice!u@h PRIVMSG AlteredParadox :\x01VERSION\x01", "AlteredParadox", "", false},
 		{"ctcp reply notice dropped", ":alice!u@h NOTICE AlteredParadox :\x01VERSION theirclient\x01", "AlteredParadox", "", false},
 		{"ctcp action persists", ":alice!u@h PRIVMSG #go :\x01ACTION waves\x01", "AlteredParadox", "#go", true},
+		{"statusmsg op-only files under bare channel", ":op!u@h PRIVMSG @#go :ops only", "AlteredParadox", "#go", true},
+		{"statusmsg voice-only files under bare channel", ":op!u@h PRIVMSG +#go :voiced only", "AlteredParadox", "#go", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -57,7 +59,7 @@ func TestPersistTarget(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse %q: %v", tc.line, err)
 			}
-			got, ok := persistTarget(m, tc.ourNick, defaultIsChannel, foldRFC1459)
+			got, ok := persistTarget(m, tc.ourNick, defaultIsChannel, foldRFC1459, "~&@%+")
 			if got != tc.want || ok != tc.ok {
 				t.Fatalf("persistTarget = (%q, %v), want (%q, %v)", got, ok, tc.want, tc.ok)
 			}
@@ -141,6 +143,7 @@ func (f *fakeConn) Nick() string                 { return f.nick }
 func (f *fakeConn) CapEnabled(name string) bool  { return f.caps[name] }
 func (f *fakeConn) IsChannel(target string) bool { return defaultIsChannel(target) }
 func (f *fakeConn) ChanTypes() string            { return "#&" }
+func (f *fakeConn) StatusPrefixes() string       { return "~&@%+" }
 func (f *fakeConn) Fold(name string) string      { return foldRFC1459(name) }
 
 // foldRFC1459 mirrors the default IRC casemapping for test fakes.

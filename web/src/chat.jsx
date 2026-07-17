@@ -47,7 +47,7 @@ function SysRow({ ev, r, focused, timeFmt }) {
 function CollapsedRow({ ev, onToggle }) {
 	return (
 		<div class="sys-row collapse-row">
-			<button type="button" class="sys-toggle" onClick={() => onToggle(ev.id)}>
+			<button type="button" class="sys-toggle" onClick={() => onToggle(ev.collapse)}>
 				{ev.summary} <span class="sys-chevron">{ev.expanded ? "▾" : "▸"}</span>
 			</button>
 		</div>
@@ -151,15 +151,17 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 	// Hide ignored senders from view (they are still stored, so
 	// un-ignoring reveals them live). Zero cost when nobody is ignored.
 	const ignoreKey = (ignoredNicks || []).join("\n");
-	// Expanded collapse-run ids; fresh per buffer.
+	// Expanded collapse runs, tracked by a member event id (see
+	// applyStatusMode): a run stays open across growth at either end.
 	const [expanded, setExpanded] = useState(() => new Set());
 	useEffect(() => setExpanded(new Set()), [buf?.key]);
 	// Swap in this buffer's saved draft (empty if none).
 	useEffect(() => setDraft(drafts.current[buf?.key] || ""), [buf?.key]);
-	const toggleRun = (id) => setExpanded((old) => {
+	const toggleRun = (run) => setExpanded((old) => {
 		const next = new Set(old);
-		if (next.has(id)) next.delete(id);
-		else next.add(id);
+		const open = run.find((e) => next.has(e.id));
+		if (open) next.delete(open.id); // collapse: drop whichever member opened it
+		else next.add(run[run.length - 1].id); // expand: anchor on the last event
 		return next;
 	});
 	const shown = useMemo(() => {

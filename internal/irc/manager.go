@@ -251,6 +251,13 @@ func (m *Manager) ChanTypes() string {
 	return m.isup.ChanTypes()
 }
 
+// StatusPrefixes returns the ISUPPORT STATUSMSG prefix set (e.g. "~&@%+"),
+// or "" when the server does not advertise it.
+func (m *Manager) StatusPrefixes() string {
+	v, _ := m.isup.Raw("STATUSMSG")
+	return v
+}
+
 // Channel returns the topic and member snapshot of a joined channel;
 // ok is false for channels we are not in (or before registration).
 func (m *Manager) Channel(name string) (topic string, members []Member, ok bool) {

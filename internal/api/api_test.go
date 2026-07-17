@@ -431,6 +431,7 @@ func (f *fakeConn) IsChannel(t string) bool {
 }
 
 func (f *fakeConn) ChanTypes() string       { return "#&" }
+func (f *fakeConn) StatusPrefixes() string  { return "~&@%+" }
 func (f *fakeConn) Fold(name string) string { return strings.ToLower(name) }
 
 func (f *fakeConn) RequestChatHistory(string, int64, string) {}
