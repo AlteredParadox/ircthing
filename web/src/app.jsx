@@ -197,7 +197,10 @@ function applyRedaction(m, key, d) {
 	const list = cur.list.map((ev) => {
 		if (ev.msgid !== d.msgid || ev.redacted) return ev;
 		hit = true;
-		return { ...ev, redacted: true, redact_reason: d.reason };
+		// Drop the raw content too, mirroring the server's destructive scrub —
+		// the tombstone renders from the redacted flag alone, and keeping raw
+		// would leave the deleted text in this client's memory.
+		return { ...ev, redacted: true, redact_reason: d.reason, raw: "" };
 	});
 	return hit ? { ...m, [key]: { ...cur, list } } : m;
 }

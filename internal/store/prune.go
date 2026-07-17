@@ -104,5 +104,14 @@ func (s *Store) pruneOnce(ctx context.Context, now time.Time) (int64, error) {
 			total += n
 		}
 	}
+	// Return the pages just freed by the deletes to the OS (auto_vacuum is
+	// INCREMENTAL), so the database file actually shrinks under retention
+	// instead of only ever growing. Best-effort: a failure here is not worth
+	// failing the prune over.
+	if total > 0 {
+		if _, err := s.db.ExecContext(ctx, `PRAGMA incremental_vacuum`); err != nil {
+			log.Printf("store: incremental_vacuum: %v", err)
+		}
+	}
 	return total, nil
 }

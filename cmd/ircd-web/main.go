@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/term"
 
 	"ircthing/internal/api"
 	"ircthing/internal/hub"
@@ -208,15 +209,29 @@ func startNetworks(ctx context.Context, st *store.Store, h *hub.Hub, fileNetwork
 }
 
 func runHashPassword() error {
-	fmt.Fprint(os.Stderr, "password (echoed): ")
-	sc := bufio.NewScanner(os.Stdin)
-	if !sc.Scan() {
-		if err := sc.Err(); err != nil {
+	var pw string
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		// Interactive: read without echo so the password never appears on
+		// screen or in scrollback.
+		fmt.Fprint(os.Stderr, "password: ")
+		b, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Fprintln(os.Stderr) // terminate the prompt line (ReadPassword ate the newline)
+		if err != nil {
 			return err
 		}
-		return fmt.Errorf("no password read")
+		pw = strings.TrimRight(string(b), "\r\n")
+	} else {
+		// Piped/redirected input (e.g. from a provisioning script): read a
+		// line; there is no terminal to suppress echo on.
+		sc := bufio.NewScanner(os.Stdin)
+		if !sc.Scan() {
+			if err := sc.Err(); err != nil {
+				return err
+			}
+			return fmt.Errorf("no password read")
+		}
+		pw = strings.TrimRight(sc.Text(), "\r\n")
 	}
-	pw := strings.TrimRight(sc.Text(), "\r\n")
 	if pw == "" {
 		return fmt.Errorf("empty password")
 	}

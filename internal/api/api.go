@@ -106,15 +106,18 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		login:        newLoginLimiter(),
 		tokens:       make(map[string]time.Time),
 	}
-	s.mux.HandleFunc("POST /api/login", s.handleLogin)
-	s.mux.HandleFunc("POST /api/logout", s.handleLogout)
+	// State-changing and media endpoints require a same-origin request (the
+	// WebSocket does its own Origin check in handleWS). GET /api/config is
+	// read-only and needs no CSRF guard.
+	s.mux.HandleFunc("POST /api/login", s.sameSiteOnly(s.handleLogin))
+	s.mux.HandleFunc("POST /api/logout", s.sameSiteOnly(s.handleLogout))
 	s.mux.HandleFunc("GET /api/ws", s.handleWS)
 	s.mux.HandleFunc("GET /api/config", s.requireAuth(s.handleClientConfig))
-	s.mux.HandleFunc("PUT /api/config", s.requireAuth(s.handleSetConfig))
+	s.mux.HandleFunc("PUT /api/config", s.sameSiteOnly(s.requireAuth(s.handleSetConfig)))
 	// The media endpoints are always registered; they refuse (403) at
 	// runtime when previews are disabled, so the switch is editable live.
-	s.mux.HandleFunc("GET /api/preview", s.requireAuth(s.handlePreview))
-	s.mux.HandleFunc("GET /api/thumb", s.requireAuth(s.handleThumb))
+	s.mux.HandleFunc("GET /api/preview", s.sameSiteOnly(s.requireAuth(s.handlePreview)))
+	s.mux.HandleFunc("GET /api/thumb", s.sameSiteOnly(s.requireAuth(s.handleThumb)))
 	if assets != nil {
 		s.mux.Handle("/", http.FileServerFS(assets))
 	}
@@ -177,6 +180,24 @@ func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.authed(r) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h(w, r)
+	}
+}
+
+// sameSiteOnly refuses a definitively cross-origin request via the
+// Sec-Fetch-Site fetch-metadata header. SameSite=Strict cookies stop true
+// cross-site requests but still treat SIBLING subdomains as same-site, so a
+// hostile sibling could form-POST /api/logout or embed authenticated media
+// GETs; requiring same-origin (rejecting "same-site"/"cross-site") closes
+// that. "none" (direct navigation) and an absent header (older browsers) are
+// allowed — the app itself only ever issues same-origin requests.
+func (s *Server) sameSiteOnly(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Sec-Fetch-Site") {
+		case "cross-site", "same-site":
+			http.Error(w, "cross-site request refused", http.StatusForbidden)
 			return
 		}
 		h(w, r)

@@ -134,6 +134,38 @@ func TestClientConfigPreviewsEnabled(t *testing.T) {
 
 // With previews disabled the media endpoints are not served (zero outbound
 // fetch) and /api/config advertises it so the UI stops requesting them.
+// A state-changing request from a cross-site or same-site (sibling
+// subdomain) context is refused via Sec-Fetch-Site; same-origin, direct
+// navigation ("none"), and older browsers (no header) are allowed.
+func TestSameSiteOnlyBlocksCrossSite(t *testing.T) {
+	ts, _ := newTestServer(t)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	put := func(site string) int {
+		req, _ := http.NewRequest("PUT", ts.URL+"/api/config", strings.NewReader(`{"previews":false}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(cookie)
+		if site != "" {
+			req.Header.Set("Sec-Fetch-Site", site)
+		}
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	for _, site := range []string{"cross-site", "same-site"} {
+		if got := put(site); got != http.StatusForbidden {
+			t.Fatalf("Sec-Fetch-Site=%s PUT = %d, want 403", site, got)
+		}
+	}
+	for _, site := range []string{"same-origin", "none", ""} {
+		if got := put(site); got == http.StatusForbidden {
+			t.Fatalf("Sec-Fetch-Site=%q PUT = 403, want allowed", site)
+		}
+	}
+}
+
 func TestPreviewsDisabledGate(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"), store.Options{})
 	if err != nil {

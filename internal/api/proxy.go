@@ -36,8 +36,12 @@ const proxyUserAgent = "ircthing-media-proxy/1.0 (+https://github.com/ircthing)"
 
 // mediaSlots is the media-path concurrency: each slot admits one whole
 // preview or thumbnail request (fetch through decode/parse and encode),
-// bounding in-flight bodies and decoded bitmaps together.
-const mediaSlots = 2
+// bounding in-flight bodies and decoded bitmaps together. One slot: a single
+// worst-case decode (10 MiB body + ~36 MiB bitmap) fits comfortably under
+// the unit's MemoryMax with room for the rest of the process; two could
+// approach it and OOM-restart the whole bouncer. Previews are best-effort,
+// so serializing them is an acceptable trade for a hard memory bound.
+const mediaSlots = 1
 
 // mediaAcquireWait bounds how long a request waits for a slot (var for
 // tests).

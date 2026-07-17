@@ -68,6 +68,11 @@ var wantedCapSet = func() map[string]bool {
 // and write the returned messages to the connection. That keeps every
 // parsing path table-testable without a socket.
 
+// maxFallbackNick caps a 433/436 fallback nick. The real NICKLEN is only
+// known from 005 (after registration), so this is a plausible ceiling that
+// keeps base+underscores from obviously overflowing a server's limit.
+const maxFallbackNick = 30
+
 type hsPhase int
 
 const (
@@ -203,7 +208,15 @@ func (h *handshake) handle(m *ircv4.Message) (out []*ircv4.Message, done bool, e
 		if h.nickTries > 3 {
 			return nil, false, fmt.Errorf("nickname %q and all fallbacks are in use", h.cfg.Nick)
 		}
-		h.nick = h.cfg.Nick + strings.Repeat("_", h.nickTries)
+		// Cap the fallback length: the real NICKLEN isn't known until 005
+		// (after 001), so a max-length configured nick plus the appended
+		// underscores could exceed it and be rejected. Truncate the base so
+		// base+underscores fits a plausible ceiling.
+		base := h.cfg.Nick
+		if max := maxFallbackNick - h.nickTries; len(base) > max {
+			base = base[:max]
+		}
+		h.nick = base + strings.Repeat("_", h.nickTries)
 		return []*ircv4.Message{newMsg("NICK", h.nick)}, false, nil
 
 	case "432": // ERR_ERRONEUSNICKNAME

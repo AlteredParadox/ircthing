@@ -194,7 +194,12 @@ func Open(path string, opts Options) (*Store, error) {
 		"?_pragma=journal_mode(WAL)" +
 		"&_pragma=synchronous(NORMAL)" +
 		"&_pragma=busy_timeout(5000)" +
-		"&_pragma=foreign_keys(1)"
+		"&_pragma=foreign_keys(1)" +
+		// INCREMENTAL auto_vacuum on a fresh database; existing ones are
+		// converted below. Freed pages (retention/redaction deletes) then go
+		// to the freelist and are returned to the OS by incremental_vacuum
+		// (run after each prune) instead of the file only ever growing.
+		"&_pragma=auto_vacuum(incremental)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -209,6 +214,14 @@ func Open(path string, opts Options) (*Store, error) {
 	// already lets those readers run concurrently with the writer.
 	db.SetMaxOpenConns(1)
 	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// The DSN pragma above only sets auto_vacuum on a FRESH database (before
+	// any table exists). An existing database created without it keeps mode
+	// 0/1 until a VACUUM rewrites the file, so convert it once here. This is
+	// a one-time rewrite on first upgrade (skipped forever after).
+	if err := ensureIncrementalVacuum(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -234,6 +247,29 @@ func Open(path string, opts Options) (*Store, error) {
 		s.startPruner(pruneInterval)
 	}
 	return s, nil
+}
+
+// ensureIncrementalVacuum converts a pre-existing database to INCREMENTAL
+// auto_vacuum (mode 2) when it isn't already, so freed pages can later be
+// returned to the OS by incremental_vacuum. Switching the mode requires a
+// full VACUUM — a one-time file rewrite on the first open after upgrade,
+// skipped forever after.
+func ensureIncrementalVacuum(db *sql.DB) error {
+	var mode int
+	if err := db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		return err
+	}
+	if mode == 2 {
+		return nil
+	}
+	if _, err := db.Exec(`PRAGMA auto_vacuum=INCREMENTAL`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`VACUUM`); err != nil {
+		return fmt.Errorf("store: converting to incremental auto_vacuum: %w", err)
+	}
+	log.Printf("store: converted database to incremental auto_vacuum")
+	return nil
 }
 
 func (s *Store) Close() error {

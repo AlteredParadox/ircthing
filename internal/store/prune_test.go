@@ -1,10 +1,57 @@
 package store
 
 import (
+	"database/sql"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 )
+
+// A fresh database uses INCREMENTAL auto_vacuum so retention deletes can be
+// reclaimed by incremental_vacuum.
+func TestAutoVacuumIncremental(t *testing.T) {
+	s, _ := openTest(t, 10)
+	var mode int
+	if err := s.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != 2 {
+		t.Fatalf("auto_vacuum = %d, want 2 (incremental)", mode)
+	}
+}
+
+// An existing database created without auto_vacuum is converted on open.
+func TestAutoVacuumConvertsExisting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE t(x)`); err != nil {
+		t.Fatal(err)
+	}
+	var m int
+	if err := raw.QueryRow(`PRAGMA auto_vacuum`).Scan(&m); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+	if m == 2 {
+		t.Skip("baseline already incremental; nothing to convert")
+	}
+	s, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var mode int
+	if err := s.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != 2 {
+		t.Fatalf("auto_vacuum after convert = %d, want 2", mode)
+	}
+}
 
 func dbCount(t *testing.T, s *Store) int {
 	t.Helper()
