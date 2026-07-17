@@ -219,11 +219,24 @@ func (h *handshake) handle(m *ircv4.Message) (out []*ircv4.Message, done bool, e
 		return nil, false, errors.New("SASL: nick locked by services (902)")
 
 	case "903": // RPL_SASLSUCCESS
+		// A 903 is only meaningful once a mechanism is actually in flight.
+		// Before CAP negotiation builds one, h.mech is nil: an unsolicited
+		// or forged early 903 would otherwise set saslDone and let the
+		// following 001 through the fail-closed guard, accepting an
+		// unauthenticated session (notably skipping SCRAM's server-
+		// signature check). Refuse it when SASL was configured; ignore the
+		// stray reply otherwise.
+		if h.mech == nil {
+			if h.cfg.SASL != nil {
+				return nil, false, errors.New("SASL: server reported success (903) before authentication began")
+			}
+			return nil, false, nil
+		}
 		// Do not trust a success the mechanism has not actually
 		// completed: for SCRAM this forces the server-signature
 		// verification (RFC 5802 §5), so an impostor server or MITM
 		// cannot skip the server-final and claim success.
-		if h.mech != nil && !h.mech.completed() {
+		if !h.mech.completed() {
 			return nil, false, fmt.Errorf("SASL %s: server reported success before the exchange completed (missing server verification)", h.mech.Name())
 		}
 		h.saslDone = true

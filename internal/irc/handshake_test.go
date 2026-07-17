@@ -610,6 +610,37 @@ func TestHandshakeSCRAMEarly903Rejected(t *testing.T) {
 	}
 }
 
+// A 903 that arrives before CAP negotiation has built any mechanism
+// (h.mech == nil) must be refused when SASL is configured: otherwise it
+// sets saslDone and lets the following 001 through the fail-closed guard,
+// accepting an unauthenticated session.
+func TestHandshakeEarly903NoMechRejected(t *testing.T) {
+	cfg := Config{
+		Addr: "irc.test:6697", Nick: "AlteredParadox", TLS: true,
+		SASL: &SASLConfig{Mechanism: "PLAIN", Login: "AlteredParadox", Password: "pw"},
+	}
+	hs := newHandshake(&cfg)
+	hs.start()
+	// No CAP LS / ACK yet, so hs.mech is still nil.
+	if _, _, err := hs.handle(ircv4.MustParseMessage(":srv 903 AlteredParadox :ok")); err == nil ||
+		!strings.Contains(err.Error(), "before authentication began") {
+		t.Fatalf("premature 903 err = %v, want rejection", err)
+	}
+
+	// Without SASL configured a stray 903 is meaningless chatter: ignore
+	// it (do not mark saslDone), and never CAP END on it.
+	ncfg := Config{Addr: "x:1", Nick: "AlteredParadox", TLS: true}
+	nh := newHandshake(&ncfg)
+	nh.start()
+	out, done, err := nh.handle(ircv4.MustParseMessage(":srv 903 AlteredParadox :ok"))
+	if err != nil || done || len(out) != 0 {
+		t.Fatalf("stray 903 (no SASL) = (%v, %v, %v), want ignored", wire(out), done, err)
+	}
+	if nh.saslDone {
+		t.Fatal("stray 903 set saslDone with no SASL configured")
+	}
+}
+
 // A server SASL challenge split across 400-byte AUTHENTICATE lines is
 // reassembled before the mechanism decodes it.
 func TestHandshakeAuthenticateChunkReassembly(t *testing.T) {

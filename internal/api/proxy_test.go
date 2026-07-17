@@ -141,6 +141,13 @@ func TestIsPublicIP(t *testing.T) {
 		{"::ffff:0:808:808", false},   // IPv4-translated (SIIT)
 		{"64:ff9b::808:808", false},   // NAT64-embedded 8.8.8.8: the whole prefix is out
 		{"2620:fe::fe", true},         // Quad9 — ordinary global unicast
+		// Non-global IPv6 the stdlib helpers do not classify: the
+		// 2000::/3 allowlist backstop must reject these.
+		{"fec0::1", false},  // deprecated site-local (RFC 3879)
+		{"febf::1", false},  // top of fec0::/10
+		{"5000::1", false},  // outside global unicast 2000::/3
+		{"1000::1", false},  // below global unicast
+		{"3000::1", true},   // still within 2000::/3 (2000::–3fff::)
 	}
 	for _, tc := range cases {
 		ip := net.ParseIP(tc.ip)

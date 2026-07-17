@@ -4,10 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os"
@@ -481,6 +481,15 @@ func (m *Manager) applyCapChange(enable bool, list string) {
 	for _, tok := range strings.Fields(list) {
 		name, removed := strings.CutPrefix(tok, "-")
 		if enable && !removed {
+			// Only accept a capability we actually want (and therefore
+			// ever requested). Without this, a hostile server can ACK an
+			// unbounded stream of unique, unrequested names post-
+			// registration, growing this copy-on-write map without limit
+			// and turning each ACK into an O(n) copy (O(n²) overall) until
+			// the process dies. wantedCapSet is a small finite set.
+			if !wantedCapSet[name] {
+				continue
+			}
 			caps[name] = true
 			if v, ok := m.pendingCapVals[name]; ok {
 				vals[name] = v
@@ -1429,13 +1438,25 @@ func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn,
 		tcfg.ServerName = host
 	}
 	// Pinned fingerprints replace CA verification: the leaf certificate's
-	// SHA-256 must be in the trusted set. Verified after the handshake
-	// (nothing has been sent yet) rather than mid-handshake, so a mismatch
-	// is a clean close instead of a TLS alert. Config validation already
-	// vetted the fingerprint format.
+	// SHA-256 must be in the trusted set. Config validation already vetted
+	// the fingerprint format.
 	fps, _ := fingerprintSet(m.cfg.TrustedFingerprints)
+	presentsClientCert := len(tcfg.Certificates) > 0 || tcfg.GetClientCertificate != nil
 	if fps != nil {
 		tcfg.InsecureSkipVerify = true
+		if presentsClientCert {
+			// SASL EXTERNAL: we will send a client certificate. Verify the
+			// pin DURING the handshake via VerifyConnection (still invoked
+			// under InsecureSkipVerify) — Go runs it after the server
+			// certificate arrives but BEFORE our Certificate is sent, so a
+			// mismatched endpoint never receives that certificate or its
+			// transcript-bound proof. Without a client certificate there is
+			// nothing to leak, so we verify after the handshake instead (a
+			// clean close rather than a mid-handshake TLS alert).
+			tcfg.VerifyConnection = func(cs tls.ConnectionState) error {
+				return verifyPinned(cs.PeerCertificates, fps)
+			}
+		}
 	}
 	tconn := tls.Client(conn, tcfg)
 	hctx, hcancel := context.WithTimeout(ctx, m.cfg.DialTimeout)
@@ -1444,8 +1465,9 @@ func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn,
 		conn.Close()
 		return nil, fmt.Errorf("tls handshake: %w", err)
 	}
-	if fps != nil {
-		if err := verifyPinned(tconn, fps); err != nil {
+	if fps != nil && !presentsClientCert {
+		if err := verifyPinned(tconn.ConnectionState().PeerCertificates, fps); err != nil {
+			tconn.Close()
 			return nil, err
 		}
 	}
@@ -1453,22 +1475,18 @@ func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn,
 }
 
 // verifyPinned checks the leaf certificate's SHA-256 against the trusted
-// set, closing the connection on mismatch. The close absorbs
-// post-handshake messages (TLS 1.3 session tickets) briefly and sends
-// close_notify, so the server sees a clean EOF instead of a reset.
-func verifyPinned(tconn *tls.Conn, fps map[string]bool) error {
-	certs := tconn.ConnectionState().PeerCertificates
+// set. It is used both as a tls.Config.VerifyConnection hook (so a
+// mismatch aborts the handshake before an EXTERNAL client certificate is
+// sent) and for post-handshake verification when no client certificate is
+// at stake.
+func verifyPinned(certs []*x509.Certificate, fps map[string]bool) error {
 	if len(certs) == 0 {
-		tconn.Close()
 		return errors.New("tls: server presented no certificate")
 	}
 	sum := sha256.Sum256(certs[0].Raw)
 	if fps[hex.EncodeToString(sum[:])] {
 		return nil
 	}
-	tconn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	_, _ = io.Copy(io.Discard, tconn)
-	tconn.Close()
 	return fmt.Errorf("tls: server certificate SHA-256 %s does not match any trusted fingerprint",
 		hex.EncodeToString(sum[:]))
 }

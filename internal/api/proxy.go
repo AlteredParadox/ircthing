@@ -270,5 +270,19 @@ func isPublicIP(ip net.IP) bool {
 			return false
 		}
 	}
+	// IPv6 allowlist backstop: require global unicast (2000::/3). The
+	// denylist above is necessarily incomplete for non-global space that
+	// net.IP's helpers do not classify — e.g. deprecated site-local
+	// fec0::/10 (RFC 3879), which a host with a lingering internal route
+	// could still reach. Everything routable on the public Internet lives
+	// in 2000::/3; reject anything outside it.
+	if addr.Is6() && !globalUnicastV6.Contains(addr) {
+		return false
+	}
 	return true
 }
+
+// globalUnicastV6 is the IPv6 global-unicast block (RFC 4291 §2.4). It
+// backs the isPublicIP allowlist so non-global IPv6 space (site-local,
+// ULA, link-local, multicast) is rejected regardless of the denylist.
+var globalUnicastV6 = netip.MustParsePrefix("2000::/3")

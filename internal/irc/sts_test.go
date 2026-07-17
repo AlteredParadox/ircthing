@@ -152,3 +152,29 @@ func TestCapNotifySTSUpgrade(t *testing.T) {
 		t.Fatalf("secure CAP NEW sts: %v", err)
 	}
 }
+
+// A post-registration CAP ACK must only enable capabilities we actually
+// want (and therefore requested). Otherwise a hostile server can ACK an
+// unbounded stream of unique, unrequested names, growing the copy-on-
+// write capability map without limit (O(n²) copying) until the process
+// dies.
+func TestCapNotifyACKRejectsUnrequested(t *testing.T) {
+	m, err := NewManager(Config{Addr: "irc.test:6667", Nick: "AlteredParadox", AllowPlaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.handleCapNotify(ircv4.MustParseMessage(":srv CAP AlteredParadox ACK :evil-1 evil-2 evil-3"))
+	if m.CapEnabled("evil-1") || m.CapEnabled("evil-2") || m.CapEnabled("evil-3") {
+		t.Fatal("ACK of unrequested capabilities was accepted")
+	}
+	// A wanted capability, by contrast, is enabled by its ACK.
+	m.handleCapNotify(ircv4.MustParseMessage(":srv CAP AlteredParadox ACK :away-notify"))
+	if !m.CapEnabled("away-notify") {
+		t.Fatal("ACK of a wanted capability (away-notify) was not enabled")
+	}
+	// DEL still drops arbitrary names (no allowlist on removal).
+	m.handleCapNotify(ircv4.MustParseMessage(":srv CAP AlteredParadox DEL :away-notify"))
+	if m.CapEnabled("away-notify") {
+		t.Fatal("DEL did not remove away-notify")
+	}
+}
