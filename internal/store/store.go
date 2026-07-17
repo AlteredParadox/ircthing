@@ -305,6 +305,7 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 	if fold != nil {
 		target, _ = s.canonicalLocked(ctx, network, target, fold)
 	}
+	m.Network, m.Target = network, target
 	if create && guardCreate != nil {
 		blocked, err := s.createVetoed(ctx, network, target, guardCreate)
 		if err != nil {
@@ -321,6 +322,12 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 	if bufID == 0 {
 		return Message{}, nil // no such buffer and create is off
 	}
+	return s.insertLocked(ctx, bufID, r, m)
+}
+
+// insertLocked writes m into the buffer and hot ring (caller holds s.mu).
+// A dropped INSERT OR IGNORE (duplicate msgid) returns the zero Message.
+func (s *Store) insertLocked(ctx context.Context, bufID int64, r *ring, m Message) (Message, error) {
 	res, err := s.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO messages (buffer_id, ts, msgid, sender, command, raw, text) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		bufID, m.Time.UnixMilli(), nullString(m.MsgID), m.Sender, m.Command, m.Raw, nullString(m.Text))
@@ -334,7 +341,6 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 	if err != nil {
 		return Message{}, err
 	}
-	m.Network, m.Target = network, target
 	r.insert(m)
 	return m, nil
 }
