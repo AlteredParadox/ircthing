@@ -902,11 +902,12 @@ func (h *Hub) persistMembership(ctx context.Context, c Conn, ev irc.Event, repla
 	for _, target := range h.membershipTargets(ctx, ev, replay, batch, c.Fold) {
 		// A just-closed buffer must not be resurrected by QUIT/NICK
 		// fan-out either (mirrors persistEvent's grace): the guard, applied
-		// atomically with buffer creation in the store, drops a live
-		// straggler for a buffer closed concurrently. Replayed history is
-		// never subject to the grace, so its guard is always false.
+		// atomically with buffer creation in the store, drops a straggler
+		// for a buffer closed concurrently. This is replay-agnostic to match
+		// persistEvent — a replayed (event-playback) QUIT/NICK for a buffer
+		// the user just closed must not re-create it either.
 		stored, err := h.store.AppendGuarded(ctx, ev.Network, target,
-			func() bool { return !replay && h.recentlyClosed(ev.Network, c.Fold(target)) },
+			func() bool { return h.recentlyClosed(ev.Network, c.Fold(target)) },
 			storeMessage(ev))
 		if err != nil {
 			log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)

@@ -369,6 +369,56 @@ func TestQuitDoesNotResurrectClosedBuffer(t *testing.T) {
 	}
 }
 
+// A QUIT/NICK replayed inside an event-playback batch must not resurrect a
+// buffer the user just closed either — the close grace is replay-agnostic
+// (mirrors persistEvent). Before the fix the replay path skipped the grace
+// and re-created the buffer with orphan system lines.
+func TestReplayedQuitDoesNotResurrectClosedBuffer(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox",
+		chans: map[string][]irc.Member{"#foo": {{Nick: "AlteredParadox"}, {Nick: "bob"}}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+			Msg: ircv4.MustParseMessage(line)}
+	}
+	// Seed #foo.
+	conn.ch <- ev(":bob!u@h PRIVMSG #foo :hi")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#foo", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed not persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Close it, then an event-playback batch for #foo replays a QUIT.
+	s := h.NewSession()
+	defer s.Close()
+	s.Handle(ctxb, request(t, "close_buffer", 1, BufferRef{Network: "libera", Buffer: "#foo"}))
+	recv(t, s, "ok", "buffer_closed", "event")
+	conn.ch <- ev(":srv BATCH +r1 chathistory #foo")
+	conn.ch <- ev("@batch=r1;time=2026-07-15T00:00:06.000Z :bob!u@h QUIT :bye")
+	conn.ch <- ev(":srv BATCH -r1")
+
+	time.Sleep(200 * time.Millisecond)
+	bufs, err := h.store.Buffers(ctxb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bufs) != 0 {
+		t.Fatalf("replayed QUIT resurrected the closed buffer: %+v", bufs)
+	}
+}
+
 // monitor_add for a network that is neither configured nor connected is
 // rejected, so it cannot mint phantom network/monitor rows.
 func TestMonitorRejectsUnknownNetwork(t *testing.T) {

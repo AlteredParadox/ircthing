@@ -992,11 +992,32 @@ func (m *Manager) feedMultiline(ctx context.Context, ml *multiline, in *ircv4.Me
 	return consumed, nil
 }
 
+// boundedPong builds the PONG answering a server PING, echoing just the
+// token (the last param) bounded to the writer's line limit. Echoing an
+// arbitrarily long, non-compliant token verbatim would build an
+// over-length PONG that the writer rejects fatally — a remote
+// reconnect-loop DoS (mirrors maxCTCPPingToken; the reader admits PING
+// lines far larger than LINELEN, so the cap must live here).
+func boundedPong(in *ircv4.Message, limit int) *ircv4.Message {
+	token := ""
+	if n := len(in.Params); n > 0 {
+		token = in.Params[n-1]
+	}
+	budget := limit - len("PONG :\r\n")
+	if budget < 0 {
+		budget = 0
+	}
+	if len(token) > budget {
+		token = token[:budget]
+	}
+	return newMsg("PONG", token)
+}
+
 // serviceLine answers protocol housekeeping on a line: server PINGs and
 // post-registration cap-notify (including its STS refresh).
 func (m *Manager) serviceLine(ctx context.Context, lc *liveConn, in *ircv4.Message) error {
 	if in.Command == "PING" {
-		if err := lc.send([]*ircv4.Message{newMsg("PONG", in.Params...)}); err != nil {
+		if err := lc.send([]*ircv4.Message{boundedPong(in, m.lineLen())}); err != nil {
 			return err
 		}
 	}

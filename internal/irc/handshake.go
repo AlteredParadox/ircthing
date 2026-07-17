@@ -168,7 +168,11 @@ func (h *handshake) passLine() []*ircv4.Message {
 func (h *handshake) handle(m *ircv4.Message) (out []*ircv4.Message, done bool, err error) {
 	switch m.Command {
 	case "PING":
-		return []*ircv4.Message{newMsg("PONG", m.Params...)}, false, nil
+		// Bound the echoed token: 005 (which can raise/lower LINELEN)
+		// arrives only after 001, so registration always runs at the
+		// default limit — but a hostile server can still PING an over-long
+		// token here and loop the connection before it registers.
+		return []*ircv4.Message{boundedPong(m, defaultLineLen)}, false, nil
 
 	case "ERROR":
 		return nil, false, fmt.Errorf("server error: %s", m.Trailing())

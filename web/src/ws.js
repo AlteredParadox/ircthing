@@ -24,6 +24,26 @@ export class Socket {
 		for (const fn of this.handlers.get(type) || []) fn(data);
 	}
 
+	// dispatch routes one decoded envelope. A seq-tagged envelope is a
+	// request reply, never a push: settle it if still pending, otherwise it
+	// arrived after the request timed out — drop it rather than emit() it,
+	// where a late reply that shares a type with a push (e.g. get_prefs vs
+	// the prefs push) would clobber unsynced local state. Seq-less
+	// envelopes (seq 0/absent) are server pushes.
+	dispatch(env) {
+		if (env.v !== V) return;
+		if (env.seq) {
+			const p = this.pending.get(env.seq);
+			if (!p) return;
+			this.pending.delete(env.seq);
+			clearTimeout(p.timer);
+			if (env.type === "error") p.reject(Object.assign(new Error(env.data?.message || "error"), { code: env.data?.code }));
+			else p.resolve(env.data);
+			return;
+		}
+		this.emit(env.type, env.data);
+	}
+
 	connect() {
 		this.ws = new WebSocket(this.url);
 		this.ws.onopen = () => {
@@ -37,16 +57,7 @@ export class Socket {
 			} catch {
 				return;
 			}
-			if (env.v !== V) return;
-			if (env.seq && this.pending.has(env.seq)) {
-				const p = this.pending.get(env.seq);
-				this.pending.delete(env.seq);
-				clearTimeout(p.timer);
-				if (env.type === "error") p.reject(Object.assign(new Error(env.data?.message || "error"), { code: env.data?.code }));
-				else p.resolve(env.data);
-				return;
-			}
-			this.emit(env.type, env.data);
+			this.dispatch(env);
 		};
 		this.ws.onclose = () => {
 			this.emit("_close");

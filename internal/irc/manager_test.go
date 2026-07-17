@@ -1271,10 +1271,12 @@ func TestConfigRejectsOversizedRegistration(t *testing.T) {
 	}
 }
 
-// An internal line that would exceed the line limit after serialization
-// (here a PONG echoing an over-long server PING) tears the connection
-// down at the writer rather than emitting a line the server rejects.
-func TestManagerDisconnectsOnOversizedInternalLine(t *testing.T) {
+// A hostile server that PINGs an over-long, non-compliant token must not
+// tear our connection down: we answer with a PONG bounded to the line
+// limit instead of building an over-length line the writer would fatally
+// reject (which looped the connection — a remote reconnect-loop DoS). The
+// connection stays up and keeps answering pings.
+func TestOversizedPingAnsweredWithBoundedPong(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1286,11 +1288,17 @@ func TestManagerDisconnectsOnOversizedInternalLine(t *testing.T) {
 	s.register("AlteredParadox")
 	waitState(t, m, StateRegistered)
 
-	s.send("PING :" + strings.Repeat("x", 600)) // PONG echo > 512
-
-	s2 := accept(t, conns) // torn down, reconnects
-	s2.register("AlteredParadox")
-	waitState(t, m, StateRegistered)
+	s.send("PING :" + strings.Repeat("x", 600))
+	pong := s.readCmd("PONG")
+	if n := len(pong.Param(0)); n >= 600 || n > defaultLineLen {
+		t.Fatalf("PONG token = %d bytes, want truncated to fit the line limit", n)
+	}
+	// The connection survived: a normal ping still round-trips (no teardown,
+	// so no second accept()).
+	s.send("PING :ok")
+	if p := s.readCmd("PONG"); p.Param(0) != "ok" {
+		t.Fatalf("PONG = %q, want ok", p.Param(0))
+	}
 }
 
 // A server spoofing an unbounded stream of self-JOINs is torn down
