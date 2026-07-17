@@ -5,44 +5,58 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
-	"strings"
 
 	"ircthing/internal/proxydial"
 	"ircthing/internal/store"
 )
 
-// The media proxy and previews switch are runtime-editable from the UI and
-// persisted here, so they can change over time without a config edit and
-// restart. The config-file fields are only the initial default, used until
-// something is saved.
-const mediaConfigKey = "media_config"
+// The previews switch is runtime-editable from the UI and persisted here,
+// so it can be toggled without a config edit and restart. The config-file
+// disable_previews field is only the initial default, used until something
+// is saved.
+//
+// The media *proxy* is not a global setting: preview/thumbnail fetches use
+// the proxy of the network the link came from (proxyForNetwork), so they
+// automatically inherit that network's anonymity posture — a link in a
+// Tor'd network is previewed over Tor, one in a direct network goes direct.
+const previewsKey = "previews_enabled"
 
-// mediaConfigJSON is the wire + stored shape. Proxy is the full URL
-// (including any credentials) so the settings form can round-trip it;
-// empty means fetch directly.
-type mediaConfigJSON struct {
-	Proxy    string `json:"proxy"`
-	Previews bool   `json:"previews"`
+// loadPreviews resolves the effective previews switch: the stored value if
+// present, else the config-file default.
+func loadPreviews(ctx context.Context, st *store.Store, cfg Config) bool {
+	if v, err := st.Setting(ctx, previewsKey); err == nil && v != "" {
+		return v == "1"
+	}
+	return !cfg.PreviewsDisabled
 }
 
-// loadMediaConfig resolves the effective media config: the stored value if
-// present and valid, else the config-file default.
-func loadMediaConfig(ctx context.Context, st *store.Store, cfg Config) (*url.URL, bool) {
-	if v, err := st.Setting(ctx, mediaConfigKey); err == nil && v != "" {
-		var m mediaConfigJSON
-		if json.Unmarshal([]byte(v), &m) == nil {
-			var proxy *url.URL
-			if m.Proxy != "" {
-				// A stored value was validated when saved; ignore it if it no
-				// longer parses rather than fail startup.
-				if u, perr := proxydial.Parse(m.Proxy); perr == nil {
-					proxy = u
-				}
-			}
-			return proxy, m.Previews
-		}
+func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Previews bool `json:"previews"`
+	}{Previews: s.previewsEnabled()})
+}
+
+func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Previews bool `json:"previews"`
 	}
-	return cfg.MediaProxy, !cfg.PreviewsDisabled
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&body); err != nil {
+		http.Error(w, "malformed config", http.StatusBadRequest)
+		return
+	}
+	val := "0"
+	if body.Previews {
+		val = "1"
+	}
+	if err := s.hub.Store().SetSetting(r.Context(), previewsKey, val); err != nil {
+		http.Error(w, "storing config failed", http.StatusInternalServerError)
+		return
+	}
+	s.mediaMu.Lock()
+	s.previewsOn = body.Previews
+	s.mediaMu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func proxyString(u *url.URL) string {
@@ -52,47 +66,26 @@ func proxyString(u *url.URL) string {
 	return u.String()
 }
 
-func (s *Server) handleGetMediaConfig(w http.ResponseWriter, r *http.Request) {
-	s.mediaMu.RLock()
-	out := mediaConfigJSON{Proxy: proxyString(s.mediaProxy), Previews: s.previewsOn}
-	s.mediaMu.RUnlock()
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(out)
-}
-
-func (s *Server) handleSetMediaConfig(w http.ResponseWriter, r *http.Request) {
-	var m mediaConfigJSON
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&m); err != nil {
-		http.Error(w, "malformed media config", http.StatusBadRequest)
-		return
+// proxyForNetwork returns the proxy configured for network name, or nil for
+// a direct fetch (no network, unknown network, or no proxy). The stored
+// config was validated when saved, so the proxy is extracted directly.
+func (s *Server) proxyForNetwork(ctx context.Context, name string) *url.URL {
+	if name == "" {
+		return nil
 	}
-	var proxy *url.URL
-	if p := strings.TrimSpace(m.Proxy); p != "" {
-		u, err := proxydial.Parse(p)
-		if err != nil {
-			http.Error(w, "invalid proxy: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-		proxy = u
+	nc, ok, err := s.hub.Store().NetworkConfig(ctx, name)
+	if err != nil || !ok {
+		return nil
 	}
-	// Persist the normalized form, then swap the live fetchers.
-	blob, _ := json.Marshal(mediaConfigJSON{Proxy: proxyString(proxy), Previews: m.Previews})
-	if err := s.hub.Store().SetSetting(r.Context(), mediaConfigKey, string(blob)); err != nil {
-		http.Error(w, "storing media config failed", http.StatusInternalServerError)
-		return
+	var cfg struct {
+		Proxy string `json:"proxy"`
 	}
-	s.applyMediaConfig(proxy, m.Previews)
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// applyMediaConfig swaps the live proxy, previews switch, and fetchers. The
-// fetchers are cheap http.Clients; rebuilding drops the old ones (in-flight
-// requests keep the fetcher they captured before the swap).
-func (s *Server) applyMediaConfig(proxy *url.URL, previews bool) {
-	s.mediaMu.Lock()
-	defer s.mediaMu.Unlock()
-	s.mediaProxy = proxy
-	s.previewsOn = previews
-	s.htmlFetcher = newFetcher(maxHTMLBytes, proxy)
-	s.imageFetcher = newFetcher(maxImageBytes, proxy)
+	if json.Unmarshal([]byte(nc.Config), &cfg) != nil || cfg.Proxy == "" {
+		return nil
+	}
+	u, err := proxydial.Parse(cfg.Proxy)
+	if err != nil {
+		return nil
+	}
+	return u
 }

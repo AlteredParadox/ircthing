@@ -44,7 +44,11 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad url", http.StatusBadRequest)
 		return
 	}
-	if pv, ok := s.previewCache.get(target); ok {
+	// The link's network selects the proxy, so cache per (network, url): the
+	// same URL in a Tor'd network and a direct one must fetch independently.
+	net := r.URL.Query().Get("net")
+	ck := net + "\x00" + target
+	if pv, ok := s.previewCache.get(ck); ok {
 		writeJSON(w, pv)
 		return
 	}
@@ -54,7 +58,7 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.releaseMedia()
-	ct, body, err := s.htmlF().get(r.Context(), target)
+	ct, body, err := s.htmlFetcherFor(s.proxyForNetwork(r.Context(), net)).get(r.Context(), target)
 	if err != nil {
 		http.Error(w, "preview unavailable", http.StatusBadGateway)
 		return
@@ -67,7 +71,7 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	} else {
 		extractMeta(string(body), target, &pv)
 	}
-	s.previewCache.put(target, pv)
+	s.previewCache.put(ck, pv)
 	writeJSON(w, pv)
 }
 

@@ -172,10 +172,9 @@ func TestPreviewsDisabledGate(t *testing.T) {
 	}
 }
 
-// The media proxy and previews switch are editable at runtime via
-// /api/media-config, take effect live (fetchers rebuilt, endpoints gated),
-// and persist to the store so a restart keeps them.
-func TestMediaConfigRuntime(t *testing.T) {
+// The previews switch is editable at runtime via PUT /api/config, gates
+// the media endpoints live, and persists to the store.
+func TestPreviewsToggleRuntime(t *testing.T) {
 	ts, srv := newTestServerWithRef(t)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
 	do := func(method, path, body string) *http.Response {
@@ -188,7 +187,6 @@ func TestMediaConfigRuntime(t *testing.T) {
 		return resp
 	}
 
-	// Default: previews on, direct fetch.
 	var cfg struct{ Previews bool }
 	resp := do("GET", "/api/config", "")
 	decodeJSON(t, resp, &cfg)
@@ -197,8 +195,8 @@ func TestMediaConfigRuntime(t *testing.T) {
 		t.Fatal("previews should default on")
 	}
 
-	// Turn previews off live.
-	resp = do("PUT", "/api/media-config", `{"proxy":"","previews":false}`)
+	// Turn off live -> endpoints refuse.
+	resp = do("PUT", "/api/config", `{"previews":false}`)
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("disable PUT = %d", resp.StatusCode)
 	}
@@ -215,38 +213,49 @@ func TestMediaConfigRuntime(t *testing.T) {
 		t.Fatalf("preview while disabled = %d, want 403", resp.StatusCode)
 	}
 
-	// Set a proxy and re-enable; it round-trips and the live fetcher is
-	// rebuilt through the proxy.
-	resp = do("PUT", "/api/media-config", `{"proxy":"socks5://user:pass@127.0.0.1:1080","previews":true}`)
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("proxy PUT = %d", resp.StatusCode)
-	}
+	// Back on, and persisted (a stored "on" overrides a disabled default).
+	resp = do("PUT", "/api/config", `{"previews":true}`)
 	resp.Body.Close()
-	var mc struct {
-		Proxy    string
-		Previews bool
+	if !srv.previewsEnabled() {
+		t.Fatal("previews not re-enabled")
 	}
-	resp = do("GET", "/api/media-config", "")
-	decodeJSON(t, resp, &mc)
-	resp.Body.Close()
-	if mc.Proxy != "socks5://user:pass@127.0.0.1:1080" || !mc.Previews {
-		t.Fatalf("media-config = %+v", mc)
+	if !loadPreviews(context.Background(), srv.hub.Store(), Config{PreviewsDisabled: true}) {
+		t.Fatal("stored previews=on not read back over the config default")
 	}
-	if !srv.htmlF().proxied || !srv.imageF().proxied {
-		t.Fatal("fetchers not rebuilt through the proxy")
-	}
+}
 
-	// An invalid proxy is rejected and leaves the config unchanged.
-	resp = do("PUT", "/api/media-config", `{"proxy":"ftp://x:1","previews":true}`)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("bad proxy PUT = %d, want 400", resp.StatusCode)
+// Previews use the source network's proxy: proxyForNetwork resolves it from
+// the stored config, and the per-proxy fetcher pool builds + reuses one
+// fetcher per distinct proxy.
+func TestProxyForNetwork(t *testing.T) {
+	_, srv := newTestServerWithRef(t)
+	ctx := context.Background()
+	st := srv.hub.Store()
+	if err := st.PutNetworkConfig(ctx, "tornet",
+		`{"name":"tornet","addr":"x:6697","tls":true,"nick":"a","proxy":"socks5://user:pass@127.0.0.1:9050"}`); err != nil {
+		t.Fatal(err)
 	}
-	resp.Body.Close()
-
-	// Persisted: a fresh load from the same store reads the saved value.
-	proxy, previews := loadMediaConfig(context.Background(), srv.hub.Store(), Config{})
-	if proxy == nil || proxy.Host != "127.0.0.1:1080" || !previews {
-		t.Fatalf("loadMediaConfig = %v, %v", proxy, previews)
+	if err := st.PutNetworkConfig(ctx, "direct",
+		`{"name":"direct","addr":"y:6667","allow_plaintext":true,"nick":"a"}`); err != nil {
+		t.Fatal(err)
+	}
+	if p := srv.proxyForNetwork(ctx, "tornet"); p == nil || p.Host != "127.0.0.1:9050" {
+		t.Fatalf("tornet proxy = %v, want 127.0.0.1:9050", p)
+	}
+	for _, name := range []string{"direct", "nonexistent", ""} {
+		if p := srv.proxyForNetwork(ctx, name); p != nil {
+			t.Fatalf("proxyForNetwork(%q) = %v, want nil", name, p)
+		}
+	}
+	f1 := srv.htmlFetcherFor(srv.proxyForNetwork(ctx, "tornet"))
+	if !f1.proxied {
+		t.Fatal("tornet fetcher not proxied")
+	}
+	if f2 := srv.htmlFetcherFor(srv.proxyForNetwork(ctx, "tornet")); f2 != f1 {
+		t.Fatal("per-proxy fetcher not cached/reused")
+	}
+	if fd := srv.htmlFetcherFor(nil); fd.proxied {
+		t.Fatal("direct fetcher must not be proxied")
 	}
 }
 

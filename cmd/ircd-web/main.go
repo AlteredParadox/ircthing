@@ -104,16 +104,11 @@ func run(cfg *config) error {
 	if err != nil {
 		return fmt.Errorf("embedded assets: %w", err)
 	}
-	mediaProxy, err := cfg.mediaProxyURL()
-	if err != nil {
-		return fmt.Errorf("media_proxy: %w", err)
-	}
 	handler, err := api.New(api.Config{
 		Username:         cfg.User.Username,
 		PasswordHash:     cfg.User.PasswordHash,
 		SessionTTL:       cfg.sessionTTL(),
 		SecureCookies:    cfg.SecureCookies,
-		MediaProxy:       mediaProxy,
 		PreviewsDisabled: cfg.DisablePreviews,
 	}, h, assets)
 	if err != nil {

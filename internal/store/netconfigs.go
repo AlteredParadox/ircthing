@@ -40,6 +40,24 @@ func (s *Store) NetworkConfigs(ctx context.Context) ([]NetworkConfig, error) {
 	return out, rows.Err()
 }
 
+// NetworkConfig returns one stored definition by name (ok=false when
+// absent).
+func (s *Store) NetworkConfig(ctx context.Context, name string) (NetworkConfig, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var nc NetworkConfig
+	err := s.db.QueryRowContext(ctx,
+		`SELECT name, config FROM network_configs WHERE name = ?`, name).Scan(&nc.Name, &nc.Config)
+	if errors.Is(err, sql.ErrNoRows) {
+		return NetworkConfig{}, false, nil
+	}
+	if err != nil {
+		return NetworkConfig{}, false, err
+	}
+	return nc, true, nil
+}
+
 // PutNetworkConfig inserts or replaces a definition.
 func (s *Store) PutNetworkConfig(ctx context.Context, name, config string) error {
 	s.mu.Lock()

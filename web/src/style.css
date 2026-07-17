@@ -1590,13 +1590,6 @@ input::placeholder {
 	font-size: 0.8571rem;
 }
 
-.media-actions {
-	display: flex;
-	align-items: center;
-	gap: 10px;
-	margin-top: 10px;
-}
-
 /* Compact single-line pref input (e.g. the nick separator character). */
 .pref-input {
 	width: 5rem;

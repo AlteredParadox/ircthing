@@ -50,10 +50,8 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	const [enabled, setEnabled] = useState(notifier.enabled);
 	const netNames = Object.keys(networks).sort((a, b) => a.localeCompare(b));
 
-	// Server-side media config (proxy + previews switch), loaded on open and
-	// saved on demand — it's a server setting, not a per-keystroke pref.
-	const [media, setMedia] = useState(null); // { proxy, previews } | null while loading
-	const [mediaSaved, setMediaSaved] = useState(""); // "" | "saved" | "error"
+	// Server-side previews switch, loaded on open and applied on toggle.
+	const [previewsOn, setPreviewsOn] = useState(null); // null while loading
 
 	useEffect(() => {
 		const onKey = (e) => e.key === "Escape" && onClose();
@@ -62,26 +60,20 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	}, []);
 
 	useEffect(() => {
-		fetch("/api/media-config")
+		fetch("/api/config")
 			.then((r) => (r.ok ? r.json() : null))
-			.then((d) => d && setMedia({ proxy: d.proxy || "", previews: !!d.previews }))
+			.then((d) => d && setPreviewsOn(!!d.previews))
 			.catch(() => {});
 	}, []);
 
-	function saveMedia() {
-		if (!media) return;
-		setMediaSaved("");
-		fetch("/api/media-config", {
+	function togglePreviews(on) {
+		setPreviewsOn(on);
+		onPreviews?.(on); // reflect in the live UI immediately
+		fetch("/api/config", {
 			method: "PUT",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ proxy: media.proxy.trim(), previews: media.previews }),
-		})
-			.then((r) => {
-				if (!r.ok) return setMediaSaved("error");
-				setMediaSaved("saved");
-				onPreviews?.(media.previews); // reflect the switch in the live UI
-			})
-			.catch(() => setMediaSaved("error"));
+			body: JSON.stringify({ previews: on }),
+		}).catch(() => {});
 	}
 
 	async function enableNotif() {
@@ -230,40 +222,23 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 					</section>
 
 					<section class="settings-section">
-						<div class="settings-label">Link previews &amp; media</div>
+						<div class="settings-label">Link previews</div>
 						<div class="settings-note">
-							Previews and image thumbnails are fetched by the server. Route them
-							through a proxy so they don't reveal the server's IP (use this when
-							your networks run over a proxy for anonymity — otherwise a previewed
-							link leaks your egress IP to whoever controls it), or turn them off
-							for zero outbound fetches. Applies immediately, no restart.
+							Previews and image thumbnails are fetched by the server, each through
+							its link's network proxy — a link in a proxied network is previewed
+							over that proxy (no IP leak), one in a direct network goes direct.
+							Turn them off for zero outbound fetches. Applies immediately.
 						</div>
-						{media && (
-							<>
-								<div class="pref-row">
-									<span class="pref-name">Show link previews</span>
-									<Seg
-										value={media.previews ? "on" : "off"}
-										options={["off", "on"]}
-										labels={["Off", "On"]}
-										onPick={(v) => setMedia({ ...media, previews: v === "on" })}
-									/>
-								</div>
-								<div class="pref-row">
-									<span class="pref-name">Media proxy</span>
-									<input
-										class="rule-input"
-										value={media.proxy}
-										placeholder="socks5://[user:pass@]host:port — blank = direct"
-										onInput={(e) => setMedia({ ...media, proxy: e.currentTarget.value })}
-									/>
-								</div>
-								<div class="media-actions">
-									<button class="btn-accent" onClick={saveMedia}>Save</button>
-									{mediaSaved === "saved" && <span class="pref-hint">Saved</span>}
-									{mediaSaved === "error" && <span class="cmd-error">Couldn't save — check the proxy URL</span>}
-								</div>
-							</>
+						{previewsOn !== null && (
+							<div class="pref-row">
+								<span class="pref-name">Show link previews</span>
+								<Seg
+									value={previewsOn ? "on" : "off"}
+									options={["off", "on"]}
+									labels={["Off", "On"]}
+									onPick={(v) => togglePreviews(v === "on")}
+								/>
+							</div>
 						)}
 					</section>
 

@@ -62,7 +62,9 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad url", http.StatusBadRequest)
 		return
 	}
-	if t, ok := s.thumbCache.get(target); ok {
+	net := r.URL.Query().Get("net")
+	ck := net + "\x00" + target
+	if t, ok := s.thumbCache.get(ck); ok {
 		writeThumb(w, t)
 		return
 	}
@@ -76,7 +78,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.releaseMedia()
 
-	ct, body, err := s.imageF().get(r.Context(), target)
+	ct, body, err := s.imageFetcherFor(s.proxyForNetwork(r.Context(), net)).get(r.Context(), target)
 	if err != nil {
 		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
 		return
@@ -111,7 +113,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(res.data) <= maxThumbCacheEntry { // keep worst-case cache residency small
-		s.thumbCache.put(target, res)
+		s.thumbCache.put(ck, res)
 	}
 	writeThumb(w, res)
 }

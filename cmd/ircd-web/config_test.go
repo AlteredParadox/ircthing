@@ -78,16 +78,6 @@ func TestLoadConfig(t *testing.T) {
 			content: `{"user": {"username": "a", "password_hash": "h"}} {"oops": 1}`,
 			errSub:  "trailing data",
 		},
-		{
-			name:    "valid media_proxy",
-			content: `{"user": {"username": "a", "password_hash": "h"}, "media_proxy": "socks5://user:pass@127.0.0.1:1080"}`,
-			errSub:  "",
-		},
-		{
-			name:    "bad media_proxy scheme",
-			content: `{"user": {"username": "a", "password_hash": "h"}, "media_proxy": "ftp://127.0.0.1:1080"}`,
-			errSub:  "media_proxy",
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

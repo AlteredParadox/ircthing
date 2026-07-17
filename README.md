@@ -75,8 +75,7 @@ loudly. See `config.example.json` for a complete example.
 | `user.username`, `user.password_hash` | Web login. Generate the bcrypt hash with `ircd-web -hash-password`. |
 | `session_ttl_days` | Login cookie lifetime. Default 30. |
 | `ring_size` | Hot scrollback kept in memory per buffer. Default 200; older history is read from SQLite. |
-| `media_proxy` | **Initial default** for routing the server-side media proxy (link previews, image thumbnails) through a proxy so those fetches don't reveal the server's real IP. Same form as a network `proxy`: `socks5://[user:pass@]host:port` (SOCKS5 with RFC 1929 auth, DNS resolves proxy-side), `socks5h://…`, or `http://[user:pass@]host:port`. Empty = fetch directly. Editable later — and without a restart — in **Settings → Link previews & media** (the saved value is stored in the database and wins over this). Use it when your networks run over a proxy for anonymity, else a previewed link leaks your egress IP to whoever controls it. |
-| `disable_previews` | **Initial default** for the previews switch. `true` starts with previews off, so the server makes **zero** outbound fetches for links/images. Toggle it live in **Settings → Link previews & media** (the saved value wins over this). |
+| `disable_previews` | **Initial default** for the previews switch. `true` starts with link/image previews off, so the server makes **zero** outbound fetches. Toggle it live in **Settings → Link previews** (the saved value wins over this). Previews are fetched through **each link's own network proxy**, so a link in a proxied network is previewed over that proxy (no egress-IP leak) and one in a direct network goes direct — there's no separate media proxy to configure. |
 
 Networks are managed from the web UI: the **+** button in the sidebar
 adds one; clicking a network's name offers *Join channel*, *Edit

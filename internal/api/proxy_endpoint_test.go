@@ -12,11 +12,12 @@ import (
 	"testing"
 )
 
-// permit rewires a Server's proxy fetchers to allow loopback so tests can
-// use httptest origins.
+// permit rewires a Server's direct (no-proxy) fetchers to allow loopback so
+// tests can use httptest origins. Preview/thumb requests without a `net`
+// param resolve to the direct fetcher, which this builds and relaxes.
 func permit(s *Server) {
-	s.htmlFetcher.allowIP = func(net.IP) bool { return true }
-	s.imageFetcher.allowIP = func(net.IP) bool { return true }
+	s.htmlFetcherFor(nil).allowIP = func(net.IP) bool { return true }
+	s.imageFetcherFor(nil).allowIP = func(net.IP) bool { return true }
 }
 
 func TestPreviewEndpoint(t *testing.T) {

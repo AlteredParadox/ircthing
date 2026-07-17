@@ -37,6 +37,5 @@
     }
   ],
   "session_ttl_days": 30,
-  "media_proxy": "",
   "disable_previews": false
 }
