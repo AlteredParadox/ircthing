@@ -418,7 +418,7 @@ func TestAdoptOwnMsgID(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The server's later-timestamped copy carries a msgid.
-	adopted, err := s.AdoptOwnMsgID(ctx, "net", "#c", "me", "hello", "srv-msgid-1", nil, local.Add(-time.Minute).UnixMilli())
+	adopted, err := s.AdoptOwnMsgID(ctx, OwnMsg{Network: "net", Target: "#c", Sender: "me", Text: "hello", MsgID: "srv-msgid-1", SinceMs: local.Add(-time.Minute).UnixMilli()}, nil)
 	if err != nil || !adopted {
 		t.Fatalf("adopt = %v, %v; want true", adopted, err)
 	}
@@ -438,7 +438,7 @@ func TestAdoptOwnMsgID(t *testing.T) {
 		t.Fatalf("scrollback has %d messages, want 1 (no duplicate)", len(msgs))
 	}
 	// No matching placeholder -> no adoption.
-	if adopted, _ := s.AdoptOwnMsgID(ctx, "net", "#c", "me", "different", "x", nil, 0); adopted {
+	if adopted, _ := s.AdoptOwnMsgID(ctx, OwnMsg{Network: "net", Target: "#c", Sender: "me", Text: "different", MsgID: "x"}, nil); adopted {
 		t.Fatal("adopted a non-matching row")
 	}
 	// A msgid-less message with the SAME text but a DIFFERENT sender (a peer,
@@ -448,7 +448,7 @@ func TestAdoptOwnMsgID(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if adopted, _ := s.AdoptOwnMsgID(ctx, "net", "#c", "me", "peer", "y", nil, local.Add(-time.Minute).UnixMilli()); adopted {
+	if adopted, _ := s.AdoptOwnMsgID(ctx, OwnMsg{Network: "net", Target: "#c", Sender: "me", Text: "peer", MsgID: "y", SinceMs: local.Add(-time.Minute).UnixMilli()}, nil); adopted {
 		t.Fatal("adopted another sender's identical-text row")
 	}
 }
@@ -473,10 +473,10 @@ func TestAdoptOwnMsgIDPairsInOrder(t *testing.T) {
 	}
 	since := base.Add(-time.Minute).UnixMilli()
 	// Replay oldest-first: m1 then m2.
-	if ok, _ := s.AdoptOwnMsgID(ctx, "net", "#c", "me", "ok", "m1", nil, since); !ok {
+	if ok, _ := s.AdoptOwnMsgID(ctx, OwnMsg{Network: "net", Target: "#c", Sender: "me", Text: "ok", MsgID: "m1", SinceMs: since}, nil); !ok {
 		t.Fatal("adopt m1")
 	}
-	if ok, _ := s.AdoptOwnMsgID(ctx, "net", "#c", "me", "ok", "m2", nil, since); !ok {
+	if ok, _ := s.AdoptOwnMsgID(ctx, OwnMsg{Network: "net", Target: "#c", Sender: "me", Text: "ok", MsgID: "m2", SinceMs: since}, nil); !ok {
 		t.Fatal("adopt m2")
 	}
 	var mid1, mid2 sql.NullString
@@ -503,7 +503,7 @@ func TestAdoptOwnMsgIDPairsInOrder(t *testing.T) {
 		t.Fatal("REDACT m2 wrongly scrubbed p1 (the earlier message)")
 	}
 	// An overlapping replay re-delivering m1 is a no-op, not a UNIQUE error.
-	if ok, err := s.AdoptOwnMsgID(ctx, "net", "#c", "me", "ok", "m1", nil, since); ok || err != nil {
+	if ok, err := s.AdoptOwnMsgID(ctx, OwnMsg{Network: "net", Target: "#c", Sender: "me", Text: "ok", MsgID: "m1", SinceMs: since}, nil); ok || err != nil {
 		t.Fatalf("re-adopt of an already-stamped msgid = (%v, %v), want (false, nil)", ok, err)
 	}
 }
@@ -526,7 +526,7 @@ func TestAdoptOwnMsgIDCasingMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The server replays it with canonical casing "bob".
-	adopted, err := s.AdoptOwnMsgID(ctx, "net", "bob", "me", "hi", "srv-1", fold, local.Add(-time.Minute).UnixMilli())
+	adopted, err := s.AdoptOwnMsgID(ctx, OwnMsg{Network: "net", Target: "bob", Sender: "me", Text: "hi", MsgID: "srv-1", SinceMs: local.Add(-time.Minute).UnixMilli()}, fold)
 	if err != nil || !adopted {
 		t.Fatalf("adopt across casing = %v, %v; want true", adopted, err)
 	}

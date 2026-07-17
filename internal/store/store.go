@@ -507,6 +507,19 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 	return true, nil
 }
 
+// OwnMsg identifies one of our own sent messages for chathistory adoption:
+// the buffer it lives in (Network/Target), the Sender and Text to match a
+// no-msgid placeholder against, the MsgID to stamp on, and the SinceMs lower
+// bound on the candidate's timestamp.
+type OwnMsg struct {
+	Network string
+	Target  string
+	Sender  string
+	Text    string
+	MsgID   string
+	SinceMs int64
+}
+
 // AdoptOwnMsgID reconciles a chathistory-replayed copy of one of our own
 // messages with the local no-msgid placeholder persistOwn stored: it
 // finds the OLDEST msgid-less row in the buffer with matching text (newer
@@ -525,17 +538,18 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 // casing than the buffer's stored spelling still finds the placeholder —
 // otherwise the adopt misses, the insert lands with its own msgid, and the
 // own message duplicates.
-func (s *Store) AdoptOwnMsgID(ctx context.Context, network, target, sender, text, msgid string, fold func(string) string, sinceMs int64) (bool, error) {
-	if msgid == "" || text == "" || sender == "" {
+func (s *Store) AdoptOwnMsgID(ctx context.Context, msg OwnMsg, fold func(string) string) (bool, error) {
+	if msg.MsgID == "" || msg.Text == "" || msg.Sender == "" {
 		return false, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	target := msg.Target
 	if fold != nil {
-		target, _ = s.canonicalLocked(ctx, network, target, fold)
+		target, _ = s.canonicalLocked(ctx, msg.Network, target, fold)
 	}
-	bufID, err := s.bufferID(ctx, network, target, false)
+	bufID, err := s.bufferID(ctx, msg.Network, target, false)
 	if err != nil || bufID == 0 {
 		return false, err
 	}
@@ -544,7 +558,7 @@ func (s *Store) AdoptOwnMsgID(ctx context.Context, network, target, sender, text
 	// Treat that as a no-op.
 	var seen int
 	switch err := s.db.QueryRowContext(ctx,
-		`SELECT 1 FROM messages WHERE buffer_id = ? AND msgid = ? LIMIT 1`, bufID, msgid).Scan(&seen); {
+		`SELECT 1 FROM messages WHERE buffer_id = ? AND msgid = ? LIMIT 1`, bufID, msg.MsgID).Scan(&seen); {
 	case err == nil:
 		return false, nil
 	case !errors.Is(err, sql.ErrNoRows):
@@ -557,18 +571,18 @@ func (s *Store) AdoptOwnMsgID(ctx context.Context, network, target, sender, text
 	err = s.db.QueryRowContext(ctx,
 		`SELECT id FROM messages
 		 WHERE buffer_id = ? AND msgid IS NULL AND sender = ? AND text = ? AND ts >= ?
-		 ORDER BY ts ASC, id ASC LIMIT 1`, bufID, sender, text, sinceMs).Scan(&id)
+		 ORDER BY ts ASC, id ASC LIMIT 1`, bufID, msg.Sender, msg.Text, msg.SinceMs).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE messages SET msgid = ? WHERE id = ?`, msgid, id); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE messages SET msgid = ? WHERE id = ?`, msg.MsgID, id); err != nil {
 		return false, err
 	}
 	if r, ok := s.rings[bufID]; ok {
-		r.adoptMsgID(id, msgid)
+		r.adoptMsgID(id, msg.MsgID)
 	}
 	return true, nil
 }

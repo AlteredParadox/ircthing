@@ -54,24 +54,13 @@ func (s *Store) pruneOnce(ctx context.Context, now time.Time) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Reconcile the hot rings with EXACTLY the criteria that actually landed
-	// on disk — via defer, so it runs even if a later DELETE errors out. A
-	// ring can be `complete` (holds a buffer's entire history) and is then
-	// served authoritatively without touching the DB, so a dormant buffer
-	// whose rows were deleted would otherwise keep serving them from memory
-	// until process restart. appliedCutoff/appliedMax are set only after
-	// their DELETE succeeds, so a failed dimension never trims the rings out
-	// of step with disk. Filtering in place keeps the cache warm.
+	// Reconcile the hot rings (via defer, so it runs even if a later DELETE
+	// errors out) with EXACTLY the criteria that actually landed on disk:
+	// appliedCutoff/appliedMax are set only after their DELETE succeeds.
 	var total int64
 	var appliedCutoff int64
 	var appliedMax int
-	defer func() {
-		if appliedCutoff > 0 || appliedMax > 0 {
-			for _, r := range s.rings {
-				r.applyRetention(appliedCutoff, appliedMax)
-			}
-		}
-	}()
+	defer func() { s.reconcileRings(appliedCutoff, appliedMax) }()
 
 	if s.retention.days > 0 {
 		cutoff := now.Add(-time.Duration(s.retention.days) * 24 * time.Hour).UnixMilli()
@@ -114,4 +103,19 @@ func (s *Store) pruneOnce(ctx context.Context, now time.Time) (int64, error) {
 		}
 	}
 	return total, nil
+}
+
+// reconcileRings trims each hot ring to the retention criteria that actually
+// deleted rows on disk (a zero dimension is a no-op). A ring can be `complete`
+// — it holds a buffer's entire history and is then served authoritatively
+// without touching the DB — so a dormant buffer whose rows were deleted would
+// otherwise keep serving them from memory until process restart. Filtering in
+// place keeps the cache warm. Callers must hold s.mu.
+func (s *Store) reconcileRings(appliedCutoff int64, appliedMax int) {
+	if appliedCutoff <= 0 && appliedMax <= 0 {
+		return
+	}
+	for _, r := range s.rings {
+		r.applyRetention(appliedCutoff, appliedMax)
+	}
 }

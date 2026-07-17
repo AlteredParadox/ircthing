@@ -1481,6 +1481,14 @@ func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn,
 	if !secure {
 		return conn, nil
 	}
+	return m.wrapTLS(ctx, conn, addr)
+}
+
+// wrapTLS negotiates TLS over an already-connected raw conn for addr. When
+// TrustedFingerprints are configured, pinned fingerprints replace CA
+// verification: the leaf certificate's SHA-256 must be in the trusted set
+// (config validation already vetted the fingerprint format).
+func (m *Manager) wrapTLS(ctx context.Context, conn net.Conn, addr string) (net.Conn, error) {
 	tcfg := m.cfg.TLSConfig.Clone() // Clone on nil returns nil
 	if tcfg == nil {
 		tcfg = &tls.Config{}
@@ -1493,9 +1501,6 @@ func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn,
 		}
 		tcfg.ServerName = host
 	}
-	// Pinned fingerprints replace CA verification: the leaf certificate's
-	// SHA-256 must be in the trusted set. Config validation already vetted
-	// the fingerprint format.
 	fps, _ := fingerprintSet(m.cfg.TrustedFingerprints)
 	presentsClientCert := len(tcfg.Certificates) > 0 || tcfg.GetClientCertificate != nil
 	if fps != nil {

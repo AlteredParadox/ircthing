@@ -1,6 +1,37 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { anchorId, Geometry, prependedCount } from "./vmath.js";
 
+// computeWindow picks the [start, end) row slice to render this frame: the
+// overscan window around the scroll position, widened to (a) include the tail
+// while pinned, (b) surround the focus target during a search jump, and (c)
+// cover the ENTIRE just-prepended page so the layout effect can measure real
+// heights — the estimate ignores density and font, so estimate-based anchoring
+// overshoots (compact + mono rows are ~20px, the estimate assumes ~27+) and the
+// async ResizeObserver correction otherwise shows up as a jarring scroll jump.
+function computeWindow(geo, items, viewTop, viewH, overscan, pinned, focusing, focusIdx, k) {
+	let { start, end } = geo.range(viewTop - overscan, viewTop + viewH + overscan);
+	if (pinned && items.length) {
+		// While pinned the tail must be in the window even before the scroll
+		// position catches up (first paint, buffer switch, append).
+		end = items.length;
+		start = Math.max(0, Math.min(start, end - 1));
+		const bottom = geo.total();
+		const r = geo.range(bottom - viewH - overscan, bottom);
+		start = Math.min(start, r.start);
+	}
+	if (focusing && focusIdx !== -1) {
+		// Force the target and its neighbors into the DOM so the layout effect
+		// can scroll to a rendered, measurable row.
+		start = Math.min(start, Math.max(0, focusIdx - 12));
+		end = Math.max(end, Math.min(items.length, focusIdx + 12));
+	}
+	if (k > 0) {
+		start = 0;
+		end = Math.max(end, Math.min(items.length, k));
+	}
+	return { start, end };
+}
+
 // VirtualList: windowed rendering for the message list. Only the rows
 // intersecting the viewport (plus `overscan` px each side) exist in the
 // DOM; spacer divs stand in for everything else, so 50k+ loaded messages
@@ -73,32 +104,10 @@ export function VirtualList({
 	const headerH = headerEl.current?.offsetHeight || 0;
 	const viewTop = el ? el.scrollTop - headerH : 0;
 	const viewH = el ? el.clientHeight : 800;
-	let { start, end } = geo.range(viewTop - overscan, viewTop + viewH + overscan);
-	if (pinned.current && items.length) {
-		// While pinned the tail must be in the window even before the
-		// scroll position catches up (first paint, buffer switch, append).
-		end = items.length;
-		start = Math.max(0, Math.min(start, end - 1));
-		const bottom = geo.total();
-		const r = geo.range(bottom - viewH - overscan, bottom);
-		start = Math.min(start, r.start);
-	}
-	if (pendingFocus.current && focusIdx !== -1) {
-		// Force the target and its neighbors into the DOM so the layout
-		// effect can scroll to a rendered, measurable row.
-		start = Math.min(start, Math.max(0, focusIdx - 12));
-		end = Math.max(end, Math.min(items.length, focusIdx + 12));
-	}
-	if (k > 0) {
-		// Render the ENTIRE just-prepended page this frame so the layout
-		// effect can measure every new row and anchor the scroll with real
-		// heights. The estimate ignores density and message font, so
-		// estimate-based anchoring overshoots (e.g. compact + mono rows are
-		// ~20px, the estimate assumes ~27+) and the async ResizeObserver
-		// correction shows up as a jarring scroll jump on each older page.
-		start = 0;
-		end = Math.max(end, Math.min(items.length, k));
-	}
+	const { start, end } = computeWindow(
+		geo, items, viewTop, viewH, overscan,
+		pinned.current, pendingFocus.current, focusIdx, k,
+	);
 
 	const topPad = geo.offsetOf(start);
 	const bottomPad = geo.total() - geo.offsetOf(end);

@@ -346,7 +346,11 @@ func (h *Hub) adoptReplayedOwn(ctx context.Context, c Conn, ev irc.Event, target
 	// persistOwn stored on the placeholder. adoptReplayedOwn only runs for
 	// own+replay, so Prefix is non-nil.
 	sender := ev.Msg.Prefix.Name
-	if _, aerr := h.store.AdoptOwnMsgID(ctx, ev.Network, target, sender, searchText(ev.Msg), mid, c.Fold, since); aerr != nil {
+	own := store.OwnMsg{
+		Network: ev.Network, Target: target, Sender: sender,
+		Text: searchText(ev.Msg), MsgID: mid, SinceMs: since,
+	}
+	if _, aerr := h.store.AdoptOwnMsgID(ctx, own, c.Fold); aerr != nil {
 		log.Printf("irc[%s]: own-message dedup for %q: %v", ev.Network, target, aerr)
 	}
 }
@@ -379,45 +383,13 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	if replay && own {
 		h.adoptReplayedOwn(ctx, c, ev, target)
 	}
-	var stored store.Message
-	var err error
-	if selfPart {
-		// Our own PART echo must never create a buffer, but must still find
-		// the existing one under casemapping: the echo can carry different
-		// casing than the stored buffer spelling (#Go vs #go), and an
-		// unfolded exact-name lookup would miss and drop the PART. Fold the
-		// target, veto creation, AND drop within the close grace — a PART
-		// echo is a straggler too, so if it lands after markClosed but before
-		// DeleteBuffer (buffer still exists) it must be dropped rather than
-		// broadcast as a live event that resurrects the buffer, matching the
-		// general channel branch and persistMembership below.
-		stored, err = h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
-			func(exists bool) bool { return !exists || h.recentlyClosed(ev.Network, c.Fold(target)) },
-			storeMessage(ev))
-	} else {
-		// The close-grace check is evaluated inside the store, atomically
-		// with the buffer existence check, so a straggler in flight when the
-		// user closes the buffer cannot resurrect it (the recentlyClosed
-		// check and the append used to be a check-then-act split across h.mu
-		// and store.mu — a two-lock TOCTOU). The guard IGNORES exists so it
-		// also DROPS a straggler landing in the window after markClosed but
-		// before DeleteBuffer — otherwise that straggler appends and
-		// broadcasts a live event that re-creates the buffer on clients (and
-		// races the buffer_closed push).
-		//
-		// For LIVE traffic the grace is CHANNEL-only: channels have stragglers
-		// (QUIT/NICK, our own PART echo, late lines) that must not reopen a
-		// just-closed buffer, but a live PM is a NEW conversation and must
-		// reopen its query rather than be dropped for the 10s window. REPLAYED
-		// (event-playback / chathistory) traffic is always a straggler,
-		// including a backfilled PM: it must never undo a close, so the grace
-		// applies to a replayed query too.
-		stored, err = h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
-			func(bool) bool {
-				return (replay || c.IsChannel(target)) && h.recentlyClosed(ev.Network, c.Fold(target))
-			},
-			storeMessage(ev))
-	}
+	// graceGuard resolves this event's close-grace policy; AppendFoldedGuarded
+	// evaluates it inside the store, atomically with the buffer-existence
+	// check, so a straggler in flight when the user closes a buffer cannot
+	// resurrect it (the recentlyClosed check and the append used to be a
+	// check-then-act split across h.mu and store.mu — a two-lock TOCTOU).
+	stored, err := h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
+		h.graceGuard(ev, c, target, selfPart, replay), storeMessage(ev))
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -432,6 +404,31 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 		h.broadcast(envelope("event", 0, eventData(stored)))
 	}
 	return nil
+}
+
+// graceGuard returns the buffer-creation/close-grace predicate for one event.
+// The guard IGNORES the exists flag so it also DROPS a straggler landing in
+// the window after markClosed but before DeleteBuffer — otherwise that
+// straggler appends and broadcasts a live event that re-creates the buffer on
+// clients (and races the buffer_closed push).
+func (h *Hub) graceGuard(ev irc.Event, c Conn, target string, selfPart, replay bool) func(bool) bool {
+	folded := c.Fold(target)
+	if selfPart {
+		// Our own PART echo must never create a buffer, but must still find the
+		// existing one under casemapping (target is already folded by the
+		// store). A PART echo is a straggler too: drop it within the close
+		// grace so it cannot broadcast a live event that resurrects the buffer.
+		return func(exists bool) bool { return !exists || h.recentlyClosed(ev.Network, folded) }
+	}
+	// For LIVE traffic the grace is CHANNEL-only: channels have stragglers
+	// (QUIT/NICK, our own PART echo, late lines) that must not reopen a
+	// just-closed buffer, but a live PM is a NEW conversation and must reopen
+	// its query rather than be dropped for the 10s window. REPLAYED
+	// (event-playback / chathistory) traffic is always a straggler, including a
+	// backfilled PM: it must never undo a close, so the grace applies then too.
+	return func(bool) bool {
+		return (replay || c.IsChannel(target)) && h.recentlyClosed(ev.Network, folded)
+	}
 }
 
 // backfill requests missed history for the network's non-channel (query)
@@ -1070,24 +1067,8 @@ func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fo
 	if isChan(t) {
 		return t, true
 	}
-	// NOTICEs that aren't to a channel collect in the network server buffer
-	// (The Lounge lobby): server "***" notices, and services (NickServ,
-	// ChanServ, SaslServ) whose per-sender query buffers would otherwise
-	// clutter the sidebar. A genuine PRIVMSG still opens its own query below.
 	if m.Command == "NOTICE" {
-		own := m.Prefix != nil && ourNick != "" && fold(m.Prefix.Name) == fold(ourNick)
-		if own {
-			// Our own echoed notice -> the recipient's buffer.
-			if t != "" && fold(t) != fold(ourNick) {
-				return t, true
-			}
-			return "", false
-		}
-		// Addressed to us (t == our nick) or the pre-registration "*".
-		if t == serverBufferTarget || ourNick == "" || fold(t) == fold(ourNick) {
-			return serverBufferTarget, true
-		}
-		return "", false
+		return noticeTarget(m, t, ourNick, fold)
 	}
 	if m.Prefix == nil || m.Prefix.Name == "" || ourNick == "" {
 		return "", false
@@ -1099,6 +1080,26 @@ func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fo
 	// recipient so sent PMs land in the query buffer.
 	if fold(m.Prefix.Name) == fold(ourNick) && t != "" {
 		return t, true
+	}
+	return "", false
+}
+
+// noticeTarget files a NOTICE that is not addressed to a channel. Server
+// "***" notices and service messages (NickServ/ChanServ/SaslServ) — anything
+// addressed to us or the pre-registration "*" — collect in the network server
+// buffer (The Lounge lobby) rather than spawning a per-sender query that would
+// clutter the sidebar. Our own echoed notice goes to its recipient's buffer.
+func noticeTarget(m *ircv4.Message, t, ourNick string, fold func(string) string) (string, bool) {
+	own := m.Prefix != nil && ourNick != "" && fold(m.Prefix.Name) == fold(ourNick)
+	if own {
+		if t != "" && fold(t) != fold(ourNick) {
+			return t, true // our own echoed notice -> the recipient's buffer
+		}
+		return "", false
+	}
+	// Addressed to us (t == our nick) or the pre-registration "*".
+	if t == serverBufferTarget || ourNick == "" || fold(t) == fold(ourNick) {
+		return serverBufferTarget, true
 	}
 	return "", false
 }

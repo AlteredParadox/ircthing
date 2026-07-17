@@ -51,10 +51,9 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSe
 							const srvUnread = (sec.server?.unread || 0) > 0;
 							const openMenu = (x, y) => onNetworkMenu(sec.name, x, y);
 							return (
-								<div
+								<button
+									type="button"
 									class={"net-head has-menu" + (srvActive ? " active" : "") + (srvUnread ? " unread" : "")}
-									role="button"
-									tabIndex={0}
 									onClick={() => {
 										if (pressFired.current) {
 											pressFired.current = false;
@@ -66,12 +65,6 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSe
 										e.preventDefault();
 										openMenu(e.clientX, e.clientY);
 									}}
-									onKeyDown={(e) => {
-										if (e.key === "Enter" || e.key === " ") {
-											e.preventDefault();
-											onSelect(sec.name, SERVER_BUFFER);
-										}
-									}}
 									{...longPress(openMenu, pressFired)}
 								>
 									<span class={"dot " + stateDot(sec.state)} />
@@ -81,7 +74,7 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSe
 											{sec.server.unread > 99 ? "99+" : sec.server.unread}
 										</span>
 									)}
-								</div>
+								</button>
 							);
 						})()}
 						{sec.buffers.map((b) => {

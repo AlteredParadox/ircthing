@@ -189,35 +189,10 @@ func (h *handshake) handle(m *ircv4.Message) (out []*ircv4.Message, done bool, e
 		return h.handleAuthenticate(m)
 
 	case "001": // RPL_WELCOME: registration accepted
-		if h.cfg.SASL != nil && !h.saslDone {
-			// The server registered us before SASL finished (it SHOULD
-			// have sent 906). Never fall through to an unauthenticated
-			// session when credentials were configured.
-			return nil, false, errors.New("registered before SASL authentication completed")
-		}
-		h.phase = hsDone
-		// 001's first param is the nick the server knows us by —
-		// authoritative if it truncated or otherwise changed ours.
-		if p := m.Param(0); p != "" && p != "*" {
-			h.nick = p
-		}
-		return nil, true, nil
+		return h.handleWelcome(m)
 
 	case "433", "436": // ERR_NICKNAMEINUSE, ERR_NICKCOLLISION
-		h.nickTries++
-		if h.nickTries > 3 {
-			return nil, false, fmt.Errorf("nickname %q and all fallbacks are in use", h.cfg.Nick)
-		}
-		// Cap the fallback length: the real NICKLEN isn't known until 005
-		// (after 001), so a max-length configured nick plus the appended
-		// underscores could exceed it and be rejected. Truncate the base so
-		// base+underscores fits a plausible ceiling.
-		base := h.cfg.Nick
-		if max := maxFallbackNick - h.nickTries; len(base) > max {
-			base = base[:max]
-		}
-		h.nick = base + strings.Repeat("_", h.nickTries)
-		return []*ircv4.Message{newMsg("NICK", h.nick)}, false, nil
+		return h.handleNickInUse()
 
 	case "432": // ERR_ERRONEUSNICKNAME
 		return nil, false, fmt.Errorf("server rejected nickname %q", h.nick)
@@ -275,6 +250,41 @@ func (h *handshake) handle(m *ircv4.Message) (out []*ircv4.Message, done bool, e
 	// Anything else (020, 042, snotices, ...) is passed through by the
 	// caller as a regular event.
 	return nil, false, nil
+}
+
+// handleWelcome processes RPL_WELCOME (001): registration is accepted unless
+// SASL was configured but never completed — fail closed rather than fall
+// through to an unauthenticated session (the server SHOULD have sent 906).
+func (h *handshake) handleWelcome(m *ircv4.Message) (out []*ircv4.Message, done bool, err error) {
+	if h.cfg.SASL != nil && !h.saslDone {
+		return nil, false, errors.New("registered before SASL authentication completed")
+	}
+	h.phase = hsDone
+	// 001's first param is the nick the server knows us by — authoritative if
+	// it truncated or otherwise changed ours.
+	if p := m.Param(0); p != "" && p != "*" {
+		h.nick = p
+	}
+	return nil, true, nil
+}
+
+// handleNickInUse processes ERR_NICKNAMEINUSE/ERR_NICKCOLLISION (433/436),
+// retrying with underscore-suffixed fallbacks and giving up after three tries.
+func (h *handshake) handleNickInUse() (out []*ircv4.Message, done bool, err error) {
+	h.nickTries++
+	if h.nickTries > 3 {
+		return nil, false, fmt.Errorf("nickname %q and all fallbacks are in use", h.cfg.Nick)
+	}
+	// Cap the fallback length: the real NICKLEN isn't known until 005 (after
+	// 001), so a max-length configured nick plus the appended underscores could
+	// exceed it and be rejected. Truncate the base so base+underscores fits a
+	// plausible ceiling.
+	base := h.cfg.Nick
+	if max := maxFallbackNick - h.nickTries; len(base) > max {
+		base = base[:max]
+	}
+	h.nick = base + strings.Repeat("_", h.nickTries)
+	return []*ircv4.Message{newMsg("NICK", h.nick)}, false, nil
 }
 
 func (h *handshake) handleCAP(m *ircv4.Message) ([]*ircv4.Message, bool, error) {

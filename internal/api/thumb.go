@@ -88,17 +88,57 @@ func isProgressiveJPEG(b []byte) bool {
 			// TEM / RSTn / SOI / EOI: standalone, no length payload
 			continue
 		default: // segment carrying a 2-byte length
-			if i+1 >= len(b) {
+			next := skipSegment(b, i)
+			if next < 0 {
 				return false
 			}
-			segLen := int(b[i])<<8 | int(b[i+1])
-			if segLen < 2 {
-				return false
-			}
-			i += segLen
+			i = next
 		}
 	}
 	return false
+}
+
+// skipSegment returns the index just past a marker segment's length-prefixed
+// payload starting at i, or -1 if the 2-byte length is missing or invalid.
+func skipSegment(b []byte, i int) int {
+	if i+1 >= len(b) {
+		return -1
+	}
+	segLen := int(b[i])<<8 | int(b[i+1])
+	if segLen < 2 {
+		return -1
+	}
+	return i + segLen
+}
+
+// decodableFormat validates that body is an image we are willing to fully
+// decode within maxDecodeBytes, returning its format. ok is false when the
+// header is unreadable, the dimensions are out of range, or the modeled
+// decode would exceed the memory cap. Bounding decoded BYTES (not just
+// pixels) matters: a 16-bit-depth image decodes to 8 bytes/pixel
+// (RGBA64/NRGBA64/Gray16), double the assumed 4, so a pixel-only cap would
+// let it use twice the intended memory.
+func decodableFormat(body []byte) (format string, ok bool) {
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(body))
+	// The dimension caps are checked FIRST (short-circuit) so the byte
+	// product below can never overflow int64.
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 ||
+		cfg.Width > maxImageDim || cfg.Height > maxImageDim {
+		return "", false
+	}
+	// Per-pixel decode cost is the output bitmap PLUS, for a progressive
+	// JPEG, the decoder's full up-front DCT coefficient allocation: image/jpeg
+	// holds ~256 bytes per 8x8 block per component (~12 bytes/pixel at 4:4:4),
+	// entirely separate from the result. Modeling only the output bitmap lets
+	// a small progressive JPEG blow past maxDecodeBytes at image.Decode time.
+	perPixel := bytesPerPixel(cfg.ColorModel)
+	if format == "jpeg" && isProgressiveJPEG(body) {
+		perPixel += 12
+	}
+	if int64(cfg.Width)*int64(cfg.Height)*perPixel > maxDecodeBytes {
+		return "", false
+	}
+	return format, true
 }
 
 func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
@@ -144,28 +184,9 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Reject oversized decodes from the cheap header read, before
-	// committing to a full decode. Bound decoded BYTES, not just pixels:
-	// a 16-bit-depth image decodes to 8 bytes/pixel (RGBA64/NRGBA64/
-	// Gray16), double the assumed 4, so a pixel-only cap would let it
-	// use twice the intended memory.
-	cfg, format, err := image.DecodeConfig(bytes.NewReader(body))
-	// The dimension caps are checked FIRST (short-circuit) so the byte
-	// product below can never overflow int64.
-	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 ||
-		cfg.Width > maxImageDim || cfg.Height > maxImageDim {
-		http.Error(w, "unsupported image", http.StatusUnsupportedMediaType)
-		return
-	}
-	// Per-pixel decode cost is the output bitmap PLUS, for a progressive
-	// JPEG, the decoder's full up-front DCT coefficient allocation: image/jpeg
-	// holds ~256 bytes per 8x8 block per component (~12 bytes/pixel at 4:4:4),
-	// entirely separate from the result. Modeling only the output bitmap lets
-	// a small progressive JPEG blow past maxDecodeBytes at image.Decode time.
-	perPixel := bytesPerPixel(cfg.ColorModel)
-	if format == "jpeg" && isProgressiveJPEG(body) {
-		perPixel += 12
-	}
-	if int64(cfg.Width)*int64(cfg.Height)*perPixel > maxDecodeBytes {
+	// committing to a full decode.
+	format, ok := decodableFormat(body)
+	if !ok {
 		http.Error(w, "unsupported image", http.StatusUnsupportedMediaType)
 		return
 	}

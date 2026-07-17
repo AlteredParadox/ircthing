@@ -255,6 +255,12 @@ input::placeholder {
 	display: flex;
 	align-items: center;
 	gap: 7px;
+	width: 100%;
+	border: 0;
+	background: transparent;
+	appearance: none;
+	text-align: left;
+	cursor: pointer;
 	padding: 4px 8px 6px;
 	font-family: var(--mono-font);
 	font-size: 0.7857rem;
