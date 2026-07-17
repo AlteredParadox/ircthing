@@ -47,10 +47,11 @@ type Config struct {
 	// whenever TLS terminates in front of the binary; off by default
 	// because the default deployment is plain HTTP on loopback.
 	SecureCookies bool
-	// PreviewsDisabled is the initial default for the previews switch: true
-	// starts with link/image previews off (the server makes zero outbound
-	// media fetches). Editable at runtime via /api/config, which then wins.
-	PreviewsDisabled bool
+	// PreviewsDefault is the initial state of the previews switch (true =
+	// previews start on). It defaults to false (privacy-first: zero outbound
+	// media fetches) unless the config explicitly enables them. Editable at
+	// runtime via /api/config, which then wins.
+	PreviewsDefault bool
 }
 
 // Server is the http.Handler for everything: /api/* plus the embedded

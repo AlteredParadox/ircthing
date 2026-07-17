@@ -35,7 +35,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *hub.Hub) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Config{Username: "AlteredParadox", PasswordHash: string(hash)}, h, nil)
+	srv, err := New(Config{Username: "AlteredParadox", PasswordHash: string(hash), PreviewsDefault: true}, h, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func newTestServerWithRef(t *testing.T) (*httptest.Server, *Server) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Config{Username: "AlteredParadox", PasswordHash: string(hash)}, hub.New(st), nil)
+	srv, err := New(Config{Username: "AlteredParadox", PasswordHash: string(hash), PreviewsDefault: true}, hub.New(st), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestClientConfigPreviewsEnabled(t *testing.T) {
 	decodeJSON(t, resp, &cfg)
 	resp.Body.Close()
 	if !cfg.Previews {
-		t.Fatal("config.previews = false, want true by default")
+		t.Fatal("config.previews = false, want true when enabled")
 	}
 
 	// The endpoint requires auth.
@@ -144,7 +144,7 @@ func TestPreviewsDisabledGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Config{Username: "AlteredParadox", PasswordHash: string(hash), PreviewsDisabled: true}, hub.New(st), nil)
+	srv, err := New(Config{Username: "AlteredParadox", PasswordHash: string(hash), PreviewsDefault: false}, hub.New(st), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestPreviewsToggleRuntime(t *testing.T) {
 	if !srv.previewsEnabled() {
 		t.Fatal("previews not re-enabled")
 	}
-	if !loadPreviews(context.Background(), srv.hub.Store(), Config{PreviewsDisabled: true}) {
+	if !loadPreviews(context.Background(), srv.hub.Store(), Config{PreviewsDefault: false}) {
 		t.Fatal("stored previews=on not read back over the config default")
 	}
 }

@@ -11,9 +11,10 @@ import (
 )
 
 // The previews switch is runtime-editable from the UI and persisted here,
-// so it can be toggled without a config edit and restart. The config-file
-// disable_previews field is only the initial default, used until something
-// is saved.
+// so it can be toggled without a config edit and restart. Config.PreviewsDefault
+// (resolved from the config-file disable_previews tri-state) is only the
+// initial default, used until something is saved. That default is off
+// (privacy-first) unless the config explicitly enables previews.
 //
 // The media *proxy* is not a global setting: preview/thumbnail fetches use
 // the proxy of the network the link came from (proxyForNetwork), so they
@@ -27,7 +28,7 @@ func loadPreviews(ctx context.Context, st *store.Store, cfg Config) bool {
 	if v, err := st.Setting(ctx, previewsKey); err == nil && v != "" {
 		return v == "1"
 	}
-	return !cfg.PreviewsDisabled
+	return cfg.PreviewsDefault
 }
 
 func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {

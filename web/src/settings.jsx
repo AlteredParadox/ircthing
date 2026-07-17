@@ -236,7 +236,9 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 							Previews and image thumbnails are fetched by the server, each through
 							its link's network proxy — a link in a proxied network is previewed
 							over that proxy (no IP leak), one in a direct network goes direct.
-							Turn them off for zero outbound fetches. Applies immediately.
+							Off by default: an auto-fetched preview is a tracking beacon — whoever
+							posts a link can tell when you open the buffer. Leave off for zero
+							outbound fetches. Applies immediately.
 						</div>
 						{previewsOn !== null && (
 							<div class="pref-row">

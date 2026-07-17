@@ -37,13 +37,29 @@ type config struct {
 	// only). Turn this on when a TLS-terminating reverse proxy fronts
 	// the binary — i.e. any deployment beyond plain-HTTP loopback.
 	SecureCookies bool `json:"secure_cookies"`
-	// DisablePreviews is the initial default for the previews switch: true
-	// starts with link/image previews off, so the server makes zero
-	// outbound fetches for links/images. It is toggleable at runtime in the
-	// UI (Settings → Link previews & media), which then wins. Preview
-	// fetches use each link's network proxy, so there is no separate media
-	// proxy to configure.
-	DisablePreviews bool `json:"disable_previews"`
+	// DisablePreviews is the initial default for the previews switch, and
+	// is deliberately tri-state so the default can be privacy-first without
+	// silently overriding an explicit choice:
+	//   - absent (nil): previews start OFF — the server makes zero outbound
+	//     fetches until they are turned on. This is the default because an
+	//     auto-fetched preview is a tracking beacon (a poster learns when a
+	//     buffer is viewed).
+	//   - false: previews start ON (not disabled).
+	//   - true:  previews start OFF (explicitly).
+	// It is toggleable at runtime in the UI (Settings → Link previews &
+	// media), which then wins. Preview fetches use each link's network
+	// proxy, so there is no separate media proxy to configure.
+	DisablePreviews *bool `json:"disable_previews"`
+}
+
+// previewsDefault resolves the initial state of the previews switch from
+// the tri-state disable_previews field: off unless the config explicitly
+// sets disable_previews=false (see the field doc).
+func (c *config) previewsDefault() bool {
+	if c.DisablePreviews == nil {
+		return false
+	}
+	return !*c.DisablePreviews
 }
 
 type userConfig struct {

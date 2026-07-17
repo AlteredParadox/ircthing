@@ -137,6 +137,30 @@ func TestConfigDefaultsAndMapping(t *testing.T) {
 	}
 }
 
+func TestPreviewsDefaultTriState(t *testing.T) {
+	base := `{"user": {"username": "a", "password_hash": "h"}`
+	cases := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"absent defaults off (privacy-first)", base + "}", false},
+		{"explicit false enables", base + `, "disable_previews": false}`, true},
+		{"explicit true disables", base + `, "disable_previews": true}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadConfig(writeConfig(t, tc.content))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.previewsDefault(); got != tc.want {
+				t.Fatalf("previewsDefault() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestExampleConfigParses(t *testing.T) {
 	// The committed example must always stay loadable.
 	if _, err := loadConfig("../../config.example.json"); err != nil {
