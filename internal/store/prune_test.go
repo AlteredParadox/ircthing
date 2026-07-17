@@ -42,12 +42,49 @@ func TestPruneByAge(t *testing.T) {
 	if got := dbCount(t, s); got != 2 {
 		t.Fatalf("db has %d rows, want 2", got)
 	}
+	// The (complete) ring is reconciled too, so ring-served reads do not
+	// return the pruned messages from memory.
+	if got, _ := s.Latest(ctx, "net", "#c", 10); len(got) != 2 {
+		t.Fatalf("ring served %d messages, want 2 after age prune", len(got))
+	}
 	// The FTS index tracks the deletion (delete trigger).
 	if got := searchTexts(t, s, SearchOptions{Query: "body0"}); len(got) != 0 {
 		t.Fatalf("pruned message still searchable: %v", got)
 	}
 	if got := searchTexts(t, s, SearchOptions{Query: "body4"}); len(got) != 1 {
 		t.Fatalf("retained message not searchable: %v", got)
+	}
+}
+
+// Regression: an age-only policy that deletes every row of a dormant
+// buffer whose history fits in the ring must not keep serving those rows
+// from the (complete) ring.
+func TestPruneReconcilesCompleteRing(t *testing.T) {
+	s, _ := openTest(t, 100) // ring larger than history -> stays complete
+	base := time.UnixMilli(1_700_000_000_000)
+	for i := 0; i < 5; i++ {
+		if _, err := s.Append(ctx, "net", "#c", Message{
+			Time: base.Add(time.Duration(i) * 24 * time.Hour),
+			Sender: "a", Command: "PRIVMSG", Raw: fmt.Sprintf("m%d", i),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, _ := s.Latest(ctx, "net", "#c", 10); len(got) != 5 {
+		t.Fatalf("pre-prune Latest = %d, want 5", len(got))
+	}
+
+	s.retention = retentionPolicy{days: 1} // age only, maxPerBuffer = 0
+	n, err := s.pruneOnce(ctx, base.Add(10*24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 || dbCount(t, s) != 0 {
+		t.Fatalf("prune deleted %d (db=%d), want 5 (db=0)", n, dbCount(t, s))
+	}
+	// The bug: the ring kept serving all 5 from memory. Must be 0 now.
+	if got, _ := s.Latest(ctx, "net", "#c", 10); len(got) != 0 {
+		t.Fatalf("ring served %d pruned messages from memory, want 0", len(got))
 	}
 }
 

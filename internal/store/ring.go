@@ -93,6 +93,31 @@ func (r *ring) adoptMsgID(id int64, msgid string) {
 	}
 }
 
+// applyRetention removes messages the store's retention pruning just
+// deleted from disk, keeping the hot ring consistent without dropping (and
+// having to re-warm) it. cutoffMs > 0 drops entries older than the cutoff
+// (ts < cutoffMs, matching the DELETE); maxPerBuffer > 0 keeps only the
+// newest N.
+//
+// complete is left unchanged, which is always safe: filtering a complete
+// ring in step with the identical disk delete keeps it a faithful complete
+// view, and leaving a non-complete ring non-complete only means reads may
+// still fall back to disk (which now returns the same rows).
+func (r *ring) applyRetention(cutoffMs int64, maxPerBuffer int) {
+	if cutoffMs > 0 {
+		// msgs are ascending by (ts, id): find the first kept entry.
+		i := sort.Search(len(r.msgs), func(i int) bool {
+			return r.msgs[i].Time.UnixMilli() >= cutoffMs
+		})
+		if i > 0 {
+			r.msgs = append(r.msgs[:0], r.msgs[i:]...)
+		}
+	}
+	if maxPerBuffer > 0 && len(r.msgs) > maxPerBuffer {
+		r.msgs = append(r.msgs[:0], r.msgs[len(r.msgs)-maxPerBuffer:]...)
+	}
+}
+
 func (r *ring) redact(msgid, reason string) {
 	for i := range r.msgs {
 		if r.msgs[i].MsgID == msgid {

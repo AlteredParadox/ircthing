@@ -55,8 +55,9 @@ func (s *Store) pruneOnce(ctx context.Context, now time.Time) (int64, error) {
 	defer s.mu.Unlock()
 
 	var total int64
+	var cutoff int64
 	if s.retention.days > 0 {
-		cutoff := now.Add(-time.Duration(s.retention.days) * 24 * time.Hour).UnixMilli()
+		cutoff = now.Add(-time.Duration(s.retention.days) * 24 * time.Hour).UnixMilli()
 		res, err := s.db.ExecContext(ctx, `DELETE FROM messages WHERE ts < ?`, cutoff)
 		if err != nil {
 			return total, err
@@ -84,14 +85,17 @@ func (s *Store) pruneOnce(ctx context.Context, now time.Time) (int64, error) {
 			total += n
 		}
 	}
-	// A hot ring holds the newest suffix of a buffer. Age pruning removes
-	// OLD rows the ring rarely holds, so those rings self-correct on
-	// eviction. But if the per-buffer cap is below the ring size, a ring can
-	// hold rows we just deleted from disk and would serve them from memory —
-	// drop the rings so they re-warm from disk. This only triggers in the
-	// unusual small-cap configuration.
-	if total > 0 && s.retention.maxPerBuffer > 0 && s.retention.maxPerBuffer < s.ringSize {
-		s.rings = make(map[int64]*ring)
+	// Reconcile the hot rings with the same criteria we just applied to
+	// disk. This is required for correctness, not just tidiness: a ring can
+	// be `complete` (holds a buffer's entire history) and is then served
+	// authoritatively without touching the DB, so a dormant buffer whose
+	// messages all aged out would otherwise keep serving the deleted rows
+	// from memory until process restart. Filtering each ring in step keeps
+	// the cache warm and truthful.
+	if total > 0 {
+		for _, r := range s.rings {
+			r.applyRetention(cutoff, s.retention.maxPerBuffer)
+		}
 	}
 	return total, nil
 }
