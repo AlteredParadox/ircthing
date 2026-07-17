@@ -89,6 +89,16 @@ export function VirtualList({
 		start = Math.min(start, Math.max(0, focusIdx - 12));
 		end = Math.max(end, Math.min(items.length, focusIdx + 12));
 	}
+	if (k > 0) {
+		// Render the ENTIRE just-prepended page this frame so the layout
+		// effect can measure every new row and anchor the scroll with real
+		// heights. The estimate ignores density and message font, so
+		// estimate-based anchoring overshoots (e.g. compact + mono rows are
+		// ~20px, the estimate assumes ~27+) and the async ResizeObserver
+		// correction shows up as a jarring scroll jump on each older page.
+		start = 0;
+		end = Math.max(end, Math.min(items.length, k));
+	}
 
 	const topPad = geo.offsetOf(start);
 	const bottomPad = geo.total() - geo.offsetOf(end);
@@ -179,7 +189,18 @@ export function VirtualList({
 			return;
 		}
 		if (pendingPrepend.current > 0) {
-			sc.scrollTop += geo.offsetOf(pendingPrepend.current);
+			// Measure the just-prepended rows NOW (they're in the DOM, before
+			// paint — the render above forced the whole page into the window)
+			// so the anchor compensation uses real heights instead of the
+			// density/font-blind estimate. This keeps offsetOf(k) exact, so
+			// the previously-visible content stays put with no visible jump;
+			// the ResizeObserver later re-measures to the same value (a no-op).
+			const kk = pendingPrepend.current;
+			for (let i = 0; i < kk; i++) {
+				const node = rowEls.current.get(items[i].id);
+				if (node) geo.measure(items[i].id, node.offsetHeight);
+			}
+			sc.scrollTop += geo.offsetOf(kk);
 			pendingPrepend.current = 0;
 		}
 		if (pinned.current && appended) {
