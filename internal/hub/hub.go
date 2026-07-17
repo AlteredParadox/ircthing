@@ -995,6 +995,17 @@ func persistTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, f
 	return "", false
 }
 
+// stripStatusPrefix removes a single leading STATUSMSG prefix (e.g. '@' in
+// "@#chan", '+' in "+#chan") when the remainder is a channel, so a message
+// to a channel-member subset is filed under the bare channel buffer. Any
+// other target (a plain channel, a nick) is returned unchanged.
+func stripStatusPrefix(target, statusPrefixes string, isChan func(string) bool) string {
+	if len(target) > 1 && strings.IndexByte(statusPrefixes, target[0]) != -1 && isChan(target[1:]) {
+		return target[1:]
+	}
+	return target
+}
+
 // directTarget files a PRIVMSG/NOTICE: channels under themselves,
 // messages addressed to us under the sender (queries, NickServ, server
 // notices), and our own echoes under the recipient.
@@ -1006,14 +1017,9 @@ func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fo
 		!strings.HasPrefix(body, "\x01ACTION") {
 		return "", false
 	}
-	t := m.Param(0)
+	t := stripStatusPrefix(m.Param(0), statusPrefixes, isChan)
 	if isChan(t) {
 		return t, true
-	}
-	// STATUSMSG: "@#chan"/"+#chan" addresses a subset of #chan's members.
-	// Strip the status prefix and file under the bare channel buffer.
-	if len(t) > 1 && strings.IndexByte(statusPrefixes, t[0]) != -1 && isChan(t[1:]) {
-		return t[1:], true
 	}
 	if m.Prefix == nil || m.Prefix.Name == "" || ourNick == "" {
 		return "", false

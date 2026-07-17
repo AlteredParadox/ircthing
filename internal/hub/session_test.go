@@ -358,6 +358,52 @@ func TestSessionSend(t *testing.T) {
 	}
 }
 
+// A STATUSMSG send ("/msg @#chan") on a no-echo-message network must be
+// persisted under the bare channel buffer, matching the echo/replay path
+// (directTarget) — not a phantom "@#chan" buffer.
+func TestSessionSendStatusMsgFilesUnderChannel(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	a := h.NewSession()
+	defer a.Close()
+
+	a.Handle(ctx, request(t, "send", 5, SendData{Network: "libera", Target: "@#go", Text: "ops only"}))
+
+	// The wire target keeps the STATUSMSG prefix.
+	deadline := time.Now().Add(5 * time.Second)
+	for len(conn.sentMsgs()) < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("message not sent")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := conn.sentMsgs()[0].Param(0); got != "@#go" {
+		t.Fatalf("wire target = %q, want @#go", got)
+	}
+
+	// But it is persisted/broadcast under the bare channel buffer.
+	ev := decode[EventData](t, recv(t, a, "event"))
+	if ev.Buffer != "#go" {
+		t.Fatalf("own STATUSMSG event buffer = %q, want #go", ev.Buffer)
+	}
+	msgs, err := h.store.Latest(ctx, "libera", "#go", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].Sender != "AlteredParadox" {
+		t.Fatalf("persisted under #go: %+v", msgs)
+	}
+	// No phantom "@#go" buffer was created.
+	if phantom, _ := h.store.Latest(ctx, "libera", "@#go", 10); len(phantom) != 0 {
+		t.Fatalf("phantom @#go buffer holds %d messages", len(phantom))
+	}
+}
+
 func waitForNetwork(t *testing.T, h *Hub, name string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

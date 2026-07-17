@@ -1042,6 +1042,8 @@ export function App() {
 		const buf = buffers[activeKey];
 		const cur = msgs[activeKey];
 		if (!buf || !cur?.list.length || cur.reachedTop) return Promise.resolve();
+		const key = activeKey;
+		const gen = historyGen.current[key] || 0;
 		const oldest = cur.list[0];
 		return sock.current
 			.request("get_history", {
@@ -1051,10 +1053,12 @@ export function App() {
 			.then((page) => {
 				const older = page.messages || [];
 				setMsgs((m) => {
-					// The buffer's pages may have been dropped while the
-					// request was in flight (backfill, close, network
-					// removal) — don't resurrect a dropped buffer.
-					const prev = m[activeKey];
+					// A history_changed invalidated this buffer while the
+					// request was in flight (backfill, close, network removal)
+					// — discard the stale page rather than merging it or
+					// wrongly marking reachedTop, mirroring the initial load.
+					if ((historyGen.current[key] || 0) !== gen) return m;
+					const prev = m[key];
 					if (!prev) return m;
 					let list = mergeById(prev.list, older);
 					// Bound memory on the paging-back path too: keep the
@@ -1067,7 +1071,7 @@ export function App() {
 					}
 					return {
 						...m,
-						[activeKey]: {
+						[key]: {
 							...prev,
 							list,
 							reachedTop: older.length < PAGE,

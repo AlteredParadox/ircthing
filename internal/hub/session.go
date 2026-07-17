@@ -236,9 +236,14 @@ func (s *Session) persistOwn(ctx context.Context, conn Conn, network, target, te
 	}
 	// The target is client-supplied: file under the canonical stored
 	// spelling (atomically, so "/msg #Go" cannot race the event
-	// consumer into a second buffer next to #go).
+	// consumer into a second buffer next to #go). Strip a leading STATUSMSG
+	// prefix ("/msg @#chan") the same way the echo/replay path does
+	// (directTarget), so an own message files under the bare channel buffer
+	// rather than a phantom "@#chan" one. The Raw line keeps the original
+	// wire target, matching what the server would echo.
 	msg := &ircv4.Message{Command: "PRIVMSG", Params: []string{target, text}}
-	stored, err := s.hub.store.AppendFolded(ctx, network, target, conn.Fold, store.Message{
+	buffer := stripStatusPrefix(target, conn.StatusPrefixes(), conn.IsChannel)
+	stored, err := s.hub.store.AppendFolded(ctx, network, buffer, conn.Fold, store.Message{
 		Time:    time.Now(),
 		Sender:  conn.Nick(),
 		Command: "PRIVMSG",

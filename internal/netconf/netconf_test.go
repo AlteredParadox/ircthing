@@ -21,6 +21,8 @@ func TestParse(t *testing.T) {
 		{"newline in realname", `{"addr": "a:1", "nick": "me", "realname": "a\nb"}`, "CR, LF, or NUL"},
 		{"NUL in username", `{"addr": "a:1", "nick": "me", "username": "a\u0000b"}`, "CR, LF, or NUL"},
 		{"space in channel", `{"addr": "a:1", "nick": "me", "channels": ["#a b"]}`, "spaces, CR, LF"},
+		{"space in nick", `{"addr": "a:1", "nick": "John Doe"}`, "nick must not contain spaces"},
+		{"space in username", `{"addr": "a:1", "nick": "me", "username": "John Doe"}`, "username must not contain spaces"},
 		{"CRLF in sasl password", `{"addr": "a:1", "nick": "me", "sasl": {"login": "u", "password": "p\r\nx"}}`, "CR, LF, or NUL"},
 	}
 	for _, tc := range cases {

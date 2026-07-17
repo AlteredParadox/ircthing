@@ -87,6 +87,19 @@ func (n *Network) Validate() error {
 			return fmt.Errorf("%s must not contain CR, LF, or NUL", name)
 		}
 	}
+	// nick and username are written as NON-trailing parameters of the
+	// registration lines (NICK <nick>; USER <username> 0 * :realname, with
+	// username defaulting to nick when unset). A space there would be
+	// re-parsed by the server as a parameter boundary, and the writer's
+	// fatal framing guard tears the connection down — wedging the network
+	// in a permanent reconnect loop with a misleading error. Reject it at
+	// config time instead, loudly.
+	if strings.IndexByte(n.Nick, ' ') != -1 {
+		return errors.New("nick must not contain spaces")
+	}
+	if strings.IndexByte(n.Username, ' ') != -1 {
+		return errors.New("username must not contain spaces")
+	}
 	for i, ch := range n.Channels {
 		if strings.ContainsAny(ch, " \r\n\x00") { // space too: one JOIN target
 			return fmt.Errorf("channels[%d] must not contain spaces, CR, LF, or NUL", i)
