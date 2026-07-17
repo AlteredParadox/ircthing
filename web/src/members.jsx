@@ -1,3 +1,4 @@
+import { useMemo, useState } from "preact/hooks";
 import { groupMembers, nickColor } from "./irc.js";
 import { menuTrigger } from "./menu.jsx";
 
@@ -17,14 +18,29 @@ function memberTitle(m, ignored) {
 export function Members({ info, theme, ignoredNicks, onNick }) {
 	const members = info?.members || [];
 	const ignored = new Set(ignoredNicks || []);
+	// Live filter: the header doubles as a filter field (placeholder "Members"),
+	// so the panel gains a filter without an extra row of chrome.
+	const [filter, setFilter] = useState("");
+	const q = filter.trim().toLowerCase();
+	const shown = useMemo(
+		() => (q ? members.filter((m) => m.nick.toLowerCase().includes(q)) : members),
+		[members, q],
+	);
 	return (
 		<div class="right-inner">
 			<div class="right-head">
-				<div class="panel-label">Members</div>
-				<div class="side-meta">{members.length}</div>
+				<input
+					class="member-filter panel-label"
+					value={filter}
+					onInput={(e) => setFilter(e.currentTarget.value)}
+					placeholder="Members"
+					aria-label="Filter members"
+				/>
+				<div class="side-meta">{q ? `${shown.length}/${members.length}` : members.length}</div>
 			</div>
 			<div class="side-list scroll">
-				{groupMembers(members).map((g) => (
+				{q && shown.length === 0 && <div class="member-group-head">no matches</div>}
+				{groupMembers(shown).map((g) => (
 					<div class="net-group" key={g.label}>
 						<div class="member-group-head">{g.label} — {g.members.length}</div>
 						{g.members.map((m) => {

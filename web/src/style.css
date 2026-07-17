@@ -1028,6 +1028,29 @@ input::placeholder {
 	color: var(--text-dim);
 }
 
+/* The members header doubles as a live filter: styled as the label until
+   focused, when it reads as an input and drops the uppercasing so the typed
+   query is legible. */
+.member-filter {
+	flex: 1;
+	min-width: 0;
+	border: 0;
+	background: transparent;
+	padding: 0;
+	color: var(--text);
+}
+
+.member-filter::placeholder {
+	color: var(--text-dim);
+	opacity: 1;
+}
+
+.member-filter:focus {
+	outline: none;
+	text-transform: none;
+	letter-spacing: normal;
+}
+
 .member-group-head {
 	padding: 2px 8px 6px;
 	font-family: var(--mono-font);
