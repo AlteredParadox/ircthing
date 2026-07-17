@@ -1212,7 +1212,7 @@ export function App() {
 			{settingsOpen && (
 				<Settings
 					networks={networks} rules={rules} onRules={updateRules}
-					prefs={prefs} onPrefs={updatePrefs}
+					prefs={prefs} onPrefs={updatePrefs} onPreviews={setPreviews}
 					notifier={notifier.current} onClose={() => setSettingsOpen(false)}
 				/>
 			)}

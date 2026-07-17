@@ -53,6 +53,10 @@ func bytesPerPixel(m color.Model) int64 {
 }
 
 func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
+	if !s.previewsEnabled() {
+		http.Error(w, "previews disabled", http.StatusForbidden)
+		return
+	}
 	target := r.URL.Query().Get("url")
 	if len(target) == 0 || len(target) > 2048 {
 		http.Error(w, "bad url", http.StatusBadRequest)
@@ -72,7 +76,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.releaseMedia()
 
-	ct, body, err := s.imageFetcher.get(r.Context(), target)
+	ct, body, err := s.imageF().get(r.Context(), target)
 	if err != nil {
 		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
 		return

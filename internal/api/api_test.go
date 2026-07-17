@@ -172,6 +172,84 @@ func TestPreviewsDisabledGate(t *testing.T) {
 	}
 }
 
+// The media proxy and previews switch are editable at runtime via
+// /api/media-config, take effect live (fetchers rebuilt, endpoints gated),
+// and persist to the store so a restart keeps them.
+func TestMediaConfigRuntime(t *testing.T) {
+	ts, srv := newTestServerWithRef(t)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	do := func(method, path, body string) *http.Response {
+		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		req.AddCookie(cookie)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// Default: previews on, direct fetch.
+	var cfg struct{ Previews bool }
+	resp := do("GET", "/api/config", "")
+	decodeJSON(t, resp, &cfg)
+	resp.Body.Close()
+	if !cfg.Previews {
+		t.Fatal("previews should default on")
+	}
+
+	// Turn previews off live.
+	resp = do("PUT", "/api/media-config", `{"proxy":"","previews":false}`)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("disable PUT = %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	resp = do("GET", "/api/config", "")
+	decodeJSON(t, resp, &cfg)
+	resp.Body.Close()
+	if cfg.Previews {
+		t.Fatal("previews still on after disable")
+	}
+	resp = do("GET", "/api/preview?url=http://example.com", "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("preview while disabled = %d, want 403", resp.StatusCode)
+	}
+
+	// Set a proxy and re-enable; it round-trips and the live fetcher is
+	// rebuilt through the proxy.
+	resp = do("PUT", "/api/media-config", `{"proxy":"socks5://user:pass@127.0.0.1:1080","previews":true}`)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("proxy PUT = %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	var mc struct {
+		Proxy    string
+		Previews bool
+	}
+	resp = do("GET", "/api/media-config", "")
+	decodeJSON(t, resp, &mc)
+	resp.Body.Close()
+	if mc.Proxy != "socks5://user:pass@127.0.0.1:1080" || !mc.Previews {
+		t.Fatalf("media-config = %+v", mc)
+	}
+	if !srv.htmlF().proxied || !srv.imageF().proxied {
+		t.Fatal("fetchers not rebuilt through the proxy")
+	}
+
+	// An invalid proxy is rejected and leaves the config unchanged.
+	resp = do("PUT", "/api/media-config", `{"proxy":"ftp://x:1","previews":true}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad proxy PUT = %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Persisted: a fresh load from the same store reads the saved value.
+	proxy, previews := loadMediaConfig(context.Background(), srv.hub.Store(), Config{})
+	if proxy == nil || proxy.Host != "127.0.0.1:1080" || !previews {
+		t.Fatalf("loadMediaConfig = %v, %v", proxy, previews)
+	}
+}
+
 func TestLogin(t *testing.T) {
 	ts, srv := newTestServerWithRef(t)
 	cases := []struct {

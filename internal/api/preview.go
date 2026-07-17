@@ -35,6 +35,10 @@ type PreviewData struct {
 }
 
 func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
+	if !s.previewsEnabled() {
+		http.Error(w, "previews disabled", http.StatusForbidden)
+		return
+	}
 	target := r.URL.Query().Get("url")
 	if len(target) == 0 || len(target) > 2048 {
 		http.Error(w, "bad url", http.StatusBadRequest)
@@ -50,7 +54,7 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.releaseMedia()
-	ct, body, err := s.htmlFetcher.get(r.Context(), target)
+	ct, body, err := s.htmlF().get(r.Context(), target)
 	if err != nil {
 		http.Error(w, "preview unavailable", http.StatusBadGateway)
 		return

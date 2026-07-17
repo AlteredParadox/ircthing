@@ -66,9 +66,15 @@ type Server struct {
 	hub *hub.Hub
 	mux *http.ServeMux
 
-	// Media proxy: separate fetchers (different size caps), result
-	// caches, and a request-wide semaphore bounding the memory-heavy
-	// span (fetch + decode + encode) of concurrent media requests.
+	// Media proxy: separate fetchers (different size caps), result caches,
+	// and a request-wide semaphore bounding the memory-heavy span (fetch +
+	// decode + encode) of concurrent media requests. The fetchers, the
+	// proxy, and the previews switch are runtime-editable (see
+	// /api/media-config), so they are guarded by mediaMu; caches and the
+	// semaphore are fixed for the process lifetime.
+	mediaMu      sync.RWMutex
+	mediaProxy   *url.URL
+	previewsOn   bool
 	htmlFetcher  *fetcher
 	imageFetcher *fetcher
 	previewCache *ttlCache[PreviewData]
@@ -91,12 +97,18 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 	if cfg.SessionTTL <= 0 {
 		cfg.SessionTTL = 30 * 24 * time.Hour
 	}
+	// Effective media config: the DB value (set via the UI) if present,
+	// else the config-file default — so it survives restarts and can be
+	// changed later without editing config.json.
+	proxy, previews := loadMediaConfig(context.Background(), h.Store(), cfg)
 	s := &Server{
 		cfg:          cfg,
 		hub:          h,
 		mux:          http.NewServeMux(),
-		htmlFetcher:  newFetcher(maxHTMLBytes, cfg.MediaProxy),
-		imageFetcher: newFetcher(maxImageBytes, cfg.MediaProxy),
+		mediaProxy:   proxy,
+		previewsOn:   previews,
+		htmlFetcher:  newFetcher(maxHTMLBytes, proxy),
+		imageFetcher: newFetcher(maxImageBytes, proxy),
 		previewCache: newTTLCache[PreviewData](30*time.Minute, 512),
 		thumbCache:   newTTLCache[thumbResult](24*time.Hour, maxThumbCache),
 		mediaSem:     make(chan struct{}, mediaSlots),
@@ -107,12 +119,12 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 	s.mux.HandleFunc("POST /api/logout", s.handleLogout)
 	s.mux.HandleFunc("GET /api/ws", s.handleWS)
 	s.mux.HandleFunc("GET /api/config", s.requireAuth(s.handleClientConfig))
-	// With previews disabled the endpoints are simply not registered, so a
-	// request 404s and the server never fetches anything remote.
-	if !cfg.PreviewsDisabled {
-		s.mux.HandleFunc("GET /api/preview", s.requireAuth(s.handlePreview))
-		s.mux.HandleFunc("GET /api/thumb", s.requireAuth(s.handleThumb))
-	}
+	s.mux.HandleFunc("GET /api/media-config", s.requireAuth(s.handleGetMediaConfig))
+	s.mux.HandleFunc("PUT /api/media-config", s.requireAuth(s.handleSetMediaConfig))
+	// The media endpoints are always registered; they refuse (403) at
+	// runtime when previews are disabled, so the switch is editable live.
+	s.mux.HandleFunc("GET /api/preview", s.requireAuth(s.handlePreview))
+	s.mux.HandleFunc("GET /api/thumb", s.requireAuth(s.handleThumb))
 	if assets != nil {
 		s.mux.Handle("/", http.FileServerFS(assets))
 	}
@@ -126,7 +138,28 @@ func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
 		Previews bool `json:"previews"`
-	}{Previews: !s.cfg.PreviewsDisabled})
+	}{Previews: s.previewsEnabled()})
+}
+
+// previewsEnabled reports the current (runtime-editable) previews switch.
+func (s *Server) previewsEnabled() bool {
+	s.mediaMu.RLock()
+	defer s.mediaMu.RUnlock()
+	return s.previewsOn
+}
+
+// htmlF and imageF return the current fetchers under the media lock; they
+// may be swapped when the proxy changes.
+func (s *Server) htmlF() *fetcher {
+	s.mediaMu.RLock()
+	defer s.mediaMu.RUnlock()
+	return s.htmlFetcher
+}
+
+func (s *Server) imageF() *fetcher {
+	s.mediaMu.RLock()
+	defer s.mediaMu.RUnlock()
+	return s.imageFetcher
 }
 
 // requireAuth wraps a handler so only authenticated sessions reach it —

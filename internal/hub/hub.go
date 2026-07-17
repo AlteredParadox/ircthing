@@ -84,6 +84,11 @@ type Hub struct {
 	recentClose map[string]int64
 }
 
+// Store exposes the shared store so the HTTP layer can read/write its own
+// settings keys (e.g. the runtime media-proxy config) without a second
+// handle to the database.
+func (h *Hub) Store() *store.Store { return h.store }
+
 func New(st *store.Store) *Hub {
 	return &Hub{
 		store:       st,
