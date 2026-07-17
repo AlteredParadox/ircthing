@@ -310,16 +310,18 @@ input::placeholder {
 	box-shadow: inset 2px 0 0 var(--accent);
 }
 
-.chan-hash {
-	font-family: var(--mono-font);
-	font-size: 1rem;
-	color: var(--text-faint);
-	width: 12px;
-	text-align: center;
+/* Buffer glyph (filled bubble = channel, outline = query). Muted by
+   default; brighter for unread and the active/selected row. */
+.buf-icon {
 	flex: 0 0 auto;
+	color: var(--text-faint);
 }
 
-.chan-row.active .chan-hash {
+.chan-row.unread .buf-icon {
+	color: var(--text-dim);
+}
+
+.chan-row.active .buf-icon {
 	color: var(--accent);
 }
 
@@ -549,15 +551,14 @@ input::placeholder {
 }
 
 .topic-name {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
 	font-family: var(--mono-font);
 	font-weight: 600;
 	font-size: 1.071rem;
 	color: var(--text);
 	white-space: nowrap;
-}
-
-.topic-name .hash {
-	color: var(--text-faint);
 }
 
 .topic-sep {
@@ -1406,7 +1407,7 @@ input::placeholder {
 	box-shadow: inset 2px 0 0 var(--accent);
 }
 
-.switch-row.sel .chan-hash {
+.switch-row.sel .buf-icon {
 	color: var(--accent);
 }
 

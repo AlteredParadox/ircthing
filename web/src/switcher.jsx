@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { rankBuffers } from "./irc.js";
+import { BufIcon } from "./icons.jsx";
 
 // Channel switcher palette (Ctrl+K): type to filter buffers, arrows to
 // move, Enter to jump. Mentions and unread buffers float to the top, so
@@ -62,8 +63,8 @@ export function Switcher({ buffers, networks, onSelect, onClose }) {
 								onFocus={() => setIdx(i)}
 								onClick={() => onSelect(b.network, b.buffer)}
 							>
-								<span class="chan-hash">{isChan ? b.buffer[0] : "@"}</span>
-								<span class="switch-name">{isChan ? b.buffer.slice(1) : b.buffer}</span>
+								<BufIcon chan={isChan} />
+								<span class="switch-name">{b.buffer}</span>
 								<span class="switch-net">{b.network}</span>
 								{b.unread > 0 && (
 									<span class={"badge" + (b.mention ? " mention" : "")}>

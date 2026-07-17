@@ -12,6 +12,7 @@ import { SearchOverlay } from "./search.jsx";
 import { Settings } from "./settings.jsx";
 import { Sidebar } from "./sidebar.jsx";
 import { Switcher } from "./switcher.jsx";
+import { BufIcon } from "./icons.jsx";
 import { Socket } from "./ws.js";
 
 const PAGE = 100;
@@ -50,8 +51,8 @@ function TopBar({ activeBuf, isChan, topicText, sideOpen, rightOpen, theme, onSi
 			>◧</button>
 			{activeBuf && (
 				<span class="topic-name">
-					<span class="hash">{isChan ? activeBuf.buffer[0] : "@"}</span>
-					{activeBuf.buffer.replace(/^[#&]/, "")}
+					<BufIcon chan={isChan} />
+					{activeBuf.buffer}
 				</span>
 			)}
 			<div class="topic-sep" />

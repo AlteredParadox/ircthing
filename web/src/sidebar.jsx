@@ -2,6 +2,7 @@ import { useRef, useState } from "preact/hooks";
 import { pressable } from "./a11y.js";
 import { longPress, menuTrigger } from "./menu.jsx";
 import { bufKey, nickColor } from "./irc.js";
+import { BufIcon } from "./icons.jsx";
 
 function stateDot(state) {
 	if (state === "registered") return "online";
@@ -69,8 +70,8 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSe
 									}}
 									{...longPress(openMenu, pressFired)}
 								>
-									<span class="chan-hash">{isChan ? b.buffer[0] : "@"}</span>
-									<span class="chan-name">{isChan ? b.buffer.slice(1) : b.buffer}</span>
+									<BufIcon chan={isChan} />
+									<span class="chan-name">{b.buffer}</span>
 									{muted && <span class="chan-mute" title="Muted">🔇</span>}
 									{unread && (
 										<span class={"badge" + (b.mention ? " mention" : "")}>
