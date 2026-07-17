@@ -900,13 +900,19 @@ func eventData(m store.Message) EventData {
 // msgid dedup makes the fan-out idempotent under overlapping backfill.
 func (h *Hub) persistMembership(ctx context.Context, c Conn, ev irc.Event, replay bool, batch *histBatch) {
 	for _, target := range h.membershipTargets(ctx, ev, replay, batch, c.Fold) {
-		// A just-closed buffer must not be resurrected by QUIT/NICK
-		// fan-out either (mirrors persistEvent's grace): the guard, applied
+		// Canonicalize under the network casemapping (like persistEvent) so
+		// a QUIT/NICK for #FOO lands in the existing #foo buffer instead of
+		// splitting off a case-variant duplicate: the channel targets come
+		// from the roster's raw wire spelling, which can differ in case from
+		// the stored buffer.
+		//
+		// A just-closed buffer must not be resurrected by QUIT/NICK fan-out
+		// either (mirrors persistEvent's grace): the guard, applied
 		// atomically with buffer creation in the store, drops a straggler
 		// for a buffer closed concurrently. This is replay-agnostic to match
 		// persistEvent — a replayed (event-playback) QUIT/NICK for a buffer
 		// the user just closed must not re-create it either.
-		stored, err := h.store.AppendGuarded(ctx, ev.Network, target,
+		stored, err := h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
 			func() bool { return h.recentlyClosed(ev.Network, c.Fold(target)) },
 			storeMessage(ev))
 		if err != nil {

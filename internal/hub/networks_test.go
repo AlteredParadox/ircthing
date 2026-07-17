@@ -419,6 +419,57 @@ func TestReplayedQuitDoesNotResurrectClosedBuffer(t *testing.T) {
 	}
 }
 
+// A QUIT/NICK fan-out target comes from the roster's raw wire spelling,
+// which can differ in case from the stored buffer. It must be canonicalized
+// so the system line lands in the existing buffer instead of splitting off
+// a case-variant duplicate.
+func TestQuitFoldsToExistingChannelBuffer(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox",
+		chans: map[string][]irc.Member{"#foo": {{Nick: "AlteredParadox"}, {Nick: "bob"}}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	ev := func(line string, affected ...string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+			Msg: ircv4.MustParseMessage(line), Affected: affected}
+	}
+	// Seed the stored buffer under lowercase '#foo'.
+	conn.ch <- ev(":bob!u@h PRIVMSG #foo :hi")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#foo", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed not persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// A QUIT fan-out arrives with the roster's uppercase wire spelling.
+	conn.ch <- ev(":bob!u@h QUIT :bye", "#FOO")
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#foo", 5); len(b) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("QUIT not persisted to #foo")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	bufs, err := h.store.Buffers(ctxb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bufs) != 1 {
+		t.Fatalf("QUIT split into a case-variant buffer: %+v", bufs)
+	}
+}
+
 // monitor_add for a network that is neither configured nor connected is
 // rejected, so it cannot mint phantom network/monitor rows.
 func TestMonitorRejectsUnknownNetwork(t *testing.T) {

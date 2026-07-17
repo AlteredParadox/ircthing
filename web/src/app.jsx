@@ -437,13 +437,17 @@ export function App() {
 		s.on("_open", async () => {
 			setConnected(true);
 			s.request("get_prefs", null).then(adoptPrefs).catch(() => {});
+			// Drop cached pages up front so every open buffer refetches a
+			// fresh tail covering the offline window. This must NOT hang off
+			// get_buffers succeeding: if that request rejects (error envelope
+			// or timeout) while the socket stays up, a stale active buffer
+			// would keep loaded:true, never refetch, and silently gap when
+			// live events resume appending to it.
+			setMsgs({});
 			try {
 				applyBuffers(await s.request("get_buffers", null));
-				// History may have advanced while we were away; refetch the
-				// open buffer.
-				setMsgs({});
 			} catch {
-				/* reconnect will retry */
+				/* sidebar refresh will retry; scrollback already reset above */
 			}
 		});
 		s.on("_close", () => setConnected(false));
