@@ -97,12 +97,12 @@ func New(st *store.Store) *Hub {
 	return &Hub{
 		store:       st,
 		recentClose: make(map[string]int64),
-		networks:   make(map[string]Conn),
-		states:     make(map[string]string),
-		presence:   make(map[string]map[string]bool),
-		motdWanted: make(map[string]bool),
-		procs:      make(map[string]*netProc),
-		sessions:   make(map[*Session]struct{}),
+		networks:    make(map[string]Conn),
+		states:      make(map[string]string),
+		presence:    make(map[string]map[string]bool),
+		motdWanted:  make(map[string]bool),
+		procs:       make(map[string]*netProc),
+		sessions:    make(map[*Session]struct{}),
 	}
 }
 
@@ -194,7 +194,7 @@ func (h *Hub) onState(ctx context.Context, c Conn, ev irc.Event) {
 // handleControlNumeric handles the self-contained standard-reply
 // (FAIL/WARN/NOTE) and MONITOR numerics, returning true when it consumed
 // the message.
-func (h *Hub) handleControlNumeric(ev irc.Event) bool {
+func (h *Hub) handleControlNumeric(ctx context.Context, c Conn, ev irc.Event) bool {
 	switch ev.Msg.Command {
 	case "FAIL", "WARN", "NOTE":
 		if ev.Msg.Command == "FAIL" {
@@ -208,10 +208,10 @@ func (h *Hub) handleControlNumeric(ev irc.Event) bool {
 		}
 		return true
 	case "730": // RPL_MONONLINE
-		h.updatePresence(ev.Network, ev.Msg, true)
+		h.updatePresence(ctx, c, ev.Network, ev.Msg, true)
 		return true
 	case "731": // RPL_MONOFFLINE
-		h.updatePresence(ev.Network, ev.Msg, false)
+		h.updatePresence(ctx, c, ev.Network, ev.Msg, false)
 		return true
 	case "734": // ERR_MONLISTFULL
 		log.Printf("irc[%s]: MONITOR list full: %s", ev.Network, ev.Msg.Trailing())
@@ -224,7 +224,7 @@ func (h *Hub) handleControlNumeric(ev irc.Event) bool {
 
 func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches map[string]*histBatch, backfillPages map[string]int, whois map[string]*WhoisData) error {
 	// Standard-replies and MONITOR numerics are self-contained.
-	if h.handleControlNumeric(ev) {
+	if h.handleControlNumeric(ctx, c, ev) {
 		return nil
 	}
 	// WHOIS replies accumulate into one card (consumed here).
@@ -453,22 +453,34 @@ func (h *Hub) startMonitor(ctx context.Context, c Conn) {
 // server-fed structures (multiline batches, line length). Legitimate
 // use stays far below these.
 const (
-	maxPresenceEntries = 1024        // MONITOR online/offline nicks per network
-	maxOpenWhois       = 64          // concurrent WHOIS accumulations
-	maxOpenHistBatches = 256         // concurrent chathistory replay batches
-	maxBackfillTargets = 4096        // distinct targets tracked for paginated backfill
-	closeGraceMs       = 10_000      // buffer stays closed against stragglers this long
+	maxOpenWhois       = 64               // concurrent WHOIS accumulations
+	maxOpenHistBatches = 256              // concurrent chathistory replay batches
+	maxBackfillTargets = 4096             // distinct targets tracked for paginated backfill
+	closeGraceMs       = 10_000           // buffer stays closed against stragglers this long
 	ownDedupWindow     = 10 * time.Minute // reconcile a replayed own message with its local placeholder
 )
 
-func (h *Hub) updatePresence(network string, m *ircv4.Message, online bool) {
+func (h *Hub) updatePresence(ctx context.Context, c Conn, network string, m *ircv4.Message, online bool) {
+	// 730/731 report the target's CURRENT-nick casing, which can differ from
+	// the configured spelling. Resolve each back to the configured nick via
+	// CASEMAPPING so presence keys match the buddy list monitorList/the client
+	// render (an unfolded key made an online buddy show perpetually offline).
+	configured, err := h.store.Monitors(ctx, network)
+	if err != nil {
+		return
+	}
+	byFold := make(map[string]string, len(configured))
+	for _, nk := range configured {
+		byFold[c.Fold(nk)] = nk
+	}
 	for _, target := range strings.Split(m.Trailing(), ",") {
 		nick := strings.TrimSpace(target)
 		if i := strings.IndexByte(nick, '!'); i != -1 {
 			nick = nick[:i]
 		}
-		if nick == "" {
-			continue
+		key, ok := byFold[c.Fold(nick)]
+		if nick == "" || !ok {
+			continue // empty, or a nick we don't monitor — nothing to update
 		}
 		h.mu.Lock()
 		p := h.presence[network]
@@ -476,16 +488,9 @@ func (h *Hub) updatePresence(network string, m *ircv4.Message, online bool) {
 			p = make(map[string]bool)
 			h.presence[network] = p
 		}
-		// Bound the map: a well-behaved server only reports nicks we
-		// monitor, so ignoring unknown nicks past the cap cannot lose
-		// legitimate presence.
-		if _, known := p[nick]; !known && len(p) >= maxPresenceEntries {
-			h.mu.Unlock()
-			continue
-		}
-		p[nick] = online
+		p[key] = online
 		h.mu.Unlock()
-		h.broadcast(envelope("presence", 0, PresenceData{Network: network, Nick: nick, Online: online}))
+		h.broadcast(envelope("presence", 0, PresenceData{Network: network, Nick: key, Online: online}))
 	}
 }
 

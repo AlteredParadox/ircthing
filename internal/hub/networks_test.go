@@ -239,19 +239,33 @@ func TestCloseBufferResurrectionGuard(t *testing.T) {
 	}
 }
 
-// The MONITOR presence map is bounded: a server streaming endless unique
-// nicks cannot grow it without limit.
-func TestPresenceMapBounded(t *testing.T) {
+// MONITOR presence is stored only for configured buddies (so the map is
+// bounded by the monitor list), and the server-reported nick casing is
+// folded back to the configured spelling — otherwise an online buddy shows
+// perpetually offline.
+func TestPresenceCasemapping(t *testing.T) {
 	h := newTestHub(t)
-	for i := 0; i < maxPresenceEntries+500; i++ {
-		m := ircv4.MustParseMessage(":srv 730 AlteredParadox :nick" + strconv.Itoa(i))
-		h.updatePresence("libera", m, true)
+	ctx := context.Background()
+	c := &fakeConn{ch: make(chan irc.Event, 1), name: "libera", nick: "AlteredParadox"}
+	if err := h.store.AddMonitor(ctx, "libera", "bob"); err != nil {
+		t.Fatal(err)
 	}
+	// Server reports it online with different casing.
+	h.updatePresence(ctx, c, "libera", ircv4.MustParseMessage(":srv 730 AlteredParadox :Bob!u@h"), true)
+	entries, err := h.monitorList(ctx, "libera")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Nick != "bob" || !entries[0].Online {
+		t.Fatalf("monitor entries = %+v, want [{bob online}]", entries)
+	}
+	// A nick we don't monitor is ignored, so the map stays bounded.
+	h.updatePresence(ctx, c, "libera", ircv4.MustParseMessage(":srv 730 AlteredParadox :stranger!u@h"), true)
 	h.mu.Lock()
 	n := len(h.presence["libera"])
 	h.mu.Unlock()
-	if n > maxPresenceEntries {
-		t.Fatalf("presence map = %d entries, want <= %d", n, maxPresenceEntries)
+	if n != 1 {
+		t.Fatalf("presence map = %d entries, want 1 (only monitored buddies)", n)
 	}
 }
 

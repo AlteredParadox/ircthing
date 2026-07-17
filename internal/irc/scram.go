@@ -87,6 +87,13 @@ func (c *scramClient) clientFinal(serverFirst string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// RFC 5802 §5.1: the reserved mandatory-extension attribute "m" MUST
+	// cause authentication failure when present — we cannot honor an unknown
+	// mandatory extension, and ignoring it would defeat its downgrade
+	// protection.
+	if _, ok := attrs["m"]; ok {
+		return nil, errors.New("scram: server-first requires an unsupported mandatory extension (m=)")
+	}
 	rnonce, salt64, iterStr := attrs["r"], attrs["s"], attrs["i"]
 	if rnonce == "" || salt64 == "" || iterStr == "" {
 		return nil, fmt.Errorf("scram: incomplete server-first %q", serverFirst)

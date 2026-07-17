@@ -71,6 +71,14 @@ func TestSCRAMRejectsBadServer(t *testing.T) {
 	if _, err := c.respond([]byte("e=invalid-proof")); err == nil || !strings.Contains(err.Error(), "invalid-proof") {
 		t.Fatalf("server error not surfaced: %v", err)
 	}
+
+	// A server-first carrying a mandatory extension (m=) MUST fail
+	// authentication (RFC 5802 §5.1), not be silently ignored.
+	c = mk()
+	if _, err := c.respond([]byte("m=someext,r=rOprNGfwEbeRWgbNEkqO-x,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")); err == nil ||
+		!strings.Contains(err.Error(), "mandatory extension") {
+		t.Fatalf("m= not rejected: %v", err)
+	}
 }
 
 func TestSCRAMEscaping(t *testing.T) {
