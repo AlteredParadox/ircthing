@@ -476,10 +476,12 @@ func TestAdoptOwnMsgIDCasingMismatch(t *testing.T) {
 	}
 }
 
-// AppendGuarded consults the create guard atomically with the buffer
-// existence check: a vetoed create of a missing buffer is dropped (this is
-// what closes the close_buffer resurrection race), a permitted one creates,
-// and an append to an EXISTING buffer never consults the guard.
+// AppendGuarded consults the guard atomically with the buffer existence
+// check, passing whether the buffer exists. A create-only guard (!exists)
+// vetoes a missing buffer but appends to an existing one; a straggler-drop
+// guard (ignores exists, returns true) drops the append even to an existing
+// buffer — closing the close_buffer resurrection race in the window before
+// DeleteBuffer runs.
 func TestAppendGuarded(t *testing.T) {
 	s, _ := openTest(t, 10)
 	defer s.Close()
@@ -487,9 +489,12 @@ func TestAppendGuarded(t *testing.T) {
 	msg := func(raw string) Message {
 		return Message{Sender: "a", Command: "PRIVMSG", Raw: raw, Text: raw}
 	}
+	createOnly := func(exists bool) bool { return !exists }
+	dropAlways := func(bool) bool { return true }
+	permit := func(bool) bool { return false }
 
-	// Guard vetoes creating a fresh buffer -> dropped, no resurrection.
-	got, err := s.AppendGuarded(ctx, "net", "#closed", func() bool { return true }, msg("x"))
+	// create-only guard vetoes creating a fresh buffer -> dropped.
+	got, err := s.AppendGuarded(ctx, "net", "#closed", createOnly, msg("x"))
 	if err != nil || got.ID != 0 {
 		t.Fatalf("vetoed create of missing buffer = %+v, %v; want no-op (ID 0)", got, err)
 	}
@@ -498,15 +503,24 @@ func TestAppendGuarded(t *testing.T) {
 	}
 
 	// Guard permits creation -> buffer created.
-	if got, err := s.AppendGuarded(ctx, "net", "#open", func() bool { return false }, msg("y")); err != nil || got.ID == 0 {
+	if got, err := s.AppendGuarded(ctx, "net", "#open", permit, msg("y")); err != nil || got.ID == 0 {
 		t.Fatalf("permitted create = %+v, %v; want created", got, err)
 	}
 
-	// An existing buffer appends regardless of the guard.
-	if got, err := s.AppendGuarded(ctx, "net", "#open", func() bool { return true }, msg("z")); err != nil || got.ID == 0 {
-		t.Fatalf("append to existing buffer = %+v, %v; want appended", got, err)
+	// create-only guard appends to an EXISTING buffer (exists -> not vetoed).
+	if got, err := s.AppendGuarded(ctx, "net", "#open", createOnly, msg("z")); err != nil || got.ID == 0 {
+		t.Fatalf("create-only guard on existing buffer = %+v, %v; want appended", got, err)
 	}
 	if m, _ := s.Latest(ctx, "net", "#open", 10); len(m) != 2 {
 		t.Fatalf("existing buffer has %d rows, want 2", len(m))
+	}
+
+	// A straggler-drop guard DROPS the append to the existing buffer — this
+	// is the close_buffer race fix.
+	if got, err := s.AppendGuarded(ctx, "net", "#open", dropAlways, msg("w")); err != nil || got.ID != 0 {
+		t.Fatalf("drop guard on existing buffer = %+v, %v; want dropped (ID 0)", got, err)
+	}
+	if m, _ := s.Latest(ctx, "net", "#open", 10); len(m) != 2 {
+		t.Fatalf("existing buffer has %d rows after dropped straggler, want 2", len(m))
 	}
 }

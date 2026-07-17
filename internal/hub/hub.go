@@ -366,20 +366,24 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 		// unfolded exact-name lookup would miss and drop the PART. Fold the
 		// target and veto creation unconditionally.
 		stored, err = h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
-			func() bool { return true }, storeMessage(ev))
+			func(exists bool) bool { return !exists }, storeMessage(ev))
 	} else {
 		// The close-grace check is evaluated inside the store, atomically
-		// with buffer creation, so a straggler in flight when the user
-		// closes the buffer cannot resurrect it (the recentlyClosed check
-		// and the append used to be a check-then-act split across h.mu and
-		// store.mu — a two-lock TOCTOU).
+		// with the buffer existence check, so a straggler in flight when the
+		// user closes the buffer cannot resurrect it (the recentlyClosed
+		// check and the append used to be a check-then-act split across h.mu
+		// and store.mu — a two-lock TOCTOU). The guard IGNORES exists so it
+		// also DROPS a straggler landing in the window after markClosed but
+		// before DeleteBuffer — otherwise that straggler appends and
+		// broadcasts a live event that re-creates the buffer on clients (and
+		// races the buffer_closed push).
 		//
 		// The grace is CHANNEL-only: channels have stragglers (QUIT/NICK,
 		// our own PART echo, late lines) that must not reopen a just-closed
 		// buffer. A query has none — an inbound PM is a new conversation and
 		// must reopen the query, not be dropped for the 10s window.
 		stored, err = h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
-			func() bool { return c.IsChannel(target) && h.recentlyClosed(ev.Network, c.Fold(target)) },
+			func(bool) bool { return c.IsChannel(target) && h.recentlyClosed(ev.Network, c.Fold(target)) },
 			storeMessage(ev))
 	}
 	if err != nil {
@@ -950,7 +954,7 @@ func (h *Hub) persistMembership(ctx context.Context, c Conn, ev irc.Event, repla
 		// persistEvent — a replayed (event-playback) QUIT/NICK for a buffer
 		// the user just closed must not re-create it either.
 		stored, err := h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
-			func() bool { return h.recentlyClosed(ev.Network, c.Fold(target)) },
+			func(bool) bool { return h.recentlyClosed(ev.Network, c.Fold(target)) },
 			storeMessage(ev))
 		if err != nil {
 			log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)

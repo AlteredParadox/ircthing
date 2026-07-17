@@ -520,6 +520,59 @@ func TestSelfPartFoldsToExistingChannelBuffer(t *testing.T) {
 	}
 }
 
+// A straggler for a channel in its close grace but NOT yet deleted (the
+// window between markClosed and DeleteBuffer) must be dropped, not appended
+// and broadcast — otherwise it resurrects the buffer on clients. The guard
+// must veto the append even though the buffer still exists.
+func TestStragglerToClosedChannelDropped(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox",
+		chans: map[string][]irc.Member{"#go": {{Nick: "AlteredParadox"}}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+			Msg: ircv4.MustParseMessage(line)}
+	}
+	// Seed the #go buffer.
+	conn.ch <- ev(":bob!u@h PRIVMSG #go :hi")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#go", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed not persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Enter the race window: marked closed, buffer NOT yet deleted.
+	h.markClosed("libera", conn.Fold("#go"), time.Now().UnixMilli())
+
+	// The straggler, then a message to a different open buffer as an ordering
+	// barrier (events are processed in order on the Run goroutine).
+	conn.ch <- ev(":bob!u@h PRIVMSG #go :straggler")
+	conn.ch <- ev(":bob!u@h PRIVMSG #other :hello")
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#other", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("barrier message not persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The straggler must have been dropped: #go still holds only the seed.
+	if b, _ := h.store.Latest(ctxb, "libera", "#go", 5); len(b) != 1 {
+		t.Fatalf("straggler to a closed channel was appended: #go has %d rows, want 1", len(b))
+	}
+}
+
 // The close grace is channel-only: an inbound PM to a just-closed query
 // must reopen the conversation, not be dropped as a straggler.
 func TestInboundPMReopensClosedQuery(t *testing.T) {

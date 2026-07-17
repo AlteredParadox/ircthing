@@ -265,20 +265,20 @@ func (s *Store) AppendExisting(ctx context.Context, network, target string, m Me
 	return s.append(ctx, network, target, m, false, nil, nil)
 }
 
-// AppendGuarded is Append with an atomic create guard: when the buffer
-// does not yet exist, guardCreate is consulted UNDER the store lock and, if
-// it returns true, the message is dropped (ID 0) instead of creating the
-// buffer. The hub uses this to close the close_buffer resurrection race —
-// a message already in flight when a buffer is closed cannot re-create it,
-// because the create-vs-skip decision is now atomic with the buffer
-// lookup/delete (all under store.mu) rather than a check-then-act split
-// across two locks.
-func (s *Store) AppendGuarded(ctx context.Context, network, target string, guardCreate func() bool, m Message) (Message, error) {
+// AppendGuarded is Append with an atomic guard consulted UNDER the store
+// lock, together with the buffer existence check: if guardCreate(exists)
+// returns true the message is dropped (ID 0). This closes the close_buffer
+// resurrection race without a check-then-act split across two locks. Pass
+// `!exists` to veto only buffer creation (a straggler must not re-open a
+// closed buffer), or ignore exists and veto unconditionally to also DROP a
+// straggler appended to a buffer not yet deleted (so it cannot broadcast a
+// live event that resurrects the buffer on clients).
+func (s *Store) AppendGuarded(ctx context.Context, network, target string, guardCreate func(exists bool) bool, m Message) (Message, error) {
 	return s.append(ctx, network, target, m, true, nil, guardCreate)
 }
 
-// AppendFoldedGuarded is AppendFolded plus the AppendGuarded create guard.
-func (s *Store) AppendFoldedGuarded(ctx context.Context, network, target string, fold func(string) string, guardCreate func() bool, m Message) (Message, error) {
+// AppendFoldedGuarded is AppendFolded plus the AppendGuarded append guard.
+func (s *Store) AppendFoldedGuarded(ctx context.Context, network, target string, fold func(string) string, guardCreate func(exists bool) bool, m Message) (Message, error) {
 	return s.append(ctx, network, target, m, true, fold, guardCreate)
 }
 
@@ -300,19 +300,23 @@ func nullString(s string) any {
 	return s
 }
 
-// createVetoed reports whether a would-be-new buffer must NOT be created:
-// the buffer doesn't exist and the caller's guard vetoes re-creation. The
-// existence check and the veto happen together under s.mu (the caller holds
-// it) so a concurrent DeleteBuffer can't be undone by an in-flight append.
-func (s *Store) createVetoed(ctx context.Context, network, target string, guard func() bool) (bool, error) {
+// appendVetoed reports whether the caller's guard vetoes this append. The
+// guard is told whether the target buffer already exists, and the existence
+// check + guard run together under s.mu (the caller holds it) so a
+// concurrent DeleteBuffer cannot race the decision. A create-only guard
+// returns !exists (veto only a would-be-new buffer). A straggler-drop guard
+// ignores exists and vetoes whenever the buffer was just closed — dropping a
+// late line even in the window before DeleteBuffer removes the buffer, so a
+// straggler can never broadcast an event that resurrects it on clients.
+func (s *Store) appendVetoed(ctx context.Context, network, target string, guard func(exists bool) bool) (bool, error) {
 	id, err := s.bufferID(ctx, network, target, false)
 	if err != nil {
 		return false, err
 	}
-	return id == 0 && guard(), nil
+	return guard(id != 0), nil
 }
 
-func (s *Store) append(ctx context.Context, network, target string, m Message, create bool, fold func(string) string, guardCreate func() bool) (Message, error) {
+func (s *Store) append(ctx context.Context, network, target string, m Message, create bool, fold func(string) string, guardCreate func(exists bool) bool) (Message, error) {
 	if network == "" || target == "" {
 		return Message{}, errors.New("store: network and target must be non-empty")
 	}
@@ -326,8 +330,8 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 		target, _ = s.canonicalLocked(ctx, network, target, fold)
 	}
 	m.Network, m.Target = network, target
-	if create && guardCreate != nil {
-		blocked, err := s.createVetoed(ctx, network, target, guardCreate)
+	if guardCreate != nil {
+		blocked, err := s.appendVetoed(ctx, network, target, guardCreate)
 		if err != nil {
 			return Message{}, err
 		}
