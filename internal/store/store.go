@@ -341,13 +341,22 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 // then relies on the normal (buffer_id, msgid) dedup to drop the
 // replayed insert, so a no-echo-message + chathistory server does not
 // duplicate own messages after a reconnect. Reports whether it adopted.
-func (s *Store) AdoptOwnMsgID(ctx context.Context, network, target, text, msgid string, sinceMs int64) (bool, error) {
+//
+// target is resolved to its canonical stored spelling under fold (as
+// AppendFolded does), so a replay carrying different-but-case-equivalent
+// casing than the buffer's stored spelling still finds the placeholder —
+// otherwise the adopt misses, the insert lands with its own msgid, and the
+// own message duplicates.
+func (s *Store) AdoptOwnMsgID(ctx context.Context, network, target, text, msgid string, fold func(string) string, sinceMs int64) (bool, error) {
 	if msgid == "" || text == "" {
 		return false, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if fold != nil {
+		target, _ = s.canonicalLocked(ctx, network, target, fold)
+	}
 	bufID, err := s.bufferID(ctx, network, target, false)
 	if err != nil || bufID == 0 {
 		return false, err

@@ -417,7 +417,7 @@ func TestAdoptOwnMsgID(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The server's later-timestamped copy carries a msgid.
-	adopted, err := s.AdoptOwnMsgID(ctx, "net", "#c", "hello", "srv-msgid-1", local.Add(-time.Minute).UnixMilli())
+	adopted, err := s.AdoptOwnMsgID(ctx, "net", "#c", "hello", "srv-msgid-1", nil, local.Add(-time.Minute).UnixMilli())
 	if err != nil || !adopted {
 		t.Fatalf("adopt = %v, %v; want true", adopted, err)
 	}
@@ -437,7 +437,41 @@ func TestAdoptOwnMsgID(t *testing.T) {
 		t.Fatalf("scrollback has %d messages, want 1 (no duplicate)", len(msgs))
 	}
 	// No matching placeholder -> no adoption.
-	if adopted, _ := s.AdoptOwnMsgID(ctx, "net", "#c", "different", "x", 0); adopted {
+	if adopted, _ := s.AdoptOwnMsgID(ctx, "net", "#c", "different", "x", nil, 0); adopted {
 		t.Fatal("adopted a non-matching row")
+	}
+}
+
+// A replay whose target casing differs from the buffer's stored spelling
+// still adopts, because AdoptOwnMsgID canonicalizes under fold — matching
+// AppendFolded, which is how the placeholder buffer was created. Without
+// this the adopt would miss and the own message would duplicate.
+func TestAdoptOwnMsgIDCasingMismatch(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+	fold := strings.ToLower // stand-in for the network casemapping
+
+	local := time.Now()
+	// Placeholder filed under the user-typed spelling "Bob".
+	if _, err := s.AppendFolded(ctx, "net", "Bob", fold, Message{
+		Time: local, Sender: "me", Command: "PRIVMSG", Raw: ":me PRIVMSG Bob :hi", Text: "hi",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The server replays it with canonical casing "bob".
+	adopted, err := s.AdoptOwnMsgID(ctx, "net", "bob", "hi", "srv-1", fold, local.Add(-time.Minute).UnixMilli())
+	if err != nil || !adopted {
+		t.Fatalf("adopt across casing = %v, %v; want true", adopted, err)
+	}
+	got, err := s.AppendFolded(ctx, "net", "bob", fold, Message{
+		Time: local.Add(time.Second), Sender: "me", Command: "PRIVMSG",
+		MsgID: "srv-1", Raw: ":me PRIVMSG bob :hi", Text: "hi",
+	})
+	if err != nil || got.ID != 0 {
+		t.Fatalf("replayed copy = %+v, %v; want deduped (ID 0)", got, err)
+	}
+	if msgs, _ := s.Latest(ctx, "net", "Bob", 10); len(msgs) != 1 {
+		t.Fatalf("scrollback has %d messages, want 1 (no duplicate)", len(msgs))
 	}
 }

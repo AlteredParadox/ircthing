@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1103,6 +1104,27 @@ func TestOwnActionReplayDedup(t *testing.T) {
 	}
 	if msgs[0].MsgID != "act1" {
 		t.Fatalf("placeholder did not adopt the server msgid: %+v", msgs[0])
+	}
+}
+
+// A hostile server that closes a paginated chathistory batch for an
+// endlessly varying target must not grow the per-connection backfillPages
+// map without bound.
+func TestBackfillTargetsCap(t *testing.T) {
+	h := newTestHub(t)
+	c := &fakeConn{ch: make(chan irc.Event, 1), name: "libera", nick: "AlteredParadox"}
+	batches := map[string]*histBatch{}
+	pages := map[string]int{}
+	ps := c.HistoryPageSize()
+	for i := 0; i < maxBackfillTargets+100; i++ {
+		ref := "b" + strconv.Itoa(i)
+		// A full-page batch with a resume point qualifies for a follow-up.
+		batches[ref] = &histBatch{target: "#c" + strconv.Itoa(i), count: ps, lastTS: 1}
+		ev := irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage("BATCH -" + ref)}
+		h.trackHistoryBatch(ev, c, batches, pages)
+	}
+	if len(pages) > maxBackfillTargets {
+		t.Fatalf("backfillPages = %d keys, want <= %d", len(pages), maxBackfillTargets)
 	}
 }
 

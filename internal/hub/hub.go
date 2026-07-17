@@ -333,7 +333,7 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 		ev.Msg.Prefix != nil && c.Fold(ev.Msg.Prefix.Name) == c.Fold(c.Nick()) {
 		if mid := ev.Msg.Tags["msgid"]; mid != "" {
 			since := messageTime(ev).Add(-ownDedupWindow).UnixMilli()
-			if _, aerr := h.store.AdoptOwnMsgID(ctx, ev.Network, target, searchText(ev.Msg), mid, since); aerr != nil {
+			if _, aerr := h.store.AdoptOwnMsgID(ctx, ev.Network, target, searchText(ev.Msg), mid, c.Fold, since); aerr != nil {
 				log.Printf("irc[%s]: own-message dedup for %q: %v", ev.Network, target, aerr)
 			}
 		}
@@ -390,6 +390,7 @@ const (
 	maxPresenceEntries = 1024        // MONITOR online/offline nicks per network
 	maxOpenWhois       = 64          // concurrent WHOIS accumulations
 	maxOpenHistBatches = 256         // concurrent chathistory replay batches
+	maxBackfillTargets = 4096        // distinct targets tracked for paginated backfill
 	closeGraceMs       = 10_000      // buffer stays closed against stragglers this long
 	ownDedupWindow     = 10 * time.Minute // reconcile a replayed own message with its local placeholder
 )
@@ -706,7 +707,14 @@ func (h *Hub) trackHistoryBatch(ev irc.Event, c Conn, batches map[string]*histBa
 		}
 		delete(batches, ref[1:])
 		key := c.Fold(b.target)
-		if b.count >= c.HistoryPageSize() && b.lastTS > 0 && pages[key] < maxBackfillPages {
+		// Cap the number of distinct targets tracked, not just the pages per
+		// target: a hostile server can close a chathistory batch for an
+		// endlessly varying target and grow this map for the life of the
+		// connection otherwise (mirrors the presence/whois key caps above).
+		_, known := pages[key]
+		if !known && len(pages) >= maxBackfillTargets {
+			// Drop the follow-up rather than track a new target.
+		} else if b.count >= c.HistoryPageSize() && b.lastTS > 0 && pages[key] < maxBackfillPages {
 			pages[key]++
 			c.RequestChatHistory(b.target, b.lastTS, b.lastID)
 		}

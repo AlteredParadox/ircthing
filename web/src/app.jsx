@@ -191,11 +191,19 @@ function applyRedaction(m, key, d) {
 // in while the fetch was in flight (the page is authoritative for what
 // it covers).
 function mergeHistoryPage(m, key, page) {
+	const cur = m[key];
+	// An installed jump/search window is a non-tail slice (atTail === false).
+	// An initial tail load must not merge into it: that would splice the
+	// live tail onto an older window (a temporal gap) and wrongly flip
+	// atTail true. The window owns the buffer until the user returns to the
+	// tail, which reloads it. (jumpTo also bumps historyGen to discard the
+	// in-flight load early; this guards the re-dispatch race belt-and-braces.)
+	if (cur?.loaded && cur.atTail === false) return m;
 	const pageMsgs = page.messages || [];
 	return {
 		...m,
 		[key]: {
-			list: mergeById(m[key]?.list || [], pageMsgs),
+			list: mergeById(cur?.list || [], pageMsgs),
 			loaded: true,
 			reachedTop: pageMsgs.length < PAGE,
 			atTail: true,
@@ -814,12 +822,16 @@ export function App() {
 	}
 
 	// editTopic selects the channel and prefills the composer with its
-	// current topic for editing (sent as /topic).
+	// current topic for editing (sent as /topic). The topic is fetched for
+	// the target directly: chanInfo tracks only the (previously) active
+	// buffer, and activeKeyRef still holds the old key synchronously after
+	// select(). Resolving asynchronously also lands the prefill after the
+	// buffer-switch draft reset, so it is not clobbered.
 	function editTopic(network, buffer) {
 		select(network, buffer);
-		const active = activeKeyRef.current === bufKey(network, buffer);
-		const topic = active ? chanInfo?.topic || "" : "";
-		composerApi.current?.prefill(`/topic ${topic}`);
+		sock.current?.request("get_channel", { network, buffer })
+			.then((d) => composerApi.current?.prefill(`/topic ${d?.topic || ""}`))
+			.catch(() => composerApi.current?.prefill("/topic "));
 	}
 
 	// openUserMenu: the right-click menu for a nick (member list, message).
@@ -971,6 +983,11 @@ export function App() {
 	function jumpTo(ev) {
 		const key = bufKey(ev.network, ev.buffer);
 		setSearchOpen(false);
+		// Invalidate any in-flight initial history load for this buffer so
+		// its resolve is discarded (see the load effect's gen check) instead
+		// of merging the live tail into — and flipping atTail true on — the
+		// around-window we install below, which would leave a temporal gap.
+		historyGen.current[key] = (historyGen.current[key] || 0) + 1;
 		sock.current
 			?.request("get_history", {
 				network: ev.network, buffer: ev.buffer,

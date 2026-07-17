@@ -1337,6 +1337,22 @@ func TestCapListCap(t *testing.T) {
 	}
 }
 
+// A hostile server that ends NAMES for endlessly varying channels must not
+// grow the per-connection whoxDone set without bound.
+func TestWHOXDoneCap(t *testing.T) {
+	m, err := NewManager(Config{Addr: "x:1", Nick: "AlteredParadox", AllowPlaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.isup.handle(ircv4.MustParseMessage(":srv 005 AlteredParadox WHOX :are supported"))
+	for i := 0; i < maxJoinedChannels+100; i++ {
+		m.maybeWHOX("#c" + strconv.Itoa(i))
+	}
+	if len(m.whoxDone) > maxJoinedChannels {
+		t.Fatalf("whoxDone = %d keys, want <= %d", len(m.whoxDone), maxJoinedChannels)
+	}
+}
+
 // Under no-implicit-names, a fresh self-JOIN must re-arm EnsureNames so
 // the roster reloads after a part/rejoin (or channel forward/cycle).
 func TestEnsureNamesReArmedOnRejoin(t *testing.T) {

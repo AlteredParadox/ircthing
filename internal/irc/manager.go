@@ -1133,6 +1133,13 @@ func (m *Manager) maybeWHOX(channel string) *ircv4.Message {
 	if m.whoxDone[key] {
 		return nil
 	}
+	// Bound the set: a hostile server can end NAMES for endlessly varying
+	// channel names and grow this map for the life of the connection
+	// otherwise (mirrors maxJoinedChannels). Above the cap we skip the
+	// WHOX rather than track the channel.
+	if len(m.whoxDone) >= maxJoinedChannels {
+		return nil
+	}
 	m.whoxDone[key] = true
 	return newMsg("WHO", channel, "%tnfa,"+whoxToken)
 }
