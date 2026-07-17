@@ -75,7 +75,7 @@ loudly. See `config.example.json` for a complete example.
 | `user.username`, `user.password_hash` | Web login. Generate the bcrypt hash with `ircd-web -hash-password`. |
 | `session_ttl_days` | Login cookie lifetime. Default 30. |
 | `ring_size` | Hot scrollback kept in memory per buffer. Default 200; older history is read from SQLite. |
-| `disable_previews` | **Initial default** for the previews switch. `true` starts with link/image previews off, so the server makes **zero** outbound fetches. Toggle it live in **Settings → Link previews** (the saved value wins over this). Previews are fetched through **each link's own network proxy**, so a link in a proxied network is previewed over that proxy (no egress-IP leak) and one in a direct network goes direct — there's no separate media proxy to configure. If a link's network can't be resolved to a direct-or-proxied decision, the fetch is **refused** rather than sent direct. **SSRF caveat:** direct fetches validate the resolved IP against a public-address policy; proxied fetches leave DNS to the proxy, so only literal private-IP targets are blocked — a hostname resolving proxy-side to an internal address is reachable. Use a proxy whose egress you trust (Tor exits publicly; a plain LAN SOCKS proxy does not), or disable previews for it. |
+| `disable_previews` | **Initial default** for the previews switch. `true` starts with link/image previews off, so the server makes **zero** outbound fetches. Toggle it live in **Settings → Link previews** (the saved value wins over this). Previews are fetched through **each link's own network proxy** — see [Preview fetches & the proxy SSRF caveat](#preview-fetches--the-proxy-ssrf-caveat). |
 
 Networks are managed from the web UI: the **+** button in the sidebar
 adds one; clicking a network's name offers *Join channel*, *Edit
@@ -97,6 +97,36 @@ Per network (`networks[]` seed / edit form):
 | `pass` | Server password (`PASS`), rarely needed. |
 | `sasl` | `mechanism` `""` picks automatically (EXTERNAL without a password, else SCRAM-SHA-256 when offered, else PLAIN). `cert_file`/`key_file` supply the client certificate for EXTERNAL. |
 | `channels` | Joined after every registration, so they come back on reconnect. The UI keeps this in sync: joining via the network menu adds to it, the *Leave channel* action removes. |
+
+### Preview fetches & the proxy SSRF caveat
+
+Link and image previews are fetched server-side, through the **proxy of the
+network the link came from** — a link in a proxied network is previewed over
+that proxy (your egress IP never leaks), one in a direct network goes
+direct, and if the link's network can't be resolved to a direct-or-proxied
+decision the fetch is **refused** rather than sent direct. There is no
+separate media proxy to configure.
+
+Direct (unproxied) fetches are fully hardened: the *resolved* IP of every
+connection and redirect hop is checked against a public-address policy at
+connect time, which is rebinding-safe.
+
+The one nuance is on the **proxied** path: the proxy owns DNS, so the server
+can only block *literal* private-IP targets — a hostname that resolves
+*proxy-side* to an internal address is reachable through the proxy. Whether
+that matters depends on **where the proxy runs**:
+
+- **A commercial VPN's SOCKS5 (Mullvad, TorGuard, …), or Tor — safe.** The
+  fetch egresses from the provider's network, not yours, so it cannot reach
+  your LAN, loopback, or cloud metadata; those are exactly what the proxy
+  shields. The only theoretical target is the provider's own infrastructure,
+  which reputable providers isolate — you gain no exposure. (Tor also refuses
+  private-IP destinations by exit policy.)
+- **A SOCKS proxy on your own machine or LAN** (self-hosted `dante`,
+  `ssh -D`, a local daemon) — **the case to watch.** There `127.0.0.1` and
+  `192.168.x/10.x` resolve to *your* host/network, so a malicious preview
+  link could probe internal services. Use a proxy whose egress you trust, or
+  turn previews off for that network.
 
 ## Deployment
 
