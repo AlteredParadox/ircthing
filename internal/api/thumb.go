@@ -60,6 +60,47 @@ func bytesPerPixel(m color.Model) int64 {
 	}
 }
 
+// isProgressiveJPEG reports whether b is a progressive JPEG (SOF2). It walks
+// the marker segments of the header rather than substring-scanning for
+// 0xFFC2 (which would false-positive inside entropy-coded data), stopping at
+// the first scan (SOS) by which point any frame header has appeared.
+func isProgressiveJPEG(b []byte) bool {
+	if len(b) < 2 || b[0] != 0xFF || b[1] != 0xD8 { // SOI
+		return false
+	}
+	for i := 2; i+1 < len(b); {
+		if b[i] != 0xFF { // not at a marker: resync
+			i++
+			continue
+		}
+		marker := b[i+1]
+		if marker == 0xFF { // fill byte
+			i++
+			continue
+		}
+		i += 2
+		switch {
+		case marker == 0xC2: // SOF2: progressive
+			return true
+		case marker == 0xDA: // SOS: entropy data begins, no frame header past here
+			return false
+		case marker == 0x01 || (marker >= 0xD0 && marker <= 0xD9):
+			// TEM / RSTn / SOI / EOI: standalone, no length payload
+			continue
+		default: // segment carrying a 2-byte length
+			if i+1 >= len(b) {
+				return false
+			}
+			segLen := int(b[i])<<8 | int(b[i+1])
+			if segLen < 2 {
+				return false
+			}
+			i += segLen
+		}
+	}
+	return false
+}
+
 func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	if !s.previewsEnabled() {
 		http.Error(w, "previews disabled", http.StatusForbidden)
@@ -111,8 +152,20 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// The dimension caps are checked FIRST (short-circuit) so the byte
 	// product below can never overflow int64.
 	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 ||
-		cfg.Width > maxImageDim || cfg.Height > maxImageDim ||
-		int64(cfg.Width)*int64(cfg.Height)*bytesPerPixel(cfg.ColorModel) > maxDecodeBytes {
+		cfg.Width > maxImageDim || cfg.Height > maxImageDim {
+		http.Error(w, "unsupported image", http.StatusUnsupportedMediaType)
+		return
+	}
+	// Per-pixel decode cost is the output bitmap PLUS, for a progressive
+	// JPEG, the decoder's full up-front DCT coefficient allocation: image/jpeg
+	// holds ~256 bytes per 8x8 block per component (~12 bytes/pixel at 4:4:4),
+	// entirely separate from the result. Modeling only the output bitmap lets
+	// a small progressive JPEG blow past maxDecodeBytes at image.Decode time.
+	perPixel := bytesPerPixel(cfg.ColorModel)
+	if format == "jpeg" && isProgressiveJPEG(body) {
+		perPixel += 12
+	}
+	if int64(cfg.Width)*int64(cfg.Height)*perPixel > maxDecodeBytes {
 		http.Error(w, "unsupported image", http.StatusUnsupportedMediaType)
 		return
 	}

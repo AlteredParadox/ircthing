@@ -178,10 +178,16 @@ func (m *Manager) Fold(name string) string { return m.isup.Fold(name) }
 // server advertises ISUPPORT LINELEN, and always during registration.
 const defaultLineLen = 512
 
-// lineLen returns the server's advertised LINELEN (default 512).
+// lineLen returns the server's advertised LINELEN, floored at the RFC 1459
+// default. A server may legitimately RAISE the limit, but must never lower
+// the effective OUTBOUND limit below 512: this value gates the writer's
+// FATAL length backstop and boundedPong's budget, so a hostile 005
+// LINELEN=1 would otherwise reject even a mandatory PONG and pin the network
+// in a tight, backoff-reset reconnect loop. Mirrors the reader's clamp in
+// linereader.setLimit.
 func (m *Manager) lineLen() int {
 	if v, ok := m.isup.Raw("LINELEN"); ok {
-		if n, _ := strconv.Atoi(v); n > 0 {
+		if n, _ := strconv.Atoi(v); n > defaultLineLen {
 			return n
 		}
 	}

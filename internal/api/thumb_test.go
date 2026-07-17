@@ -5,6 +5,7 @@ import (
 	"context"
 	"image"
 	"image/color"
+	"image/jpeg"
 	"image/png"
 	"net/http"
 	"testing"
@@ -123,6 +124,47 @@ func TestDecodeByteGate(t *testing.T) {
 	// pixel-only cap of 9 MP would have allowed it.
 	if int64(3000)*3000*bytesPerPixel(color.NRGBA64Model) <= maxDecodeBytes {
 		t.Fatal("16-bit 3000x3000 should exceed the byte cap")
+	}
+}
+
+func TestIsProgressiveJPEG(t *testing.T) {
+	// A stdlib-encoded JPEG is baseline (SOF0), never progressive.
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	if isProgressiveJPEG(buf.Bytes()) {
+		t.Fatal("baseline jpeg.Encode output detected as progressive")
+	}
+
+	cases := []struct {
+		name string
+		b    []byte
+		want bool
+	}{
+		{"progressive SOF2", []byte{0xFF, 0xD8, 0xFF, 0xC2, 0x00, 0x03, 0x00}, true},
+		{"baseline SOF0 then SOS", []byte{0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x03, 0x00, 0xFF, 0xDA, 0x00, 0x02}, false},
+		{"SOF2 after an APP0 segment", []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xC2, 0x00, 0x03, 0x00}, true},
+		{"SOS before any SOF", []byte{0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02}, false},
+		{"not a jpeg", []byte{0x89, 0x50, 0x4E, 0x47}, false},
+		{"too short", []byte{0xFF}, false},
+	}
+	for _, tc := range cases {
+		if got := isProgressiveJPEG(tc.b); got != tc.want {
+			t.Errorf("%s: isProgressiveJPEG = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// The gate charges progressive JPEG the coefficient overhead: a ~4 MP
+	// progressive image (4M * 16 = 64 MB) exceeds maxDecodeBytes, where the
+	// same pixels baseline (4M * 4 = 16 MB) pass.
+	const px = 4_000_000
+	if int64(px)*(bytesPerPixel(color.RGBAModel)+12) <= maxDecodeBytes {
+		t.Fatal("progressive per-pixel factor too low to bound the coefficient allocation")
+	}
+	if int64(px)*bytesPerPixel(color.RGBAModel) > maxDecodeBytes {
+		t.Fatal("baseline 4MP should pass the cap; test premise wrong")
 	}
 }
 

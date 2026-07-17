@@ -540,6 +540,9 @@ export function App() {
 				delete next[key];
 				return next;
 			});
+			// Invalidate any in-flight initial get_history for this buffer, so
+			// its resolve doesn't reinstall a phantom msgs entry after teardown.
+			historyGen.current[key] = (historyGen.current[key] || 0) + 1;
 			setMsgs((m) => dropBufferMsgs(m, key));
 			if (activeKeyRef.current === key) {
 				setActiveKey(null);
@@ -562,6 +565,8 @@ export function App() {
 				for (const g of gone) delete next[g.key];
 				return next;
 			});
+			// Invalidate any in-flight initial loads for the removed buffers.
+			for (const g of gone) historyGen.current[g.key] = (historyGen.current[g.key] || 0) + 1;
 			setMsgs((m) => {
 				let next = m;
 				for (const g of gone) next = dropBufferMsgs(next, g.key);
@@ -846,6 +851,9 @@ export function App() {
 			delete next[key];
 			return next;
 		});
+		// Invalidate any in-flight initial get_history so it can't reinstall a
+		// phantom msgs entry for the buffer we're closing.
+		historyGen.current[key] = (historyGen.current[key] || 0) + 1;
 		setMsgs((m) => dropBufferMsgs(m, key));
 		if (activeKeyRef.current !== key) return;
 		const rest = Object.values(buffersRef.current)

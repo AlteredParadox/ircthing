@@ -249,28 +249,54 @@ func TestReconnectClearsStaleLineLen(t *testing.T) {
 	conns := listen(t, ln)
 	m := startManager(t, testCfg(ln.Addr().String()))
 
-	// First connection registers, then advertises a tiny LINELEN.
+	// First connection registers, then advertises a raised LINELEN (a value
+	// the floor honors — a tiny one would be clamped to the default and
+	// never go live; see TestLineLenFloor).
 	s := accept(t, conns)
 	s.register("AlteredParadox")
 	waitState(t, m, StateRegistered)
-	s.send(":irc.test 005 AlteredParadox LINELEN=5 :are supported by this server")
+	s.send(":irc.test 005 AlteredParadox LINELEN=1024 :are supported by this server")
 	// Poll until the manager has applied it, so the stale value is really
 	// live at reconnect time (otherwise the test could pass vacuously).
 	deadline := time.Now().Add(2 * time.Second)
-	for m.lineLen() > 5 {
+	for m.lineLen() != 1024 {
 		if time.Now().After(deadline) {
-			t.Fatal("LINELEN=5 never applied")
+			t.Fatal("LINELEN=1024 never applied")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
 
-	// Drop; the reconnect must register again rather than tearing itself
-	// down on the stale limit.
+	// Drop; the reconnect must reset ISUPPORT and register again at the
+	// default, not carry the stale limit forward.
 	s.c.Close()
 	waitState(t, m, StateDisconnected)
 	s2 := accept(t, conns)
 	s2.register("AlteredParadox")
 	waitState(t, m, StateRegistered)
+	if m.lineLen() != defaultLineLen {
+		t.Fatalf("stale LINELEN after reconnect: %d, want %d", m.lineLen(), defaultLineLen)
+	}
+}
+
+// A hostile server must not be able to shrink the outbound line limit below
+// the RFC 1459 default (which would reject even a mandatory PONG and pin the
+// network in a tight reconnect loop); a legitimate raise is honored.
+func TestLineLenFloor(t *testing.T) {
+	m, err := NewManager(Config{Addr: "x:1", Nick: "n", AllowPlaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.lineLen(); got != defaultLineLen {
+		t.Fatalf("default lineLen = %d, want %d", got, defaultLineLen)
+	}
+	m.isup.applyToken("LINELEN", "1")
+	if got := m.lineLen(); got != defaultLineLen {
+		t.Fatalf("LINELEN=1 -> %d, want floored to %d", got, defaultLineLen)
+	}
+	m.isup.applyToken("LINELEN", "1024")
+	if got := m.lineLen(); got != 1024 {
+		t.Fatalf("LINELEN=1024 -> %d, want 1024 (raise honored)", got)
+	}
 }
 
 func TestManagerSend(t *testing.T) {
