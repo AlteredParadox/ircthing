@@ -475,3 +475,38 @@ func TestAdoptOwnMsgIDCasingMismatch(t *testing.T) {
 		t.Fatalf("scrollback has %d messages, want 1 (no duplicate)", len(msgs))
 	}
 }
+
+// AppendGuarded consults the create guard atomically with the buffer
+// existence check: a vetoed create of a missing buffer is dropped (this is
+// what closes the close_buffer resurrection race), a permitted one creates,
+// and an append to an EXISTING buffer never consults the guard.
+func TestAppendGuarded(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+	msg := func(raw string) Message {
+		return Message{Sender: "a", Command: "PRIVMSG", Raw: raw, Text: raw}
+	}
+
+	// Guard vetoes creating a fresh buffer -> dropped, no resurrection.
+	got, err := s.AppendGuarded(ctx, "net", "#closed", func() bool { return true }, msg("x"))
+	if err != nil || got.ID != 0 {
+		t.Fatalf("vetoed create of missing buffer = %+v, %v; want no-op (ID 0)", got, err)
+	}
+	if m, _ := s.Latest(ctx, "net", "#closed", 10); len(m) != 0 {
+		t.Fatalf("buffer resurrected despite guard: %d rows", len(m))
+	}
+
+	// Guard permits creation -> buffer created.
+	if got, err := s.AppendGuarded(ctx, "net", "#open", func() bool { return false }, msg("y")); err != nil || got.ID == 0 {
+		t.Fatalf("permitted create = %+v, %v; want created", got, err)
+	}
+
+	// An existing buffer appends regardless of the guard.
+	if got, err := s.AppendGuarded(ctx, "net", "#open", func() bool { return true }, msg("z")); err != nil || got.ID == 0 {
+		t.Fatalf("append to existing buffer = %+v, %v; want appended", got, err)
+	}
+	if m, _ := s.Latest(ctx, "net", "#open", 10); len(m) != 2 {
+		t.Fatalf("existing buffer has %d rows, want 2", len(m))
+	}
+}

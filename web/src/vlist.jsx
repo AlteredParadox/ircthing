@@ -123,6 +123,15 @@ export function VirtualList({
 	);
 	useLayoutEffect(() => () => ro.disconnect(), []);
 
+	// Emit the initial pinned state once after mount. The parent (Chat) is
+	// NOT remounted per buffer, so its own pinned tracking would otherwise
+	// carry a stale value from the previous buffer and silently suppress
+	// read-marker updates; this list IS keyed per buffer, so it knows the
+	// truth — true at the tail, false for a focus (search) jump.
+	useLayoutEffect(() => {
+		onPinned?.(pinned.current);
+	}, []);
+
 	// Row ref callback: (un)observe and track elements by id.
 	function rowRef(id) {
 		return (node) => {

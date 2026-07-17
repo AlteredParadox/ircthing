@@ -237,6 +237,42 @@ func TestManagerRegistersRespondsAndReconnects(t *testing.T) {
 	waitState(t, m, StateRegistered)
 }
 
+// A small ISUPPORT LINELEN advertised on one connection must not leak into
+// the next connection's registration: the reset now runs before register(),
+// so a reconnect always handshakes against the default limit. Without it a
+// stale small LINELEN failed the handshake lines and bricked reconnects.
+func TestReconnectClearsStaleLineLen(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+
+	// First connection registers, then advertises a tiny LINELEN.
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+	s.send(":irc.test 005 AlteredParadox LINELEN=5 :are supported by this server")
+	// Poll until the manager has applied it, so the stale value is really
+	// live at reconnect time (otherwise the test could pass vacuously).
+	deadline := time.Now().Add(2 * time.Second)
+	for m.lineLen() > 5 {
+		if time.Now().After(deadline) {
+			t.Fatal("LINELEN=5 never applied")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Drop; the reconnect must register again rather than tearing itself
+	// down on the stale limit.
+	s.c.Close()
+	waitState(t, m, StateDisconnected)
+	s2 := accept(t, conns)
+	s2.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+}
+
 func TestManagerSend(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

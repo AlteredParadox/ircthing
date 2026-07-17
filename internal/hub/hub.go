@@ -340,10 +340,18 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	}
 	var stored store.Message
 	var err error
-	if selfPart || h.recentlyClosed(ev.Network, c.Fold(target)) {
+	if selfPart {
+		// Our own PART echo must never create a buffer.
 		stored, err = h.store.AppendExisting(ctx, ev.Network, target, storeMessage(ev))
 	} else {
-		stored, err = h.store.AppendFolded(ctx, ev.Network, target, c.Fold, storeMessage(ev))
+		// The close-grace check is evaluated inside the store, atomically
+		// with buffer creation, so a straggler in flight when the user
+		// closes the buffer cannot resurrect it (the recentlyClosed check
+		// and the append used to be a check-then-act split across h.mu and
+		// store.mu — a two-lock TOCTOU).
+		stored, err = h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
+			func() bool { return h.recentlyClosed(ev.Network, c.Fold(target)) },
+			storeMessage(ev))
 	}
 	if err != nil {
 		if ctx.Err() != nil {
@@ -893,13 +901,13 @@ func eventData(m store.Message) EventData {
 func (h *Hub) persistMembership(ctx context.Context, c Conn, ev irc.Event, replay bool, batch *histBatch) {
 	for _, target := range h.membershipTargets(ctx, ev, replay, batch, c.Fold) {
 		// A just-closed buffer must not be resurrected by QUIT/NICK
-		// fan-out either (mirrors persistEvent's grace): append without
-		// creation during the close window.
-		appendFn := h.store.Append
-		if !replay && h.recentlyClosed(ev.Network, c.Fold(target)) {
-			appendFn = h.store.AppendExisting
-		}
-		stored, err := appendFn(ctx, ev.Network, target, storeMessage(ev))
+		// fan-out either (mirrors persistEvent's grace): the guard, applied
+		// atomically with buffer creation in the store, drops a live
+		// straggler for a buffer closed concurrently. Replayed history is
+		// never subject to the grace, so its guard is always false.
+		stored, err := h.store.AppendGuarded(ctx, ev.Network, target,
+			func() bool { return !replay && h.recentlyClosed(ev.Network, c.Fold(target)) },
+			storeMessage(ev))
 		if err != nil {
 			log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
 			continue

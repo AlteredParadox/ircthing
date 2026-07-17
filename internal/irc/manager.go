@@ -727,6 +727,22 @@ func (m *Manager) rejoinChannels(send func([]*ircv4.Message) error) error {
 func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	m.drainSendQueue()
 
+	// Reset per-connection ISUPPORT/roster/lazy-NAMES/WHOX state up front,
+	// BEFORE register(): the writer checks every outbound line against the
+	// ISUPPORT LINELEN, and register() drives the handshake through the
+	// writer, so a stale small LINELEN carried over from a previous
+	// connection would fail registration lines — and, because the reset used
+	// to run only after register() returned, would never clear, bricking
+	// every subsequent reconnect. All four are repopulated by the
+	// 005/JOIN/353 replies of the new connection, and registration is not
+	// signalled until later, so a consumer still never sees the previous
+	// connection's state once "registered".
+	m.isup.reset()
+	m.roster.clear()
+	defer m.roster.clear()
+	m.resetNames()
+	m.whoxDone = make(map[string]bool)
+
 	addr, secure := m.effectiveAddr()
 	conn, err := m.dial(ctx, addr, secure)
 	if err != nil {
@@ -776,16 +792,6 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	if err != nil {
 		return err
 	}
-
-	// Reset per-connection state before signalling registration, so a
-	// consumer that sees "registered" never observes the previous
-	// connection's ISUPPORT, roster, or lazy-NAMES set. All three are
-	// repopulated by the 005/JOIN/353 replies that follow.
-	m.isup.reset()
-	m.roster.clear()
-	defer m.roster.clear()
-	m.resetNames()
-	m.whoxDone = make(map[string]bool)
 
 	m.nick.Store(hs.nick)
 	m.applyCaps(hs)

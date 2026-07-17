@@ -233,7 +233,7 @@ func (s *Store) Close() error {
 // and the zero Message (ID 0) is returned — callers use that to skip
 // broadcasting.
 func (s *Store) Append(ctx context.Context, network, target string, m Message) (Message, error) {
-	return s.append(ctx, network, target, m, true, nil)
+	return s.append(ctx, network, target, m, true, nil, nil)
 }
 
 // AppendExisting is Append minus buffer creation: the message is
@@ -242,7 +242,24 @@ func (s *Store) Append(ctx context.Context, network, target string, m Message) (
 // close_buffer delete and the PART echo race, and both orders must end
 // with the buffer gone.
 func (s *Store) AppendExisting(ctx context.Context, network, target string, m Message) (Message, error) {
-	return s.append(ctx, network, target, m, false, nil)
+	return s.append(ctx, network, target, m, false, nil, nil)
+}
+
+// AppendGuarded is Append with an atomic create guard: when the buffer
+// does not yet exist, guardCreate is consulted UNDER the store lock and, if
+// it returns true, the message is dropped (ID 0) instead of creating the
+// buffer. The hub uses this to close the close_buffer resurrection race —
+// a message already in flight when a buffer is closed cannot re-create it,
+// because the create-vs-skip decision is now atomic with the buffer
+// lookup/delete (all under store.mu) rather than a check-then-act split
+// across two locks.
+func (s *Store) AppendGuarded(ctx context.Context, network, target string, guardCreate func() bool, m Message) (Message, error) {
+	return s.append(ctx, network, target, m, true, nil, guardCreate)
+}
+
+// AppendFoldedGuarded is AppendFolded plus the AppendGuarded create guard.
+func (s *Store) AppendFoldedGuarded(ctx context.Context, network, target string, fold func(string) string, guardCreate func() bool, m Message) (Message, error) {
+	return s.append(ctx, network, target, m, true, fold, guardCreate)
 }
 
 // AppendFolded resolves target to its canonical stored spelling under
@@ -251,10 +268,10 @@ func (s *Store) AppendExisting(ctx context.Context, network, target string, m Me
 // IRC event run on independent goroutines) cannot each decide no buffer
 // exists and create separate rows. m.Target is set to the resolved name.
 func (s *Store) AppendFolded(ctx context.Context, network, target string, fold func(string) string, m Message) (Message, error) {
-	return s.append(ctx, network, target, m, true, fold)
+	return s.append(ctx, network, target, m, true, fold, nil)
 }
 
-func (s *Store) append(ctx context.Context, network, target string, m Message, create bool, fold func(string) string) (Message, error) {
+func (s *Store) append(ctx context.Context, network, target string, m Message, create bool, fold func(string) string, guardCreate func() bool) (Message, error) {
 	if network == "" || target == "" {
 		return Message{}, errors.New("store: network and target must be non-empty")
 	}
@@ -266,6 +283,17 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 
 	if fold != nil {
 		target, _ = s.canonicalLocked(ctx, network, target, fold)
+	}
+	if create && guardCreate != nil {
+		// Would this create a fresh buffer? Decide create-vs-skip atomically
+		// with the existence check (both under s.mu) so a concurrent
+		// DeleteBuffer cannot be undone by an in-flight append: if the buffer
+		// is already gone and the guard vetoes re-creation, drop the message.
+		if id, err := s.bufferID(ctx, network, target, false); err != nil {
+			return Message{}, err
+		} else if id == 0 && guardCreate() {
+			return Message{}, nil
+		}
 	}
 	bufID, r, err := s.bufferAndRing(ctx, network, target, create)
 	if err != nil {
