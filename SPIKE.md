@@ -206,3 +206,67 @@ worst case. Before a merge decision, re-run 2b–2d on the **1 vCPU / 1 GB** box
 72 MB target under GOMEMLIMIT pressure without unacceptable GC CPU, this is a
 viable phase-4 feature and the dependency (`gvisor.dev/gvisor`) can be proposed
 for approval with these numbers on record.
+
+---
+
+## 6. Target-box validation (host-a, 2026-07-18)
+
+**Environment:** 1 vCPU / 1 GB VPS, Debian 13 (6.12 cloud kernel),
+`GOMEMLIMIT=64MiB`, `GODEBUG=gctrace=1`, hardened DynamicUser unit. Real WG
+peer on a fleet host (host-b, port 51821 — a resident WireGuard service owns 51820), tunnel
+DNS = 9.9.9.9 resolved in-tunnel, client-side only (unlike §2's
+both-sides-in-process bench). Network: libera/#linux via hostname, TLS.
+
+| metric | result | budget/req |
+|---|---|---|
+| DNS leak — tcpdump on real ifaces during connect+join, live port-53 workload | 0 packets escaped | 0 |
+| DNS leak — failure paths (multiple dial timeouts/retries observed 00:42–01:01) | no local-resolver fallback | 0 |
+| idle RSS after 6.7 h connected | 35.1 MB (VmHWM = VmRSS: never exceeded) | <72 MB |
+| GC at idle | forced 2-min cadence, ~1.5 ms/cycle, 0% CPU; heap 25 MB vs 50 MB goal | no thrash |
+| replay (full overnight #linux scrollback, 1 client) — peak CPU | 9% for ~2 s, 0.65% avg | usable on 1 vCPU |
+| replay — peak heap / peak RSS | 51 MB / 57.9 MB | <72 MB (transient) |
+| replay — retained heap after GC | 29→27 MB (baseline 25); worst GC pause 7.6 ms | no retention |
+| restarts / crashes over soak | 0 | — |
+
+RSS caveat: post-replay RSS holds at ~58 MB due to MADV_FREE lazy reclaim;
+live heap confirms ~zero retention. Effective settled cost ≈ idle + noise.
+
+### Findings (pre-merge fixes)
+
+1. **Endpoint must accept hostnames.** UAPI takes literal IPs only
+   (`ParseAddr` error). Resolve via the LOCAL resolver pre-tunnel — the one
+   intentional exception to the leak rule (chicken-and-egg); comment it as
+   such. Re-resolve on reconnect.
+2. **v6-less kernels hard-fail the bind** (`EAFNOSUPPORT` bringing up the
+   device). Budget-VPS target hardware; degrade to v4-only when endpoint is
+   v4. (Surfaced initially via the sandbox, but applies to genuinely
+   v6-disabled kernels too.)
+3. **Unit needs `AF_NETLINK`** in `RestrictAddressFamilies` for the WG bind
+   path. Update deploy/ unit with a do-not-remove comment; failure mode
+   (EAFNOSUPPORT) only manifests on WG-enabled networks.
+4. **`dns` field should accept host:port** (default :53). Port 53 isn't
+   always usable at the far end (a resident WireGuard service DNS handling, port squatters).
+5. **Replay churn:** ~25 MB transient alloc per replay stream, zero
+   retained. Consider pooling encode/send buffers to flatten the transient;
+   low priority, no leak.
+
+### Rig notes (for future spikes)
+
+- a resident WireGuard service hosts: 51820/udp is taken; a resident WireGuard service's DNS machinery affects port 53
+  handling — run any test resolver off-port, or skip resolver infra entirely.
+- The leak oracle is client-side tcpdump. Don't build peer-side resolver
+  infrastructure to prove a client-side property (a public resolver dialed
+  through the tunnel tests the same thing, harder).
+- Fleet drop-policy forward chains: accepts must be inserted INTO the fleet
+  chain — accept in a parallel chain doesn't exempt packets from other
+  hooks' drops. Manual rules die on the next Ansible push (by design).
+- DynamicUser state lives at /var/lib/private/<name>; wiping the
+  /var/lib/<name> symlink doesn't wipe state.
+- `fwd` is a reserved nft keyword; don't name chains that.
+
+### Verdict
+
+**Merge approved**, contingent on findings 1–4 (5 optional). Approve
+`golang.zx2c4.com/wireguard` and `gvisor.dev/gvisor` onto the CLAUDE.md
+allowlist citing this document. Binary 14.58 MB vs 30 MB gate — no budget
+changes.
