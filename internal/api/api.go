@@ -53,6 +53,11 @@ type Config struct {
 	// media fetches) unless the config explicitly enables them. Editable at
 	// runtime via /api/config, which then wins.
 	PreviewsDefault bool
+	// TrustProxyForwarded makes the login backoff key on the X-Real-IP /
+	// X-Forwarded-For client address instead of the (shared) proxy RemoteAddr.
+	// Enable ONLY behind a trusted reverse proxy that sets those headers — a
+	// direct-facing deployment must not honor client-settable headers.
+	TrustProxyForwarded bool
 }
 
 // Server is the http.Handler for everything: /api/* plus the embedded
@@ -296,7 +301,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Login is the one unauthenticated endpoint that burns CPU (bcrypt):
 	// per-source failure backoff plus a bounded hashing semaphore keep it
 	// from being a cheap exhaustion vector.
-	source := loginSourceKey(r)
+	source := s.loginSourceKey(r)
 	if wait := s.login.retryAfter(source, time.Now()); wait > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds()+1)))
 		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)

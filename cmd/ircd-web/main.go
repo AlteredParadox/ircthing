@@ -113,11 +113,12 @@ func run(cfg *config) error {
 		return fmt.Errorf("embedded assets: %w", err)
 	}
 	handler, err := api.New(api.Config{
-		Username:        cfg.User.Username,
-		PasswordHash:    cfg.User.PasswordHash,
-		SessionTTL:      cfg.sessionTTL(),
-		SecureCookies:   cfg.SecureCookies,
-		PreviewsDefault: cfg.previewsDefault(),
+		Username:            cfg.User.Username,
+		PasswordHash:        cfg.User.PasswordHash,
+		SessionTTL:          cfg.sessionTTL(),
+		SecureCookies:       cfg.SecureCookies,
+		PreviewsDefault:     cfg.previewsDefault(),
+		TrustProxyForwarded: cfg.BehindProxy,
 	}, h, assets)
 	if err != nil {
 		return err

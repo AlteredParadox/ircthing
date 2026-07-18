@@ -45,7 +45,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	// The current-password check is a credential comparison, so rate-limit and
 	// bound the bcrypt work exactly like login.
-	source := loginSourceKey(r)
+	source := s.loginSourceKey(r)
 	if wait := s.login.retryAfter(source, time.Now()); wait > 0 {
 		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
 		return

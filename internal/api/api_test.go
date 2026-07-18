@@ -989,3 +989,26 @@ func TestWSRevokedOnLogout(t *testing.T) {
 		t.Fatal("socket still open 3s after logout")
 	}
 }
+
+// The login backoff keys on the forwarded client IP only when TrustProxyForwarded
+// is set, so one attacker behind a proxy can't lock out every user.
+func TestLoginSourceKeyForwarded(t *testing.T) {
+	srv := &Server{cfg: Config{TrustProxyForwarded: true}}
+	req := httptest.NewRequest("POST", "/api/login", nil)
+	req.RemoteAddr = "10.0.0.1:5555" // the proxy
+
+	req.Header.Set("X-Real-IP", "203.0.113.7")
+	if got := srv.loginSourceKey(req); got != "203.0.113.7" {
+		t.Fatalf("X-Real-IP source = %q, want 203.0.113.7", got)
+	}
+	req.Header.Del("X-Real-IP")
+	req.Header.Set("X-Forwarded-For", "1.2.3.4, 203.0.113.9") // last hop = real client
+	if got := srv.loginSourceKey(req); got != "203.0.113.9" {
+		t.Fatalf("XFF source = %q, want 203.0.113.9", got)
+	}
+	// Untrusted: client-settable headers are ignored, fall back to RemoteAddr.
+	srv.cfg.TrustProxyForwarded = false
+	if got := srv.loginSourceKey(req); got != "10.0.0.1" {
+		t.Fatalf("untrusted source = %q, want 10.0.0.1", got)
+	}
+}

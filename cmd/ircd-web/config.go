@@ -50,6 +50,12 @@ type config struct {
 	// only). Turn this on when a TLS-terminating reverse proxy fronts
 	// the binary — i.e. any deployment beyond plain-HTTP loopback.
 	SecureCookies bool `json:"secure_cookies"`
+	// BehindProxy: the binary sits behind a trusted reverse proxy that sets
+	// X-Real-IP / X-Forwarded-For. The login backoff then keys on the real
+	// client IP instead of the shared proxy address, so one attacker can't
+	// lock out every user. Leave false for direct/loopback deployments —
+	// otherwise a client could spoof those headers to evade backoff.
+	BehindProxy bool `json:"behind_proxy"`
 	// DisablePreviews is the initial default for the previews switch, and
 	// is deliberately tri-state so the default can be privacy-first without
 	// silently overriding an explicit choice:

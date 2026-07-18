@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -106,11 +107,38 @@ func (l *loginLimiter) release() {
 	<-l.sem
 }
 
-// loginSourceKey identifies the attempt source: the remote IP.
-func loginSourceKey(r *http.Request) string {
+// loginSourceKey identifies the attempt source for backoff. Behind a reverse
+// proxy every attempt would otherwise share the proxy's IP, so one attacker's
+// sustained failures lock out the real user (and even authenticated password
+// changes) — a public denial of service. When TrustProxyForwarded is set (the
+// deployment is behind a trusted single-hop proxy) it uses the forwarded
+// client IP instead, giving each real client its own backoff bucket. These
+// headers are client-settable, so they are consulted ONLY under that flag.
+func (s *Server) loginSourceKey(r *http.Request) string {
+	if s.cfg.TrustProxyForwarded {
+		if ip := forwardedClientIP(r); ip != "" {
+			return ip
+		}
+	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// forwardedClientIP is the client address a trusted single-hop proxy reports:
+// X-Real-IP (the single immediate-peer value nginx/Caddy can set), else the
+// LAST X-Forwarded-For entry — the proxy appends the address it received from
+// AFTER any client-supplied values, so on a single trusted hop it is the real
+// client and can't be spoofed.
+func forwardedClientIP(r *http.Request) string {
+	if v := strings.TrimSpace(r.Header.Get("X-Real-IP")); v != "" {
+		return v
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		return strings.TrimSpace(parts[len(parts)-1])
+	}
+	return ""
 }
