@@ -23,6 +23,47 @@ const PAGE = 100;
 // array grow to hundreds of MB, and each live append copies the array.
 const TRIM_AT = 5000;
 const TRIM_TO = 2500;
+// Byte bound per buffer, enforced alongside the count bound: 5000 messages of
+// the store's 16 KiB cap would be ~80 MB, so a hostile server sending max-size
+// lines is capped here regardless of count. Real scrollback is a fraction of
+// this. Tracked incrementally (msgs[key].bytes) so appends stay O(1).
+const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
+
+// evBytes estimates one event's retained size; a whois card is already
+// server-side clamped to a small bound.
+function evBytes(ev) {
+	if (ev.whois) return 4096;
+	return (ev.raw ? ev.raw.length : 0) + (ev.text ? ev.text.length : 0) + 48;
+}
+function listBytes(list) {
+	let t = 0;
+	for (const e of list) t += evBytes(e);
+	return t;
+}
+
+// trimBuffer bounds a list by BOTH count and bytes, given a running byte total,
+// and reports the new total. Drops from the front (oldest); reachedTop clears
+// if anything was dropped, since older pages must then refetch.
+function trimBuffer(list, bytes, reachedTop) {
+	if (list.length > TRIM_AT) {
+		const drop = list.length - TRIM_TO;
+		for (let i = 0; i < drop; i++) bytes -= evBytes(list[i]);
+		list = list.slice(drop);
+		reachedTop = false;
+	}
+	if (bytes > MAX_BUFFER_BYTES) {
+		let i = 0;
+		while (i < list.length - 1 && bytes > MAX_BUFFER_BYTES) {
+			bytes -= evBytes(list[i]);
+			i++;
+		}
+		if (i > 0) {
+			list = list.slice(i);
+			reachedTop = false;
+		}
+	}
+	return { list, bytes, reachedTop };
+}
 // Live message lists are kept only for the few most-recently-active
 // buffers. A bouncer pushes events for every joined channel, so without
 // this bound the in-memory lists grow one-capped-list-per-buffer across
@@ -110,28 +151,22 @@ function appendEventMsgs(m, key, ev, keep) {
 	// Accumulate even before history is loaded — the fetch response
 	// merges and dedupes, so events racing an in-flight history request
 	// are never lost.
-	let list = [...(cur?.list || []), ev];
-	let reachedTop = cur?.reachedTop;
-	if (list.length > TRIM_AT) {
-		list = list.slice(list.length - TRIM_TO);
-		reachedTop = false;
-	}
-	return { ...m, [key]: { ...cur, list, reachedTop } };
+	const list = [...(cur?.list || []), ev];
+	const bytes = (cur?.bytes ?? listBytes(cur?.list || [])) + evBytes(ev);
+	return { ...m, [key]: { ...cur, ...trimBuffer(list, bytes, cur?.reachedTop) } };
 }
 
-// appendInfoLine appends an ephemeral server_info system line, bounded the
-// same way appendEventMsgs is: a flood (e.g. /list streaming one line per
-// channel on a huge network) must not grow the buffer without limit.
+// appendInfoLine appends an ephemeral server_info / whois line. It creates the
+// buffer (MOTD/whois must show even before it's viewed), but the count+byte
+// bound caps its growth, and a recreated-after-eviction buffer is reclaimed on
+// the next buffer switch (the eviction effect), so a server_info flood can't
+// grow it or the buffer set without limit.
 function appendInfoLine(m, key, ev) {
 	const cur = m[key];
 	if (cur?.loaded && cur.atTail === false) return m;
-	let list = [...(cur?.list || []), ev];
-	let reachedTop = cur?.reachedTop;
-	if (list.length > TRIM_AT) {
-		list = list.slice(list.length - TRIM_TO);
-		reachedTop = false;
-	}
-	return { ...m, [key]: { ...cur, list, reachedTop } };
+	const list = [...(cur?.list || []), ev];
+	const bytes = (cur?.bytes ?? listBytes(cur?.list || [])) + evBytes(ev);
+	return { ...m, [key]: { ...cur, ...trimBuffer(list, bytes, cur?.reachedTop) } };
 }
 
 // clearTyperFor drops one nick's typing state (they just spoke).
@@ -220,10 +255,12 @@ function mergeHistoryPage(m, key, page, tombstones) {
 	// in-flight load early; this guards the re-dispatch race belt-and-braces.)
 	if (cur?.loaded && cur.atTail === false) return m;
 	const pageMsgs = page.messages || [];
+	const list = applyTombstones(mergeById(cur?.list || [], pageMsgs), tombstones);
 	return {
 		...m,
 		[key]: {
-			list: applyTombstones(mergeById(cur?.list || [], pageMsgs), tombstones),
+			list,
+			bytes: listBytes(list),
 			loaded: true,
 			reachedTop: pageMsgs.length < PAGE,
 			atTail: true,
@@ -1111,13 +1148,13 @@ export function App() {
 				// ghost buffer, mirroring the initial load and loadOlder guards.
 				if ((historyGen.current[key] || 0) !== gen) return;
 				setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(ev.network, ev.buffer) }));
-				setMsgs((m) => ({
-					...m,
-					[key]: {
-						list: applyTombstones(page.messages || [], redactedIds.current.get(key)),
-						loaded: true, reachedTop: false, atTail: false,
-					},
-				}));
+				setMsgs((m) => {
+					const list = applyTombstones(page.messages || [], redactedIds.current.get(key));
+					return {
+						...m,
+						[key]: { list, bytes: listBytes(list), loaded: true, reachedTop: false, atTail: false },
+					};
+				});
 				location.hash = toHash(ev.network, ev.buffer);
 				setActiveKey(key);
 				setFocusId(ev.id);
@@ -1161,6 +1198,7 @@ export function App() {
 						[key]: {
 							...prev,
 							list,
+							bytes: listBytes(list),
 							reachedTop: older.length < PAGE,
 							atTail,
 						},

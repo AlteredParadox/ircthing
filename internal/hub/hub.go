@@ -796,11 +796,26 @@ func (h *Hub) accumulateWhois(ev irc.Event, whois map[string]*WhoisData) bool {
 		if w := whois[nick]; w != nil {
 			delete(whois, nick)
 			w.Network = ev.Network
+			clampWhois(w) // bound server-controlled fields the client then retains
 			h.broadcast(envelope("whois", 0, w))
 		}
 		return true
 	}
 	return false
+}
+
+// clampWhois bounds every server-controlled string field of a whois card
+// before it is broadcast — a hostile server can pack ~64 KiB into each, and
+// the client keeps completed cards in scrollback.
+func clampWhois(w *WhoisData) {
+	w.User = clampServerInfo(w.User)
+	w.Host = clampServerInfo(w.Host)
+	w.Realname = clampServerInfo(w.Realname)
+	w.Server = clampServerInfo(w.Server)
+	w.Channels = clampServerInfo(w.Channels)
+	w.Account = clampServerInfo(w.Account)
+	w.Actual = clampServerInfo(w.Actual)
+	w.Away = clampServerInfo(w.Away)
 }
 
 // applyWhois sets the field one WHOIS numeric carries.
