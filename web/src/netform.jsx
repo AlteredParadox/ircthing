@@ -1,10 +1,10 @@
 import { useState } from "preact/hooks";
 
 // NetworkForm: add/edit a network (The Lounge-style form). `initial` is
-// the stored config object when editing (unshown fields like
-// trusted_fingerprints are preserved by spreading it), null when adding.
-// Saving reconnects the network; the server replies with an error string
-// on invalid input, surfaced inline.
+// the stored config object when editing (spread so any field this form does
+// not surface is preserved), null when adding. Saving reconnects the network;
+// the server replies with an error string on invalid input (e.g. a malformed
+// pinned fingerprint), surfaced inline.
 
 const SASL_CHOICES = ["none", "auto", "PLAIN", "SCRAM-SHA-256", "EXTERNAL"];
 
@@ -28,6 +28,7 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 		...initial,
 	}));
 	const [channels, setChannels] = useState((initial?.channels || []).join(" "));
+	const [fingerprints, setFingerprints] = useState((initial?.trusted_fingerprints || []).join("\n"));
 	const [confirmDel, setConfirmDel] = useState(false);
 	const set = (patch) => setCfg((c) => ({ ...c, ...patch }));
 	const sasl = saslChoice(cfg);
@@ -48,11 +49,13 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 		e.preventDefault();
 		const out = { ...cfg };
 		out.channels = channels.split(/[\s,]+/).filter(Boolean);
+		out.trusted_fingerprints = fingerprints.split(/[\s,]+/).filter(Boolean);
 		// Empty optional strings just clutter the stored JSON.
 		for (const k of ["username", "realname", "pass", "proxy"]) {
 			if (!out[k]) delete out[k];
 		}
 		if (!out.channels.length) delete out.channels;
+		if (!out.trusted_fingerprints.length) delete out.trusted_fingerprints;
 		if (out.sasl) {
 			const s2 = { ...out.sasl };
 			for (const k of ["mechanism", "login", "password", "cert_file", "key_file"]) {
@@ -93,6 +96,18 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 								</label>
 							)}
 						</div>
+						{cfg.tls && (
+							<Field label="Pinned cert fingerprints">
+								<textarea
+									class="rule-input"
+									rows={2}
+									spellcheck={false}
+									value={fingerprints}
+									onInput={(e) => setFingerprints(e.currentTarget.value)}
+									placeholder="SHA-256 hex, one per line (optional; for self-signed servers)"
+								/>
+							</Field>
+						)}
 						<Field label="Nick">
 							<input class="rule-input" value={cfg.nick || ""} onInput={(e) => set({ nick: e.currentTarget.value })} />
 						</Field>
