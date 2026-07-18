@@ -38,6 +38,16 @@ const (
 	// copy (see append) stops an oversized field from a hostile server
 	// pinning a whole 64 KiB parsed line alive in a hot ring.
 	maxStoredFieldBytes = 512
+	// maxHotRingBytes is the global budget for all resident hot rings combined.
+	// The per-buffer ring count (DefaultRingSize) and per-message clamps bound
+	// ONE ring, but nothing bounded the total across buffers: a hostile server
+	// opening many buffers of max-size messages could hold GBs resident. Above
+	// this the least-recently-used rings are evicted (re-warmed from SQLite on
+	// next access). Still ~16× the ~50-buffer design point (~1 MB of hot rings),
+	// so it never bites legitimate use; sized to leave headroom for SQLite
+	// write-churn so even an adversarial flood keeps process RSS under the 72 MB
+	// target (see the adversarial memcheck scenario).
+	maxHotRingBytes = 16 << 20 // 16 MiB
 )
 
 // clampUTF8 truncates s to at most max bytes, trimming a trailing partial
@@ -132,15 +142,20 @@ type Options struct {
 // caches; at IRC message rates lock contention is a non-issue and this
 // keeps the invariants easy to reason about.
 type Store struct {
-	db        *sql.DB
-	ringSize  int
-	retention retentionPolicy
+	db           *sql.DB
+	ringSize     int
+	maxRingBytes int // global hot-ring byte budget; resident rings are LRU-evicted above it
+	retention    retentionPolicy
 
-	mu       sync.Mutex
-	networks map[string]int64
-	buffers  map[bufKey]int64
-	rings    map[int64]*ring
-	stats    struct{ ringPages, dbPages int } // observability for tests
+	mu        sync.Mutex
+	networks  map[string]int64
+	buffers   map[bufKey]int64
+	rings     map[int64]*ring
+	ringBytes int64  // running sum of every resident ring's bytes (kept in step under mu)
+	accessSeq uint64 // monotonic LRU clock, stamped onto a ring by touchRing
+	stats     struct {
+		ringPages, dbPages, ringEvictions int // observability for tests
+	}
 
 	stopPruner chan struct{}  // closed by Close to end the pruner
 	prunerDone sync.WaitGroup // waits for the pruner goroutine to exit
@@ -278,12 +293,13 @@ func Open(path string, opts Options) (*Store, error) {
 		}
 	}
 	s := &Store{
-		db:        db,
-		ringSize:  opts.RingSize,
-		retention: retentionPolicy{days: opts.RetentionDays, maxPerBuffer: opts.RetentionMaxMessages},
-		networks:  make(map[string]int64),
-		buffers:   make(map[bufKey]int64),
-		rings:     make(map[int64]*ring),
+		db:           db,
+		ringSize:     opts.RingSize,
+		maxRingBytes: maxHotRingBytes,
+		retention:    retentionPolicy{days: opts.RetentionDays, maxPerBuffer: opts.RetentionMaxMessages},
+		networks:     make(map[string]int64),
+		buffers:      make(map[bufKey]int64),
+		rings:        make(map[int64]*ring),
 	}
 	// The settings table (seeded from config on first run) is authoritative
 	// for retention, so a UI change survives a restart.
@@ -466,7 +482,9 @@ func (s *Store) insertLocked(ctx context.Context, bufID int64, r *ring, m Messag
 	if err != nil {
 		return Message{}, err
 	}
-	r.insert(m)
+	s.ringBytes += int64(r.insert(m))
+	s.touchRing(r)
+	s.evictRings(bufID)
 	return m, nil
 }
 
@@ -538,7 +556,8 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 		return false, err
 	}
 	if r, ok := s.rings[bufID]; ok {
-		r.redact(msgid, reason)
+		s.ringBytes += int64(r.redact(msgid, reason)) // frees Raw/Text: a net decrease
+		s.touchRing(r)
 	}
 	return true, nil
 }
@@ -618,7 +637,9 @@ func (s *Store) AdoptOwnMsgID(ctx context.Context, msg OwnMsg, fold func(string)
 		return false, err
 	}
 	if r, ok := s.rings[bufID]; ok {
-		r.adoptMsgID(id, msg.MsgID)
+		s.ringBytes += int64(r.adoptMsgID(id, msg.MsgID))
+		s.touchRing(r)
+		s.evictRings(bufID)
 	}
 	return true, nil
 }
@@ -844,6 +865,39 @@ func (s *Store) bufferID(ctx context.Context, network, target string, create boo
 	return bufID, nil
 }
 
+// touchRing stamps a ring as most-recently-used for the LRU clock. Caller holds s.mu.
+func (s *Store) touchRing(r *ring) {
+	s.accessSeq++
+	r.lastUsed = s.accessSeq
+}
+
+// evictRings drops least-recently-used resident rings until the global hot-ring
+// byte total is back within budget, never evicting keepID (the ring the current
+// operation is using). An evicted ring re-warms from SQLite on next access, so
+// eviction is transparent to correctness — it only forces a disk read. Caller
+// holds s.mu.
+func (s *Store) evictRings(keepID int64) {
+	for s.ringBytes > int64(s.maxRingBytes) {
+		var victim int64
+		var seq uint64
+		found := false
+		for id, r := range s.rings {
+			if id == keepID {
+				continue
+			}
+			if !found || r.lastUsed < seq {
+				victim, seq, found = id, r.lastUsed, true
+			}
+		}
+		if !found {
+			return // only the in-use ring remains; can't evict it
+		}
+		s.ringBytes -= int64(s.rings[victim].bytes)
+		delete(s.rings, victim)
+		s.stats.ringEvictions++
+	}
+}
+
 // bufferAndRing resolves the buffer and returns its ring, warming the ring
 // from disk on first touch after startup. A nil ring means the buffer does
 // not exist (and create was false). Caller holds s.mu.
@@ -853,6 +907,7 @@ func (s *Store) bufferAndRing(ctx context.Context, network, target string, creat
 		return 0, nil, err
 	}
 	if r, ok := s.rings[bufID]; ok {
+		s.touchRing(r)
 		return bufID, r, nil
 	}
 	// Warm with the newest ringSize+1 rows: getting fewer proves the ring
@@ -875,6 +930,9 @@ func (s *Store) bufferAndRing(ctx context.Context, network, target string, creat
 		r.insert(m)
 	}
 	s.rings[bufID] = r
+	s.ringBytes += int64(r.bytes)
+	s.touchRing(r)
+	s.evictRings(bufID) // a full warm can add up to one ring's worth at once
 	return bufID, r, nil
 }
 

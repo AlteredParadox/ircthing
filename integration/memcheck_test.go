@@ -204,6 +204,101 @@ func TestMemoryScenario(t *testing.T) {
 	}
 }
 
+// Adversarial scenario for the hot-ring global byte budget (store #5): one
+// hostile network floods many channels with near-max-size messages. The total
+// hot-ring payload without the budget would be advChannels*advMsgs*advMsgBytes
+// (~75 MB), far past the 16 MiB budget; LRU eviction must keep the process RSS
+// under the 72 MB target.
+const (
+	advChannels = 24
+	advMsgs     = 200   // fill each ring (DefaultRingSize)
+	advMsgBytes = 16000 // near the 16 KiB per-message clamp
+)
+
+// startBigBlast writes advMsgs rounds of one near-max-size PRIVMSG per channel,
+// one round per write so the test never builds the whole flood in memory.
+func (f *fakeIRCServer) startBigBlast(t *testing.T, channels []string) {
+	body := strings.Repeat("x", advMsgBytes)
+	for i := 0; i < advMsgs; i++ {
+		var b strings.Builder
+		for _, ch := range channels {
+			fmt.Fprintf(&b, ":user%d!u@example.com PRIVMSG %s :%s\r\n", i%20, ch, body)
+		}
+		if err := f.writeString(b.String()); err != nil {
+			t.Errorf("big blast: %v", err)
+			return
+		}
+	}
+}
+
+func TestMemoryScenarioAdversarial(t *testing.T) {
+	bin := os.Getenv("IRCTHING_BIN")
+	if bin == "" {
+		t.Fatal("IRCTHING_BIN not set (run via `make memcheck`)")
+	}
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "adv.db")
+
+	f := startFakeIRC(t)
+	channels := make([]string, advChannels)
+	for i := range channels {
+		channels[i] = fmt.Sprintf("#adv%d", i)
+	}
+	cfg := fmt.Sprintf(`{
+		"listen": "127.0.0.1:0",
+		"database": %q,
+		"user": {"username": "mem", "password_hash": "$2a$10$/vXcvxwnd0BAE188Vf9aSOFQFZeGKQsf1817JpdYiDhibk6nh7QQ."},
+		"networks": [{"name":"adv","addr":"%s","allow_plaintext":true,"nick":"memuser","channels":[%s]}]
+	}`, dbPath, f.ln.Addr(), `"`+strings.Join(channels, `","`)+`"`)
+	cfgPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "-config", cfgPath)
+	cmd.Env = append(os.Environ(), "GOMEMLIMIT=64MiB")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+
+	deadline := time.Now().Add(60 * time.Second)
+	for f.joined.Load() < advChannels {
+		if time.Now().After(deadline) {
+			t.Fatalf("client never joined all channels (%d/%d)", f.joined.Load(), advChannels)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	f.startBigBlast(t, channels)
+
+	ro, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	want := advChannels * advMsgs
+	deadline = time.Now().Add(180 * time.Second)
+	for {
+		var n int
+		_ = ro.QueryRow(`SELECT count(*) FROM messages`).Scan(&n)
+		if n >= want {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("persisted %d/%d messages", n, want)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	time.Sleep(3 * time.Second)
+	rss, hwm := readRSS(t, cmd.Process.Pid)
+	t.Logf("adversarial RSS = %.1f MB, peak = %.1f MB (budget %.0f MB, ~75 MB flood, 16 MiB ring budget)",
+		float64(rss)/1024, float64(hwm)/1024, float64(rssBudgetKB)/1024)
+	if rss > rssBudgetKB {
+		t.Fatalf("adversarial RSS %d kB exceeds the %d kB budget — hot-ring LRU not bounding memory", rss, rssBudgetKB)
+	}
+}
+
 // readRSS returns VmRSS and VmHWM in kB from /proc.
 func readRSS(t *testing.T, pid int) (rss, hwm int) {
 	t.Helper()

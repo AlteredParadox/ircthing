@@ -21,10 +21,28 @@ type ring struct {
 	max      int
 	msgs     []Message // ascending by (ts, id)
 	complete bool
+	// bytes is the running sum of msgBytes over msgs — the ring's estimated
+	// resident cost, kept in step by every mutation so the Store can enforce a
+	// global hot-ring byte budget without rescanning. lastUsed is the LRU access
+	// sequence, stamped by Store.touchRing.
+	bytes    int
+	lastUsed uint64
 }
 
 func newRing(max int) *ring {
 	return &ring{max: max}
+}
+
+// msgOverhead approximates a Message's fixed retained cost beyond its string
+// CONTENT: the string headers, Time/ID/bool fields, and per-element slice slack.
+// The budget only needs to be roughly right — it bounds memory, not bills it.
+const msgOverhead = 128
+
+// msgBytes estimates the bytes a Message keeps resident in a ring: all its
+// (server-controlled, already-clamped) string content plus the fixed overhead.
+func msgBytes(m Message) int {
+	return len(m.Network) + len(m.Target) + len(m.Sender) + len(m.MsgID) +
+		len(m.Command) + len(m.Raw) + len(m.Text) + len(m.RedactReason) + msgOverhead
 }
 
 func cursorLess(a, b Cursor) bool {
@@ -33,8 +51,10 @@ func cursorLess(a, b Cursor) bool {
 
 // insert places m in cursor order and evicts the oldest entry when over
 // capacity. Live traffic is almost always an append at the end; the sorted
-// insert only matters for slightly out-of-order server-time values.
-func (r *ring) insert(m Message) {
+// insert only matters for slightly out-of-order server-time values. Returns the
+// change in r.bytes so the Store can track the global total.
+func (r *ring) insert(m Message) int {
+	before := r.bytes
 	c := m.Cursor()
 	i := sort.Search(len(r.msgs), func(i int) bool {
 		return cursorLess(c, r.msgs[i].Cursor())
@@ -42,12 +62,15 @@ func (r *ring) insert(m Message) {
 	r.msgs = append(r.msgs, Message{})
 	copy(r.msgs[i+1:], r.msgs[i:])
 	r.msgs[i] = m
+	r.bytes += msgBytes(m)
 	if len(r.msgs) > r.max {
 		// The evicted message (possibly m itself, if it predates
 		// everything here) lives only on disk now.
+		r.bytes -= msgBytes(r.msgs[0])
 		r.msgs = append(r.msgs[:0], r.msgs[1:]...)
 		r.complete = false
 	}
+	return r.bytes - before
 }
 
 // pageBefore returns up to limit messages with cursor < c (ascending) and
@@ -84,13 +107,16 @@ func (r *ring) pageAfter(c Cursor, limit int) ([]Message, bool) {
 // history pages reflect the redaction without a database round-trip.
 // adoptMsgID stamps a msgid onto the ring's copy of a row (matched by
 // id), keeping the hot cache consistent with AdoptOwnMsgID.
-func (r *ring) adoptMsgID(id int64, msgid string) {
+func (r *ring) adoptMsgID(id int64, msgid string) int {
 	for i := range r.msgs {
 		if r.msgs[i].ID == id {
+			delta := len(msgid) - len(r.msgs[i].MsgID)
 			r.msgs[i].MsgID = msgid
-			return
+			r.bytes += delta
+			return delta
 		}
 	}
+	return 0
 }
 
 // applyRetention removes messages the store's retention pruning just
@@ -103,33 +129,46 @@ func (r *ring) adoptMsgID(id int64, msgid string) {
 // ring in step with the identical disk delete keeps it a faithful complete
 // view, and leaving a non-complete ring non-complete only means reads may
 // still fall back to disk (which now returns the same rows).
-func (r *ring) applyRetention(cutoffMs int64, maxPerBuffer int) {
+func (r *ring) applyRetention(cutoffMs int64, maxPerBuffer int) int {
+	before := r.bytes
 	if cutoffMs > 0 {
 		// msgs are ascending by (ts, id): find the first kept entry.
 		i := sort.Search(len(r.msgs), func(i int) bool {
 			return r.msgs[i].Time.UnixMilli() >= cutoffMs
 		})
 		if i > 0 {
+			for j := 0; j < i; j++ {
+				r.bytes -= msgBytes(r.msgs[j])
+			}
 			r.msgs = append(r.msgs[:0], r.msgs[i:]...)
 		}
 	}
 	if maxPerBuffer > 0 && len(r.msgs) > maxPerBuffer {
-		r.msgs = append(r.msgs[:0], r.msgs[len(r.msgs)-maxPerBuffer:]...)
+		drop := len(r.msgs) - maxPerBuffer
+		for j := 0; j < drop; j++ {
+			r.bytes -= msgBytes(r.msgs[j])
+		}
+		r.msgs = append(r.msgs[:0], r.msgs[drop:]...)
 	}
+	return r.bytes - before
 }
 
-func (r *ring) redact(msgid, reason string) {
+func (r *ring) redact(msgid, reason string) int {
 	for i := range r.msgs {
 		if r.msgs[i].MsgID == msgid {
+			old := len(r.msgs[i].Raw) + len(r.msgs[i].Text) + len(r.msgs[i].RedactReason)
 			r.msgs[i].Redacted = true
 			r.msgs[i].RedactReason = reason
 			// Scrub the hot copy in step with the destructive DB update, so
 			// pages served from memory do not leak the redacted body.
 			r.msgs[i].Raw = ""
 			r.msgs[i].Text = ""
-			return
+			delta := len(reason) - old
+			r.bytes += delta
+			return delta
 		}
 	}
+	return 0
 }
 
 // clone copies a page out of the ring so callers never alias its backing

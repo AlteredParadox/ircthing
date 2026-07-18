@@ -74,13 +74,15 @@ test("rememberRedaction + applyTombstones re-tombstones a re-delivered row", () 
 test("rememberRedaction bounds the outer per-buffer map", () => {
 	const store = new Map();
 	// Redactions across endlessly-varying targets must not grow the outer map
-	// without limit (a hostile flood). The cap is 256; add more and the oldest
-	// buffers are evicted.
+	// without limit (a hostile flood): the oldest buffers are evicted past the cap.
 	for (let i = 0; i < 400; i++) rememberRedaction(store, "libera\x00#c" + i, "m", "r");
-	is(store.size <= 256, true);
+	is(store.size <= 128, true);
 	// The oldest buffer was evicted; the newest is retained.
 	is(store.has("libera\x00#c0"), false);
 	is(store.has("libera\x00#c399"), true);
+	// A long redaction reason is truncated in the retained tombstone.
+	rememberRedaction(store, "libera\x00#c399", "big", "x".repeat(5000));
+	is(store.get("libera\x00#c399").get("big").length, 256);
 });
 
 test("applyTombstones is a no-op without tombstones", () => {

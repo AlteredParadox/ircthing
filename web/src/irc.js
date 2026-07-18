@@ -679,8 +679,14 @@ export function mergeById(existing, incoming) {
 // redaction flood across endlessly-varying targets can't grow the outer map
 // without limit either (it is only a belt-and-braces guard over the server's
 // destructive scrub). The reason string is server-clamped upstream.
-const maxTombstonesPerBuffer = 1000;
-const maxTombstoneBuffers = 256;
+// Bounds on the redaction-tombstone store (belt-and-braces over the server's
+// DESTRUCTIVE scrub, so it only guards the narrow snapshot-before-scrub race).
+// Kept modest so a hostile server redacting endlessly can't grow browser memory
+// without limit: worst case ~maxTombstoneBuffers × maxTombstonesPerBuffer ×
+// (msgid ≤512 B + maxTombstoneReason) ≈ tens of MB, not hundreds.
+const maxTombstonesPerBuffer = 400;
+const maxTombstoneBuffers = 128;
+const maxTombstoneReason = 256; // display only needs a short reason
 
 export function rememberRedaction(store, key, msgid, reason) {
 	if (!msgid) return;
@@ -692,7 +698,7 @@ export function rememberRedaction(store, key, msgid, reason) {
 			store.delete(store.keys().next().value); // evict oldest buffer, insertion order
 		}
 	}
-	byId.set(msgid, reason || "");
+	byId.set(msgid, (reason || "").slice(0, maxTombstoneReason));
 	if (byId.size > maxTombstonesPerBuffer) {
 		byId.delete(byId.keys().next().value); // evict oldest by insertion order
 	}

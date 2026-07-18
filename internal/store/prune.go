@@ -184,6 +184,6 @@ func (s *Store) reconcileRings(appliedCutoff int64, appliedMax int) {
 		return
 	}
 	for _, r := range s.rings {
-		r.applyRetention(appliedCutoff, appliedMax)
+		s.ringBytes += int64(r.applyRetention(appliedCutoff, appliedMax)) // frees rows: a net decrease
 	}
 }
