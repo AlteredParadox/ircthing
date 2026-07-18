@@ -400,9 +400,13 @@ export function proxyCredsExposed(proxy) {
 
 // foldNick applies an RFC1459-superset case fold for keying nick comparisons
 // client-side (we don't know the network's exact CASEMAPPING): lowercase, plus
-// the []\~ -> {}|^ mapping rfc1459/-strict treat as case-equivalent. Folding a
-// superset never fails to match equivalent nicks; at worst it over-matches two
-// the server keeps distinct, harmless for the /whois reply correlation.
+// the full []\~ -> {}|^ mapping of rfc1459 (rfc1459-strict folds only []\,
+// and ascii folds none of them — this is deliberately the LOOSEST of the
+// three). Folding a superset never fails to match equivalent nicks; the
+// accepted tradeoff is that two nicks the server keeps distinct (e.g. Name[
+// vs Name{ on an ascii network) can collide in the pending-/whois Set, so
+// one of two near-simultaneous whois replies may be dropped — rare, bounded,
+// and recoverable by re-issuing the /whois.
 export function foldNick(s) {
 	const m = { "[": "{", "]": "}", "\\": "|", "~": "^" };
 	return String(s).toLowerCase().replace(/[[\]\\~]/g, (c) => m[c]);

@@ -1789,6 +1789,46 @@ func TestWhoisAccumulation(t *testing.T) {
 	expectSilence(t, s)
 }
 
+// Real servers (Ergo among them) send the WHOIS detail numerics with the
+// target's CANONICAL spelling but echo the CLIENT'S requested spelling in
+// the 318 terminator. The accumulator must correlate the two under the
+// connection's casemapping fold — keyed by exact spelling, /whois ALICE for
+// canonical Alice would strand the card and the client would never see it.
+func TestWhoisMixedCaseFlushes(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 16), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+
+	// /whois ALICE: details arrive canonical, 301 and 318 echo the request.
+	conn.ch <- ev(":srv 311 AlteredParadox Alice ~auser example.org * :Alice A.")
+	conn.ch <- ev(":srv 301 AlteredParadox ALICE :gone fishing")
+	conn.ch <- ev(":srv 318 AlteredParadox ALICE :End of /WHOIS list")
+	w := decode[WhoisData](t, recv(t, s, "whois"))
+	if w.Nick != "Alice" || w.Away != "gone fishing" {
+		t.Fatalf("mixed-case whois card = %+v; want canonical Nick with away folded in", w)
+	}
+
+	// rfc1459 folds []\~ as well as letters: nick[a and nick{a correlate.
+	conn.ch <- ev(":srv 311 AlteredParadox nick[a ~u h * :real")
+	conn.ch <- ev(":srv 318 AlteredParadox NICK{A :End of /WHOIS list")
+	if w := decode[WhoisData](t, recv(t, s, "whois")); w.Nick != "nick[a" {
+		t.Fatalf("rfc1459-special whois card = %+v", w)
+	}
+
+	// Both cards flushed — a repeat terminator has nothing left to consume.
+	conn.ch <- ev(":srv 318 AlteredParadox alice :End of /WHOIS list")
+	expectSilence(t, s)
+}
+
 // Concurrent hub sessions are capped; the next NewSession returns nil so
 // the transport can reject the upgrade.
 func TestHubSessionCap(t *testing.T) {

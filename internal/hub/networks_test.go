@@ -273,10 +273,11 @@ func TestPresenceCasemapping(t *testing.T) {
 // nicks that never terminate with 318.
 func TestWhoisMapBounded(t *testing.T) {
 	whois := make(map[string]*WhoisData)
+	conn := &fakeConn{name: "libera", nick: "AlteredParadox"}
 	for i := 0; i < maxOpenWhois+200; i++ {
 		ev := irc.Event{Network: "libera", Kind: irc.EventMessage,
 			Msg: ircv4.MustParseMessage(":srv 311 AlteredParadox nick" + strconv.Itoa(i) + " u h * :real")}
-		newTestHub(t).accumulateWhois(ev, whois)
+		newTestHub(t).accumulateWhois(conn, ev, whois)
 	}
 	if len(whois) > maxOpenWhois {
 		t.Fatalf("whois map = %d entries, want <= %d", len(whois), maxOpenWhois)

@@ -242,7 +242,7 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 		return nil
 	}
 	// WHOIS replies accumulate into one card (consumed here).
-	if h.accumulateWhois(ev, whois) {
+	if h.accumulateWhois(c, ev, whois) {
 		return nil
 	}
 	// Other command replies (WHOWAS/WHO/LIST/AWAY/...) and error numerics
@@ -770,44 +770,51 @@ func clampServerInfo(s string) string {
 	return s
 }
 
-// accumulateWhois collects the WHOIS reply numerics into one card,
-// keyed by the queried nick (param 1), and flushes it as a "whois" push
-// on 318 (end of /WHOIS). It returns true when it consumed the message
-// — so whois numerics never reach serverInfo. 301 (away) is folded in
-// only while a whois for that nick is in progress; a standalone away
-// notice falls through to serverInfo. Whois state is per connection
-// (reset on registration in Run).
-func (h *Hub) accumulateWhois(ev irc.Event, whois map[string]*WhoisData) bool {
+// accumulateWhois collects the WHOIS reply numerics into one card, keyed
+// by the CONNECTION-FOLDED queried nick (param 1), and flushes it as a
+// "whois" push on 318 (end of /WHOIS). The fold matters: real servers
+// (Ergo among them) send the detail numerics with the target's CANONICAL
+// spelling but echo the CLIENT'S requested spelling in 318 — /whois ALICE
+// for canonical Alice would otherwise accumulate whois["Alice"] and try
+// to flush whois["ALICE"], stranding the card until re-registration.
+// Returns true when it consumed the message — so whois numerics never
+// reach serverInfo. 301 (away) is folded in only while a whois for that
+// nick is in progress; a standalone away notice falls through to
+// serverInfo. Whois state is per connection (reset on registration in
+// Run).
+func (h *Hub) accumulateWhois(c Conn, ev irc.Event, whois map[string]*WhoisData) bool {
 	m := ev.Msg
 	switch m.Command {
 	case "311", "312", "313", "317", "319", "330", "335", "338", "378", "379", "671":
-		// Clamp+detach the key: it is a retained map key AND the card's Nick, so a
-		// hostile ~64 KiB nick must not pin the parsed line for the card's life.
+		// Clamp+detach BEFORE folding: the fold's output becomes a retained
+		// map key, and the card's Nick keeps the wire spelling — neither may
+		// pin a hostile ~64 KiB parsed line for the card's life.
 		nick := clampDetach(m.Param(1))
 		if nick == "" {
 			return true
 		}
-		w := whois[nick]
+		key := c.Fold(nick)
+		w := whois[key]
 		if w == nil {
 			if len(whois) >= maxOpenWhois {
 				return true // consumed but not tracked: bound the map
 			}
 			w = &WhoisData{Nick: nick}
-			whois[nick] = w
+			whois[key] = w
 		}
 		applyWhois(w, m)
 		clampWhois(w) // bound+detach fields now — the server may never send 318
 		return true
 	case "301": // away — part of a whois only if one is open
-		if w := whois[clampServerInfo(m.Param(1))]; w != nil {
+		if w := whois[c.Fold(clampServerInfo(m.Param(1)))]; w != nil {
 			w.Away = clampDetach(m.Trailing())
 			return true
 		}
 		return false
 	case "318": // end of /WHOIS: flush the card
-		nick := clampServerInfo(m.Param(1)) // same value as the stored key
-		if w := whois[nick]; w != nil {
-			delete(whois, nick)
+		key := c.Fold(clampServerInfo(m.Param(1))) // folded like the stored key
+		if w := whois[key]; w != nil {
+			delete(whois, key)
 			w.Network = ev.Network
 			clampWhois(w) // idempotent re-clamp before broadcast
 			h.broadcast(envelope("whois", 0, w))
