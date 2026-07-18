@@ -143,7 +143,10 @@ max-age=63072000; includeSubDomains`) so browsers refuse to downgrade.
 WebSocket upgrade for `/api/ws` must be allowed through the proxy (Caddy
 does this automatically); rate-limiting `/api/login` at the proxy is also
 recommended (the binary applies its own per-source backoff as a second
-layer).
+layer). The proxy must **forward the `Origin` and `Sec-Fetch-Site` request
+headers unchanged** — the state-changing/media endpoints use them as a CSRF
+defense and fail closed without them (a proxy that strips both would make
+those endpoints refuse every request).
 
 A hardened systemd unit ships in [`deploy/ircthing.service`](deploy/ircthing.service).
 It uses `DynamicUser=yes` — no service account to create — and hands the
