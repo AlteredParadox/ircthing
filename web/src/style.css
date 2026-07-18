@@ -1994,6 +1994,18 @@ input::placeholder {
 	.msg-time {
 		min-width: 2.5rem;
 	}
+
+	/* Cap a long nick so it truncates with an ellipsis instead of forcing the
+	   inline row wider than the viewport (horizontal scroll). inline-block is
+	   required for the width cap; vertical-align:bottom keeps it sitting on the
+	   line with the time/body despite overflow:hidden's baseline shift. */
+	.msg-row .msg-nick {
+		display: inline-block;
+		max-width: 60vw;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		vertical-align: bottom;
+	}
 }
 
 /* Very narrow (phones portrait): the topic gives way to the channel
