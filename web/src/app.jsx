@@ -584,6 +584,7 @@ export function App() {
 			// Invalidate any in-flight initial get_history for this buffer, so
 			// its resolve doesn't reinstall a phantom msgs entry after teardown.
 			historyGen.current[key] = (historyGen.current[key] || 0) + 1;
+			redactedIds.current.delete(key); // its scrollback is gone; drop tombstones
 			setMsgs((m) => dropBufferMsgs(m, key));
 			if (activeKeyRef.current === key) {
 				setActiveKey(null);
@@ -607,7 +608,10 @@ export function App() {
 				return next;
 			});
 			// Invalidate any in-flight initial loads for the removed buffers.
-			for (const g of gone) historyGen.current[g.key] = (historyGen.current[g.key] || 0) + 1;
+			for (const g of gone) {
+				historyGen.current[g.key] = (historyGen.current[g.key] || 0) + 1;
+				redactedIds.current.delete(g.key); // drop tombstones for gone buffers
+			}
 			setMsgs((m) => {
 				let next = m;
 				for (const g of gone) next = dropBufferMsgs(next, g.key);
@@ -1314,7 +1318,7 @@ export function App() {
 				</div>
 			)}
 			{searchOpen && (
-				<SearchOverlay sock={sock} onJump={jumpTo} onClose={() => setSearchOpen(false)} timeFmt={timeFmt} nickSep={prefs.nickSep} />
+				<SearchOverlay sock={sock} onJump={jumpTo} onClose={() => setSearchOpen(false)} timeFmt={timeFmt} nickSep={prefs.nickSep} redactedIds={redactedIds} />
 			)}
 			{switcherOpen && (
 				<Switcher

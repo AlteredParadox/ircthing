@@ -1,11 +1,25 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { pressable } from "./a11y.js";
-import { fmtTime, renderable } from "./irc.js";
+import { bufKey, fmtTime, renderable } from "./irc.js";
+
+// tombstoneResults re-marks search rows that were redacted while the buffer
+// was unloaded — a snapshot taken before the destructive scrub could otherwise
+// display deleted content. redactedIds is the app's Map<bufKey, Map<msgid,…>>.
+function tombstoneResults(list, redactedIds) {
+	if (!redactedIds) return list;
+	return list.map((ev) => {
+		if (ev.redacted || !ev.msgid) return ev;
+		const set = redactedIds.current.get(bufKey(ev.network, ev.buffer));
+		return set && set.has(ev.msgid)
+			? { ...ev, redacted: true, redact_reason: set.get(ev.msgid), raw: "" }
+			: ev;
+	});
+}
 
 // Full-text search overlay. Debounced queries hit the server FTS index;
 // each result renders like a message line (via the shared renderer) and,
 // when clicked, jumps to that message in its buffer.
-export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep }) {
+export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep, redactedIds }) {
 	const [query, setQuery] = useState("");
 	const [results, setResults] = useState([]);
 	const [state, setState] = useState("idle"); // idle | loading | done
@@ -32,7 +46,9 @@ export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep }) {
 			setResults((rs) => {
 				let hit = false;
 				const next = rs.map((ev) => {
-					if (ev.msgid !== d.msgid || ev.redacted) return ev;
+					// Match the full identity, not just msgid — the same msgid can
+					// exist in another network/buffer and must not be tombstoned here.
+					if (ev.redacted || ev.msgid !== d.msgid || ev.network !== d.network || ev.buffer !== d.buffer) return ev;
 					hit = true;
 					return { ...ev, redacted: true, redact_reason: d.reason, raw: "" };
 				});
@@ -57,7 +73,9 @@ export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep }) {
 				?.request("search", { query: q, limit: 50 })
 				.then((data) => {
 					if (mine !== seq.current) return; // a newer query superseded us
-					setResults(data.messages || []);
+					// Apply known tombstones to the freshly-installed rows: a row
+					// snapshotted before its redaction scrub must not display content.
+					setResults(tombstoneResults(data.messages || [], redactedIds));
 					setState("done");
 				})
 				.catch(() => mine === seq.current && setState("done"));
