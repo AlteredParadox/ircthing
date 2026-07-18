@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"log"
 	"strconv"
 	"time"
@@ -119,63 +121,184 @@ func (s *Store) startPruner(interval time.Duration) {
 	}()
 }
 
+// pruneChunk bounds how many rows one DELETE removes before releasing s.mu.
+// The first prune after enabling retention on a large existing database can
+// delete millions of rows; doing it in one statement would hold the store
+// lock (blocking every append and history page) for the whole operation.
+// Chunking re-acquires the lock per batch so real traffic interleaves. 2000
+// rows keeps each batch's lock-hold to a few ms on the deployment target.
+// var (not const) so a test can shrink it to exercise the multi-chunk loop.
+var pruneChunk = 2000
+
 // pruneOnce deletes messages that exceed the retention policy: those older
 // than the age cutoff, and those beyond the newest maxPerBuffer in each
-// buffer. The FTS index stays in step via the messages delete trigger.
-// Returns the number of rows deleted.
+// buffer. The FTS index stays in step via the messages delete trigger. It
+// deletes in bounded chunks, re-acquiring s.mu per chunk rather than holding
+// it across a potentially multi-GB delete+vacuum. Returns the rows deleted.
 func (s *Store) pruneOnce(ctx context.Context, now time.Time) (int64, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	days, maxPer := s.retention.days, s.retention.maxPerBuffer
+	s.mu.Unlock()
 
-	// Reconcile the hot rings (via defer, so it runs even if a later DELETE
-	// errors out) with EXACTLY the criteria that actually landed on disk:
-	// appliedCutoff/appliedMax are set only after their DELETE succeeds.
+	// Reconcile the hot rings at the end (via defer, so it runs even if a
+	// DELETE errors out) with EXACTLY the criteria that reached disk:
+	// appliedCutoff/appliedMax are set once a dimension's delete has run.
 	var total int64
 	var appliedCutoff int64
 	var appliedMax int
-	defer func() { s.reconcileRings(appliedCutoff, appliedMax) }()
+	defer func() {
+		s.mu.Lock()
+		s.reconcileRings(appliedCutoff, appliedMax)
+		s.mu.Unlock()
+	}()
 
-	if s.retention.days > 0 {
-		cutoff := now.Add(-time.Duration(s.retention.days) * 24 * time.Hour).UnixMilli()
-		res, err := s.db.ExecContext(ctx, `DELETE FROM messages WHERE ts < ?`, cutoff)
+	if days > 0 {
+		cutoff := now.Add(-time.Duration(days) * 24 * time.Hour).UnixMilli()
+		n, err := s.deleteChunked(ctx,
+			`DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE ts < ? LIMIT ?)`,
+			cutoff)
+		total += n
+		// Trim the rings to the cutoff whenever any pre-cutoff row was (or is
+		// being) deleted: an untrimmed complete ring would keep serving them.
+		// Safe on partial failure — a ring miss just falls back to disk.
+		if n > 0 || err == nil {
+			appliedCutoff = cutoff
+		}
 		if err != nil {
 			return total, err
 		}
-		appliedCutoff = cutoff
-		if n, err := res.RowsAffected(); err == nil {
-			total += n
-		}
 	}
-	if s.retention.maxPerBuffer > 0 {
-		// Window function ranks each buffer's rows newest-first; anything
-		// past the cap is deleted. row_number() (SQLite >= 3.25) is
-		// supported by modernc/sqlite.
-		res, err := s.db.ExecContext(ctx, `
-			DELETE FROM messages WHERE id IN (
-				SELECT id FROM (
-					SELECT id, row_number() OVER (
-						PARTITION BY buffer_id ORDER BY ts DESC, id DESC
-					) AS rn FROM messages
-				) WHERE rn > ?
-			)`, s.retention.maxPerBuffer)
+	if maxPer > 0 {
+		n, err := s.pruneByCount(ctx, maxPer)
+		total += n
+		if n > 0 || err == nil {
+			appliedMax = maxPer
+		}
 		if err != nil {
 			return total, err
 		}
-		appliedMax = s.retention.maxPerBuffer
-		if n, err := res.RowsAffected(); err == nil {
-			total += n
-		}
 	}
-	// Return the pages just freed by the deletes to the OS (auto_vacuum is
-	// INCREMENTAL), so the database file actually shrinks under retention
-	// instead of only ever growing. Best-effort: a failure here is not worth
-	// failing the prune over.
+	// Return the freed pages to the OS (auto_vacuum is INCREMENTAL) in bounded
+	// steps, so the file shrinks under retention without a long lock-hold.
+	// Best-effort: a failure here is not worth failing the prune over.
 	if total > 0 {
-		if _, err := s.db.ExecContext(ctx, `PRAGMA incremental_vacuum`); err != nil {
-			log.Printf("store: incremental_vacuum: %v", err)
+		s.vacuumChunked(ctx)
+	}
+	return total, nil
+}
+
+// deleteChunked runs a `DELETE ... id IN (SELECT ... LIMIT ?)` statement
+// repeatedly — re-acquiring s.mu for each chunk — until a short batch signals
+// the last rows are gone. args are the query parameters BEFORE the trailing
+// LIMIT. Returns the total rows deleted.
+func (s *Store) deleteChunked(ctx context.Context, query string, args ...any) (int64, error) {
+	var total int64
+	chunkArgs := append(append(make([]any, 0, len(args)+1), args...), pruneChunk)
+	for {
+		s.mu.Lock()
+		res, err := s.db.ExecContext(ctx, query, chunkArgs...)
+		if err != nil {
+			s.mu.Unlock()
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		s.mu.Unlock()
+		total += n
+		if n < int64(pruneChunk) {
+			return total, nil // last (partial) batch
+		}
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		default:
+		}
+	}
+}
+
+// pruneByCount enforces the per-buffer newest-N cap without a global window
+// scan: for each buffer it finds the cursor of the last row to KEEP (the
+// maxPer-th newest), then chunk-deletes everything older in that buffer using
+// the (buffer_id, ts) index. This bounds each chunk's cost — a single
+// row_number() over the whole table would re-rank every row per chunk.
+func (s *Store) pruneByCount(ctx context.Context, maxPer int) (int64, error) {
+	// Read buffer ids from the table, not s.buffers: on the first prune after
+	// Open the in-memory cache is empty while the DB is full.
+	s.mu.Lock()
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM buffers`)
+	if err != nil {
+		s.mu.Unlock()
+		return 0, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			s.mu.Unlock()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	err = rows.Err()
+	s.mu.Unlock()
+	if err != nil {
+		return 0, err
+	}
+
+	var total int64
+	for _, bufID := range ids {
+		// The last row to keep: the maxPer-th newest (OFFSET maxPer-1). No row
+		// means the buffer has <= maxPer rows — nothing to prune.
+		s.mu.Lock()
+		var keepTS, keepID int64
+		err := s.db.QueryRowContext(ctx,
+			`SELECT ts, id FROM messages WHERE buffer_id = ?
+			 ORDER BY ts DESC, id DESC LIMIT 1 OFFSET ?`, bufID, maxPer-1).Scan(&keepTS, &keepID)
+		s.mu.Unlock()
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return total, err
+		}
+		// Delete everything strictly older than the last-kept cursor.
+		n, err := s.deleteChunked(ctx,
+			`DELETE FROM messages WHERE id IN (
+				SELECT id FROM messages
+				WHERE buffer_id = ? AND (ts < ? OR (ts = ? AND id < ?)) LIMIT ?)`,
+			bufID, keepTS, keepTS, keepID)
+		total += n
+		if err != nil {
+			return total, err
 		}
 	}
 	return total, nil
+}
+
+// vacuumChunked returns freed pages to the OS in bounded steps (auto_vacuum is
+// INCREMENTAL), re-acquiring s.mu per step so a large reclaim doesn't stall
+// traffic. Best-effort: any error just stops early.
+func (s *Store) vacuumChunked(ctx context.Context) {
+	for {
+		s.mu.Lock()
+		var free int
+		if err := s.db.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&free); err != nil || free == 0 {
+			s.mu.Unlock()
+			return
+		}
+		_, err := s.db.ExecContext(ctx, `PRAGMA incremental_vacuum(1000)`)
+		s.mu.Unlock()
+		if err != nil {
+			log.Printf("store: incremental_vacuum: %v", err)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+	}
 }
 
 // reconcileRings trims each hot ring to the retention criteria that actually

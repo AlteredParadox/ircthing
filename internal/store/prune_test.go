@@ -223,6 +223,81 @@ func TestPruneDisabledIsNoop(t *testing.T) {
 	}
 }
 
+// Chunked deletion must remove EVERY qualifying row across multiple batches,
+// for both the age and per-buffer-count dimensions, with a chunk far smaller
+// than the dataset.
+func TestPruneChunkedMultiBatch(t *testing.T) {
+	defer func(c int) { pruneChunk = c }(pruneChunk)
+	pruneChunk = 3 // force several batches over the row counts below
+
+	s, _ := openTest(t, 500)
+	base := time.UnixMilli(1_700_000_000_000)
+	// #c: 20 messages, one per hour.
+	for i := 0; i < 20; i++ {
+		if _, err := s.Append(ctx, "net", "#c", Message{
+			Time: base.Add(time.Duration(i) * time.Hour),
+			Sender: "a", Command: "PRIVMSG", Raw: fmt.Sprintf("c%d", i),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// #d: 14 messages, so the per-buffer cap prunes it independently.
+	for i := 0; i < 14; i++ {
+		if _, err := s.Append(ctx, "net", "#d", Message{
+			Time: base.Add(time.Duration(i) * time.Hour),
+			Sender: "a", Command: "PRIVMSG", Raw: fmt.Sprintf("d%d", i),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Age prune: cutoff at hour 8 drops #c[0..7] and #d[0..7] = 16 rows,
+	// across many 3-row chunks.
+	s.retention = retentionPolicy{days: 0}
+	cutoff := base.Add(8 * time.Hour)
+	// Drive age pruning directly via a controlled now: retain "0 days" won't
+	// prune, so use maxPerBuffer to also exercise the count path below. First
+	// the age path:
+	s.retention = retentionPolicy{days: 1}
+	n, err := s.pruneOnce(ctx, cutoff.Add(24*time.Hour)) // now = cutoff + 1 day
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 16 {
+		t.Fatalf("age prune deleted %d, want 16 (8 from each buffer)", n)
+	}
+	if got := dbCount(t, s); got != 18 { // 12 + 6
+		t.Fatalf("db has %d rows after age prune, want 18", got)
+	}
+
+	// Now a per-buffer count cap of 4 across the survivors: #c 12->4 (drop 8),
+	// #d 6->4 (drop 2) = 10 rows, again across many chunks.
+	s.retention = retentionPolicy{maxPerBuffer: 4}
+	n, err = s.pruneOnce(ctx, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 10 {
+		t.Fatalf("count prune deleted %d, want 10", n)
+	}
+	if got := dbCount(t, s); got != 8 { // 4 + 4
+		t.Fatalf("db has %d rows after count prune, want 8", got)
+	}
+	// The survivors are the NEWEST 4 of each buffer, in order.
+	got, _ := s.Latest(ctx, "net", "#c", 10)
+	if len(got) != 4 || got[3].Raw != "c19" || got[0].Raw != "c16" {
+		t.Fatalf("#c survivors = %v, want c16..c19", rawsOf(got))
+	}
+}
+
+func rawsOf(ms []Message) []string {
+	out := make([]string, len(ms))
+	for i, m := range ms {
+		out[i] = m.Raw
+	}
+	return out
+}
+
 // Open with retention configured must start a pruner that Close stops
 // cleanly (no hang, no leak).
 func TestPrunerLifecycle(t *testing.T) {
