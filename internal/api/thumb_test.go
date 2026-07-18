@@ -197,6 +197,7 @@ func TestMediaBudgetSaturated(t *testing.T) {
 	body := `{"url":"http://example.com/x.png","net":"` + testNet + `"}`
 	req, _ := http.NewRequestWithContext(rctx, "POST", ts.URL+"/api/thumb", bytes.NewReader([]byte(body)))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", ts.URL)
 	req.AddCookie(cookie)
 	resp, err := ts.Client().Do(req)
 	if err != nil {

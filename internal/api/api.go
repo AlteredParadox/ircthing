@@ -218,26 +218,30 @@ func (s *Server) cookieName() string {
 	return sessionCookie
 }
 
-// sameSiteOnly refuses a definitively cross-origin request via the
-// Sec-Fetch-Site fetch-metadata header. SameSite=Strict cookies stop true
-// cross-site requests but still treat SIBLING subdomains as same-site, so a
-// hostile sibling could form-POST /api/logout or embed authenticated media
-// GETs; requiring same-origin (rejecting "same-site"/"cross-site") closes
-// that. When the header is ABSENT (older browsers, a header-stripping proxy)
-// we fall back to an Origin check so a sibling isn't a free pass — a present
-// Origin must match this request's host; an absent Origin (typical for a
-// top-level GET navigation) is allowed, since the app only ever issues
-// same-origin requests.
+// sameSiteOnly refuses a cross-origin request to a state-changing / media
+// endpoint (all guarded routes are POST/PUT). SameSite=Strict cookies stop
+// true cross-site requests but still treat SIBLING subdomains as same-site, so
+// a hostile sibling could form-POST /api/logout or trigger authenticated media
+// fetches. The Sec-Fetch-Site fetch-metadata header distinguishes these:
+// same-origin/none are trusted, same-site/cross-site refused.
+//
+// When Sec-Fetch-Site is ABSENT (an older browser or a header-stripping proxy)
+// we FAIL CLOSED via Origin: browsers send Origin on every POST/PUT, even
+// same-origin, so a legitimate request always carries one — a missing or
+// cross-origin Origin is refused rather than waved through (which a sibling
+// could otherwise exploit). A non-browser API client can supply Origin or
+// Sec-Fetch-Site: same-origin. Deployment note: a fronting reverse proxy MUST
+// preserve Origin (or Sec-Fetch-Site), or these endpoints refuse everything.
 func (s *Server) sameSiteOnly(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Header.Get("Sec-Fetch-Site") {
+		case "same-origin", "none":
+			// Trusted: a same-origin fetch or a direct navigation.
 		case "cross-site", "same-site":
 			http.Error(w, "cross-site request refused", http.StatusForbidden)
 			return
-		case "same-origin", "none":
-			// Trusted: a same-origin fetch or a direct navigation.
-		default: // absent/unknown: fall back to Origin
-			if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
+		default: // absent/unknown: require a same-origin Origin (fail closed)
+			if origin := r.Header.Get("Origin"); origin == "" || !sameOrigin(origin, r.Host) {
 				http.Error(w, "cross-origin request refused", http.StatusForbidden)
 				return
 			}

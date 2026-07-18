@@ -84,8 +84,11 @@ func decodeJSON(t *testing.T, resp *http.Response, v any) {
 
 func login(t *testing.T, ts *httptest.Server, username, password string) *http.Response {
 	t.Helper()
-	body := strings.NewReader(`{"username":"` + username + `","password":"` + password + `"}`)
-	resp, err := http.Post(ts.URL+"/api/login", "application/json", body)
+	body := `{"username":"` + username + `","password":"` + password + `"}`
+	req, _ := http.NewRequest("POST", ts.URL+"/api/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", ts.URL) // same-origin, as a browser sends on POST
+	resp, err := ts.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,6 +115,7 @@ func mediaPost(t *testing.T, ts *httptest.Server, cookie *http.Cookie, path, tar
 	body, _ := json.Marshal(map[string]string{"url": target, "net": net})
 	req, _ := http.NewRequest("POST", ts.URL+path, strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", ts.URL) // same-origin
 	if cookie != nil {
 		req.AddCookie(cookie)
 	}
@@ -150,20 +154,22 @@ func TestClientConfigPreviewsEnabled(t *testing.T) {
 	}
 }
 
-// With previews disabled the media endpoints are not served (zero outbound
-// fetch) and /api/config advertises it so the UI stops requesting them.
-// A state-changing request from a cross-site or same-site (sibling
-// subdomain) context is refused via Sec-Fetch-Site; same-origin, direct
-// navigation ("none"), and older browsers (no header) are allowed.
+// A state-changing request from a cross-site or same-site (sibling subdomain)
+// context is refused via Sec-Fetch-Site; same-origin and direct navigation
+// ("none") are allowed. With the header ABSENT (older browser / stripping
+// proxy) we fail closed: only a same-origin Origin passes.
 func TestSameSiteOnlyBlocksCrossSite(t *testing.T) {
 	ts, _ := newTestServer(t)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
-	put := func(site string) int {
+	put := func(site, origin string) int {
 		req, _ := http.NewRequest("PUT", ts.URL+"/api/config", strings.NewReader(`{"previews":false}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.AddCookie(cookie)
 		if site != "" {
 			req.Header.Set("Sec-Fetch-Site", site)
+		}
+		if origin != "" {
+			req.Header.Set("Origin", origin)
 		}
 		resp, err := ts.Client().Do(req)
 		if err != nil {
@@ -172,15 +178,26 @@ func TestSameSiteOnlyBlocksCrossSite(t *testing.T) {
 		resp.Body.Close()
 		return resp.StatusCode
 	}
+	// Fetch-metadata present: same-origin / direct navigation trusted.
+	for _, site := range []string{"same-origin", "none"} {
+		if got := put(site, ""); got == http.StatusForbidden {
+			t.Fatalf("Sec-Fetch-Site=%q PUT refused: %d", site, got)
+		}
+	}
 	for _, site := range []string{"cross-site", "same-site"} {
-		if got := put(site); got != http.StatusForbidden {
+		if got := put(site, ""); got != http.StatusForbidden {
 			t.Fatalf("Sec-Fetch-Site=%s PUT = %d, want 403", site, got)
 		}
 	}
-	for _, site := range []string{"same-origin", "none", ""} {
-		if got := put(site); got == http.StatusForbidden {
-			t.Fatalf("Sec-Fetch-Site=%q PUT = 403, want allowed", site)
-		}
+	// No Sec-Fetch-Site: fail closed unless a same-origin Origin is present.
+	if got := put("", ""); got != http.StatusForbidden {
+		t.Fatalf("no fetch-metadata + no Origin PUT = %d, want 403 (fail closed)", got)
+	}
+	if got := put("", ts.URL); got == http.StatusForbidden {
+		t.Fatalf("no fetch-metadata but same-origin Origin PUT refused: %d", got)
+	}
+	if got := put("", "https://evil.example"); got != http.StatusForbidden {
+		t.Fatalf("cross-origin Origin PUT = %d, want 403", got)
 	}
 }
 
@@ -240,6 +257,7 @@ func TestPreviewsToggleRuntime(t *testing.T) {
 	do := func(method, path, body string) *http.Response {
 		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
 		req.AddCookie(cookie)
+		req.Header.Set("Origin", ts.URL) // same-origin
 		resp, err := ts.Client().Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -292,6 +310,7 @@ func TestConfigRetentionAndSessionRuntime(t *testing.T) {
 	do := func(method, path, body string) *http.Response {
 		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
 		req.AddCookie(cookie)
+		req.Header.Set("Origin", ts.URL) // same-origin
 		resp, err := ts.Client().Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -345,6 +364,7 @@ func TestChangePassword(t *testing.T) {
 		req, _ := http.NewRequest("POST", ts.URL+"/api/password",
 			strings.NewReader(`{"current":"`+current+`","new":"`+newpw+`"}`))
 		req.AddCookie(cookie)
+		req.Header.Set("Origin", ts.URL)
 		resp, err := ts.Client().Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -383,6 +403,7 @@ func TestChangePasswordWrongCurrent(t *testing.T) {
 	req, _ := http.NewRequest("POST", ts.URL+"/api/password",
 		strings.NewReader(`{"current":"wrongpass","new":"newpassword1"}`))
 	req.AddCookie(cookie)
+	req.Header.Set("Origin", ts.URL)
 	resp, err := ts.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -544,6 +565,7 @@ func TestLogoutInvalidatesSession(t *testing.T) {
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
 
 	req, _ := http.NewRequest("POST", ts.URL+"/api/logout", nil)
+	req.Header.Set("Origin", ts.URL)
 	req.AddCookie(cookie)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -798,6 +820,7 @@ func TestSecureCookieFlag(t *testing.T) {
 	}
 	// Logout's deletion cookie carries matching attributes.
 	req, _ := http.NewRequest("POST", ts.URL+"/api/logout", nil)
+	req.Header.Set("Origin", ts.URL)
 	req.AddCookie(c)
 	resp, err := ts.Client().Do(req)
 	if err != nil {
@@ -949,6 +972,7 @@ func TestWSRevokedOnLogout(t *testing.T) {
 
 	// Invalidate the token (as logout does).
 	req, _ := http.NewRequest("POST", ts.URL+"/api/logout", nil)
+	req.Header.Set("Origin", ts.URL)
 	req.AddCookie(cookie)
 	resp, err := ts.Client().Do(req)
 	if err != nil {
