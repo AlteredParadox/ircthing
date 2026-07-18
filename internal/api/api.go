@@ -34,6 +34,18 @@ const sessionCookie = "ircthing_session"
 // to a synchronous c.Write and the buffer is returned immediately after.
 var wsWriteBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
+// maxPooledWSBuf bounds what goes back into the pool: a single big history page
+// can grow a buffer to megabytes, and retaining that in the shared pool would
+// pin the high-water-mark allocation against the RSS budget. Oversized buffers
+// are dropped (GC'd) instead of pooled.
+const maxPooledWSBuf = 64 * 1024
+
+func putWSBuf(buf *bytes.Buffer) {
+	if buf.Cap() <= maxPooledWSBuf {
+		wsWriteBufPool.Put(buf)
+	}
+}
+
 // wsEnvelopeHeadroom is slack above the largest payload (a prefs blob)
 // for the JSON envelope wrapping it (v/type/seq/data keys and quoting).
 const wsEnvelopeHeadroom = 16 * 1024
@@ -280,11 +292,13 @@ func (s *Server) sameSiteOnly(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// sameOrigin reports whether an Origin header names the SAME origin as the
-// request — scheme AND host:port (a web origin is the full tuple, RFC 6454),
-// not just authority, so an http Origin can't pass for an https request. The
-// request's effective scheme is TLS state, or X-Forwarded-Proto when we trust
-// the proxy (that header is client-settable, so it's honored only then).
+// sameOrigin reports whether an Origin names the same origin as the request. It
+// backs BOTH the WebSocket handshake gate and sameSiteOnly's absent-Sec-Fetch-
+// Site fallback. Host must always match; the scheme is compared only when it is
+// reliably known (see the body) — an indeterminate scheme falls back to host-
+// only so a reverse-proxy deployment isn't locked out. The residual is that on
+// such a deployment a same-HOST cross-scheme Origin is accepted; the host match
+// plus the authenticated SameSite=Strict cookie remain the guard.
 func (s *Server) sameOrigin(origin string, r *http.Request) bool {
 	u, err := url.Parse(origin)
 	if err != nil || u.Host != r.Host {
@@ -523,7 +537,7 @@ func (s *Server) wsWritePump(ctx context.Context, c *websocket.Conn, sess *hub.S
 			buf.Reset()
 			err := json.NewEncoder(buf).Encode(env)
 			if err != nil {
-				wsWriteBufPool.Put(buf)
+				putWSBuf(buf)
 				continue
 			}
 			// json.Encoder appends a newline; drop it to keep the frame
@@ -532,7 +546,7 @@ func (s *Server) wsWritePump(ctx context.Context, c *websocket.Conn, sess *hub.S
 			wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
 			err = c.Write(wctx, websocket.MessageText, b)
 			wcancel()
-			wsWriteBufPool.Put(buf)
+			putWSBuf(buf)
 			if err != nil {
 				return
 			}

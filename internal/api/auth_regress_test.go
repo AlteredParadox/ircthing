@@ -41,6 +41,10 @@ func TestSameOrigin(t *testing.T) {
 		{"proxy + xfp=https, http origin refused", true, "h.example", "http://h.example", false, "https", false},
 		{"proxy, no xfp -> scheme unknown, https accepted", true, "h.example", "https://h.example", false, "", true},
 		{"caddy in front, behind_proxy off -> https accepted (the regression)", false, "h.example", "https://h.example", false, "", true},
+		// Documented residual: when the scheme is indeterminate, a same-host http
+		// Origin is also accepted (host-only). Enable behind_proxy + X-Forwarded-
+		// Proto to restore strict scheme checking.
+		{"indeterminate scheme -> same-host http also accepted", false, "h.example", "http://h.example", false, "", true},
 		{"cross host refused", false, "h.example", "https://evil.example", true, "", false},
 	}
 	for _, tc := range cases {

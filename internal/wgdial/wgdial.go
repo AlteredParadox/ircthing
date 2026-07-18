@@ -67,6 +67,14 @@ func New(ctx context.Context, cfg Config) (*Tunnel, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Resolve the endpoint BEFORE allocating the netstack device: the lookup can
+	// fail (hostname endpoint + DNS flap), and CreateNetTUN spins up a gVisor
+	// stack + goroutines that only device.Close releases — resolving first avoids
+	// leaking one per failed (re)connect attempt.
+	resolvedEndpoint, err := resolveEndpoint(ctx, cfg.Endpoint)
+	if err != nil {
+		return nil, err
+	}
 	mtu := cfg.MTU
 	if mtu == 0 {
 		mtu = 1420
@@ -74,10 +82,6 @@ func New(ctx context.Context, cfg Config) (*Tunnel, error) {
 	tun, tnet, err := netstack.CreateNetTUN([]netip.Addr{addr}, []netip.Addr{dnsIP}, mtu)
 	if err != nil {
 		return nil, fmt.Errorf("wgdial: create netstack tun: %w", err)
-	}
-	resolvedEndpoint, err := resolveEndpoint(ctx, cfg.Endpoint)
-	if err != nil {
-		return nil, err
 	}
 
 	dev := device.NewDevice(tun, chooseBind(resolvedEndpoint), device.NewLogger(device.LogLevelError, "wg "))
@@ -125,10 +129,14 @@ func Validate(cfg Config) error {
 	if _, _, _, err := parseDNS(cfg.DNS); err != nil {
 		return err
 	}
-	if _, _, err := net.SplitHostPort(cfg.Endpoint); err != nil {
+	_, portStr, err := net.SplitHostPort(cfg.Endpoint)
+	if err != nil {
 		return fmt.Errorf("wgdial: endpoint %q: not host:port: %w", cfg.Endpoint, err)
 	}
-	_, err := uapiConfig(cfg, cfg.Endpoint) // validates the base64 keys
+	if _, err := endpointPort(portStr); err != nil {
+		return fmt.Errorf("wgdial: endpoint %q: %w", cfg.Endpoint, err)
+	}
+	_, err = uapiConfig(cfg, cfg.Endpoint) // validates the base64 keys
 	return err
 }
 
@@ -195,12 +203,21 @@ func (t *Tunnel) Close() {
 // through the tunnel that does not yet exist. Prefers an IPv4 result so a
 // v4-only host stays on v4 (see chooseBind).
 func resolveEndpoint(ctx context.Context, endpoint string) (string, error) {
-	host, port, err := net.SplitHostPort(endpoint)
+	host, portStr, err := net.SplitHostPort(endpoint)
 	if err != nil {
 		return "", fmt.Errorf("wgdial: endpoint %q: %w", endpoint, err)
 	}
-	if _, err := netip.ParseAddr(host); err == nil {
-		return endpoint, nil // literal IP: no lookup
+	port, err := endpointPort(portStr)
+	if err != nil {
+		return "", fmt.Errorf("wgdial: endpoint %q: %w", endpoint, err)
+	}
+	// Always reconstruct the returned endpoint from a parsed netip.AddrPort, for
+	// BOTH the literal-IP and resolved paths: it yields a canonical ip:port with
+	// no room for the raw config string (whose port SplitHostPort would accept
+	// with an embedded newline) to inject extra UAPI directives, and it unmaps a
+	// 4-in-6 literal so it agrees with endpointIsV4 / the v4-only bind.
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return netip.AddrPortFrom(ip.Unmap(), port).String(), nil // literal IP: no lookup
 	}
 	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 	if err != nil {
@@ -216,7 +233,19 @@ func resolveEndpoint(ctx context.Context, endpoint string) (string, error) {
 			break
 		}
 	}
-	return net.JoinHostPort(pick.Unmap().String(), port), nil
+	return netip.AddrPortFrom(pick.Unmap(), port).String(), nil
+}
+
+// endpointPort parses and bounds a host:port port field to 1..65535. A
+// non-numeric value — e.g. one carrying a newline that SplitHostPort otherwise
+// accepts — is rejected; this is what stops the endpoint from injecting extra
+// UAPI directives (a second peer, allowed_ip, ...) into the device config.
+func endpointPort(portStr string) (uint16, error) {
+	n, err := strconv.Atoi(portStr)
+	if err != nil || n < 1 || n > 65535 {
+		return 0, fmt.Errorf("bad port %q", portStr)
+	}
+	return uint16(n), nil
 }
 
 // parseDNS splits the configured DNS value into the netstack DNS server IP, its

@@ -95,6 +95,13 @@ func (n *Network) Validate() error {
 	if n.Nick == "" {
 		return errors.New("nick is required")
 	}
+	// Egress is either a proxy or a WireGuard tunnel, never both. The full
+	// WireGuard validation is deferred to wgdial.Validate via IRCConfig/NewManager;
+	// this cheap mutual-exclusion check lives here too so the config layer rejects
+	// the combo directly, independent of that funnel (defense in depth).
+	if n.Proxy != "" && n.WireGuard != nil {
+		return errors.New("proxy and wireguard are mutually exclusive")
+	}
 	// The frontend keys several plain JS objects by the network name (ignores,
 	// monitors, per-network maps). A name that collides with an Object.prototype
 	// property is either silently dropped (__proto__) or returns the inherited

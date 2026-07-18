@@ -35,6 +35,9 @@ func TestValidate(t *testing.T) {
 		{"bad dns", func(c *Config) { c.DNS = "1.2.3" }},
 		{"endpoint without port", func(c *Config) { c.Endpoint = "203.0.113.7" }},
 		{"empty endpoint", func(c *Config) { c.Endpoint = "" }},
+		{"endpoint non-numeric port", func(c *Config) { c.Endpoint = "203.0.113.7:https" }},
+		{"endpoint port out of range", func(c *Config) { c.Endpoint = "203.0.113.7:99999" }},
+		{"endpoint newline-injected port", func(c *Config) { c.Endpoint = "203.0.113.7:51820\npublic_key=x" }},
 	}
 	for _, tc := range bad {
 		c := goodConfig()
@@ -100,6 +103,16 @@ func TestResolveEndpoint(t *testing.T) {
 	// v4 is preferred, so expect the loopback v4 with the port preserved.
 	if got, err := resolveEndpoint(ctx, "localhost:51820"); err != nil || got != "127.0.0.1:51820" {
 		t.Fatalf("resolveEndpoint(localhost) = %q, %v; want 127.0.0.1:51820", got, err)
+	}
+	// A 4-in-6 literal is unmapped so it agrees with endpointIsV4 / the v4 bind.
+	if got, err := resolveEndpoint(ctx, "[::ffff:203.0.113.7]:51820"); err != nil || got != "203.0.113.7:51820" {
+		t.Fatalf("resolveEndpoint(4-in-6) = %q, %v; want 203.0.113.7:51820", got, err)
+	}
+	// A non-numeric / newline-injected port is rejected (no UAPI injection).
+	for _, bad := range []string{"203.0.113.7:https", "203.0.113.7:99999", "203.0.113.7:51820\npublic_key=x"} {
+		if _, err := resolveEndpoint(ctx, bad); err == nil {
+			t.Errorf("resolveEndpoint(%q) accepted a bad port", bad)
+		}
 	}
 	// Missing port is rejected.
 	if _, err := resolveEndpoint(ctx, "203.0.113.7"); err == nil {

@@ -50,13 +50,13 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 	const setWG = (patch) => setCfg((c) => ({ ...c, wireguard: { ...c.wireguard, ...patch } }));
 	const sasl = saslChoice(cfg);
 
-	// pickEgress switches egress mode and keeps proxy/wireguard mutually
-	// exclusive: only the selected one survives into the saved config.
+	// pickEgress switches egress mode. It does NOT clear the other block, so a
+	// typed proxy URL or WireGuard config survives toggling away and back; submit()
+	// is the single authority that keeps only the selected mode's block. It just
+	// seeds an empty wireguard object so the WG fields render.
 	function pickEgress(mode) {
 		setEgress(mode);
-		if (mode === "direct") set({ proxy: undefined, wireguard: undefined });
-		else if (mode === "proxy") set({ wireguard: undefined });
-		else set({ proxy: undefined, wireguard: cfg.wireguard || {} });
+		if (mode === "wireguard" && !cfg.wireguard) set({ wireguard: {} });
 	}
 
 	function pickSASL(choice) {
@@ -76,10 +76,10 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 		const out = { ...cfg };
 		out.channels = channels.split(/[\s,]+/).filter(Boolean);
 		out.trusted_fingerprints = fingerprints.split(/[\s,]+/).filter(Boolean);
-		// Egress is exactly one of direct / proxy / wireguard — drop the others
-		// so a stale value from a mode the user switched away from isn't stored.
+		// Egress is exactly one of direct / proxy / wireguard. The form keeps
+		// typed proxy/WG values across toggles, so submit is the SOLE authority on
+		// what gets stored: keep only the selected mode's block, drop the others.
 		if (egress === "wireguard") {
-			delete out.proxy;
 			const wg = { ...(out.wireguard || {}) };
 			if (!wg.preshared_key) delete wg.preshared_key;
 			const mtu = parseInt(wg.mtu, 10);
@@ -89,6 +89,7 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 		} else {
 			delete out.wireguard;
 		}
+		if (egress !== "proxy") delete out.proxy;
 		// Empty optional strings just clutter the stored JSON.
 		for (const k of ["username", "realname", "pass", "proxy"]) {
 			if (!out[k]) delete out[k];
