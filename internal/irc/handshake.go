@@ -297,7 +297,17 @@ func fallbackNick(nick string, attempt int) string {
 		}
 		return string(rune('a' + n))
 	}
-	runes[len(runes)-1] = rune('0' + attempt)
+	// Replace the last rune with a digit distinct from what's already there, so
+	// a nick that ALREADY ends in a digit (e.g. "at1") doesn't map back to
+	// itself and waste one of the three retries.
+	digits := []rune("123456789")
+	pick := make([]rune, 0, len(digits))
+	for _, d := range digits {
+		if d != runes[len(runes)-1] {
+			pick = append(pick, d)
+		}
+	}
+	runes[len(runes)-1] = pick[(attempt-1)%len(pick)]
 	return string(runes)
 }
 

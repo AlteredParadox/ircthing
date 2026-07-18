@@ -208,3 +208,23 @@ func TestISupportReset(t *testing.T) {
 		t.Fatal("raw values survived reset")
 	}
 }
+
+// A CASEMAPPING that changes mid-session is ignored: folding is baked into
+// existing map keys, so the first explicit mapping is pinned for the connection.
+func TestISupportCasemappingLocked(t *testing.T) {
+	s := newISupport()
+	feed005(s, "CASEMAPPING=ascii")
+	if s.FoldEqual("a[", "a{") { // ascii: [ and { are distinct
+		t.Fatal("ascii mapping not applied")
+	}
+	feed005(s, "CASEMAPPING=rfc1459") // must be ignored
+	if s.FoldEqual("a[", "a{") {
+		t.Fatal("mid-session CASEMAPPING change was applied (should be locked to ascii)")
+	}
+	// A fresh registration (reset) accepts a new mapping again.
+	s.reset()
+	feed005(s, "CASEMAPPING=rfc1459")
+	if !s.FoldEqual("a[", "a{") {
+		t.Fatal("reset should re-open CASEMAPPING")
+	}
+}

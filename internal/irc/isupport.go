@@ -38,6 +38,7 @@ type isupport struct {
 	prefixSymbols string // "~&@%+", same order (rank: highest first)
 	chanModes     [4]string
 	caseMapping   string
+	caseLocked    bool // first explicit CASEMAPPING wins; later changes ignored
 }
 
 func newISupport() *isupport {
@@ -50,6 +51,7 @@ func (s *isupport) reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.raw = make(map[string]string)
+	s.caseLocked = false
 	s.applyDefault("CHANTYPES")
 	s.applyDefault("PREFIX")
 	s.applyDefault("CHANMODES")
@@ -125,15 +127,19 @@ func (s *isupport) applyToken(name, value string) {
 		}
 		s.chanModes = cm
 	case "CASEMAPPING":
-		// Known limitation (deliberate): a CASEMAPPING that CHANGES after the
-		// roster/NAMES/WHOX maps are already populated is not re-keyed, so
-		// existing entries keyed under the old mapping could become
-		// unreachable. Real servers fix CASEMAPPING at registration and never
-		// flip it mid-session; re-keying every folded map on a hostile flip is
-		// disproportionate to that non-threat. Left as-is intentionally.
+		// The FIRST explicit mapping wins for the whole connection; a later
+		// change is ignored. Folding semantics are baked into the roster/
+		// NAMES/WHOX map KEYS, so flipping mid-session would silently strand
+		// or collide existing entries. Real servers fix CASEMAPPING at
+		// registration and never flip it, so pinning it is a cheap fail-safe
+		// (cheaper than re-keying every folded map on a hostile flip).
+		if s.caseLocked {
+			break
+		}
 		switch value {
 		case "rfc1459", "rfc1459-strict", "ascii":
 			s.caseMapping = value
+			s.caseLocked = true
 		}
 	}
 }

@@ -719,7 +719,7 @@ func TestHandshakeAuthenticateChallengeBounded(t *testing.T) {
 // A 433 fallback must never be LONGER than the rejected nick (that nick is a
 // valid length — an invalid one is 432), and must differ from it.
 func TestFallbackNick(t *testing.T) {
-	for _, nick := range []string{"abcdefghi", "AlteredParadox", "x", "z", "ab"} {
+	for _, nick := range []string{"abcdefghi", "AlteredParadox", "x", "z", "ab", "at1", "user9", "a2"} {
 		for attempt := 1; attempt <= 3; attempt++ {
 			fb := fallbackNick(nick, attempt)
 			if len([]rune(fb)) > len([]rune(nick)) {
