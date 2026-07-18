@@ -50,8 +50,9 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	const [enabled, setEnabled] = useState(notifier.enabled);
 	const netNames = Object.keys(networks).sort((a, b) => a.localeCompare(b));
 
-	// Server-side previews switch, loaded on open and applied on toggle.
+	// Server-side settings, loaded on open and applied on change.
 	const [previewsOn, setPreviewsOn] = useState(null); // null while loading
+	const [retention, setRetention] = useState(null); // { days, max } | null
 
 	useEffect(() => {
 		const onKey = (e) => e.key === "Escape" && onClose();
@@ -62,9 +63,28 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	useEffect(() => {
 		fetch("/api/config")
 			.then((r) => (r.ok ? r.json() : null))
-			.then((d) => d && setPreviewsOn(!!d.previews))
+			.then((d) => {
+				if (!d) return;
+				setPreviewsOn(!!d.previews);
+				setRetention({ days: d.retention_days | 0, max: d.retention_max_messages | 0 });
+			})
 			.catch(() => {});
 	}, []);
+
+	async function saveRetention(patch) {
+		const next = { ...retention, ...patch };
+		setRetention(next);
+		try {
+			await fetch("/api/config", {
+				method: "PUT",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ retention_days: next.days, retention_max_messages: next.max }),
+			});
+		} catch {
+			/* leave the optimistic value; a reopen reloads the server truth */
+		}
+	}
+	const retNum = (v) => Math.max(0, parseInt(v, 10) || 0);
 
 	async function togglePreviews(on) {
 		// Only reflect the new state once the server confirms the write.
@@ -272,6 +292,39 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 									onPick={(v) => togglePreviews(v === "on")}
 								/>
 							</div>
+						)}
+					</section>
+
+					<section class="settings-section">
+						<div class="settings-label">History retention</div>
+						<div class="settings-note">
+							Prune stored message history in the background. 0 = keep forever. Applies
+							to the server database (older scrollback beyond the in-memory cache); a
+							lower limit prunes promptly.
+						</div>
+						{retention !== null && (
+							<>
+								<div class="pref-row">
+									<span class="pref-name">Delete after (days)</span>
+									<input
+										class="pref-input"
+										type="number"
+										min="0"
+										value={retention.days}
+										onChange={(e) => saveRetention({ days: retNum(e.currentTarget.value) })}
+									/>
+								</div>
+								<div class="pref-row">
+									<span class="pref-name">Max messages per buffer</span>
+									<input
+										class="pref-input"
+										type="number"
+										min="0"
+										value={retention.max}
+										onChange={(e) => saveRetention({ max: retNum(e.currentTarget.value) })}
+									/>
+								</div>
+							</>
 						)}
 					</section>
 

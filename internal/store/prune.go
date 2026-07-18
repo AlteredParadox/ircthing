@@ -3,8 +3,70 @@ package store
 import (
 	"context"
 	"log"
+	"strconv"
 	"time"
 )
+
+// Settings-table keys for the runtime-editable retention policy. The config
+// file seeds these on first run; the stored value (set via the UI) is
+// authoritative thereafter, so a restart never reverts a runtime change.
+const (
+	retentionDaysKey = "retention_days"
+	retentionMaxKey  = "retention_max_messages"
+)
+
+// Retention returns the current policy (days, max-per-buffer).
+func (s *Store) Retention() (days, maxPerBuffer int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.retention.days, s.retention.maxPerBuffer
+}
+
+// SetRetention updates the policy, persists it, and prunes once promptly so a
+// tighter policy applies without waiting for the next hourly tick.
+func (s *Store) SetRetention(ctx context.Context, days, maxPerBuffer int) error {
+	if err := s.SetSetting(ctx, retentionDaysKey, strconv.Itoa(days)); err != nil {
+		return err
+	}
+	if err := s.SetSetting(ctx, retentionMaxKey, strconv.Itoa(maxPerBuffer)); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.retention = retentionPolicy{days: days, maxPerBuffer: maxPerBuffer}
+	s.mu.Unlock()
+	go func() {
+		if _, err := s.pruneOnce(context.Background(), time.Now()); err != nil {
+			log.Printf("store: prune after retention change: %v", err)
+		}
+	}()
+	return nil
+}
+
+// loadRetention makes the settings table authoritative for retention. On first
+// run (no stored keys) the config-seeded Options — already in s.retention — are
+// written through; otherwise the stored value overrides them.
+func (s *Store) loadRetention(ctx context.Context, opts Options) error {
+	dv, err := s.Setting(ctx, retentionDaysKey)
+	if err != nil {
+		return err
+	}
+	mv, err := s.Setting(ctx, retentionMaxKey)
+	if err != nil {
+		return err
+	}
+	if dv == "" && mv == "" { // first run: seed from config
+		if err := s.SetSetting(ctx, retentionDaysKey, strconv.Itoa(opts.RetentionDays)); err != nil {
+			return err
+		}
+		return s.SetSetting(ctx, retentionMaxKey, strconv.Itoa(opts.RetentionMaxMessages))
+	}
+	days, _ := strconv.Atoi(dv)
+	maxPer, _ := strconv.Atoi(mv)
+	s.mu.Lock()
+	s.retention = retentionPolicy{days: days, maxPerBuffer: maxPer}
+	s.mu.Unlock()
+	return nil
+}
 
 // pruneInterval is how often the background pruner runs when retention is
 // configured. History bounds are coarse, so hourly is ample and keeps the
@@ -17,8 +79,6 @@ type retentionPolicy struct {
 	days         int // delete messages older than this many days
 	maxPerBuffer int // keep only the newest N messages per buffer
 }
-
-func (p retentionPolicy) enabled() bool { return p.days > 0 || p.maxPerBuffer > 0 }
 
 // startPruner launches the background pruner: it prunes once immediately,
 // then every interval until Close closes stopPruner. Age cutoffs use

@@ -275,9 +275,15 @@ func Open(path string, opts Options) (*Store, error) {
 		buffers:   make(map[bufKey]int64),
 		rings:     make(map[int64]*ring),
 	}
-	if s.retention.enabled() {
-		s.startPruner(pruneInterval)
+	// The settings table (seeded from config on first run) is authoritative
+	// for retention, so a UI change survives a restart.
+	if err := s.loadRetention(context.Background(), opts); err != nil {
+		db.Close()
+		return nil, err
 	}
+	// Always run the pruner: retention is now runtime-settable, and pruneOnce
+	// is a cheap no-op while both dimensions are 0.
+	s.startPruner(pruneInterval)
 	return s, nil
 }
 

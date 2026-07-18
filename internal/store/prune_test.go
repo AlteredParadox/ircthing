@@ -1,12 +1,47 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+// Retention is runtime-settable and the stored value (settings table) wins
+// over the config Options across restarts: config only seeds it on first run.
+func TestRetentionRuntimeSettableAndPersists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ret.db")
+
+	// First run seeds retention from the config Options.
+	s, err := Open(path, Options{RetentionDays: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, m := s.Retention(); d != 30 || m != 0 {
+		t.Fatalf("seeded retention = %d/%d, want 30/0", d, m)
+	}
+	// A runtime change persists.
+	if err := s.SetRetention(context.Background(), 7, 500); err != nil {
+		t.Fatal(err)
+	}
+	if d, m := s.Retention(); d != 7 || m != 500 {
+		t.Fatalf("after SetRetention = %d/%d, want 7/500", d, m)
+	}
+	s.Close()
+
+	// Reopen with a DIFFERENT config: the stored runtime value wins.
+	s2, err := Open(path, Options{RetentionDays: 999, RetentionMaxMessages: 999})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if d, m := s2.Retention(); d != 7 || m != 500 {
+		t.Fatalf("after reopen = %d/%d, want 7/500 (stored wins over config)", d, m)
+	}
+}
 
 // A fresh database uses INCREMENTAL auto_vacuum so retention deletes can be
 // reclaimed by incremental_vacuum.

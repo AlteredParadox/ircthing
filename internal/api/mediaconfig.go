@@ -31,35 +31,72 @@ func loadPreviews(ctx context.Context, st *store.Store, cfg Config) bool {
 	return cfg.PreviewsDefault
 }
 
+// maxRetentionDays bounds the runtime retention setting, matching the config
+// validator: past ~106752 days the time.Duration cutoff overflows into the
+// future and would delete all history.
+const maxRetentionDays = 36500
+
 func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
+	days, maxPer := s.hub.Store().Retention()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
-		Previews bool `json:"previews"`
-	}{Previews: s.previewsEnabled()})
+		Previews             bool `json:"previews"`
+		RetentionDays        int  `json:"retention_days"`
+		RetentionMaxMessages int  `json:"retention_max_messages"`
+	}{
+		Previews:             s.previewsEnabled(),
+		RetentionDays:        days,
+		RetentionMaxMessages: maxPer,
+	})
 }
 
 func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
+	// Pointer fields so a PUT can update just one setting (the previews toggle
+	// and the retention inputs save independently) without clobbering others.
 	var body struct {
-		Previews bool `json:"previews"`
+		Previews             *bool `json:"previews"`
+		RetentionDays        *int  `json:"retention_days"`
+		RetentionMaxMessages *int  `json:"retention_max_messages"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&body); err != nil {
 		http.Error(w, "malformed config", http.StatusBadRequest)
 		return
 	}
-	val := "0"
-	if body.Previews {
-		val = "1"
+	if body.Previews != nil {
+		val := "0"
+		if *body.Previews {
+			val = "1"
+		}
+		// Persist and update the in-memory flag under one lock so two concurrent
+		// PUTs cannot interleave into disagreeing persisted/live states.
+		s.mediaMu.Lock()
+		err := s.hub.Store().SetSetting(r.Context(), previewsKey, val)
+		if err == nil {
+			s.previewsOn = *body.Previews
+		}
+		s.mediaMu.Unlock()
+		if err != nil {
+			http.Error(w, "storing config failed", http.StatusInternalServerError)
+			return
+		}
 	}
-	// Persist and update the in-memory flag under one lock so two concurrent
-	// PUTs cannot interleave into disagreeing persisted/live states (last
-	// writer wins for BOTH). previewsEnabled takes the same RWMutex to read.
-	s.mediaMu.Lock()
-	defer s.mediaMu.Unlock()
-	if err := s.hub.Store().SetSetting(r.Context(), previewsKey, val); err != nil {
-		http.Error(w, "storing config failed", http.StatusInternalServerError)
-		return
+	if body.RetentionDays != nil || body.RetentionMaxMessages != nil {
+		days, maxPer := s.hub.Store().Retention()
+		if body.RetentionDays != nil {
+			days = *body.RetentionDays
+		}
+		if body.RetentionMaxMessages != nil {
+			maxPer = *body.RetentionMaxMessages
+		}
+		if days < 0 || days > maxRetentionDays || maxPer < 0 {
+			http.Error(w, "retention out of range", http.StatusBadRequest)
+			return
+		}
+		if err := s.hub.Store().SetRetention(r.Context(), days, maxPer); err != nil {
+			http.Error(w, "storing config failed", http.StatusInternalServerError)
+			return
+		}
 	}
-	s.previewsOn = body.Previews
 	w.WriteHeader(http.StatusNoContent)
 }
 
