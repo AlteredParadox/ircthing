@@ -29,6 +29,7 @@ func TestParse(t *testing.T) {
 		{"EXTERNAL with keypair", `{"addr": "a:1", "nick": "me", "sasl": {"mechanism": "EXTERNAL", "cert_file": "/c.pem", "key_file": "/k.pem"}}`, ""},
 		// Empty mechanism + no password auto-selects EXTERNAL, so it needs a keypair too.
 		{"auto-EXTERNAL without keypair", `{"addr": "a:1", "nick": "me", "sasl": {}}`, "cert_file and key_file"},
+		{"reserved network name", `{"name": "__proto__", "addr": "a:1", "nick": "me"}`, "reserved"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

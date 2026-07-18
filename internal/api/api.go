@@ -253,7 +253,7 @@ func (s *Server) sameSiteOnly(h http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "cross-site request refused", http.StatusForbidden)
 			return
 		default: // absent/unknown: require a same-origin Origin (fail closed)
-			if origin := r.Header.Get("Origin"); origin == "" || !sameOrigin(origin, r.Host) {
+			if origin := r.Header.Get("Origin"); origin == "" || !s.sameOrigin(origin, r) {
 				http.Error(w, "cross-origin request refused", http.StatusForbidden)
 				return
 			}
@@ -262,11 +262,26 @@ func (s *Server) sameSiteOnly(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// sameOrigin reports whether an Origin header's host matches the request's
-// own Host (scheme/port included in Host comparison via the URL authority).
-func sameOrigin(origin, host string) bool {
+// sameOrigin reports whether an Origin header names the SAME origin as the
+// request — scheme AND host:port (a web origin is the full tuple, RFC 6454),
+// not just authority, so an http Origin can't pass for an https request. The
+// request's effective scheme is TLS state, or X-Forwarded-Proto when we trust
+// the proxy (that header is client-settable, so it's honored only then).
+func (s *Server) sameOrigin(origin string, r *http.Request) bool {
 	u, err := url.Parse(origin)
-	return err == nil && u.Host == host
+	if err != nil || u.Host != r.Host {
+		return false
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if s.cfg.TrustProxyForwarded {
+		if xfp := r.Header.Get("X-Forwarded-Proto"); xfp != "" {
+			scheme = xfp
+		}
+	}
+	return u.Scheme == scheme
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
