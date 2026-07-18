@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -22,14 +23,24 @@ const (
 )
 
 // loadPasswordHash resolves the effective login hash: a valid stored override
-// wins over the config hash.
-func loadPasswordHash(ctx context.Context, st *store.Store, cfg Config) string {
-	if v, err := st.Setting(ctx, passwordHashKey); err == nil && v != "" {
-		if _, err := bcrypt.Cost([]byte(v)); err == nil { // sanity: a real bcrypt hash
-			return v
-		}
+// wins over the config seed. It fails CLOSED — a store read error or a corrupt
+// override returns an error rather than silently falling back to the config
+// seed. Rotation deliberately leaves the seed untouched, so a silent fallback
+// would resurrect the pre-rotation password on the next restart. Only a
+// genuinely-absent override (empty value, no error) uses the seed, so first
+// boot still works.
+func loadPasswordHash(ctx context.Context, st *store.Store, cfg Config) (string, error) {
+	v, err := st.Setting(ctx, passwordHashKey)
+	if err != nil {
+		return "", fmt.Errorf("reading stored password override: %w", err)
 	}
-	return cfg.PasswordHash
+	if v == "" {
+		return cfg.PasswordHash, nil // no override set yet (first boot)
+	}
+	if _, err := bcrypt.Cost([]byte(v)); err != nil {
+		return "", fmt.Errorf("stored password override is not a valid bcrypt hash (refusing to fall back to the config seed)")
+	}
+	return v, nil
 }
 
 // handleChangePassword verifies the current password and stores a new bcrypt
@@ -69,7 +80,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	s.login.ok(source)
 
 	if len(req.New) < minPasswordLen || len(req.New) > maxPasswordLen {
-		http.Error(w, "new password must be 8–72 characters", http.StatusBadRequest)
+		http.Error(w, "new password must be 8–72 bytes", http.StatusBadRequest)
 		return
 	}
 	newHash, err := bcrypt.GenerateFromPassword([]byte(req.New), bcrypt.DefaultCost)
@@ -83,18 +94,24 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	nh := string(newHash)
 	s.passwordHash.Store(&nh)
-	s.credGen.Add(1) // invalidate any login that verified the old hash
 
-	// Revoke every OTHER session — a compromised old password must not keep
-	// them alive — while the browser making the change stays signed in.
+	// Bump the generation and revoke every OTHER session ATOMICALLY under the
+	// same s.mu that issueToken takes. This closes the login race: a concurrent
+	// old-password login either loses this lock (issueToken then observes the new
+	// generation and refuses to mint) or wins it (and this revoke deletes the
+	// session it just inserted). The browser making the change keeps its own
+	// cookie; an authenticated request without one revokes everything (fail-safe).
+	keep := ""
 	if c, err := r.Cookie(s.cookieName()); err == nil {
-		s.mu.Lock()
-		for tok := range s.tokens {
-			if tok != c.Value {
-				delete(s.tokens, tok)
-			}
-		}
-		s.mu.Unlock()
+		keep = c.Value
 	}
+	s.mu.Lock()
+	s.credGen.Add(1) // invalidate any login that verified the old hash
+	for tok := range s.tokens {
+		if tok != keep {
+			delete(s.tokens, tok)
+		}
+	}
+	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }

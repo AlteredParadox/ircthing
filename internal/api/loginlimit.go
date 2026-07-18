@@ -127,18 +127,28 @@ func (s *Server) loginSourceKey(r *http.Request) string {
 	return host
 }
 
-// forwardedClientIP is the client address a trusted single-hop proxy reports:
-// X-Real-IP (the single immediate-peer value nginx/Caddy can set), else the
-// LAST X-Forwarded-For entry — the proxy appends the address it received from
-// AFTER any client-supplied values, so on a single trusted hop it is the real
-// client and can't be spoofed.
+// forwardedClientIP is the client address a trusted single-hop reverse proxy
+// reports in the LAST X-Forwarded-For entry. On a single trusted hop the proxy
+// appends the address it accepted the connection from AFTER any client-supplied
+// XFF values, so the last entry is the real client and cannot be spoofed;
+// earlier entries are attacker-controlled and ignored. Returns "" when there is
+// no XFF or the last entry is not a valid IP (fall back to the socket peer).
+//
+// X-Real-IP is deliberately NOT consulted: the recommended reverse proxy (Caddy)
+// forwards a client-supplied X-Real-IP UNCHANGED by default (it sanitizes only
+// X-Forwarded-*), so trusting it would let an attacker rotate the header to
+// escape login backoff or spoof a victim's IP to poison their bucket. Deploy
+// behind_proxy only with a proxy that appends the client to X-Forwarded-For
+// (Caddy does by default; nginx: proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for).
 func forwardedClientIP(r *http.Request) string {
-	if v := strings.TrimSpace(r.Header.Get("X-Real-IP")); v != "" {
-		return v
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		return ""
 	}
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[len(parts)-1])
+	parts := strings.Split(xff, ",")
+	last := strings.TrimSpace(parts[len(parts)-1])
+	if net.ParseIP(last) == nil {
+		return ""
 	}
-	return ""
+	return last
 }

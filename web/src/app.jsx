@@ -29,10 +29,12 @@ const TRIM_TO = 2500;
 // this. Tracked incrementally (msgs[key].bytes) so appends stay O(1).
 const MAX_BUFFER_BYTES = 8 * 1024 * 1024;
 
-// evBytes estimates one event's retained size; a whois card is already
-// server-side clamped to a small bound.
+// evBytes estimates one event's retained size. A whois card holds up to 8
+// server-clamped fields (~2 KiB each, see hub.clampWhois) plus nick/numeric
+// fields, so charge ~18 KiB rather than a flat 4 KiB that under-counts a
+// hostile card ~4x and lets the byte budget be bypassed.
 function evBytes(ev) {
-	if (ev.whois) return 4096;
+	if (ev.whois) return 18 * 1024;
 	return (ev.raw ? ev.raw.length : 0) + (ev.text ? ev.text.length : 0) + 48;
 }
 function listBytes(list) {
@@ -326,6 +328,10 @@ export function App() {
 	// closure; survives buffer eviction so a late history/search page for a
 	// closed-then-reopened buffer still can't restore redacted content.
 	const redactedIds = useRef(new Map());
+	// Nicks we ran /whois on, keyed network+"\n"+lowercased-nick, so ONLY a
+	// client-initiated whois opens and selects a query buffer. An unsolicited
+	// server-pushed 311/318 must not spawn a buffer per nick or steal focus.
+	const pendingWhois = useRef(new Set());
 	const notifier = useRef();
 	if (!notifier.current) notifier.current = new Notifier();
 	// typers: bufKey -> { nick: { state, at } }; ephemeral, never stored.
@@ -689,6 +695,10 @@ export function App() {
 		// /whois does not clutter the channel (The Lounge style).
 		let whoisSeq = 0;
 		s.on("whois", (d) => {
+			// Only a whois WE asked for opens/selects a buffer. Drop an
+			// unsolicited server-pushed card so a hostile server can't spawn a
+			// buffer per nick or repeatedly steal focus (browser-memory + UX DoS).
+			if (!pendingWhois.current.delete(d.network + "\n" + String(d.nick).toLowerCase())) return;
 			const key = bufKey(d.network, d.nick);
 			setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(d.network, d.nick) }));
 			const ev = {
@@ -936,7 +946,18 @@ export function App() {
 		if (globalThis.innerWidth < 760) setSideOpen(false);
 	}
 
+	// rememberPendingWhois records a nick we asked about so its whois reply is
+	// treated as client-initiated (opens/selects a buffer). Soft-capped so a
+	// stream of never-answered requests can't grow it.
+	function rememberPendingWhois(network, nick) {
+		if (!nick) return;
+		const s = pendingWhois.current;
+		s.add(network + "\n" + String(nick).toLowerCase());
+		if (s.size > 100) s.delete(s.values().next().value);
+	}
+
 	function sendCommand(network, command, params) {
+		if (command === "WHOIS") rememberPendingWhois(network, params?.[0]);
 		sock.current?.request("command", { network, command, params })
 			.catch((e) => setCmdError(e.message || "failed"));
 	}
@@ -1186,11 +1207,24 @@ export function App() {
 					if (!prev) return m;
 					let list = applyTombstones(mergeById(prev.list, older), redactedIds.current.get(key));
 					// Bound memory on the paging-back path too: keep the
-					// oldest TRIM_TO (we are scrolled up), dropping the
-					// newest tail — it reloads on scroll-down / new events.
+					// oldest (we are scrolled up), dropping the newest tail —
+					// it reloads on scroll-down / new events. Enforce BOTH the
+					// count cap and the byte cap: a page of max-size lines can
+					// blow the byte budget well under TRIM_TO messages, and this
+					// non-tail window is never re-trimmed by live appends.
 					let atTail = prev.atTail;
 					if (list.length > TRIM_AT) {
 						list = list.slice(0, TRIM_TO);
+						atTail = false;
+					}
+					let bytes = listBytes(list);
+					if (bytes > MAX_BUFFER_BYTES) {
+						let end = list.length;
+						while (end > 1 && bytes > MAX_BUFFER_BYTES) {
+							end--;
+							bytes -= evBytes(list[end]);
+						}
+						list = list.slice(0, end);
 						atTail = false;
 					}
 					return {
@@ -1198,7 +1232,7 @@ export function App() {
 						[key]: {
 							...prev,
 							list,
-							bytes: listBytes(list),
+							bytes,
 							reachedTop: older.length < PAGE,
 							atTail,
 						},
@@ -1242,6 +1276,7 @@ export function App() {
 					.then(() => select(buf.network, p.target))
 					.catch(oops);
 			case "cmd":
+				if (p.command === "WHOIS") rememberPendingWhois(buf.network, p.params?.[0]);
 				return sock.current
 					.request("command", { network: buf.network, command: p.command, params: p.params })
 					.then(() => {

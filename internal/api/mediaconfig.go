@@ -83,6 +83,14 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Serialize the whole read-validate-apply. Retention is a read-modify-write
+	// (read the current pair, overlay the changed dimension); without this two
+	// concurrent PUTs each setting a different dimension would read the same base
+	// and last-writer-wins would drop one. Holding it across SetRetention also
+	// keeps that call's persist-then-install from interleaving with another PUT.
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+
 	// Validate EVERY provided field before applying ANY, so a bad value in one
 	// (e.g. retention_days:-1) can't leave an earlier one (previews) already
 	// changed and then return 400.

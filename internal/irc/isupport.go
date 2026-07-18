@@ -68,7 +68,14 @@ func (s *isupport) applyDefault(name string) {
 	case "CHANMODES":
 		s.chanModes = defaultChanModes
 	case "CASEMAPPING":
-		s.caseMapping = defaultCaseMapping
+		// Honor the one-time pin: once a mapping is locked (see applyToken),
+		// a later "-CASEMAPPING" negation must NOT reset folding to the
+		// default, or every already-folded map key would be stranded. reset()
+		// clears caseLocked immediately before restoring defaults, so its own
+		// path is unaffected.
+		if !s.caseLocked {
+			s.caseMapping = defaultCaseMapping
+		}
 	}
 }
 

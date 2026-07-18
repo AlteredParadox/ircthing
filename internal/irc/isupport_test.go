@@ -228,3 +228,19 @@ func TestISupportCasemappingLocked(t *testing.T) {
 		t.Fatal("reset should re-open CASEMAPPING")
 	}
 }
+
+// A CASEMAPPING NEGATION ("-CASEMAPPING") must honor the lock too: once a
+// mapping is pinned, removing it must not reset folding to the default and
+// strand already-folded map keys (the positive path is guarded; the negation
+// path must be as well).
+func TestISupportCasemappingNegationLocked(t *testing.T) {
+	s := newISupport()
+	feed005(s, "CASEMAPPING=ascii")
+	if s.FoldEqual("a[", "a{") { // ascii: [ and { are distinct
+		t.Fatal("ascii mapping not applied")
+	}
+	feed005(s, "-CASEMAPPING") // negation must be ignored once locked
+	if s.FoldEqual("a[", "a{") {
+		t.Fatal("-CASEMAPPING reset folding to the default (should stay locked to ascii)")
+	}
+}

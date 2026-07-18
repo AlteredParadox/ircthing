@@ -659,10 +659,13 @@ export function mergeById(existing, incoming) {
 // set so a later history/search response that re-delivers the pre-scrub row
 // cannot restore its content (see applyTombstones). store is a
 // Map<bufKey, Map<msgid, reason>>.
-// maxTombstonesPerBuffer bounds a buffer's redaction tombstone set so a
-// hostile redaction flood can't grow it without limit (it is only a
-// belt-and-braces guard over the server's destructive scrub).
+// maxTombstonesPerBuffer bounds a buffer's redaction tombstone set, and
+// maxTombstoneBuffers bounds how many buffers carry a set at all, so a hostile
+// redaction flood across endlessly-varying targets can't grow the outer map
+// without limit either (it is only a belt-and-braces guard over the server's
+// destructive scrub). The reason string is server-clamped upstream.
 const maxTombstonesPerBuffer = 1000;
+const maxTombstoneBuffers = 256;
 
 export function rememberRedaction(store, key, msgid, reason) {
 	if (!msgid) return;
@@ -670,6 +673,9 @@ export function rememberRedaction(store, key, msgid, reason) {
 	if (!byId) {
 		byId = new Map();
 		store.set(key, byId);
+		if (store.size > maxTombstoneBuffers) {
+			store.delete(store.keys().next().value); // evict oldest buffer, insertion order
+		}
 	}
 	byId.set(msgid, reason || "");
 	if (byId.size > maxTombstonesPerBuffer) {

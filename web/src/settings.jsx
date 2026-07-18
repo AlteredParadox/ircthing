@@ -133,26 +133,36 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 			.catch(() => {});
 	}, []);
 
+	// saveConfig PUTs a settings patch and reports whether the server accepted
+	// it (2xx). Callers revert their optimistic UI on false so this session
+	// can't silently diverge from the persisted state (and other devices).
 	async function saveConfig(patch) {
 		try {
-			await fetch("/api/config", {
+			const r = await fetch("/api/config", {
 				method: "PUT",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify(patch),
 			});
+			return r.ok;
 		} catch {
-			/* leave optimistic UI; a reopen reloads the server truth */
+			return false;
 		}
 	}
 
 	function saveRetention(patch) {
+		const prev = retention;
 		const next = { ...retention, ...patch };
 		setRetention(next);
-		saveConfig({ retention_days: next.days, retention_max_messages: next.max });
+		saveConfig({ retention_days: next.days, retention_max_messages: next.max }).then((ok) => {
+			if (!ok) setRetention(prev); // revert so the UI matches the server
+		});
 	}
 	function saveSessionDays(days) {
+		const prev = sessionDays;
 		setSessionDays(days);
-		saveConfig({ session_ttl_days: days });
+		saveConfig({ session_ttl_days: days }).then((ok) => {
+			if (!ok) setSessionDays(prev);
+		});
 	}
 	const retNum = (v) => Math.max(0, parseInt(v, 10) || 0);
 

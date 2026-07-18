@@ -75,12 +75,18 @@ func (n *Network) Validate() error {
 	if n.Nick == "" {
 		return errors.New("nick is required")
 	}
-	// The frontend keys plain JS objects by the network name; a name that
-	// collides with an Object prototype property would be silently dropped
-	// (__proto__) or throw (constructor/prototype). Reject those few reserved
-	// words rather than reshape every keyed store client-side.
+	// The frontend keys several plain JS objects by the network name (ignores,
+	// monitors, per-network maps). A name that collides with an Object.prototype
+	// property is either silently dropped (__proto__) or returns the inherited
+	// function on lookup — truthy, and a later .includes()/array op throws. Reject
+	// the full set of Object.prototype property names (plus "prototype") at this
+	// single choke point rather than reshaping every keyed store client-side; the
+	// set is fixed by the ECMAScript spec.
 	switch n.EffectiveName() {
-	case "__proto__", "constructor", "prototype":
+	case "__proto__", "constructor", "prototype",
+		"hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable",
+		"toLocaleString", "toString", "valueOf",
+		"__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__":
 		return fmt.Errorf("network name %q is reserved", n.EffectiveName())
 	}
 	fields := map[string]string{

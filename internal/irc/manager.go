@@ -289,9 +289,18 @@ func (m *Manager) EnsureNames(channel string) {
 	if !m.CapEnabled("no-implicit-names") || !m.registered.Load() {
 		return
 	}
+	if len(channel) > maxChannelNameBytes {
+		return
+	}
 	key := m.isup.Fold(channel)
 	m.namesMu.Lock()
 	already := m.namesReq[key]
+	// Bound the set (parity with whoxDone): don't grow past the cap with
+	// keys for channels we never NAMES. A new key above the cap is skipped.
+	if !already && len(m.namesReq) >= maxJoinedChannels {
+		m.namesMu.Unlock()
+		return
+	}
 	m.namesMu.Unlock()
 	if already {
 		return
@@ -1255,7 +1264,7 @@ const whoxToken = "152"
 // extended-join; changes by away-notify/account-notify. Once per channel
 // per connection.
 func (m *Manager) maybeWHOX(channel string) *ircv4.Message {
-	if channel == "" {
+	if channel == "" || len(channel) > maxChannelNameBytes {
 		return nil
 	}
 	if _, ok := m.isup.Raw("WHOX"); !ok {
@@ -1348,6 +1357,13 @@ func (m *Manager) trackJoinIntent(in *ircv4.Message) error {
 
 // maxJoinedChannels bounds the rejoin-intent set (see trackJoinIntent).
 const maxJoinedChannels = 4096
+
+// maxChannelNameBytes is a hard cap on a channel name used as a map key
+// (whoxDone, namesReq). Real names are bounded by ISUPPORT CHANNELLEN (tens of
+// bytes); this generous cap is independent of the negotiable LINELEN so a
+// hostile server can't grow those count-capped maps with near-64 KiB keys
+// (4096 × ~64 KiB ≈ 256 MiB). Matches maxRosterField, the roster's clamp.
+const maxChannelNameBytes = maxRosterField
 
 // redactRaw prepares one raw IRC line for the debug log with credentials
 // removed: the PASS parameter (server password) and any non-control

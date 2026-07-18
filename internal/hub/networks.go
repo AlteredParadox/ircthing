@@ -46,7 +46,11 @@ func (h *Hub) StartNetwork(nc *netconf.Network) error {
 		return err
 	}
 	if proxydial.CredsOverCleartext(nc.Proxy) {
-		log.Printf("network %q: proxy credentials are sent UNENCRYPTED to a non-loopback host (SOCKS5/HTTP proxy auth is cleartext); only use this if the connection to the proxy is itself protected (VPN/SSH tunnel). IRC traffic stays TLS end-to-end.", nc.EffectiveName())
+		ircCrypto := "the IRC connection runs TLS inside the tunnel, so IRC traffic stays encrypted end-to-end"
+		if !nc.TLS {
+			ircCrypto = "this network is PLAINTEXT (no TLS), so the proxy also sees the IRC traffic itself — enable TLS"
+		}
+		log.Printf("network %q: proxy credentials are sent UNENCRYPTED to a non-loopback host (SOCKS5/HTTP proxy auth is cleartext); only use this if the connection to the proxy is itself protected (VPN/SSH tunnel). %s.", nc.EffectiveName(), ircCrypto)
 	}
 	// STS policies persist in the store so upgrade-to-TLS survives
 	// restarts.

@@ -402,7 +402,10 @@ func TestChangePassword(t *testing.T) {
 		t.Fatalf("login with old password = %d, want 401", code)
 	}
 	// The override is persisted and read back over the config hash.
-	h := loadPasswordHash(context.Background(), srv.hub.Store(), Config{PasswordHash: "seed-ignored"})
+	h, err := loadPasswordHash(context.Background(), srv.hub.Store(), Config{PasswordHash: "seed-ignored"})
+	if err != nil {
+		t.Fatalf("loadPasswordHash: %v", err)
+	}
 	if bcrypt.CompareHashAndPassword([]byte(h), []byte("newpassword1")) != nil {
 		t.Fatal("stored override does not verify the new password")
 	}
@@ -661,6 +664,7 @@ func TestWSEndToEnd(t *testing.T) {
 
 	header := http.Header{}
 	header.Set("Cookie", cookie.Name+"="+cookie.Value)
+	header.Set("Origin", ts.URL) // same-origin: handleWS requires a matching Origin
 	c, _, err := websocket.Dial(ctx, ts.URL+"/api/ws", &websocket.DialOptions{HTTPHeader: header})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -890,6 +894,7 @@ func TestWSLargePrefs(t *testing.T) {
 
 	header := http.Header{}
 	header.Set("Cookie", cookie.Name+"="+cookie.Value)
+	header.Set("Origin", ts.URL) // same-origin: handleWS requires a matching Origin
 	c, _, err := websocket.Dial(ctx, ts.URL+"/api/ws", &websocket.DialOptions{HTTPHeader: header})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -976,6 +981,7 @@ func TestWSRevokedOnLogout(t *testing.T) {
 
 	header := http.Header{}
 	header.Set("Cookie", cookie.Name+"="+cookie.Value)
+	header.Set("Origin", ts.URL) // same-origin: handleWS requires a matching Origin
 	c, _, err := websocket.Dial(ctx, ts.URL+"/api/ws", &websocket.DialOptions{HTTPHeader: header})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -1009,15 +1015,26 @@ func TestLoginSourceKeyForwarded(t *testing.T) {
 	req := httptest.NewRequest("POST", "/api/login", nil)
 	req.RemoteAddr = "10.0.0.1:5555" // the proxy
 
+	// X-Real-IP is NOT trusted: the recommended proxy (Caddy) forwards a
+	// client-set X-Real-IP unchanged, so it must be ignored — fall back to the
+	// socket peer (RemoteAddr) when it's the only forwarded header present.
 	req.Header.Set("X-Real-IP", "203.0.113.7")
-	if got := srv.loginSourceKey(req); got != "203.0.113.7" {
-		t.Fatalf("X-Real-IP source = %q, want 203.0.113.7", got)
+	if got := srv.loginSourceKey(req); got != "10.0.0.1" {
+		t.Fatalf("X-Real-IP must be ignored, source = %q, want 10.0.0.1 (socket peer)", got)
 	}
 	req.Header.Del("X-Real-IP")
-	req.Header.Set("X-Forwarded-For", "1.2.3.4, 203.0.113.9") // last hop = real client
+	// The last X-Forwarded-For hop (appended by the trusted proxy) is the real
+	// client and is used even when earlier, client-forged entries precede it.
+	req.Header.Set("X-Forwarded-For", "1.2.3.4, 203.0.113.9")
 	if got := srv.loginSourceKey(req); got != "203.0.113.9" {
 		t.Fatalf("XFF source = %q, want 203.0.113.9", got)
 	}
+	// A garbage last hop is rejected, falling back to the socket peer.
+	req.Header.Set("X-Forwarded-For", "1.2.3.4, notanip")
+	if got := srv.loginSourceKey(req); got != "10.0.0.1" {
+		t.Fatalf("non-IP XFF hop source = %q, want 10.0.0.1 (socket peer)", got)
+	}
+	req.Header.Set("X-Forwarded-For", "1.2.3.4, 203.0.113.9")
 	// Untrusted: client-settable headers are ignored, fall back to RemoteAddr.
 	srv.cfg.TrustProxyForwarded = false
 	if got := srv.loginSourceKey(req); got != "10.0.0.1" {

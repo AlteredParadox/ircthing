@@ -113,13 +113,13 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 							<input class="rule-input" value={cfg.nick || ""} onInput={(e) => set({ nick: e.currentTarget.value })} />
 						</Field>
 						<Field label="Username">
-							<input class="rule-input" value={cfg.username || ""} onInput={(e) => set({ username: e.currentTarget.value })} placeholder="defaults to nick" />
+							<input class="rule-input" autocomplete="off" value={cfg.username || ""} onInput={(e) => set({ username: e.currentTarget.value })} placeholder="defaults to nick" />
 						</Field>
 						<Field label="Real name">
 							<input class="rule-input" value={cfg.realname || ""} onInput={(e) => set({ realname: e.currentTarget.value })} />
 						</Field>
 						<Field label="Server password">
-							<input class="rule-input" type="password" value={cfg.pass || ""} onInput={(e) => set({ pass: e.currentTarget.value })} />
+							<input class="rule-input" type="password" autocomplete="new-password" value={cfg.pass || ""} onInput={(e) => set({ pass: e.currentTarget.value })} />
 						</Field>
 						<Field label="Channels">
 							<input class="rule-input" value={channels} onInput={(e) => setChannels(e.currentTarget.value)} placeholder="#go #linux" />
@@ -136,10 +136,10 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 						{sasl !== "none" && sasl !== "EXTERNAL" && (
 							<>
 								<Field label="Account">
-									<input class="rule-input" value={cfg.sasl?.login || ""} onInput={(e) => set({ sasl: { ...cfg.sasl, login: e.currentTarget.value } })} />
+									<input class="rule-input" autocomplete="off" value={cfg.sasl?.login || ""} onInput={(e) => set({ sasl: { ...cfg.sasl, login: e.currentTarget.value } })} />
 								</Field>
 								<Field label="Password">
-									<input class="rule-input" type="password" value={cfg.sasl?.password || ""} onInput={(e) => set({ sasl: { ...cfg.sasl, password: e.currentTarget.value } })} />
+									<input class="rule-input" type="password" autocomplete="new-password" value={cfg.sasl?.password || ""} onInput={(e) => set({ sasl: { ...cfg.sasl, password: e.currentTarget.value } })} />
 								</Field>
 							</>
 						)}
@@ -164,8 +164,10 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 								⚠ This proxy sends a username/password to a non-loopback host. SOCKS5
 								and HTTP proxy auth are transmitted <b>unencrypted</b>, so the
 								credentials travel in the clear unless the connection to the proxy is
-								itself protected (a VPN or SSH tunnel). Your IRC traffic stays TLS
-								end-to-end regardless — only the proxy login is exposed.
+								itself protected (a VPN or SSH tunnel).{" "}
+								{cfg.tls
+									? "Your IRC traffic still runs TLS inside the tunnel, so only the proxy login is exposed."
+									: "This network is plaintext (no TLS), so the proxy also sees your IRC traffic itself — enable TLS."}
 							</div>
 						)}
 					</section>

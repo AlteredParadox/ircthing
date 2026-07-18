@@ -808,6 +808,7 @@ func (h *Hub) accumulateWhois(ev irc.Event, whois map[string]*WhoisData) bool {
 // before it is broadcast — a hostile server can pack ~64 KiB into each, and
 // the client keeps completed cards in scrollback.
 func clampWhois(w *WhoisData) {
+	w.Nick = clampServerInfo(w.Nick)
 	w.User = clampServerInfo(w.User)
 	w.Host = clampServerInfo(w.Host)
 	w.Realname = clampServerInfo(w.Realname)
@@ -1093,8 +1094,13 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 	if ev.Msg.Prefix != nil {
 		by = ev.Msg.Prefix.Name
 	}
+	// Clamp what goes on the wire: the stored copy is bounded inside SetRedacted,
+	// but this LIVE push carries the server-controlled reason (and redactor name)
+	// verbatim, which the client retains as a tombstone. Match the replay path,
+	// which serves the already-clamped stored reason.
 	h.broadcast(envelope("redact", 0, RedactData{
-		Network: ev.Network, Buffer: buffer, MsgID: msgid, By: by, Reason: reason,
+		Network: ev.Network, Buffer: buffer, MsgID: msgid,
+		By: clampServerInfo(by), Reason: clampServerInfo(reason),
 	}))
 }
 

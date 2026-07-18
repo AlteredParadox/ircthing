@@ -299,7 +299,12 @@ func (r *roster) namesEnd(m *ircv4.Message) {
 // (spec fetched 2026-07-16) carries <account> <realname>, account "*"
 // when logged out. Caller holds r.mu.
 func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
-	ch := m.Param(0)
+	// Bound and detach the channel name before it becomes a map key and the
+	// channelState.name: an unclamped ~64 KiB name (spoofed self-JOIN) would be
+	// retained twice (folded key + raw name) across up to maxRosterChannels
+	// entries. clampRoster caps to 512 B on a rune boundary and clones off the
+	// parsed line. Applied once here so the key, name, and every Fold(ch) agree.
+	ch := clampRoster(m.Param(0))
 	if ours {
 		// Create the channel only if unknown — a repeat self-JOIN (a
 		// buggy/hostile server, or a netsplit rejoin edge) must not wipe

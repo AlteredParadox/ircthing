@@ -105,6 +105,14 @@ type Server struct {
 	// doesn't slip a session through the rotation's revoke.
 	passwordMu sync.Mutex
 	credGen    atomic.Uint64
+
+	// settingsMu serializes the runtime settings writes in handleSetConfig
+	// (retention, session TTL). Retention is a read-modify-write — read the
+	// current pair, overlay the changed dimension, store both — so two
+	// concurrent PUTs would otherwise lose one dimension (last write wins), and
+	// SetRetention's persist-then-install could interleave into disagreeing DB
+	// and live state. One writer at a time closes both.
+	settingsMu sync.Mutex
 }
 
 func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
@@ -131,7 +139,10 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		tokens:       make(map[string]time.Time),
 	}
 	s.sessionTTL.Store(int64(loadSessionTTL(context.Background(), h.Store(), cfg)))
-	initHash := loadPasswordHash(context.Background(), h.Store(), cfg)
+	initHash, err := loadPasswordHash(context.Background(), h.Store(), cfg)
+	if err != nil {
+		return nil, err
+	}
 	s.passwordHash.Store(&initHash)
 	// State-changing and media endpoints require a same-origin request (the
 	// WebSocket does its own Origin check in handleWS). GET /api/config is
@@ -336,8 +347,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := s.issueToken()
+	token, err := s.issueToken(gen)
 	if err != nil {
+		// A rotation that landed between the recheck and issuance is not an
+		// internal fault — treat it as a failed (stale) credential.
+		if errors.Is(err, errCredRotated) {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -384,7 +401,12 @@ func (s *Server) sessionTTLDur() time.Duration { return time.Duration(s.sessionT
 // effectivePasswordHash is the current bcrypt login hash (override or config).
 func (s *Server) effectivePasswordHash() string { return *s.passwordHash.Load() }
 
-func (s *Server) issueToken() (string, error) {
+// errCredRotated reports that the login credentials changed between a login's
+// pre-verify snapshot and token issuance, so the just-verified session must not
+// be minted.
+var errCredRotated = errors.New("api: credentials rotated during login")
+
+func (s *Server) issueToken(gen uint64) (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
@@ -393,6 +415,13 @@ func (s *Server) issueToken() (string, error) {
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Close the rotation race: handleChangePassword bumps credGen and revokes
+	// other sessions under this same s.mu. If it committed after the caller's
+	// snapshot, refuse — otherwise a login that verified the OLD hash could
+	// insert a token the revoke loop has already passed.
+	if s.credGen.Load() != gen {
+		return "", errCredRotated
+	}
 	for t, exp := range s.tokens {
 		if now.After(exp) {
 			delete(s.tokens, t)
@@ -491,10 +520,18 @@ func (s *Server) wsWritePump(ctx context.Context, c *websocket.Conn, sess *hub.S
 // handleWS upgrades an authenticated request and bridges the connection
 // to a hub.Session: one goroutine writes Outbound envelopes to the
 // socket, the request goroutine reads client envelopes into Handle.
-// websocket.Accept enforces same-origin for browser requests.
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	if !s.authed(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	// Same-origin, scheme AND host. The coder/websocket default Origin check
+	// (websocket.Accept with nil opts) compares only the Origin HOST to Host and
+	// allows an absent Origin, so an http Origin passes on an https deployment.
+	// Browsers always send Origin on a WS handshake, so we require it and vet it
+	// with our own scheme+host check, disabling the library's weaker one below.
+	if origin := r.Header.Get("Origin"); origin == "" || !s.sameOrigin(origin, r) {
+		http.Error(w, "cross-origin request refused", http.StatusForbidden)
 		return
 	}
 	// Register the hub session BEFORE the upgrade: once Accept returns
@@ -508,7 +545,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer sess.Close()
 
-	c, err := websocket.Accept(w, r, nil)
+	// InsecureSkipVerify disables the library's weaker host-only Origin check;
+	// we already enforced a stricter scheme+host same-origin check above.
+	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		return // Accept has already written the HTTP error
 	}

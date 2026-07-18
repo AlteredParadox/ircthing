@@ -240,7 +240,7 @@ func runHashPassword() error {
 	// bootstrap credential isn't weaker than one set later. bcrypt silently
 	// ignores input past 72 bytes, so cap it rather than hash a truncated form.
 	if n := len(pw); n < 8 || n > 72 {
-		return fmt.Errorf("password must be 8–72 characters (got %d)", n)
+		return fmt.Errorf("password must be 8–72 bytes (got %d)", n)
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
 	if err != nil {
