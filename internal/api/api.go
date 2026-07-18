@@ -4,6 +4,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -26,6 +27,12 @@ import (
 )
 
 const sessionCookie = "ircthing_session"
+
+// wsWriteBufPool reuses the JSON encode buffer for outbound WebSocket frames so
+// a chathistory replay (one large pre-marshaled page per get_history) doesn't
+// allocate a second full copy of the page on every write. The bytes are handed
+// to a synchronous c.Write and the buffer is returned immediately after.
+var wsWriteBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
 // wsEnvelopeHeadroom is slack above the largest payload (a prefs blob)
 // for the JSON envelope wrapping it (v/type/seq/data keys and quoting).
@@ -75,13 +82,13 @@ type Server struct {
 	// and the request-wide semaphore (bounding the memory-heavy fetch +
 	// decode + encode span) are process-wide. mediaMu guards the fetcher
 	// maps and the runtime-editable previews switch.
-	mediaMu       sync.RWMutex
-	previewsOn    bool
-	htmlByProxy   map[string]*fetcher
-	imageByProxy  map[string]*fetcher
-	previewCache  *ttlCache[PreviewData]
-	thumbCache    *ttlCache[thumbResult]
-	mediaSem      chan struct{}
+	mediaMu      sync.RWMutex
+	previewsOn   bool
+	htmlByProxy  map[string]*fetcher
+	imageByProxy map[string]*fetcher
+	previewCache *ttlCache[PreviewData]
+	thumbCache   *ttlCache[thumbResult]
+	mediaSem     chan struct{}
 
 	login *loginLimiter
 
@@ -503,13 +510,24 @@ func (s *Server) wsWritePump(ctx context.Context, c *websocket.Conn, sess *hub.S
 			c.Close(websocket.StatusPolicyViolation, "too slow, reconnect and refetch")
 			return
 		case env := <-sess.Outbound():
-			data, err := json.Marshal(env)
+			// Encode into a pooled buffer. A chathistory replay pushes one large
+			// pre-marshaled page per get_history; reusing the buffer avoids a
+			// second full copy of every outbound frame. Safe because c.Write
+			// consumes the bytes synchronously before the buffer is returned.
+			buf := wsWriteBufPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			err := json.NewEncoder(buf).Encode(env)
 			if err != nil {
+				wsWriteBufPool.Put(buf)
 				continue
 			}
+			// json.Encoder appends a newline; drop it to keep the frame
+			// byte-identical to the prior json.Marshal output.
+			b := bytes.TrimSuffix(buf.Bytes(), []byte{'\n'})
 			wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
-			err = c.Write(wctx, websocket.MessageText, data)
+			err = c.Write(wctx, websocket.MessageText, b)
 			wcancel()
+			wsWriteBufPool.Put(buf)
 			if err != nil {
 				return
 			}

@@ -1559,12 +1559,16 @@ func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn,
 func (m *Manager) dialWireGuard(ctx context.Context, addr string) (net.Conn, error) {
 	m.wgMu.Lock()
 	if m.wgTun == nil {
-		t, err := wgdial.New(*m.cfg.WireGuard)
+		t, err := wgdial.New(ctx, *m.cfg.WireGuard)
 		if err != nil {
 			m.wgMu.Unlock()
 			return nil, err
 		}
 		m.wgTun = t
+	} else if err := m.wgTun.Reresolve(ctx); err != nil {
+		// Reconnect: refresh the endpoint IP (DNS failover / dynamic endpoint).
+		// Best-effort — keep the current endpoint if re-resolution fails.
+		log.Printf("irc[%s]: wireguard re-resolve endpoint: %v", m.cfg.Name, err)
 	}
 	tun := m.wgTun
 	m.wgMu.Unlock()

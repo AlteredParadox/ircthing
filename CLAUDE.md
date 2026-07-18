@@ -20,6 +20,7 @@ These are hard rules. If a task cannot be completed within them, stop and flag i
    - `github.com/coder/websocket` (WebSocket — the maintained continuation of nhooyr.io/websocket; use only this import path)
    - `golang.org/x/crypto` (SCRAM, etc.)
    - `golang.org/x/term` (no-echo password read for `-hash-password`)
+   - `golang.zx2c4.com/wireguard` + `gvisor.dev/gvisor` (userspace WireGuard egress, `internal/wgdial` — the optional per-network `wireguard` proxy type). Approved after the phase-4 spike; the cost is recorded in `SPIKE.md` (+2.95 MB binary → 14.58 MB, well under the 30 MB gate; ~35 MB idle / ~58 MB peak RSS under `GOMEMLIMIT=64MiB` on the 1 vCPU / 1 GB target, zero DNS leaks). gVisor is a code-heavy but single module; do not pull in more of it than `tun/netstack` transitively needs.
    Anything else: propose it with a justification and wait for approval. No web frameworks — `net/http` + `ServeMux` is sufficient.
 6. **Dependency policy (frontend):** Preact (or Solid — pick one at project start and stick to it), esbuild for bundling. No Tailwind, no component libraries, no icon packs (inline SVG only). Hand-written CSS with custom properties for theming.
 7. **`make check` must pass before any task is considered done.** It runs: `go vet`, `staticcheck`, `go test ./...`, frontend build, binary size gate (30 MB), bundle size gate (100 KB gzipped). The binary size gate measures the **release build** (`-ldflags="-s -w"`); a separate `make build-debug` target produces an unstripped, `-race`-enabled binary for delve and is never size-gated. `make memcheck` (asserts on **RSS**, not GOMEMLIMIT, against the 72 MB target) is run before releases and after changes to buffering, caching, or the store.
@@ -57,7 +58,7 @@ Client sync protocol (browser <-> server WebSocket):
 - TLS (including client certificates for SASL EXTERNAL), plaintext only with explicit config opt-in
 - CTCP: ACTION, VERSION, PING, TIME, CLIENTINFO (DCC is explicitly out of scope)
 - Correct casemapping per ISUPPORT (rfc1459, ascii) for all name comparisons
-- Server password, WEBIRC not needed (we are the client), SOCKS5/HTTP proxy support per network
+- Server password, WEBIRC not needed (we are the client), per-network egress proxy: SOCKS5/HTTP (`proxy`) or an in-process userspace WireGuard tunnel (`wireguard`; `internal/wgdial`, no TUN/root). WireGuard's Noise handshake avoids the cleartext SOCKS5/HTTP proxy-auth exposure; target DNS resolves through the tunnel (only the peer endpoint hostname resolves locally, pre-tunnel).
 - Flood protection on send (token bucket per connection)
 
 ### IRCv3 — ratified (implement all)

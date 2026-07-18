@@ -1,6 +1,9 @@
 package wgdial
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // A valid base64-encoded 32-byte WireGuard key (all zero bytes). Enough to
 // exercise decode/length checks without standing up a device.
@@ -56,6 +59,51 @@ func TestKeyHex(t *testing.T) {
 	}
 	if _, err := keyHex("%%%"); err == nil {
 		t.Error("keyHex accepted non-base64")
+	}
+}
+
+func TestParseDNS(t *testing.T) {
+	// bare IP -> port 53
+	ip, port, ap, err := parseDNS("10.64.0.1")
+	if err != nil || port != 53 || ap != "10.64.0.1:53" || ip.String() != "10.64.0.1" {
+		t.Fatalf("parseDNS(bare) = %v,%d,%q,%v", ip, port, ap, err)
+	}
+	// ip:port -> honored
+	_, port, ap, err = parseDNS("10.64.0.1:5353")
+	if err != nil || port != 5353 || ap != "10.64.0.1:5353" {
+		t.Fatalf("parseDNS(port) = %d,%q,%v", port, ap, err)
+	}
+	// IPv6 bare and with port
+	if _, port, _, err := parseDNS("fd00::1"); err != nil || port != 53 {
+		t.Fatalf("parseDNS(v6 bare) = %d,%v", port, err)
+	}
+	if _, port, _, err := parseDNS("[fd00::1]:5353"); err != nil || port != 5353 {
+		t.Fatalf("parseDNS(v6 port) = %d,%v", port, err)
+	}
+	for _, bad := range []string{"not-an-ip", "10.0.0.1:0", "10.0.0.1:99999", "10.0.0.1:abc", ""} {
+		if _, _, _, err := parseDNS(bad); err == nil {
+			t.Errorf("parseDNS(%q) accepted an invalid value", bad)
+		}
+	}
+}
+
+func TestResolveEndpoint(t *testing.T) {
+	ctx := context.Background()
+	// A literal IP passes through unchanged (no lookup).
+	if got, err := resolveEndpoint(ctx, "203.0.113.7:51820"); err != nil || got != "203.0.113.7:51820" {
+		t.Fatalf("resolveEndpoint(literal) = %q, %v", got, err)
+	}
+	if got, err := resolveEndpoint(ctx, "[2001:db8::1]:51820"); err != nil || got != "[2001:db8::1]:51820" {
+		t.Fatalf("resolveEndpoint(literal v6) = %q, %v", got, err)
+	}
+	// A hostname is resolved via the local resolver; localhost is in /etc/hosts.
+	// v4 is preferred, so expect the loopback v4 with the port preserved.
+	if got, err := resolveEndpoint(ctx, "localhost:51820"); err != nil || got != "127.0.0.1:51820" {
+		t.Fatalf("resolveEndpoint(localhost) = %q, %v; want 127.0.0.1:51820", got, err)
+	}
+	// Missing port is rejected.
+	if _, err := resolveEndpoint(ctx, "203.0.113.7"); err == nil {
+		t.Fatal("resolveEndpoint accepted an endpoint without a port")
 	}
 }
 

@@ -47,7 +47,11 @@ ProtectHostname=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# AF_NETLINK is required by the WireGuard egress dialer's UDP bind path (route
+# lookup during socket setup); without it a WireGuard-proxied network fails to
+# come up with EAFNOSUPPORT. Do NOT remove during hardening passes — the failure
+# only manifests on WG-enabled networks, so it is easy to drop by mistake.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=true
 RestrictRealtime=true
 LockPersonality=true
