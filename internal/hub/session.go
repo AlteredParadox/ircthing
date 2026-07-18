@@ -478,7 +478,7 @@ func (s *Session) handleGetChannel(ctx context.Context, env Envelope) {
 			for _, m := range members {
 				data.Members = append(data.Members, MemberData{
 					Nick: m.Nick, Prefix: m.Prefix, Away: m.Away,
-					Account: m.Account, Bot: m.Bot,
+					Account: m.Account, Bot: m.Bot, User: m.User, Host: m.Host,
 				})
 			}
 		}

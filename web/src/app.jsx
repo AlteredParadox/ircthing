@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
 import { applyTombstones, bufferOrder, bufKey, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, rememberRedaction, renderable, SERVER_BUFFER, toHash, typingExpired } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
@@ -1236,6 +1236,15 @@ export function App() {
 	const netState = activeBuf ? networks[activeBuf.network]?.state : "";
 	const isChan = activeBuf && isChannelName(activeBuf.buffer, networks[activeBuf.network]?.chantypes);
 	const topicText = topicFor(activeBuf, netState, chanInfo);
+	// Lowercased nick -> "user@host" for the active channel, so a message nick
+	// can show its ident/host on hover (from userhost-in-names / JOIN / CHGHOST).
+	const userhosts = useMemo(() => {
+		const m = new Map();
+		for (const mem of chanInfo?.members || []) {
+			if (mem.user || mem.host) m.set(mem.nick.toLowerCase(), `${mem.user || ""}@${mem.host || ""}`);
+		}
+		return m;
+	}, [chanInfo]);
 	const ignoredHere = activeBuf ? ignores[activeBuf.network] || [] : [];
 	const mutedSet = new Set(mutes);
 	const timeFmt = { clock: prefs.clock, seconds: prefs.seconds, ampm: prefs.ampm };
@@ -1277,6 +1286,7 @@ export function App() {
 						statusMode={prefs.statusMsgs}
 						timeFmt={timeFmt} nickSep={prefs.nickSep} previews={previews}
 						highlightNames={prefs.highlightNames}
+						userhosts={userhosts}
 						composerApi={composerApi}
 						onNick={(nick, x, y) => openUserMenu(activeBuf.network, nick, x, y)}
 						isHighlight={(t) => highlightText(t, selfNick, rules, activeBuf.network)}

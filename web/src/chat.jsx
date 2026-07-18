@@ -69,7 +69,7 @@ function CollapsedRow({ ev, onToggle }) {
 }
 
 // Row dispatches by event kind; a real message renders via MsgRow.
-function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onToggle, nicks, timeFmt, nickSep, previews }) {
+function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onToggle, nicks, userhosts, timeFmt, nickSep, previews }) {
 	if (ev.whois) return <WhoisCard whois={ev.whois} focused={focused} />;
 	if (ev.collapse) return <CollapsedRow ev={ev} onToggle={onToggle} />;
 	const r = renderable(ev);
@@ -79,7 +79,7 @@ function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onTo
 	return (
 		<MsgRow
 			ev={ev} r={r} selfNick={selfNick} theme={theme} focused={focused}
-			isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} nicks={nicks}
+			isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} nicks={nicks} userhosts={userhosts}
 			timeFmt={timeFmt} nickSep={nickSep} previews={previews}
 		/>
 	);
@@ -87,12 +87,12 @@ function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onTo
 
 // RowNick is the nick column: colored, right-click menu, optional trailing
 // separator ("AlteredParadox:").
-function RowNick({ sender, color, label, sep, onNick }) {
+function RowNick({ sender, color, label, sep, onNick, userhost }) {
 	return (
 		<span
 			class={"msg-nick" + (sender ? " has-menu" : "")}
 			style={{ color }}
-			title={sender}
+			title={userhost ? `${sender} (${userhost})` : sender}
 			{...(sender ? menuTrigger((x, y) => onNick(sender, x, y)) : {})}
 		>{label}{sep}</span>
 	);
@@ -112,7 +112,7 @@ function RowBody({ r, color, sender, onNick, nicks, theme }) {
 	);
 }
 
-function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick, nicks, timeFmt, nickSep, previews }) {
+function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick, nicks, userhosts, timeFmt, nickSep, previews }) {
 	const self = selfNick && ev.sender === selfNick;
 	const mention = !self && isHighlight(r.text);
 	// One preview per message (the first link), only for real messages.
@@ -128,7 +128,7 @@ function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick
 	return (
 		<div class={"msg-row" + (mention ? " mention" : "") + (focused ? " flash" : "")}>
 			<span class="msg-time">{fmtTime(ev.time, timeFmt)}</span>
-			<RowNick sender={ev.sender} color={color} label={nickLabel} sep={sep} onNick={onNick} />
+			<RowNick sender={ev.sender} color={color} label={nickLabel} sep={sep} onNick={onNick} userhost={userhosts?.get(ev.sender?.toLowerCase())} />
 			<RowBody r={r} color={color} sender={ev.sender} onNick={onNick} nicks={nicks} theme={theme} />
 			{canRedact && (
 				<button class="msg-redact" title="Delete message" onClick={() => onRedact(ev.msgid)}>⌫</button>
@@ -150,7 +150,7 @@ function estimate(ev) {
 // Chat renders the active buffer: virtualized scrollback plus composer.
 // completionNicks feeds tab-completion (channel roster, or the query
 // counterpart).
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, timeFmt, nickSep, previews, highlightNames, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, timeFmt, nickSep, previews, highlightNames, userhosts, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
 	const [draft, setDraft] = useState("");
 	// Lookup for in-body nick highlighting (Settings toggle): channel roster
 	// minus our own nick. Null when off, so the row renderer skips the scan.
@@ -332,7 +332,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 					else markRead();
 				}}
 				renderItem={(ev, i) => (
-					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} nicks={nickHi} timeFmt={timeFmt} nickSep={nickSep} previews={previews} />
+					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} nicks={nickHi} userhosts={userhosts} timeFmt={timeFmt} nickSep={nickSep} previews={previews} />
 				)}
 			/>
 			<div class="composer">

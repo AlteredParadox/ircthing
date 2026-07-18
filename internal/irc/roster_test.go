@@ -25,7 +25,44 @@ func testRoster() *roster {
 func members(t *testing.T, r *roster, ch string) []Member {
 	t.Helper()
 	_, ms, _ := r.channel(ch)
+	// User/Host (from userhost-in-names / JOIN / CHGHOST) are asserted
+	// separately in TestRosterUserHost; zero them here so the many
+	// prefix/account/away/mode tables stay focused on their subject. channel()
+	// returns fresh Member copies, so this doesn't touch roster state.
+	for i := range ms {
+		ms[i].User, ms[i].Host = "", ""
+	}
 	return ms
+}
+
+// TestRosterUserHost checks that ident/host are captured from the JOIN prefix,
+// userhost-in-names 353 entries, and CHGHOST, and surface on channel().
+func TestRosterUserHost(t *testing.T) {
+	r := testRoster()
+	feed(t, r,
+		joinGo, // :AlteredParadox!u@h JOIN #go
+		":srv 353 AlteredParadox = #go :@alice!auser@ahost bob!buser@bhost AlteredParadox",
+		":srv 366 AlteredParadox #go :end",
+		":bob!buser@bhost CHGHOST newuser newhost",
+	)
+	_, ms, ok := r.channel("#go")
+	if !ok {
+		t.Fatal("channel #go not found")
+	}
+	got := map[string]string{}
+	for _, m := range ms {
+		got[m.Nick] = m.User + "@" + m.Host
+	}
+	want := map[string]string{
+		"AlteredParadox":   "u@h",             // from the JOIN prefix
+		"alice": "auser@ahost",     // from userhost-in-names 353 (prefix stripped)
+		"bob":   "newuser@newhost", // CHGHOST overrides the 353 user@host
+	}
+	for nick, uh := range want {
+		if got[nick] != uh {
+			t.Errorf("%s user@host = %q, want %q", nick, got[nick], uh)
+		}
+	}
 }
 
 // join sets up our own membership of #go.

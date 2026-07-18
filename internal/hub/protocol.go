@@ -218,6 +218,8 @@ type MemberData struct {
 	Away    bool   `json:"away,omitempty"`    // WHOX on join + away-notify
 	Account string `json:"account,omitempty"` // services account, "" if logged out/unknown
 	Bot     bool   `json:"bot,omitempty"`     // bot mode (ISUPPORT BOT letter in WHOX flags)
+	User    string `json:"user,omitempty"`    // ident, from userhost-in-names / JOIN / CHGHOST
+	Host    string `json:"host,omitempty"`    // hostname, same sources
 }
 
 // ChannelData answers "get_channel": topic and membership as currently

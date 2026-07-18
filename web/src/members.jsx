@@ -9,6 +9,7 @@ import { menuTrigger } from "./menu.jsx";
 // for the user menu; ignored members are dimmed.
 function memberTitle(m, ignored) {
 	let t = m.nick;
+	if (m.user || m.host) t += ` (${m.user || ""}@${m.host || ""})`;
 	if (m.account) t += m.nick === m.account ? " — identified" : ` — identified as ${m.account}`;
 	if (m.bot) t += " — bot";
 	if (ignored) t += " — ignored";

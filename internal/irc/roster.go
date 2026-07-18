@@ -48,6 +48,11 @@ type Member struct {
 	Away    bool
 	Account string // services account, "" when logged out or unknown
 	Bot     bool   // bot mode set (WHOX flags contain the ISUPPORT BOT letter)
+	// User/Host are the ident and hostname, when known: from userhost-in-names
+	// (nick!user@host in 353), the JOIN prefix, and CHGHOST updates. Empty when
+	// the server doesn't advertise them.
+	User string
+	Host string
 }
 
 type channelState struct {
@@ -150,6 +155,12 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 		}
 	case "NICK":
 		r.rename(sender, m.Param(0))
+	case "CHGHOST": // chghost: ":nick!user@host CHGHOST <newuser> <newhost>"
+		user, host := strings.Clone(m.Param(0)), strings.Clone(m.Param(1))
+		r.updateEverywhere(sender, func(mem Member) Member {
+			mem.User, mem.Host = user, host
+			return mem
+		})
 	case "AWAY": // away-notify: a parameter means away, none means back
 		away := len(m.Params) > 0
 		r.updateEverywhere(sender, func(mem Member) Member {
@@ -224,7 +235,7 @@ func (r *roster) namesReply(m *ircv4.Message) {
 		if len(st.pending) >= maxChannelMembers || budget <= 0 {
 			break // bound a NAMES flood: per-channel and connection-wide
 		}
-		prefix, nick := splitNamesPrefix(r.isup.PrefixSymbols(), raw)
+		prefix, nick, user, host := splitNamesPrefix(r.isup.PrefixSymbols(), raw)
 		fk := r.isup.Fold(nick)
 		if _, exists := st.pending[fk]; !exists {
 			budget-- // only a new nick consumes the aggregate budget
@@ -232,7 +243,10 @@ func (r *roster) namesReply(m *ircv4.Message) {
 		// Clone so the stored Member does not alias the parsed 353 line
 		// (irc.v4 slices every field out of one per-line buffer, which a
 		// short nick would otherwise pin alive in the roster).
-		st.pending[fk] = Member{Nick: strings.Clone(nick), Prefix: strings.Clone(prefix)}
+		st.pending[fk] = Member{
+			Nick: strings.Clone(nick), Prefix: strings.Clone(prefix),
+			User: strings.Clone(user), Host: strings.Clone(host),
+		}
 	}
 }
 
@@ -247,6 +261,11 @@ func (r *roster) namesEnd(m *ircv4.Message) {
 	for k, mem := range st.pending {
 		if old, ok := st.members[k]; ok {
 			mem.Away, mem.Account, mem.Bot = old.Away, old.Account, old.Bot
+			// Keep a previously-learned user@host if this NAMES burst didn't
+			// carry one (server without userhost-in-names).
+			if mem.User == "" && mem.Host == "" {
+				mem.User, mem.Host = old.User, old.Host
+			}
 			st.pending[k] = mem
 		}
 	}
@@ -282,6 +301,10 @@ func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
 	}
 	// Clone so the Member doesn't alias the parsed JOIN line's backing buffer.
 	mem := Member{Nick: strings.Clone(sender)}
+	if m.Prefix != nil { // the JOIN prefix carries nick!user@host
+		mem.User = strings.Clone(m.Prefix.User)
+		mem.Host = strings.Clone(m.Prefix.Host)
+	}
 	if acct := m.Param(1); len(m.Params) >= 3 && acct != "*" {
 		mem.Account = strings.Clone(acct)
 	}
@@ -359,19 +382,25 @@ func (r *roster) whoxReply(m *ircv4.Message) {
 }
 
 // splitNamesPrefix splits a NAMES entry like "@+nick" or, under
-// userhost-in-names, "@+nick!user@host" into its status prefixes and the
-// bare nick. multi-prefix sends all prefixes "in order of 'rank', from
-// highest to lowest" — keep them as-is.
-func splitNamesPrefix(symbols, raw string) (prefixes, nick string) {
+// userhost-in-names, "@+nick!user@host" into its status prefixes, the bare
+// nick, and the user/host (empty when not advertised). multi-prefix sends all
+// prefixes "in order of 'rank', from highest to lowest" — keep them as-is.
+func splitNamesPrefix(symbols, raw string) (prefixes, nick, user, host string) {
 	i := 0
 	for i < len(raw) && strings.IndexByte(symbols, raw[i]) != -1 {
 		i++
 	}
 	prefixes, nick = raw[:i], raw[i:]
 	if bang := strings.IndexByte(nick, '!'); bang != -1 {
+		rest := nick[bang+1:]
 		nick = nick[:bang]
+		if at := strings.IndexByte(rest, '@'); at != -1 {
+			user, host = rest[:at], rest[at+1:]
+		} else {
+			user = rest
+		}
 	}
-	return prefixes, nick
+	return prefixes, nick, user, host
 }
 
 // applyChannelMode parses a channel MODE change (params: channel,
