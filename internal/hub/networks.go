@@ -426,12 +426,23 @@ func (h *Hub) knownNetwork(ctx context.Context, name string) (bool, error) {
 	return false, nil
 }
 
-// updateAutojoin adds or removes a channel in a stored definition's
-// channels list (case-insensitive dedup).
+// maxPersistedChannels caps a stored definition's channel list, matching the
+// manager's rejoin-set bound so a server forcing joins to endlessly many
+// channels can't grow the config JSON without limit.
+const maxPersistedChannels = 4096
+
+// updateAutojoin adds or removes a channel in a stored definition's channels
+// list (case-insensitive dedup). Holds netOps — use ONLY from a goroutine that
+// StopNetwork does not wait on (a session handler, not the Hub event loop; see
+// persistAutojoin, which uses TryLock to avoid that deadlock).
 func (h *Hub) updateAutojoin(ctx context.Context, network, channel string, add bool, fold func(string) string) error {
 	h.netOps.Lock()
 	defer h.netOps.Unlock()
+	return h.updateAutojoinLocked(ctx, network, channel, add, fold)
+}
 
+// updateAutojoinLocked is the read-modify-write body; the caller holds netOps.
+func (h *Hub) updateAutojoinLocked(ctx context.Context, network, channel string, add bool, fold func(string) string) error {
 	configs, err := h.store.NetworkConfigs(ctx)
 	if err != nil {
 		return err
@@ -449,6 +460,9 @@ func (h *Hub) updateAutojoin(ctx context.Context, network, channel string, add b
 	nc, err := netconf.Parse([]byte(raw))
 	if err != nil {
 		return err
+	}
+	if add && len(nc.Channels) >= maxPersistedChannels {
+		return nil // list already at the cap; don't grow it further
 	}
 	out, changed := editChannelList(nc.Channels, channel, add, fold)
 	if !changed {

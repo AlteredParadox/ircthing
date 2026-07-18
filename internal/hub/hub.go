@@ -335,6 +335,11 @@ func (h *Hub) liveHints(ctx context.Context, c Conn, ev irc.Event) {
 	h.persistAutojoin(ctx, c, ev)
 }
 
+// maxPersistedChannelLen bounds a channel name written to the stored config —
+// generous over any real CHANNELLEN, it rejects a hostile oversized name that
+// would fail registration-line validation on restart.
+const maxPersistedChannelLen = 200
+
 // persistAutojoin keeps the stored network definition's channel list in step
 // with our own live JOIN/PART, so a channel joined at runtime — via the UI, a
 // typed /join, or a server forward — is rejoined after a restart, and a PART
@@ -359,7 +364,22 @@ func (h *Hub) persistAutojoin(ctx context.Context, c Conn, ev irc.Event) {
 	if ch == "" || !c.IsChannel(ch) {
 		return
 	}
-	if err := h.updateAutojoin(ctx, ev.Network, ch, add, c.Fold); err != nil {
+	// Never persist a channel we could not validly rejoin: a spoofed self-JOIN
+	// for an over-long name or one carrying framing bytes would make
+	// netconf.Validate fail on every restart (bricking the network). A PART
+	// (remove) is always allowed, so an already-stored bad entry can be cleared.
+	if add && (len(ch) > maxPersistedChannelLen || strings.ContainsAny(ch, " \r\n\x00")) {
+		return
+	}
+	// TryLock, never Lock: this runs on the Hub event goroutine, and a network
+	// edit/delete holds netOps while StopNetwork waits for THIS goroutine to
+	// exit — a blocking Lock here would deadlock. Best-effort: skip persisting
+	// this one membership change while a network operation is in progress.
+	if !h.netOps.TryLock() {
+		return
+	}
+	defer h.netOps.Unlock()
+	if err := h.updateAutojoinLocked(ctx, ev.Network, ch, add, c.Fold); err != nil {
 		log.Printf("irc[%s]: persist autojoin %s %q: %v", ev.Network, ev.Msg.Command, ch, err)
 	}
 }

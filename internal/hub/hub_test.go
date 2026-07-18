@@ -60,6 +60,55 @@ func TestPersistAutojoinMirrorsMembership(t *testing.T) {
 	if ch := channels(); len(ch) != 0 {
 		t.Fatalf("after PART: channels = %v, want []", ch)
 	}
+
+	// An oversized channel name is NOT persisted (it would fail restart
+	// validation); a framing byte likewise.
+	feed(":AlteredParadox!u@h JOIN #" + strings.Repeat("x", maxPersistedChannelLen))
+	if ch := channels(); len(ch) != 0 {
+		t.Fatalf("oversized channel was persisted: %v", ch)
+	}
+}
+
+// persistAutojoin runs on the Hub event goroutine, which StopNetwork waits to
+// exit while holding netOps; it must therefore never BLOCK on netOps (that is
+// the deadlock finding). It uses TryLock and skips while a network op holds it.
+func TestPersistAutojoinDoesNotBlockUnderNetOps(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	raw, err := json.Marshal(netconf.Network{Name: "libera", Addr: "irc.test:6697", Nick: "AlteredParadox"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.PutNetworkConfig(ctx, "libera", string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	c := &fakeConn{name: "libera", nick: "AlteredParadox"}
+	join := irc.Event{Network: "libera", Msg: ircv4.MustParseMessage(":AlteredParadox!u@h JOIN #go")}
+
+	h.netOps.Lock() // simulate an in-progress network edit/delete
+	done := make(chan struct{})
+	go func() {
+		h.persistAutojoin(ctx, c, join)
+		close(done)
+	}()
+	select {
+	case <-done: // TryLock skipped, returned promptly — no deadlock
+	case <-time.After(3 * time.Second):
+		h.netOps.Unlock()
+		t.Fatal("persistAutojoin blocked while netOps was held")
+	}
+	h.netOps.Unlock()
+
+	// With netOps free, persistence works normally.
+	h.persistAutojoin(ctx, c, join)
+	got, _, _ := h.store.NetworkConfig(ctx, "libera")
+	var parsed netconf.Network
+	if err := json.Unmarshal([]byte(got.Config), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Channels) != 1 || parsed.Channels[0] != "#go" {
+		t.Fatalf("channels = %v, want [#go]", parsed.Channels)
+	}
 }
 
 func TestPersistTarget(t *testing.T) {
