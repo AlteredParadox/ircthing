@@ -687,23 +687,29 @@ input::placeholder {
 }
 
 .msg-row {
-	display: flex;
-	flex-wrap: wrap;
-	/* Align the time, nick, and body on their text baselines so they sit on
-	   the same line regardless of font size — robust across sans/mono
-	   instead of the per-font padding-top nudging it replaced (which drifted
-	   in mono, where the body and nick sizes match). */
-	align-items: baseline;
-	gap: 8px;
+	/* Inline flow, not a flex grid: the time and nick lead the first line as an
+	   inline prefix and the body flows after them, so a wrapped body fills the
+	   full row width (mIRC-style) instead of hang-indenting under the nick.
+	   Inline elements baseline-align naturally across sans/mono. */
+	display: block;
 	padding: var(--pad-msg) 12px var(--pad-msg) 4px;
 	position: relative;
+	line-height: 1.4;
 }
 
-/* Previews/link cards wrap onto their own full-width line (flex-basis
-   100%), so they sit flush-left under the timestamp instead of indented
-   into the body column. */
+/* The time leads the inline flow here (fixed-width, right-aligned). In a
+   .sys-row it stays a flex item, so scope the inline-block to .msg-row. */
+.msg-row .msg-time {
+	display: inline-block;
+	margin-right: 8px;
+	vertical-align: baseline;
+}
+
+/* Previews/link cards drop onto their own full-width line below the message,
+   flush-left under the timestamp rather than indented into the body. */
 .msg-media {
-	flex: 0 0 100%;
+	display: block;
+	margin-top: 4px;
 	min-width: 0;
 }
 
@@ -726,19 +732,18 @@ input::placeholder {
 }
 
 .msg-nick {
+	display: inline;
+	margin-right: 8px;
 	font-family: var(--mono-font);
 	font-size: 0.9286rem;
 	font-weight: 600;
-	max-width: 12rem;
-	flex: 0 0 auto;
+	/* nowrap keeps the nick itself intact; it flows inline so the body starts
+	   right after it and wrapped body lines run the full width. */
 	white-space: nowrap;
-	overflow: hidden;
-	text-overflow: ellipsis;
 }
 
 .msg-body {
-	flex: 1;
-	min-width: 0;
+	display: inline;
 	word-wrap: break-word;
 	overflow-wrap: anywhere;
 	font-family: var(--msg-font);
@@ -758,10 +763,14 @@ input::placeholder {
 	color: var(--text-dim);
 }
 
-/* Delete button on own messages, revealed on row hover. */
+/* Delete button on own messages, revealed on row hover. Absolutely pinned to
+   the row's top-right (the row is position:relative) now that the row is an
+   inline flow rather than a flex line; its opaque background covers any text
+   it overlaps on a full-width first line. */
 .msg-redact {
-	flex: 0 0 auto;
-	align-self: flex-start;
+	position: absolute;
+	top: var(--pad-msg);
+	right: 12px;
 	width: 22px;
 	height: 20px;
 	border: 1px solid var(--border);
@@ -1979,12 +1988,11 @@ input::placeholder {
 		background: rgba(0, 0, 0, 0.35);
 	}
 
-	.msg-nick {
-		max-width: 8rem;
-	}
-
+	/* Tighter time gutter on mobile, but min-width (not a fixed width) so a
+	   seconds / AM-PM timestamp sizes to its content instead of overflowing
+	   its box and colliding with the nick. */
 	.msg-time {
-		width: 2.5rem;
+		min-width: 2.5rem;
 	}
 }
 
