@@ -131,9 +131,9 @@ type Manager struct {
 
 	batchSeq atomic.Uint64 // outgoing multiline batch reference counter
 
-	// wgMu guards wgTun, the lazily-built WireGuard egress tunnel (SPIKE).
-	// Built on first dial when cfg.WireGuard != nil, reused across
-	// reconnects, torn down when Run returns.
+	// wgMu guards wgTun, the lazily-built WireGuard egress tunnel. Built on
+	// first dial when cfg.WireGuard != nil, reused across reconnects, torn
+	// down when Run returns.
 	wgMu  sync.Mutex
 	wgTun *wgdial.Tunnel
 }

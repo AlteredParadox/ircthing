@@ -43,8 +43,8 @@ type Config struct {
 	Proxy string
 
 	// WireGuard, when non-nil, routes this network's egress through an
-	// in-process userspace WireGuard tunnel (SPIKE, phase-4 candidate —
-	// see internal/wgdial). Mutually exclusive with Proxy. The tunnel is
+	// in-process userspace WireGuard tunnel (see internal/wgdial). Mutually
+	// exclusive with Proxy. The tunnel is
 	// built lazily on first dial and reused across reconnects; the IRC
 	// TLS handshake still runs inside it, and target DNS resolves via the
 	// tunnel's in-band resolver (no local leak).

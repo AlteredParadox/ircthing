@@ -34,18 +34,17 @@ type Network struct {
 	// Proxy routes this network through "socks5://[user:pass@]host:port"
 	// (DNS resolved proxy-side, Tor-friendly) or "http://host:port"
 	// (CONNECT tunnel). Empty connects directly.
-	Proxy    string   `json:"proxy,omitempty"`
+	Proxy string `json:"proxy,omitempty"`
 	// WireGuard optionally routes this network's egress through an
-	// in-process userspace WireGuard tunnel (SPIKE, phase-4 candidate).
-	// Its presence is the config flag that turns the tunnel on for this
-	// network; mutually exclusive with Proxy.
+	// in-process userspace WireGuard tunnel. Its presence is the config flag
+	// that turns the tunnel on for this network; mutually exclusive with Proxy.
 	WireGuard *WireGuard `json:"wireguard,omitempty"`
 	Nick      string     `json:"nick"`
-	Username string   `json:"username,omitempty"`
-	Realname string   `json:"realname,omitempty"`
-	Pass     string   `json:"pass,omitempty"`
-	SASL     *SASL    `json:"sasl,omitempty"`
-	Channels []string `json:"channels,omitempty"`
+	Username  string     `json:"username,omitempty"`
+	Realname  string     `json:"realname,omitempty"`
+	Pass      string     `json:"pass,omitempty"`
+	SASL      *SASL      `json:"sasl,omitempty"`
+	Channels  []string   `json:"channels,omitempty"`
 }
 
 type SASL struct {
@@ -60,7 +59,7 @@ type SASL struct {
 	KeyFile  string `json:"key_file,omitempty"`
 }
 
-// WireGuard is one network's in-process WireGuard egress (SPIKE). Keys are
+// WireGuard is one network's in-process WireGuard egress. Keys are
 // standard base64 (as `wg`/Mullvad print them); endpoint is the peer's
 // host:port, address is our address inside the tunnel, and dns is the
 // in-tunnel resolver (all target lookups go there, not the local resolver).

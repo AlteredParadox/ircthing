@@ -1,6 +1,6 @@
 //go:build wgbench
 
-// Measurement harness for the WireGuard egress spike (phase-4 candidate).
+// Measurement harness for the WireGuard egress tunnel (RSS/CPU; see SPIKE.md).
 // Excluded from the normal build/test by the wgbench tag; run explicitly:
 //
 //	go test -tags wgbench -run TestWGBench -v -timeout 900s ./internal/wgdial/
