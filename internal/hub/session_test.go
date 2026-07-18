@@ -1164,6 +1164,48 @@ func TestOwnActionReplayDedup(t *testing.T) {
 	}
 }
 
+// A chathistory replay of a PM query must file under the batch target, not by
+// re-deriving from the CURRENT nick: our nick may have changed since (a /nick
+// or a reconnect collision-fallback), and the replayed lines carry the OLD
+// nick. With current-nick routing both the incoming and the outgoing PM would
+// be silently dropped.
+func TestReplayPMRoutesByBatchTargetAfterNickChange(t *testing.T) {
+	h := newTestHub(t)
+	// We are now "AlteredParadox_" but the replayed PM history is from when we were "AlteredParadox".
+	conn := &fakeConn{ch: make(chan irc.Event, 16), name: "libera", nick: "AlteredParadox_"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+	conn.ch <- ev(":srv BATCH +r1 chathistory bob")
+	// Incoming, addressed to our OLD nick; outgoing, sent under our OLD nick.
+	conn.ch <- ev("@batch=r1;msgid=h1;time=2026-07-15T00:00:06.000Z :bob!u@h PRIVMSG AlteredParadox :hi there")
+	conn.ch <- ev("@batch=r1;msgid=h2;time=2026-07-15T00:00:07.000Z :AlteredParadox!u@h PRIVMSG bob :hey bob")
+	conn.ch <- ev(":srv BATCH -r1")
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		msgs, _ := h.store.Latest(ctx, "libera", "bob", 10)
+		if len(msgs) >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("PM history not filed under the bob query (got %d)", len(msgs))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Nothing leaked into a phantom buffer named after either nick.
+	for _, phantom := range []string{"AlteredParadox", "AlteredParadox_"} {
+		if m, _ := h.store.Latest(ctx, "libera", phantom, 10); len(m) != 0 {
+			t.Fatalf("PM history misfiled under phantom buffer %q: %+v", phantom, m)
+		}
+	}
+}
+
 // A hostile server that closes a paginated chathistory batch for an
 // endlessly varying target must not grow the per-connection backfillPages
 // map without bound.

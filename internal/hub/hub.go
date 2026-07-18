@@ -285,13 +285,13 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 		h.applyUpstreamMarker(ctx, c, ev)
 		return nil
 	case "REDACT": // updates an existing row, not a new one
-		h.applyRedaction(ctx, ev, c, replay)
+		h.applyRedaction(ctx, ev, c, replay, batch)
 		return nil
 	case "QUIT", "NICK": // fan out per shared channel
 		h.persistMembership(ctx, c, ev, replay, batch)
 		return nil
 	}
-	return h.persistEvent(ctx, c, ev, replay)
+	return h.persistEvent(ctx, c, ev, replay, batch)
 }
 
 // liveHints handles the side effects only live (non-replayed) messages
@@ -387,10 +387,12 @@ func (h *Hub) persistAutojoin(ctx context.Context, c Conn, ev irc.Event) {
 // adoptReplayedOwn handles a chathistory replay of one of our own messages
 // (no echo-message, so persistOwn stored a no-msgid placeholder): it stamps
 // the server's msgid onto the placeholder so the subsequent insert dedups
-// against it instead of duplicating. Caller has already confirmed the
-// message is ours and replayed.
+// against it instead of duplicating. It is called for every replayed
+// PRIVMSG/NOTICE and identifies OUR messages purely by the placeholder match
+// (buffer+sender+text) — never the current nick — so a since-then nick change
+// can't defeat it; it is a no-op for anyone else's messages.
 func (h *Hub) adoptReplayedOwn(ctx context.Context, c Conn, ev irc.Event, target string) {
-	if ev.Msg.Command != "PRIVMSG" && ev.Msg.Command != "NOTICE" {
+	if ev.Msg.Command != "PRIVMSG" && ev.Msg.Command != "NOTICE" || ev.Msg.Prefix == nil {
 		return
 	}
 	mid := ev.Msg.Tags["msgid"]
@@ -398,9 +400,8 @@ func (h *Hub) adoptReplayedOwn(ctx context.Context, c Conn, ev irc.Event, target
 		return
 	}
 	since := messageTime(ev).Add(-ownDedupWindow).UnixMilli()
-	// The replay's prefix is our nick as we sent it — the same sender
-	// persistOwn stored on the placeholder. adoptReplayedOwn only runs for
-	// own+replay, so Prefix is non-nil.
+	// The replay's prefix is the nick we sent under — the same sender persistOwn
+	// stored on the placeholder — so the match holds across a later nick change.
 	sender := ev.Msg.Prefix.Name
 	own := store.OwnMsg{
 		Network: ev.Network, Target: target, Sender: sender,
@@ -411,10 +412,35 @@ func (h *Hub) adoptReplayedOwn(ctx context.Context, c Conn, ev irc.Event, target
 	}
 }
 
+// replayTarget files a REPLAYED PRIVMSG/NOTICE under its batch target — the
+// buffer the chathistory/event-playback batch is for — regardless of the nick
+// we used when the message was sent. Non-ACTION CTCP is still dropped so a
+// hostile replay can't spam buffers.
+func replayTarget(m *ircv4.Message, batchTarget string, c Conn) (string, bool) {
+	if body := m.Trailing(); strings.HasPrefix(body, "\x01") && !strings.HasPrefix(body, "\x01ACTION") {
+		return "", false
+	}
+	t := stripStatusPrefix(batchTarget, c.StatusPrefixes(), c.IsChannel)
+	return t, t != ""
+}
+
 // persistEvent stores a message in its buffer and, when live, broadcasts
 // it. Duplicate msgids (overlapping backfill) are silently dropped.
-func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay bool) error {
-	target, ok := persistTarget(ev.Msg, c.Nick(), c.IsChannel, c.Fold, c.StatusPrefixes())
+func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay bool, batch *histBatch) error {
+	// Routing: during replay the buffer is the batch target, which is
+	// authoritative and independent of the nick we used when these messages
+	// were sent. Re-deriving from the CURRENT nick (persistTarget → directTarget)
+	// would misfile PM history after a /nick or a reconnect collision-fallback
+	// changed our nick since. Live traffic routes by the current nick, correct
+	// in the moment.
+	var target string
+	var ok bool
+	if replay && batch != nil && batch.target != "" &&
+		(ev.Msg.Command == "PRIVMSG" || ev.Msg.Command == "NOTICE") {
+		target, ok = replayTarget(ev.Msg, batch.target, c)
+	} else {
+		target, ok = persistTarget(ev.Msg, c.Nick(), c.IsChannel, c.Fold, c.StatusPrefixes())
+	}
 	if !ok {
 		return nil
 	}
@@ -436,7 +462,15 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	if own && !replay && ev.Msg.Command == "JOIN" {
 		h.unmarkClosed(ev.Network, c.Fold(target))
 	}
-	if replay && own {
+	// Dedup our own REPLAYED messages against the no-msgid placeholders
+	// persistOwn stored: adoptReplayedOwn matches by (buffer, sender, text) —
+	// the sender being the nick we sent under, recorded on both the placeholder
+	// and the replay — so it survives a since-then nick change, unlike a
+	// current-nick `own` check. Only meaningful on a no-echo-message server;
+	// with echo-message the replay dedups by msgid instead. It is a no-op for
+	// anyone else's messages (no placeholder matches their sender).
+	if replay && !c.CapEnabled("echo-message") &&
+		(ev.Msg.Command == "PRIVMSG" || ev.Msg.Command == "NOTICE") {
 		h.adoptReplayedOwn(ctx, c, ev, target)
 	}
 	// graceGuard resolves this event's close-grace policy; AppendFoldedGuarded
@@ -972,7 +1006,7 @@ func newPrivmsg(target, text string) *ircv4.Message {
 // ":nick REDACT <target> <msgid> [:reason]". It marks the referenced
 // message deleted in the store and, unless this is history replay,
 // announces it so loaded clients tombstone the message live.
-func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay bool) {
+func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay bool, batch *histBatch) {
 	target := ev.Msg.Param(0)
 	msgid := ev.Msg.Param(1)
 	if target == "" || msgid == "" {
@@ -982,12 +1016,20 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 	if len(ev.Msg.Params) > 2 {
 		reason = ev.Msg.Trailing()
 	}
-	// A redaction in a query is addressed to our nick; file it under the
-	// other party's buffer, mirroring persistTarget.
-	addressedToUs := !c.IsChannel(target) && ev.Msg.Prefix != nil && c.Fold(target) == c.Fold(c.Nick())
-	buffer := target
-	if addressedToUs {
-		buffer = ev.Msg.Prefix.Name
+	// Resolve the buffer. During replay the batch target is authoritative and
+	// nick-independent (a replayed redaction of a PM would otherwise miss after
+	// a since-then nick change). Live: a redaction addressed to our nick files
+	// under the other party's buffer, mirroring persistTarget.
+	var buffer string
+	addressedToUs := false
+	if replay && batch != nil && batch.target != "" {
+		buffer = batch.target
+	} else {
+		addressedToUs = !c.IsChannel(target) && ev.Msg.Prefix != nil && c.Fold(target) == c.Fold(c.Nick())
+		buffer = target
+		if addressedToUs {
+			buffer = ev.Msg.Prefix.Name
+		}
 	}
 	buffer = h.store.CanonicalBuffer(ctx, ev.Network, buffer, c.Fold)
 	ok, err := h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason)
