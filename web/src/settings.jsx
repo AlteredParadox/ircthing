@@ -42,6 +42,66 @@ function Seg({ value, options, labels, onPick }) {
 	);
 }
 
+// ChangePassword posts to /api/password: verify current, set new (min 8 chars,
+// confirmed). The server rotates the stored login hash and revokes other
+// sessions.
+function ChangePassword() {
+	const [current, setCurrent] = useState("");
+	const [next, setNext] = useState("");
+	const [confirm, setConfirm] = useState("");
+	const [msg, setMsg] = useState(null); // { ok, text } | null
+
+	async function submit(e) {
+		e.preventDefault();
+		setMsg(null);
+		if (next.length < 8) {
+			setMsg({ ok: false, text: "New password must be at least 8 characters." });
+			return;
+		}
+		if (next !== confirm) {
+			setMsg({ ok: false, text: "New passwords do not match." });
+			return;
+		}
+		try {
+			const r = await fetch("/api/password", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ current, new: next }),
+			});
+			if (r.ok) {
+				setMsg({ ok: true, text: "Password changed." });
+				setCurrent("");
+				setNext("");
+				setConfirm("");
+			} else {
+				setMsg({ ok: false, text: (await r.text()).trim() || "Change failed." });
+			}
+		} catch {
+			setMsg({ ok: false, text: "Change failed." });
+		}
+	}
+
+	return (
+		<form class="settings-section" onSubmit={submit}>
+			<div class="settings-label">Change password</div>
+			<div class="pref-row">
+				<span class="pref-name">Current</span>
+				<input class="pref-input" type="password" autocomplete="current-password" value={current} onInput={(e) => setCurrent(e.currentTarget.value)} />
+			</div>
+			<div class="pref-row">
+				<span class="pref-name">New</span>
+				<input class="pref-input" type="password" autocomplete="new-password" value={next} onInput={(e) => setNext(e.currentTarget.value)} />
+			</div>
+			<div class="pref-row">
+				<span class="pref-name">Confirm</span>
+				<input class="pref-input" type="password" autocomplete="new-password" value={confirm} onInput={(e) => setConfirm(e.currentTarget.value)} />
+			</div>
+			{msg && <div class={msg.ok ? "settings-note" : "cmd-error"}>{msg.text}</div>}
+			<button class="btn-accent" type="submit" disabled={!current || !next}>Change password</button>
+		</form>
+	);
+}
+
 // Settings modal: appearance preferences, desktop-notification
 // permission, and per-network highlight rules. Everything is edited live
 // and persisted by the parent.
@@ -357,6 +417,8 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 							</div>
 						)}
 					</section>
+
+					<ChangePassword />
 
 					<section class="settings-section">
 						<div class="settings-label">Desktop notifications</div>

@@ -318,6 +318,67 @@ func TestConfigRetentionAndSessionRuntime(t *testing.T) {
 	}
 }
 
+// Change-password verifies the current password, stores a new bcrypt hash as
+// a settings-table override, rotates which password logs in, and persists.
+func TestChangePassword(t *testing.T) {
+	ts, srv := newTestServerWithRef(t)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	change := func(current, newpw string) int {
+		req, _ := http.NewRequest("POST", ts.URL+"/api/password",
+			strings.NewReader(`{"current":"`+current+`","new":"`+newpw+`"}`))
+		req.AddCookie(cookie)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Correct current but too-short new: 400 (verify passed, so no lockout).
+	if code := change("hunter2", "short"); code != http.StatusBadRequest {
+		t.Fatalf("short new = %d, want 400", code)
+	}
+	// Valid change.
+	if code := change("hunter2", "newpassword1"); code != http.StatusNoContent {
+		t.Fatalf("change = %d, want 204", code)
+	}
+	// The new password logs in; the old one no longer does. (new-first so the
+	// old failure's rate-limit block doesn't shadow the success.)
+	if code := login(t, ts, "AlteredParadox", "newpassword1").StatusCode; code != http.StatusNoContent {
+		t.Fatalf("login with new password = %d, want 204", code)
+	}
+	if code := login(t, ts, "AlteredParadox", "hunter2").StatusCode; code != http.StatusUnauthorized {
+		t.Fatalf("login with old password = %d, want 401", code)
+	}
+	// The override is persisted and read back over the config hash.
+	h := loadPasswordHash(context.Background(), srv.hub.Store(), Config{PasswordHash: "seed-ignored"})
+	if bcrypt.CompareHashAndPassword([]byte(h), []byte("newpassword1")) != nil {
+		t.Fatal("stored override does not verify the new password")
+	}
+}
+
+// A wrong current password is refused (403) without changing anything.
+func TestChangePasswordWrongCurrent(t *testing.T) {
+	ts, srv := newTestServerWithRef(t)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	req, _ := http.NewRequest("POST", ts.URL+"/api/password",
+		strings.NewReader(`{"current":"wrongpass","new":"newpassword1"}`))
+	req.AddCookie(cookie)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("wrong current = %d, want 403", resp.StatusCode)
+	}
+	// Nothing was stored: no override hash was persisted.
+	if v, _ := srv.hub.Store().Setting(context.Background(), passwordHashKey); v != "" {
+		t.Fatalf("wrong-current attempt stored an override: %q", v)
+	}
+}
+
 // Previews use the source network's proxy: proxyForNetwork resolves it from
 // the stored config, and the per-proxy fetcher pool builds + reuses one
 // fetcher per distinct proxy.

@@ -87,6 +87,12 @@ type Server struct {
 	// runtime-settable (Settings → Session). Atomic so the login path reads it
 	// without the token lock.
 	sessionTTL atomic.Int64
+
+	// passwordHash is the effective bcrypt login hash: the settings-table
+	// override (set via change-password) when present, else the config hash.
+	// Atomic so login reads it lock-free. The config file may be a read-only
+	// systemd credential, so a UI change lives in the DB, not the file.
+	passwordHash atomic.Pointer[string]
 }
 
 func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
@@ -113,6 +119,8 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		tokens:       make(map[string]time.Time),
 	}
 	s.sessionTTL.Store(int64(loadSessionTTL(context.Background(), h.Store(), cfg)))
+	initHash := loadPasswordHash(context.Background(), h.Store(), cfg)
+	s.passwordHash.Store(&initHash)
 	// State-changing and media endpoints require a same-origin request (the
 	// WebSocket does its own Origin check in handleWS). GET /api/config is
 	// read-only and needs no CSRF guard.
@@ -121,6 +129,7 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 	s.mux.HandleFunc("GET /api/ws", s.handleWS)
 	s.mux.HandleFunc("GET /api/config", s.requireAuth(s.handleClientConfig))
 	s.mux.HandleFunc("PUT /api/config", s.sameSiteOnly(s.requireAuth(s.handleSetConfig)))
+	s.mux.HandleFunc("POST /api/password", s.sameSiteOnly(s.requireAuth(s.handleChangePassword)))
 	// The media endpoints are always registered; they refuse (403) at
 	// runtime when previews are disabled, so the switch is editable live.
 	s.mux.HandleFunc("GET /api/preview", s.sameSiteOnly(s.requireAuth(s.handlePreview)))
@@ -315,7 +324,7 @@ func (s *Server) authenticate(ctx context.Context, source, username, password st
 	// Evaluate both checks unconditionally so a wrong username costs the
 	// same time as a wrong password.
 	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(s.cfg.Username)) == 1
-	passErr := bcrypt.CompareHashAndPassword([]byte(s.cfg.PasswordHash), []byte(password))
+	passErr := bcrypt.CompareHashAndPassword([]byte(s.effectivePasswordHash()), []byte(password))
 	s.login.release()
 	if !userOK || passErr != nil {
 		s.login.fail(source, time.Now())
@@ -330,6 +339,9 @@ func (s *Server) authenticate(ctx context.Context, source, username, password st
 // logins cannot grow the map without bound.
 // sessionTTLDur is the effective (runtime-settable) session-cookie lifetime.
 func (s *Server) sessionTTLDur() time.Duration { return time.Duration(s.sessionTTL.Load()) }
+
+// effectivePasswordHash is the current bcrypt login hash (override or config).
+func (s *Server) effectivePasswordHash() string { return *s.passwordHash.Load() }
 
 func (s *Server) issueToken() (string, error) {
 	buf := make([]byte, 32)
