@@ -34,13 +34,17 @@ type config struct {
 	RingSize int `json:"ring_size"`
 	// RetentionDays prunes stored messages older than this many days.
 	// 0 = keep forever (the default). Pruning runs hourly in the
-	// background and keeps the search index in step.
+	// background and keeps the search index in step. Editable at runtime in
+	// Settings; this value only SEEDS the database on first run — the stored
+	// value wins thereafter, so later edits to the file have no effect.
 	RetentionDays int `json:"retention_days"`
 	// RetentionMaxMessages caps how many messages are kept per buffer
 	// (channel/query); older ones beyond the newest N are pruned.
-	// 0 = unlimited (the default).
+	// 0 = unlimited (the default). Runtime-editable / DB-authoritative like
+	// retention_days.
 	RetentionMaxMessages int `json:"retention_max_messages"`
 	// SessionTTLDays is how long login cookies stay valid. 0 = 30 days.
+	// Editable in Settings; a UI change is stored and overrides this.
 	SessionTTLDays int `json:"session_ttl_days"`
 	// SecureCookies marks the session cookie Secure (sent over HTTPS
 	// only). Turn this on when a TLS-terminating reverse proxy fronts
@@ -74,7 +78,9 @@ func (c *config) previewsDefault() bool {
 type userConfig struct {
 	Username string `json:"username"`
 	// PasswordHash is a bcrypt hash; generate one with
-	// `ircd-web -hash-password`.
+	// `ircd-web -hash-password`. It seeds the login password; a change made
+	// in Settings → Change password is stored in the database and takes
+	// precedence (the config file may be a read-only systemd credential).
 	PasswordHash string `json:"password_hash"`
 }
 
