@@ -4,7 +4,50 @@ import {
 	bufKey, firstURL, fmtTime, hostOf, linkify, looksLikeImageURL,
 	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash, applyStatusMode, mergeById, mergeServerBuffers,
 	applyTombstones, rememberRedaction, nickSet, highlightNicks, proxyCredsExposed, foldNick,
+	parseFormatting, stripFormatting,
 } from "../src/irc.js";
+
+test("parseFormatting: plain text is one unstyled run", () => {
+	const runs = parseFormatting("hello world");
+	is(runs.length, 1);
+	is(runs[0].text, "hello world");
+	is(runs[0].fg, null);
+	is(runs[0].bold, false);
+});
+
+test("parseFormatting: bold/italic toggles and reset", () => {
+	const runs = parseFormatting("a\x02b\x1dc\x0fd");
+	eq(runs.map((r) => [r.text, r.bold, r.italic]), [
+		["a", false, false],
+		["b", true, false],
+		["c", true, true],
+		["d", false, false],
+	]);
+});
+
+test("parseFormatting: the garbled-emoticon case renders clean with colors", () => {
+	// \x0306^\x0313.\x0305^\x0304/  ->  "\^.^/" (was shown as "\06^13.05^04/")
+	const runs = parseFormatting("\\\x0306^\x0313.\x0305^\x0304/");
+	is(runs.map((r) => r.text).join(""), "\\^.^/");
+	is(runs.find((r) => r.text === "^").fg, "#9c009c"); // colour 6
+});
+
+test("parseFormatting: the YouTube badge case (fg,bg with reset)", () => {
+	const runs = parseFormatting("^ \x030,4▶\x031,0YouTube\x03 :: rest");
+	const play = runs.find((r) => r.text === "▶");
+	is(play.fg, "#ffffff"); // 0 white
+	is(play.bg, "#ff0000"); // 4 red
+	const yt = runs.find((r) => r.text === "YouTube");
+	is(yt.fg, "#000000"); // 1 black
+	is(yt.bg, "#ffffff"); // 0 white
+	is(runs.find((r) => r.text === " :: rest").fg, null); // bare \x03 reset colour
+});
+
+test("stripFormatting removes codes; mentionsMe sees through them", () => {
+	is(stripFormatting("\\\x0306^\x0313.\x0305^\x0304/"), "\\^.^/");
+	is(stripFormatting("\x02bold\x0f \x0304,05colored\x03"), "bold colored");
+	is(mentionsMe("hey \x0304alice\x03!", "alice"), true); // colour code must not hide it
+});
 
 test("proxyCredsExposed flags credentials to a non-loopback proxy", () => {
 	is(proxyCredsExposed("socks5://user:pass@proxy.example.com:1080"), true);

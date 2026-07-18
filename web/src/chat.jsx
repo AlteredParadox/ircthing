@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Completer } from "./complete.js";
 import { isEditable, modalScrimOpen } from "./dom.js";
 import { menuTrigger } from "./menu.jsx";
-import { applyStatusMode, firstURL, fmtTime, highlightNicks, linkify, nickColor, nickSet, renderable, SERVER_BUFFER, TypingSender, typingText } from "./irc.js";
+import { applyStatusMode, firstURL, fmtTime, highlightNicks, linkify, nickColor, nickSet, parseFormatting, renderable, SERVER_BUFFER, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
 import { WhoisCard } from "./whois.jsx";
@@ -29,18 +29,46 @@ function bodyText(text, nicks, theme, onNick, keyBase) {
 	);
 }
 
+// fmtWrap wraps a run's rendered inner content in a span carrying its mIRC
+// formatting. An unstyled run renders inline with no wrapper (the common case).
+// Every style value comes from the fixed palette or a boolean, so there is no
+// injection surface (and Preact escapes the text content).
+function fmtWrap(run, inner, key) {
+	if (!run.bold && !run.italic && !run.underline && !run.strike && !run.mono && !run.reverse && run.fg == null && run.bg == null) {
+		return inner;
+	}
+	let { fg, bg } = run;
+	if (run.reverse) { // swap fg/bg, falling back to the theme defaults
+		[fg, bg] = [bg ?? "var(--bg)", fg ?? "var(--text)"];
+	}
+	const style = {};
+	if (fg != null) style.color = fg;
+	if (bg != null) { style.background = bg; style.padding = "0 2px"; style.borderRadius = "3px"; }
+	if (run.bold) style.fontWeight = "700";
+	if (run.italic) style.fontStyle = "italic";
+	if (run.mono) style.fontFamily = "var(--mono-font)";
+	const deco = [run.underline && "underline", run.strike && "line-through"].filter(Boolean).join(" ");
+	if (deco) style.textDecoration = deco;
+	return <span key={key} class="fmt" style={style}>{inner}</span>;
+}
+
 function Body({ text, nicks, theme, onNick }) {
-	// draft/multiline messages carry embedded newlines; render each line
-	// on its own row, linkifying within each.
+	// draft/multiline messages carry embedded newlines; render each line on its
+	// own row. Within a line, mIRC formatting is parsed into styled runs first,
+	// then links and nick mentions are resolved WITHIN each run (on its clean,
+	// code-free text).
 	const lines = text.split("\n");
 	return lines.map((line, li) => (
 		<Fragment key={li}>
 			{li > 0 && <br />}
-			{linkify(line).map((seg, si) =>
-				seg.link
-					? <a key={si} href={seg.text} target="_blank" rel="noopener noreferrer">{seg.text}</a>
-					: bodyText(seg.text, nicks, theme, onNick, li + "-" + si + "-"),
-			)}
+			{parseFormatting(line).map((run, ri) => {
+				const inner = linkify(run.text).map((seg, si) =>
+					seg.link
+						? <a key={si} href={seg.text} target="_blank" rel="noopener noreferrer">{seg.text}</a>
+						: bodyText(seg.text, nicks, theme, onNick, li + "-" + ri + "-" + si + "-"),
+				);
+				return fmtWrap(run, inner, ri);
+			})}
 		</Fragment>
 	));
 }

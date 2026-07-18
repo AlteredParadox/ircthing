@@ -763,6 +763,14 @@ input::placeholder {
 	color: var(--text-dim);
 }
 
+/* One mIRC formatting run (color/bold/etc. from parseFormatting). All style
+   values are inline from the fixed palette; this only makes a run with a
+   background+padding render cleanly when it wraps across lines. */
+.fmt {
+	box-decoration-break: clone;
+	-webkit-box-decoration-break: clone;
+}
+
 /* Delete button on own messages, revealed on row hover. Absolutely pinned to
    the row's top-right (the row is position:relative) now that the row is an
    inline flow rather than a flex line; its opaque background covers any text

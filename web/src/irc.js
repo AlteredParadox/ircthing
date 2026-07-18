@@ -206,6 +206,7 @@ export function sameGroup(prev, cur) {
 const NICK_CHARS = String.raw`A-Za-z0-9_\-\[\]\\` + "`^{}|";
 export function mentionsMe(text, nick) {
 	if (!nick) return false;
+	text = stripFormatting(text); // a colour code between chars must not hide a mention
 	const esc = nick.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
 	return new RegExp(`(^|[^${NICK_CHARS}])${esc}($|[^${NICK_CHARS}])`, "i").test(text);
 }
@@ -227,6 +228,95 @@ export function linkify(text) {
 	}
 	if (last < text.length) out.push({ link: false, text: text.slice(last) });
 	return out;
+}
+
+// IRC_PALETTE is the standard mIRC / IRCv3 99-colour table (index 0..98; 99 and
+// out-of-range mean "default", handled as null). These are FIXED hex values —
+// the only server-controlled input to formatting is the numeric index, clamped
+// into this table, so there is no way to inject an arbitrary colour string.
+// prettier-ignore
+const IRC_PALETTE = [
+	"#ffffff", "#000000", "#00007f", "#009300", "#ff0000", "#7f0000", "#9c009c", "#fc7f00",
+	"#ffff00", "#00fc00", "#009393", "#00ffff", "#0000fc", "#ff00ff", "#7f7f7f", "#d2d2d2",
+	"#470000", "#472100", "#474700", "#324700", "#004700", "#00472c", "#004747", "#002747",
+	"#000047", "#2e0047", "#470047", "#47002a", "#740000", "#743a00", "#747400", "#517400",
+	"#007400", "#007449", "#007474", "#004074", "#000074", "#4b0074", "#740074", "#740045",
+	"#b50000", "#b56300", "#b5b500", "#7db500", "#00b500", "#00b571", "#00b5b5", "#0063b5",
+	"#0000b5", "#7500b5", "#b500b5", "#b5006b", "#ff0000", "#ff8c00", "#ffff00", "#b2ff00",
+	"#00ff00", "#00ffa0", "#00ffff", "#008cff", "#0000ff", "#a500ff", "#ff00ff", "#ff0098",
+	"#ff5959", "#ffb459", "#ffff71", "#cfff60", "#6fff6f", "#65ffc9", "#6dffff", "#59b4ff",
+	"#5959ff", "#c459ff", "#ff66ff", "#ff59bc", "#ff9c9c", "#ffd39c", "#ffff9c", "#e2ff9c",
+	"#9cff9c", "#9cffdb", "#9cffff", "#9cd3ff", "#9c9cff", "#dc9cff", "#ff9cff", "#ff94d3",
+	"#000000", "#131313", "#282828", "#363636", "#4d4d4d", "#656565", "#818181", "#9f9f9f",
+	"#bcbcbc", "#e2e2e2", "#ffffff",
+];
+
+function paletteColor(digits) {
+	const n = parseInt(digits, 10);
+	return n >= 0 && n < IRC_PALETTE.length ? IRC_PALETTE[n] : null; // 99 / OOR = default
+}
+
+const isDigit = (c) => c >= "0" && c <= "9";
+const HEX6 = /^[0-9a-fA-F]{6}$/;
+
+// parseFormatting turns an IRC message body into styled runs. It consumes mIRC
+// control codes — attributes \x02 bold, \x1d italic, \x1f underline, \x1e
+// strikethrough, \x11 monospace, \x16 reverse, \x0f reset; \x03 fg[,bg] indexed
+// colour; \x04 RRGGBB[,RRGGBB] hex colour — and returns
+// [{ text, bold, italic, underline, strike, mono, reverse, fg, bg }], where
+// fg/bg are resolved CSS colour strings or null. The control bytes themselves
+// (and their numeric arguments) are removed, so callers never see them and the
+// old digit-leak (`\06^13.05^04/`) is gone.
+export function parseFormatting(text) {
+	const runs = [];
+	const st = { bold: false, italic: false, underline: false, strike: false, mono: false, reverse: false, fg: null, bg: null };
+	let buf = "";
+	const flush = () => { if (buf) { runs.push({ text: buf, ...st }); buf = ""; } };
+	const reset = () => Object.assign(st, { bold: false, italic: false, underline: false, strike: false, mono: false, reverse: false, fg: null, bg: null });
+	let i = 0;
+	while (i < text.length) {
+		const c = text.charCodeAt(i);
+		switch (c) {
+			case 0x02: flush(); st.bold = !st.bold; i++; continue;
+			case 0x1d: flush(); st.italic = !st.italic; i++; continue;
+			case 0x1f: flush(); st.underline = !st.underline; i++; continue;
+			case 0x1e: flush(); st.strike = !st.strike; i++; continue;
+			case 0x11: flush(); st.mono = !st.mono; i++; continue;
+			case 0x16: flush(); st.reverse = !st.reverse; i++; continue;
+			case 0x0f: flush(); reset(); i++; continue;
+			case 0x03: { // \x03 fg[,bg], up to 2 digits each
+				flush(); i++;
+				let d = "";
+				while (i < text.length && d.length < 2 && isDigit(text[i])) d += text[i++];
+				if (d === "") { st.fg = null; st.bg = null; continue; } // bare \x03 resets colour
+				st.fg = paletteColor(d);
+				if (text[i] === "," && isDigit(text[i + 1])) {
+					i++;
+					let e = "";
+					while (i < text.length && e.length < 2 && isDigit(text[i])) e += text[i++];
+					st.bg = paletteColor(e);
+				}
+				continue;
+			}
+			case 0x04: { // \x04 RRGGBB[,RRGGBB]
+				flush(); i++;
+				const fg = text.slice(i, i + 6);
+				if (!HEX6.test(fg)) { st.fg = null; st.bg = null; continue; }
+				st.fg = "#" + fg; i += 6;
+				if (text[i] === "," && HEX6.test(text.slice(i + 1, i + 7))) { st.bg = "#" + text.slice(i + 1, i + 7); i += 7; }
+				continue;
+			}
+			default: buf += text[i++];
+		}
+	}
+	flush();
+	return runs;
+}
+
+// stripFormatting removes all mIRC control codes (and their colour arguments)
+// so text matching — mention detection especially — sees the plain body.
+export function stripFormatting(text) {
+	return text.replace(/[\x02\x0f\x11\x16\x1d\x1e\x1f]|\x03\d{0,2}(?:,\d{1,2})?|\x04[0-9a-fA-F]{6}(?:,[0-9a-fA-F]{6})?/g, "");
 }
 
 // nickSet builds the lookup for in-body nick highlighting: lowercased nick ->
