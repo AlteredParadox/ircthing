@@ -808,10 +808,14 @@ export function App() {
 	}, [activeKey, connected, buffers, msgs, loadTick]);
 
 	// Evict live message lists for buffers outside the KEEP_BUFFERS most
-	// recently active. Runs on every activeKey change so the working set
-	// stays bounded no matter how many channels a bouncer feeds; a mid-load
-	// buffer is never evicted (its in-flight page would have nowhere to
-	// merge). An evicted buffer reloads its tail when reopened.
+	// recently active. Runs on every activeKey change AND on load completion
+	// (loadTick) so the working set stays bounded no matter how many channels a
+	// bouncer feeds; a mid-load buffer is never evicted (its in-flight page
+	// would have nowhere to merge). Re-running on loadTick matters when a load
+	// finishes for a buffer that has since scrolled out of the recent set (the
+	// user switched away while it loaded): the exemption then lifts and it is
+	// evicted, instead of lingering until the next buffer switch. An evicted
+	// buffer reloads its tail when reopened.
 	const recentKeys = useRef([]);
 	useEffect(() => {
 		if (!activeKey) return;
@@ -826,7 +830,7 @@ export function App() {
 			}
 			return next;
 		});
-	}, [activeKey]);
+	}, [activeKey, loadTick]);
 
 	// Default to the first buffer once the sidebar is known. If the
 	// active key came from a hash that names no existing buffer, clear it

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"ircthing/internal/irc"
 	"ircthing/internal/store"
@@ -216,7 +217,7 @@ func (h *Hub) handleControlNumeric(ctx context.Context, c Conn, ev irc.Event) bo
 		if txt := strings.TrimSpace(strings.Join(ev.Msg.Params, " ")); txt != "" {
 			h.broadcast(envelope("server_info", 0, ServerInfoData{
 				Network: ev.Network,
-				Text:    strings.ToLower(ev.Msg.Command) + ": " + txt,
+				Text:    clampServerInfo(strings.ToLower(ev.Msg.Command) + ": " + txt),
 			}))
 		}
 		return true
@@ -313,7 +314,7 @@ func (h *Hub) liveHints(ctx context.Context, c Conn, ev irc.Event) {
 		}
 		h.broadcast(envelope("server_info", 0, ServerInfoData{
 			Network: ev.Network,
-			Text:    ev.Msg.Prefix.Name + " invited " + who + " to " + ev.Msg.Param(1),
+			Text:    clampServerInfo(ev.Msg.Prefix.Name + " invited " + who + " to " + ev.Msg.Param(1)),
 		}))
 	}
 	// Our own JOIN is the moment to backfill that channel: requesting at
@@ -733,7 +734,30 @@ func (h *Hub) serverInfo(ev irc.Event) (ServerInfoData, bool) {
 	if txt == "" {
 		return ServerInfoData{}, false
 	}
-	return ServerInfoData{Text: txt}, true
+	return ServerInfoData{Text: clampServerInfo(txt)}, true
+}
+
+// maxServerInfoBytes bounds an ephemeral server_info line. These are NOT
+// stored (so they skip the store's clamp), but the browser keeps thousands of
+// them in a buffer, so a hostile server streaming near-LINELEN 4xx/5xx
+// numerics could bloat client memory. Real MOTD/error/notice lines are far
+// under this.
+const maxServerInfoBytes = 2048
+
+// clampServerInfo truncates s to maxServerInfoBytes, trimming a trailing
+// partial rune so the result stays valid UTF-8.
+func clampServerInfo(s string) string {
+	if len(s) <= maxServerInfoBytes {
+		return s
+	}
+	s = s[:maxServerInfoBytes]
+	for len(s) > 0 {
+		if r, size := utf8.DecodeLastRuneInString(s); r != utf8.RuneError || size != 1 {
+			break
+		}
+		s = s[:len(s)-1]
+	}
+	return s
 }
 
 // accumulateWhois collects the WHOIS reply numerics into one card,
