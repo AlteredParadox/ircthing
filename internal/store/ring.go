@@ -56,6 +56,17 @@ func cursorLess(a, b Cursor) bool {
 func (r *ring) insert(m Message) int {
 	before := r.bytes
 	c := m.Cursor()
+	// Refuse a message older than the ring's oldest entry when the ring is
+	// only a suffix of history (not complete): it belongs to the on-disk
+	// region, and front-inserting it would put a hole between it and the
+	// trimmed/evicted boundary — pageAfter/pageBefore assume the ring is a
+	// CONTIGUOUS newest-suffix and would then serve pages with the disk rows
+	// in that hole silently missing. The row is already persisted, so it is
+	// read from disk on demand. (A complete ring holds all history, so an
+	// older message genuinely extends it and is kept.)
+	if !r.complete && len(r.msgs) > 0 && cursorLess(c, r.msgs[0].Cursor()) {
+		return 0
+	}
 	i := sort.Search(len(r.msgs), func(i int) bool {
 		return cursorLess(c, r.msgs[i].Cursor())
 	})

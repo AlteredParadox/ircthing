@@ -7,6 +7,59 @@ import (
 	"time"
 )
 
+// A message older than a byte-trimmed (incomplete) ring's oldest entry must
+// NOT punch a hole the ring then serves over: after trimToBytes shrinks the
+// in-use ring below capacity, a backward (old server-time) insert used to
+// front-insert without eviction, and pageAfter's "cursor >= oldest" authority
+// then served the ring alone — dropping the on-disk rows between the
+// backfilled entry and the trim boundary. The row must instead come from disk.
+func TestTrimmedRingNoHoleOnBackwardInsert(t *testing.T) {
+	s, _ := openTest(t, 10_000) // large ring_size: the single ring can outgrow the budget
+	s.mu.Lock()
+	s.maxRingBytes = 4096
+	s.mu.Unlock()
+	// Fill with ascending server-time so the ring holds a contiguous suffix,
+	// then blows the tiny budget and gets trimmed (complete=false).
+	for i := 1; i <= 60; i++ {
+		if _, err := s.Append(ctx, "net", "#c", Message{
+			Time: time.UnixMilli(int64(i) * 1000), Sender: "a", Command: "PRIVMSG",
+			Raw: strings.Repeat("x", 200),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A new-to-disk message with an OLD server-time (a delayed relay / hostile
+	// clock) whose cursor predates the trimmed ring's oldest entry.
+	if _, err := s.Append(ctx, "net", "#c", Message{
+		Time: time.UnixMilli(5_000), Sender: "a", Command: "PRIVMSG", Raw: "late",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// All 61 rows must be served (from disk where the ring can't), in order —
+	// nothing silently missing.
+	got, err := s.Latest(ctx, "net", "#c", 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 61 {
+		t.Fatalf("Latest served %d messages, want 61 (no hole)", len(got))
+	}
+	for i := 1; i < len(got); i++ {
+		if cursorLess(got[i].Cursor(), got[i-1].Cursor()) {
+			t.Fatalf("served rows out of order at %d", i)
+		}
+	}
+	// An After page anchored before the old insert must also see everything
+	// after it (this is the exact heuristic that used to serve the hole).
+	after, err := s.After(ctx, "net", "#c", Cursor{TS: 1, ID: 0}, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 61 {
+		t.Fatalf("After served %d messages, want 61 (no hole)", len(after))
+	}
+}
+
 // The global hot-ring byte budget must bound total resident ring bytes by
 // evicting least-recently-used rings, keep its running total exactly in step
 // with the rings, and re-warm an evicted buffer from disk on next access.

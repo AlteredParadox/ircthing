@@ -165,6 +165,40 @@ func TestPersistTarget(t *testing.T) {
 	}
 }
 
+// replayTarget must file a REPLAYED private NOTICE from a correspondent in the
+// server buffer "*" — the same place live noticeTarget files it — so a
+// reconnect chathistory replay does not duplicate it into the query buffer
+// (per-buffer msgid dedup would let both persist: a duplicate row + phantom
+// unread). Channel notices and our own echoed notice keep the batch target.
+func TestReplayTargetNoticeRouting(t *testing.T) {
+	c := &fakeConn{nick: "AlteredParadox"}
+	cases := []struct {
+		name        string
+		line        string
+		batchTarget string
+		want        string
+		ok          bool
+	}{
+		{"incoming private notice -> server buffer", ":alice!u@h NOTICE AlteredParadox :ping", "alice", "*", true},
+		{"incoming private notice, case-variant batch", ":Alice!u@h NOTICE AlteredParadox :ping", "alice", "*", true},
+		{"our own echoed notice -> recipient query", ":AlteredParadox!u@h NOTICE alice :psst", "alice", "alice", true},
+		{"channel notice -> the channel", ":alice!u@h NOTICE #go :psst", "#go", "#go", true},
+		{"private message -> the query", ":alice!u@h PRIVMSG AlteredParadox :hi", "alice", "alice", true},
+		{"channel message -> the channel", ":alice!u@h PRIVMSG #go :hi", "#go", "#go", true},
+		{"statusmsg channel notice -> bare channel", ":alice!u@h NOTICE @#go :hi", "@#go", "#go", true},
+		{"non-action ctcp dropped", ":alice!u@h NOTICE AlteredParadox :\x01VERSION x\x01", "alice", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := ircv4.MustParseMessage(tc.line)
+			got, ok := replayTarget(m, tc.batchTarget, c)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("replayTarget = (%q, %v), want (%q, %v)", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
 func TestStoreMessage(t *testing.T) {
 	recv := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	cases := []struct {

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { pressable } from "./a11y.js";
-import { bufKey, fmtTime, renderable } from "./irc.js";
+import { bufKey, fmtTime, renderable, stripFormatting } from "./irc.js";
 
 // tombstoneResults re-marks search rows that were redacted while the buffer
 // was unloaded — a snapshot taken before the destructive scrub could otherwise
@@ -116,7 +116,7 @@ export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep, redacte
 								</div>
 								<div class="search-result-line">
 									<span class="search-result-nick">{ev.sender}{ev.sender ? (nickSep || "") : ""}</span>
-									<span class="search-result-text">{r.text}</span>
+									<span class="search-result-text">{stripFormatting(r.text)}</span>
 								</div>
 							</div>
 						);

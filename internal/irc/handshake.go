@@ -525,7 +525,9 @@ func parseCapList(list string, dst map[string]string) {
 		if _, known := dst[name]; !known && len(dst) >= maxAdvertisedCaps {
 			continue // bound the map; ignore further new caps
 		}
-		dst[name] = val
+		// Clone: name/val are substrings of the CAP LS line and would pin the
+		// whole (up to ~16 KiB) registration line in this map otherwise.
+		dst[strings.Clone(name)] = strings.Clone(val)
 	}
 }
 

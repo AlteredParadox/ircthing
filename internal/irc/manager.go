@@ -495,7 +495,10 @@ func (m *Manager) handleCapNotify(in *ircv4.Message) []*ircv4.Message {
 			seen[name] = true
 			req = append(req, name)
 			if value != "" {
-				m.pendingCapVals[name] = value
+				// Clone: name/value are substrings of the parsed CAP line, so
+				// stashing them would pin the whole (up to ~64 KiB) line in
+				// this connection-lifetime map even for a short known cap name.
+				m.pendingCapVals[strings.Clone(name)] = strings.Clone(value)
 			}
 		}
 		if len(req) == 0 {
@@ -543,9 +546,13 @@ func (m *Manager) applyCapChange(enable bool, list string) {
 			if !wantedCapSet[name] {
 				continue
 			}
-			caps[name] = true
+			// Clone the name (an ACK/DEL line substring) before it becomes a
+			// long-lived map key, so it can't pin the parsed line. The value
+			// came from pendingCapVals, already detached.
+			cn := strings.Clone(name)
+			caps[cn] = true
 			if v, ok := m.pendingCapVals[name]; ok {
-				vals[name] = v
+				vals[cn] = v
 				delete(m.pendingCapVals, name)
 			}
 		} else {
@@ -777,7 +784,7 @@ func (m *Manager) applyCaps(hs *handshake) {
 	vals := make(map[string]string, len(hs.enabled))
 	for name := range hs.enabled {
 		if v := hs.caps[name]; v != "" {
-			vals[name] = v
+			vals[strings.Clone(name)] = v // detach the key from any parsed line
 		}
 	}
 	m.capVals.Store(vals)
@@ -1242,7 +1249,7 @@ func (m *Manager) onLiveLine(in *ircv4.Message, send func([]*ircv4.Message) erro
 	// casemapping.
 	if in.Command == "NICK" && in.Prefix != nil && m.isup.FoldEqual(in.Prefix.Name, m.Nick()) {
 		if n := in.Param(0); n != "" {
-			m.nick.Store(n)
+			m.nick.Store(strings.Clone(n)) // detach from the parsed line (retained)
 		}
 	}
 	m.roster.handle(m.Nick(), in)

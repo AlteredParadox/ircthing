@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
-import { applyTombstones, bufferOrder, bufKey, foldNick, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, rememberRedaction, renderable, SERVER_BUFFER, toHash, typingExpired } from "./irc.js";
+import { applyTombstones, bufferOrder, bufKey, foldNick, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, rememberRedaction, renderable, SERVER_BUFFER, stripFormatting, toHash, typingExpired } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
 import { Login } from "./login.jsx";
 import { applyPrefs, loadPrefs, normalizePrefs, resolveTheme, savePrefs } from "./prefs.js";
@@ -82,7 +82,9 @@ function wsURL() {
 // topicFor: connection state trumps the topic while (re)connecting.
 function topicFor(activeBuf, netState, chanInfo) {
 	if (netState && netState !== "registered") return `${activeBuf?.network}: ${netState}…`;
-	return chanInfo?.topic || "";
+	// The topic bar is plain text (no styled runs), so strip mIRC codes rather
+	// than leak their digits into the title/label.
+	return stripFormatting(chanInfo?.topic || "");
 }
 
 // TopBar: buffer name, topic, and the panel/search/theme buttons.
@@ -641,7 +643,8 @@ export function App() {
 			// isn't looking (tab hidden, or a different buffer active).
 			if (alert && (document.hidden || key !== activeKeyRef.current)) {
 				const where = isChan ? `${ev.sender} in ${ev.buffer}` : ev.sender;
-				notifier.current.show(where, r.text, key, () => {
+				// The Notification API renders plain text, so strip mIRC codes.
+				notifier.current.show(where, stripFormatting(r.text), key, () => {
 					location.hash = toHash(ev.network, ev.buffer);
 					setActiveKey(key);
 				});
@@ -718,7 +721,11 @@ export function App() {
 			const key = bufKey(d.network, SERVER_BUFFER);
 			setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(d.network, SERVER_BUFFER) }));
 			const ev = {
-				id: `si${++infoSeq}`, network: d.network, buffer: SERVER_BUFFER,
+				// Zero-pad the sequence: a MOTD/connect burst shares one
+				// Date.now() ms, so mergeById breaks the tie by STRING id when
+				// the server buffer's history loads — unpadded, "si10" sorts
+				// before "si2", scrambling the lines.
+				id: `si${String(++infoSeq).padStart(9, "0")}`, network: d.network, buffer: SERVER_BUFFER,
 				time: Date.now(), sender: "", command: "INFO", raw: d.text,
 			};
 			setMsgs((m) => appendInfoLine(m, key, ev, true));
@@ -735,7 +742,9 @@ export function App() {
 			const key = bufKey(d.network, d.nick);
 			setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(d.network, d.nick) }));
 			const ev = {
-				id: `wh${++whoisSeq}`, network: d.network, buffer: d.nick,
+				// Zero-padded like the server_info ids so same-ms cards keep
+				// insertion order through mergeById's string tie-break.
+				id: `wh${String(++whoisSeq).padStart(9, "0")}`, network: d.network, buffer: d.nick,
 				time: Date.now(), sender: "", command: "WHOIS", raw: "", whois: d,
 			};
 			setMsgs((m) => appendInfoLine(m, key, ev));
@@ -970,8 +979,16 @@ export function App() {
 		// create a placeholder so the view renders while events arrive.
 		setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(network, buffer) }));
 		// Returning to a buffer that's showing a search-jump window drops
-		// it so the live tail reloads.
-		setMsgs((m) => (m[key]?.atTail === false ? dropBufferMsgs(m, key) : m));
+		// it so the live tail reloads. Bump the history generation on the drop
+		// so a loadOlder page already in flight for that window is discarded,
+		// not spliced into the fresh tail (a silent hole in scrollback).
+		setMsgs((m) => {
+			if (m[key]?.atTail === false) {
+				historyGen.current[key] = (historyGen.current[key] || 0) + 1;
+				return dropBufferMsgs(m, key);
+			}
+			return m;
+		});
 		setFocusId(null);
 		location.hash = toHash(network, buffer);
 		setActiveKey(key);
@@ -1185,6 +1202,11 @@ export function App() {
 	function jumpTo(ev) {
 		const key = bufKey(ev.network, ev.buffer);
 		setSearchOpen(false);
+		// Clear focus up front so re-jumping to the SAME result still registers
+		// as a focusId change — VirtualList only arms a scroll on a change, so
+		// without this, clicking the same row twice (after scrolling away) is a
+		// no-op and the view never re-centers.
+		setFocusId(null);
 		// Invalidate any in-flight initial history load for this buffer so
 		// its resolve is discarded (see the load effect's gen check) instead
 		// of merging the live tail into — and flipping atTail true on — the
@@ -1280,7 +1302,17 @@ export function App() {
 	// live events flow again.
 	function reloadTail() {
 		failedHistory.current.delete(activeKey); // explicit reload: allow a retry
-		setMsgs((m) => (m[activeKey]?.atTail === false ? dropBufferMsgs(m, activeKey) : m));
+		// Bump the history generation on the drop so a loadOlder page already in
+		// flight for the dropped (non-tail) window is discarded rather than
+		// merged into the reloaded live tail — otherwise old rows splice in
+		// adjacent to the newest, leaving a silent gap.
+		setMsgs((m) => {
+			if (m[activeKey]?.atTail === false) {
+				historyGen.current[activeKey] = (historyGen.current[activeKey] || 0) + 1;
+				return dropBufferMsgs(m, activeKey);
+			}
+			return m;
+		});
 	}
 
 	// sendInput returns a promise that resolves when the send is accepted and

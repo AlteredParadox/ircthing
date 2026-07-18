@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Completer } from "./complete.js";
 import { isEditable, modalScrimOpen } from "./dom.js";
 import { menuTrigger } from "./menu.jsx";
-import { applyStatusMode, firstURL, fmtTime, highlightNicks, linkify, nickColor, nickSet, parseFormatting, renderable, SERVER_BUFFER, TypingSender, typingText } from "./irc.js";
+import { applyStatusMode, firstURL, fmtTime, highlightNicks, linkify, nickColor, nickSet, parseFormatting, renderable, SERVER_BUFFER, stripFormatting, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
 import { WhoisCard } from "./whois.jsx";
@@ -78,7 +78,9 @@ function SysRow({ ev, r, focused, timeFmt }) {
 		<div class={"sys-row" + (r.kind === "redacted" ? " redacted" : "") + (focused ? " flash" : "")}>
 			<span class="msg-time">{fmtTime(ev.time, timeFmt)}</span>
 			<span class={"sys-mark " + r.markClass}>{r.mark}</span>
-			<span>{r.text}</span>
+			{/* System rows (part/quit/kick reasons, TOPIC) are never colour-
+			    rendered, so strip mIRC codes rather than leak their digits. */}
+			<span>{stripFormatting(r.text)}</span>
 		</div>
 	);
 }

@@ -14,6 +14,16 @@ import (
 // bloating the roster even after cloning detaches it from the parsed line.
 const maxRosterField = 512
 
+// foldKey is the canonical member/channel map-key form: clamp a
+// server-supplied name to the roster field bound, THEN fold under the
+// connection's casemapping. Every storage site keys by this form (via a
+// clampRoster'd variable), so every LOOKUP must use it too — folding the raw
+// name would never match a key stored from an oversized (>maxRosterField)
+// name, leaving ghost members/channels that only reconnect clears.
+func (r *roster) foldKey(name string) string {
+	return r.isup.Fold(clampRoster(name))
+}
+
 // clampRoster bounds s to maxRosterField bytes (trimming a trailing partial
 // rune) AND detaches it from the parsed IRC line via a fresh copy.
 func clampRoster(s string) string {
@@ -164,7 +174,7 @@ func (r *roster) clear() {
 func (r *roster) channelsWith(nick string) []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	key := r.isup.Fold(nick)
+	key := r.foldKey(nick)
 	var out []string
 	for _, st := range r.chans {
 		if _, ok := st.members[key]; ok {
@@ -179,7 +189,7 @@ func (r *roster) channelsWith(nick string) []string {
 func (r *roster) channel(name string) (topic string, members []Member, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	st := r.chans[r.isup.Fold(name)]
+	st := r.chans[r.foldKey(name)]
 	if st == nil {
 		return "", nil, false
 	}
@@ -260,7 +270,7 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 	case "354": // RPL_WHOSPCRPL: our WHOX reply
 		r.whoxReply(m)
 	case "MODE":
-		if st := r.chans[fold(m.Param(0))]; st != nil {
+		if st := r.chans[r.foldKey(m.Param(0))]; st != nil {
 			r.applyChannelMode(st, m.Params)
 		}
 	}
@@ -268,7 +278,7 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 
 // setTopic updates a known channel's topic. Caller holds r.mu.
 func (r *roster) setTopic(channel, topic string) {
-	if st := r.chans[r.isup.Fold(channel)]; st != nil {
+	if st := r.chans[r.foldKey(channel)]; st != nil {
 		t := clampRoster(topic) // bound + detach from the parsed line
 		st.bytes += len(t) - len(st.topic)
 		st.topic = t
@@ -279,11 +289,11 @@ func (r *roster) setTopic(channel, topic string) {
 // is ours the whole channel state goes. Caller holds r.mu.
 func (r *roster) memberLeft(channel, nick string, ours bool) {
 	if ours {
-		delete(r.chans, r.isup.Fold(channel))
+		delete(r.chans, r.foldKey(channel))
 		return
 	}
-	if st := r.chans[r.isup.Fold(channel)]; st != nil {
-		fk := r.isup.Fold(nick)
+	if st := r.chans[r.foldKey(channel)]; st != nil {
+		fk := r.foldKey(nick)
 		st.del(st.members, fk)
 		st.del(st.pending, fk)
 	}
@@ -315,7 +325,7 @@ func (r *roster) totalMembers() int {
 // namesReply accumulates one 353 line: <me> <symbol> <channel>
 // :<prefixed nicks>. Caller holds r.mu.
 func (r *roster) namesReply(m *ircv4.Message) {
-	st := r.chans[r.isup.Fold(m.Param(2))]
+	st := r.chans[r.foldKey(m.Param(2))]
 	if st == nil {
 		return
 	}
@@ -352,7 +362,7 @@ func (r *roster) namesReply(m *ircv4.Message) {
 // carries no away/account/bot data, so what WHOX and the notify streams
 // already taught us about surviving members is kept. Caller holds r.mu.
 func (r *roster) namesEnd(m *ircv4.Message) {
-	st := r.chans[r.isup.Fold(m.Param(1))]
+	st := r.chans[r.foldKey(m.Param(1))]
 	if st == nil || st.pending == nil {
 		return
 	}
@@ -482,7 +492,7 @@ func (r *roster) rename(from, to string) {
 // in-flight NAMES `pending` snapshot so a 366 swap arriving mid-update does not
 // revert the change to stale data. Caller holds r.mu.
 func (r *roster) updateEverywhere(nick string, fn func(Member) Member) {
-	key := r.isup.Fold(nick)
+	key := r.foldKey(nick)
 	// Over the byte budget, accept only non-growing updates: field updates
 	// bypass the admission guards, so a hostile server could otherwise admit
 	// minimal members and then inflate every one to max-clamp fields.
@@ -602,7 +612,7 @@ func (r *roster) applyChannelMode(st *channelState, params []string) {
 // applyStatusMode grants or revokes one status prefix on a member.
 // Caller holds r.mu.
 func (r *roster) applyStatusMode(st *channelState, nick, sym string, adding bool) {
-	fk := r.isup.Fold(nick)
+	fk := r.foldKey(nick)
 	// Apply to whichever map holds the member: during a NAMES burst the
 	// member is in st.pending (not yet swapped into st.members), so a
 	// MODE between 353 and 366 must land in pending to survive the swap.

@@ -289,7 +289,7 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 	switch ev.Msg.Command {
 	case "TAGMSG": // ephemeral, never persisted
 		if !replay {
-			h.relayTyping(ev, c)
+			h.relayTyping(ctx, ev, c)
 		}
 		return nil
 	case "MARKREAD": // marker state, never persisted
@@ -432,7 +432,21 @@ func replayTarget(m *ircv4.Message, batchTarget string, c Conn) (string, bool) {
 		return "", false
 	}
 	t := stripStatusPrefix(batchTarget, c.StatusPrefixes(), c.IsChannel)
-	return t, t != ""
+	if t == "" {
+		return "", false
+	}
+	// Mirror live NOTICE routing (noticeTarget): an incoming private NOTICE
+	// from the correspondent is filed in the network server buffer, not the
+	// query. Without this a reconnect replay files it in the query buffer
+	// while the live copy went to "*", and per-buffer msgid dedup lets both
+	// persist — a duplicated row and phantom unread after every reconnect.
+	// Channel notices, and our OWN echoed notice (sender is us, not the
+	// correspondent), keep the batch target.
+	if m.Command == "NOTICE" && !c.IsChannel(t) && m.Prefix != nil &&
+		c.Fold(m.Prefix.Name) == c.Fold(t) {
+		return serverBufferTarget, true
+	}
+	return t, true
 }
 
 // persistBuffer resolves the buffer an event persists into. During replay
@@ -1030,7 +1044,7 @@ func (h *Hub) broadcastExcept(except *Session, env Envelope) {
 // relayTyping turns an incoming TAGMSG carrying the +typing client tag
 // into a "typing" push. Our own echoed TAGMSGs are ignored — the local
 // client knows what it is typing.
-func (h *Hub) relayTyping(ev irc.Event, c Conn) {
+func (h *Hub) relayTyping(ctx context.Context, ev irc.Event, c Conn) {
 	state := ev.Msg.Tags["+typing"]
 	if state != "active" && state != "paused" && state != "done" {
 		return
@@ -1043,7 +1057,9 @@ func (h *Hub) relayTyping(ev irc.Event, c Conn) {
 	if sender == "" || nick == "" || c.Fold(sender) == c.Fold(nick) {
 		return
 	}
-	buffer := ev.Msg.Param(0)
+	// Strip any STATUSMSG prefix before the channel test so a TAGMSG to
+	// "@#chan" is shown in "#chan" (where its messages are filed), not dropped.
+	buffer := stripStatusPrefix(ev.Msg.Param(0), c.StatusPrefixes(), c.IsChannel)
 	if !c.IsChannel(buffer) {
 		// A typing notice addressed to us belongs in the sender's query.
 		if c.Fold(buffer) != c.Fold(nick) {
@@ -1051,6 +1067,11 @@ func (h *Hub) relayTyping(ev irc.Event, c Conn) {
 		}
 		buffer = sender
 	}
+	// Broadcast the CANONICAL stored spelling — clients key typing state by the
+	// exact buffer string (no fold), so the wire spelling of a case-variant
+	// query ("Bob" vs stored "bob") would never match and the indicator would
+	// silently never render.
+	buffer = h.store.CanonicalBuffer(ctx, ev.Network, buffer, c.Fold)
 	h.broadcast(envelope("typing", 0, TypingData{
 		Network: ev.Network, Buffer: buffer, Nick: sender, State: state,
 	}))
@@ -1114,10 +1135,13 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 		log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)
 		return
 	}
-	if !ok && addressedToUs {
-		// A private NOTICE addressed to us is filed in the server buffer (see
-		// noticeTarget), not the sender's query — retry there so a service's
-		// redaction of a stored private NOTICE actually scrubs it.
+	// A private NOTICE addressed to us is filed in the server buffer (see
+	// noticeTarget / replayTarget), not the sender's query — retry there so a
+	// redaction of a stored private NOTICE actually scrubs it. Live: only when
+	// the redaction was addressed to us. Replay: whenever a non-channel (query)
+	// target missed, since replayTarget files the correspondent's notice in "*"
+	// too and the REDACT's batch target is the query buffer.
+	if !ok && (addressedToUs || (replay && !c.IsChannel(target))) {
 		buffer = serverBufferTarget
 		if ok, err = h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason); err != nil {
 			log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)

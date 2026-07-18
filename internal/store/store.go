@@ -158,6 +158,7 @@ type Store struct {
 	}
 
 	stopPruner chan struct{}  // closed by Close to end the pruner
+	pruneNow   chan struct{}  // buffered(1) nudge: prune promptly after a policy change
 	prunerDone sync.WaitGroup // waits for the pruner goroutine to exit
 }
 
@@ -601,6 +602,17 @@ func (s *Store) AdoptOwnMsgID(ctx context.Context, msg OwnMsg, fold func(string)
 	if msg.MsgID == "" || msg.Text == "" || msg.Sender == "" {
 		return false, nil
 	}
+	// Clamp+detach the server-supplied msgid exactly as append does: it is
+	// written to the row AND the hot ring, so an oversized one would bypass
+	// the append-time defenses (pinning the parsed line, under-counting the
+	// budget) — and, stamped full-length here while a later replayed INSERT
+	// clamps its own msgid to 512, would defeat the (buffer_id, msgid) dedup
+	// this function exists to provide. Text is clamped to the same bound the
+	// placeholder was stored under so the `text = ?` match can succeed for a
+	// long (multiline, no-echo) own message; it is only a query parameter, so
+	// it need not be cloned.
+	msg.MsgID = strings.Clone(clampUTF8(msg.MsgID, maxStoredFieldBytes))
+	msg.Text = clampUTF8(msg.Text, maxStoredMessageBytes)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

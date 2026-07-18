@@ -506,6 +506,19 @@ test("mergeById: incoming replaces existing by id", () => {
 	is(out[0].v, "new");
 });
 
+test("mergeById: zero-padded ephemeral ids keep insertion order on same-ms ties", () => {
+	// server_info/whois lines share one Date.now() ms; mergeById breaks the
+	// tie by STRING id. Unpadded "si10" would sort before "si2"; zero-padding
+	// (padStart 9) keeps them in emission order when history loads.
+	const lines = [];
+	for (let i = 1; i <= 12; i++) {
+		lines.push({ id: `si${String(i).padStart(9, "0")}`, time: 1000, raw: `line ${i}` });
+	}
+	const shuffled = [lines[9], lines[1], lines[11], lines[0]]; // si10, si2, si12, si1
+	const order = mergeById([], shuffled).map((e) => e.id);
+	eq(order, [lines[0].id, lines[1].id, lines[9].id, lines[11].id]); // si1, si2, si10, si12
+});
+
 test("applyStatusMode: collapse-row id is stable when a run is extended at its top (prepend)", () => {
 	// Run of presence events 3,4,5; then an older page prepends 1,2 which
 	// are contiguous presence events, extending the run's TOP.

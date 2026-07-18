@@ -42,11 +42,14 @@ func (s *Store) SetRetention(ctx context.Context, days, maxPerBuffer int) error 
 	s.mu.Lock()
 	s.retention = retentionPolicy{days: days, maxPerBuffer: maxPerBuffer}
 	s.mu.Unlock()
-	go func() {
-		if _, err := s.pruneOnce(context.Background(), time.Now()); err != nil {
-			log.Printf("store: prune after retention change: %v", err)
-		}
-	}()
+	// Nudge the (Close-tracked) background pruner instead of spawning an
+	// untracked goroutine that could outlive Close and log against a closed
+	// database. Non-blocking: a nudge already queued will prune once with the
+	// latest policy, which is all we need.
+	select {
+	case s.pruneNow <- struct{}{}:
+	default:
+	}
 	return nil
 }
 
@@ -94,6 +97,7 @@ type retentionPolicy struct {
 // a parameter to stay testable).
 func (s *Store) startPruner(interval time.Duration) {
 	s.stopPruner = make(chan struct{})
+	s.pruneNow = make(chan struct{}, 1)
 	s.prunerDone.Add(1)
 	go func() {
 		defer s.prunerDone.Done()
@@ -108,6 +112,7 @@ func (s *Store) startPruner(interval time.Duration) {
 			select {
 			case <-s.stopPruner:
 				return
+			case <-s.pruneNow: // a SetRetention nudge: prune again promptly
 			case <-t.C:
 			}
 		}

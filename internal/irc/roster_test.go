@@ -2,6 +2,7 @@ package irc
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	ircv4 "gopkg.in/irc.v4"
@@ -472,6 +473,37 @@ func TestRoster(t *testing.T) {
 			feed(t, r, tc.lines...)
 			tc.check(t, r)
 		})
+	}
+}
+
+// A member/channel whose name exceeds maxRosterField is stored under a
+// clamped key; the removal/update lookups must clamp too, or the entry
+// becomes a ghost that only reconnect clears. Regression for the unclamped
+// fold-lookup sites (PART/KICK/MODE/AWAY/channel).
+func TestRosterOversizedNameNoGhost(t *testing.T) {
+	bigNick := strings.Repeat("n", maxRosterField+50)
+	bigChan := "#" + strings.Repeat("c", maxRosterField+50)
+
+	// Oversized nick joins #go, then parts: it must actually leave.
+	r := testRoster()
+	feed(t, r, joinGo, ":"+bigNick+"!u@h JOIN #go")
+	if _, ms, _ := r.channel("#go"); len(ms) != 2 {
+		t.Fatalf("after join: %d members, want 2", len(ms))
+	}
+	feed(t, r, ":"+bigNick+"!u@h PART #go :bye")
+	if _, ms, _ := r.channel("#go"); len(ms) != 1 {
+		t.Fatalf("oversized nick ghosted after PART: %d members, want 1", len(ms))
+	}
+
+	// A self-JOIN to an oversized channel, then self-PART: the channel state
+	// must be deleted, not stranded.
+	feed(t, r, ":AlteredParadox!u@h JOIN "+bigChan)
+	if _, _, ok := r.channel(bigChan); !ok {
+		t.Fatal("oversized channel not created on self-JOIN")
+	}
+	feed(t, r, ":AlteredParadox!u@h PART "+bigChan)
+	if _, _, ok := r.channel(bigChan); ok {
+		t.Fatal("oversized channel ghosted after self-PART")
 	}
 }
 

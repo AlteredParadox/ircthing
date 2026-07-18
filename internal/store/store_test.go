@@ -24,8 +24,25 @@ func reopen(t *testing.T, path string, ringSize int) *Store {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	// Stop the always-on background pruner so tests that set a retention
+	// policy and call pruneOnce with a controlled `now` are deterministic:
+	// the startup goroutine's wall-clock pruneOnce would otherwise race the
+	// test's setup and delete its (old-timestamped) fixture rows. The startup
+	// prune has already run (or will, harmlessly, against the empty DB before
+	// Wait returns); no store test relies on the goroutine running.
+	haltPruner(s)
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+// haltPruner stops the background pruner so a test can drive pruning
+// deterministically via pruneOnce. Idempotent: Close then skips it.
+func haltPruner(s *Store) {
+	if s.stopPruner != nil {
+		close(s.stopPruner)
+		s.prunerDone.Wait()
+		s.stopPruner = nil
+	}
 }
 
 // seed appends n messages to net/#chan with ts = (i+1) seconds since
