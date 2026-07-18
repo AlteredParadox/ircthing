@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	ircv4 "gopkg.in/irc.v4"
 )
@@ -68,11 +67,6 @@ var wantedCapSet = func() map[string]bool {
 // The state machine is pure: callers feed each server message to handle()
 // and write the returned messages to the connection. That keeps every
 // parsing path table-testable without a socket.
-
-// maxFallbackNick caps a 433/436 fallback nick. The real NICKLEN is only
-// known from 005 (after registration), so this is a plausible ceiling that
-// keeps base+underscores from obviously overflowing a server's limit.
-const maxFallbackNick = 30
 
 type hsPhase int
 
@@ -269,32 +263,42 @@ func (h *handshake) handleWelcome(m *ircv4.Message) (out []*ircv4.Message, done 
 	return nil, true, nil
 }
 
-// handleNickInUse processes ERR_NICKNAMEINUSE/ERR_NICKCOLLISION (433/436),
-// retrying with underscore-suffixed fallbacks and giving up after three tries.
+// handleNickInUse processes ERR_NICKNAMEINUSE/ERR_NICKCOLLISION (433/436) with
+// fallbacks that are NEVER longer than the rejected nick. A 433 means the nick
+// is already in use — an INVALID (e.g. over-NICKLEN) nick is a 432 — so the
+// rejected nick is a valid length for this server. We therefore REPLACE its
+// last rune with the attempt's digit rather than appending, which could push a
+// max-length nick past a small NICKLEN and loop forever (NICKLEN isn't known
+// until 005, after registration). Gives up after three tries.
 func (h *handshake) handleNickInUse() (out []*ircv4.Message, done bool, err error) {
 	h.nickTries++
 	if h.nickTries > 3 {
 		return nil, false, fmt.Errorf("nickname %q and all fallbacks are in use", h.cfg.Nick)
 	}
-	// Cap the fallback length: the real NICKLEN isn't known until 005 (after
-	// 001), so a max-length configured nick plus the appended underscores could
-	// exceed it and be rejected. Truncate the base so base+underscores fits a
-	// plausible ceiling.
-	base := h.cfg.Nick
-	if max := maxFallbackNick - h.nickTries; len(base) > max {
-		base = base[:max]
-		// Trim a trailing partial rune so a multibyte nick isn't cut mid-rune
-		// into an invalid NICK. (max already reserves room for the trailing
-		// underscores, so base+underscores stays within the ceiling.)
-		for len(base) > 0 {
-			if r, size := utf8.DecodeLastRuneInString(base); r != utf8.RuneError || size != 1 {
-				break
-			}
-			base = base[:len(base)-1]
-		}
-	}
-	h.nick = base + strings.Repeat("_", h.nickTries)
+	h.nick = fallbackNick(h.cfg.Nick, h.nickTries)
 	return []*ircv4.Message{newMsg("NICK", h.nick)}, false, nil
+}
+
+// fallbackNick derives a 433 fallback of the same length or shorter than nick:
+// the last rune becomes the attempt's digit (1..3). A single-rune nick can't
+// take a trailing digit (a nick must start with a letter), so it substitutes
+// an alternate letter.
+func fallbackNick(nick string, attempt int) string {
+	runes := []rune(nick)
+	if len(runes) <= 1 {
+		base := 'a'
+		if len(runes) == 1 {
+			base = runes[0]
+		}
+		// Next distinct letters, wrapping a..z (a nick must start with a letter).
+		n := (int(base-'a') + attempt) % 26
+		if n < 0 {
+			n += 26
+		}
+		return string(rune('a' + n))
+	}
+	runes[len(runes)-1] = rune('0' + attempt)
+	return string(runes)
 }
 
 func (h *handshake) handleCAP(m *ircv4.Message) ([]*ircv4.Message, bool, error) {

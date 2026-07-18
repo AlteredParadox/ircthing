@@ -234,24 +234,26 @@ func TestHandshake(t *testing.T) {
 			},
 		},
 		{
-			name: "nick in use falls back with underscores",
+			// 433 = in use (valid length), so fallbacks replace the last rune
+			// with a digit — never longer than the rejected nick.
+			name: "nick in use falls back by replacing the last rune",
 			cfg:  baseCfg,
 			steps: []step{
-				{in: ":irc.test 433 * AlteredParadox :Nickname is already in use", want: []string{"NICK AlteredParadox_"}},
-				{in: ":irc.test 433 * AlteredParadox_ :Nickname is already in use", want: []string{"NICK AlteredParadox__"}},
+				{in: ":irc.test 433 * AlteredParadox :Nickname is already in use", want: []string{"NICK at1"}},
+				{in: ":irc.test 433 * at1 :Nickname is already in use", want: []string{"NICK at2"}},
 				{in: "CAP * LS :example/none", want: []string{"CAP END"}},
-				{in: ":irc.test 001 AlteredParadox__ :Welcome", done: true},
+				{in: ":irc.test 001 at2 :Welcome", done: true},
 			},
-			wantNick: "AlteredParadox__",
+			wantNick: "at2",
 		},
 		{
 			name: "nick fallbacks exhausted fails",
 			cfg:  baseCfg,
 			steps: []step{
-				{in: ":irc.test 433 * AlteredParadox :in use", want: []string{"NICK AlteredParadox_"}},
-				{in: ":irc.test 433 * AlteredParadox_ :in use", want: []string{"NICK AlteredParadox__"}},
-				{in: ":irc.test 433 * AlteredParadox__ :in use", want: []string{"NICK AlteredParadox___"}},
-				{in: ":irc.test 433 * AlteredParadox___ :in use", errSub: "all fallbacks"},
+				{in: ":irc.test 433 * AlteredParadox :in use", want: []string{"NICK at1"}},
+				{in: ":irc.test 433 * at1 :in use", want: []string{"NICK at2"}},
+				{in: ":irc.test 433 * at2 :in use", want: []string{"NICK at3"}},
+				{in: ":irc.test 433 * at3 :in use", errSub: "all fallbacks"},
 			},
 		},
 		{
@@ -712,4 +714,24 @@ func TestHandshakeAuthenticateChallengeBounded(t *testing.T) {
 		}
 	}
 	t.Fatalf("streaming chunks never triggered the bound (buf=%d)", len(hs.challengeBuf))
+}
+
+// A 433 fallback must never be LONGER than the rejected nick (that nick is a
+// valid length — an invalid one is 432), and must differ from it.
+func TestFallbackNick(t *testing.T) {
+	for _, nick := range []string{"abcdefghi", "AlteredParadox", "x", "z", "ab"} {
+		for attempt := 1; attempt <= 3; attempt++ {
+			fb := fallbackNick(nick, attempt)
+			if len([]rune(fb)) > len([]rune(nick)) {
+				t.Errorf("fallbackNick(%q, %d) = %q grew the nick", nick, attempt, fb)
+			}
+			if fb == nick {
+				t.Errorf("fallbackNick(%q, %d) = %q equals the rejected nick", nick, attempt, fb)
+			}
+		}
+	}
+	// The motivating case: a 9-char nick on a NICKLEN=9 server stays 9 chars.
+	if got := fallbackNick("abcdefghi", 1); got != "abcdefgh1" {
+		t.Fatalf("fallbackNick = %q, want abcdefgh1", got)
+	}
 }
