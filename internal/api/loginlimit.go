@@ -10,9 +10,11 @@ import (
 )
 
 // loginLimiter bounds the cost of the unauthenticated login endpoint,
-// which runs bcrypt per attempt: a small semaphore caps concurrent
-// hashing (small requests cannot pin the CPU), and a per-source failure
-// tracker imposes exponential backoff (1s doubling to a 60s cap).
+// which runs bcrypt per attempt, in three layers: a global token bucket
+// caps total attempt rate (rotating source addresses cannot buy
+// unlimited bcrypt work), a small semaphore caps concurrent hashing
+// (small requests cannot pin the CPU), and a per-source failure tracker
+// imposes exponential backoff (1s doubling to a 60s cap).
 //
 // The source is the connection's remote IP. Behind the expected reverse
 // proxy all attempts share the proxy's IP, so a sustained attack also
@@ -23,6 +25,10 @@ type loginLimiter struct {
 
 	mu      sync.Mutex
 	sources map[string]*loginSource
+
+	// Global attempt bucket. Refilled lazily on each globalAllow call.
+	tokens     float64
+	lastRefill time.Time
 }
 
 type loginSource struct {
@@ -35,13 +41,41 @@ const (
 	loginBackoffMax  = time.Minute
 	loginAcquireWait = 2 * time.Second
 	loginSourcesMax  = 1024
+
+	// Global attempt budget. Per-source backoff alone cannot stop an
+	// attacker rotating source addresses — every fresh source gets a free
+	// first attempt, enough to keep both bcrypt slots pinned on the 1-vCPU
+	// target. One token per second (burst 5) is far above any human login
+	// cadence and bounds worst-case bcrypt CPU to a few percent of a core.
+	loginGlobalRate  = 1.0 // tokens per second
+	loginGlobalBurst = 5.0
 )
 
 func newLoginLimiter() *loginLimiter {
 	return &loginLimiter{
-		sem:     make(chan struct{}, 2),
-		sources: make(map[string]*loginSource),
+		sem:        make(chan struct{}, 2),
+		sources:    make(map[string]*loginSource),
+		tokens:     loginGlobalBurst,
+		lastRefill: time.Now(),
 	}
+}
+
+// globalAllow consumes one attempt from the global bucket, reporting 0 when
+// the attempt may proceed and otherwise how long until a token is available.
+// Unlike the per-source tracker it charges every attempt before hashing, so
+// rotating source addresses cannot buy unlimited bcrypt work.
+func (l *loginLimiter) globalAllow(now time.Time) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if elapsed := now.Sub(l.lastRefill).Seconds(); elapsed > 0 {
+		l.tokens = min(l.tokens+elapsed*loginGlobalRate, loginGlobalBurst)
+		l.lastRefill = now
+	}
+	if l.tokens >= 1 {
+		l.tokens--
+		return 0
+	}
+	return time.Duration((1 - l.tokens) / loginGlobalRate * float64(time.Second))
 }
 
 // retryAfter reports how long the source is still blocked (0 = allowed).

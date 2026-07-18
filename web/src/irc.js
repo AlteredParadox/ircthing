@@ -267,6 +267,14 @@ const HEX6 = /^[0-9a-fA-F]{6}$/;
 // fg/bg are resolved CSS colour strings or null. The control bytes themselves
 // (and their numeric arguments) are removed, so callers never see them and the
 // old digit-leak (`\06^13.05^04/`) is gone.
+// MAX_FMT_RUNS caps the styled runs one message can produce: a hostile body
+// alternating control codes could otherwise explode 16 KiB into ~8k runs,
+// each of which Body maps through linkify/highlight into VNodes — and a
+// visible message re-renders on every composer keystroke. Past the cap the
+// remainder renders as one run with its codes stripped. Real formatted
+// messages use a handful of runs; even ASCII-art bots stay far below this.
+const MAX_FMT_RUNS = 1024;
+
 export function parseFormatting(text) {
 	const runs = [];
 	const st = { bold: false, italic: false, underline: false, strike: false, mono: false, reverse: false, fg: null, bg: null };
@@ -275,6 +283,10 @@ export function parseFormatting(text) {
 	const reset = () => Object.assign(st, { bold: false, italic: false, underline: false, strike: false, mono: false, reverse: false, fg: null, bg: null });
 	let i = 0;
 	while (i < text.length) {
+		if (runs.length >= MAX_FMT_RUNS) {
+			buf += stripFormatting(text.slice(i));
+			break;
+		}
 		const c = text.charCodeAt(i);
 		switch (c) {
 			case 0x02: flush(); st.bold = !st.bold; i++; continue;
@@ -314,9 +326,12 @@ export function parseFormatting(text) {
 }
 
 // stripFormatting removes all mIRC control codes (and their colour arguments)
-// so text matching — mention detection especially — sees the plain body.
+// so text matching — mention detection especially — sees the plain body. The
+// \x04 arguments are optional, mirroring parseFormatting's consume-one-byte
+// handling of a bare \x04: "al\x04ice" renders as "alice" and must also
+// MATCH as "alice", or the mention is visible but never alerts.
 export function stripFormatting(text) {
-	return text.replace(/[\x02\x0f\x11\x16\x1d\x1e\x1f]|\x03\d{0,2}(?:,\d{1,2})?|\x04[0-9a-fA-F]{6}(?:,[0-9a-fA-F]{6})?/g, "");
+	return text.replace(/[\x02\x0f\x11\x16\x1d\x1e\x1f]|\x03\d{0,2}(?:,\d{1,2})?|\x04(?:[0-9a-fA-F]{6}(?:,[0-9a-fA-F]{6})?)?/g, "");
 }
 
 // nickSet builds the lookup for in-body nick highlighting: lowercased nick ->

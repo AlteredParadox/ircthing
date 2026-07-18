@@ -130,9 +130,12 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 			.then((r) => (r.ok ? r.json() : null))
 			.then((d) => {
 				if (!d) return;
+				// Not `|0`: that wraps values above 2^31-1 negative, corrupting
+				// the display and making every later retention save a 400.
+				const num = (v) => Math.max(0, Math.floor(Number(v) || 0));
 				setPreviewsOn(!!d.previews);
-				setRetention({ days: d.retention_days | 0, max: d.retention_max_messages | 0 });
-				setSessionDays(d.session_ttl_days | 0);
+				setRetention({ days: num(d.retention_days), max: num(d.retention_max_messages) });
+				setSessionDays(num(d.session_ttl_days));
 			})
 			.catch(() => {});
 	}, []);
@@ -153,25 +156,33 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 		}
 	}
 
-	// Revert only if THIS is still the latest in-flight save (generation guard):
-	// otherwise an older request that fails could clobber a newer request that
-	// already succeeded.
+	// Saves are serialized per-setting (saveQueue): the next PUT is not sent
+	// until the previous settles, so an older request can never land after —
+	// and silently overwrite — a newer one server-side. The generation guard
+	// additionally reverts only if THIS is still the latest in-flight save:
+	// otherwise an older request that fails could clobber a newer request
+	// that already succeeded.
+	const saveQueue = useRef(Promise.resolve());
 	function saveRetention(patch) {
 		const prev = retention;
 		const next = { ...retention, ...patch };
 		setRetention(next);
 		const gen = ++retentionGen.current;
-		saveConfig({ retention_days: next.days, retention_max_messages: next.max }).then((ok) => {
-			if (!ok && gen === retentionGen.current) setRetention(prev);
-		});
+		saveQueue.current = saveQueue.current
+			.then(() => saveConfig({ retention_days: next.days, retention_max_messages: next.max }))
+			.then((ok) => {
+				if (!ok && gen === retentionGen.current) setRetention(prev);
+			});
 	}
 	function saveSessionDays(days) {
 		const prev = sessionDays;
 		setSessionDays(days);
 		const gen = ++sessionGen.current;
-		saveConfig({ session_ttl_days: days }).then((ok) => {
-			if (!ok && gen === sessionGen.current) setSessionDays(prev);
-		});
+		saveQueue.current = saveQueue.current
+			.then(() => saveConfig({ session_ttl_days: days }))
+			.then((ok) => {
+				if (!ok && gen === sessionGen.current) setSessionDays(prev);
+			});
 	}
 	const retNum = (v) => Math.max(0, parseInt(v, 10) || 0);
 

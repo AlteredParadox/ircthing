@@ -38,6 +38,12 @@ func loadPreviews(ctx context.Context, st *store.Store, cfg Config) bool {
 // future and would delete all history.
 const maxRetentionDays = 36500
 
+// maxRetentionMessages bounds retention_max_messages. Anything past 2^31-1
+// would round-trip through the frontend's 32-bit coercion as a negative
+// (breaking later saves); a billion messages is already beyond any real
+// SQLite deployment here.
+const maxRetentionMessages = 1_000_000_000
+
 // sessionTTLKey stores the runtime session-cookie lifetime, in days.
 const sessionTTLKey = "session_ttl_days"
 
@@ -104,7 +110,7 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 		if body.RetentionMaxMessages != nil {
 			rMax = *body.RetentionMaxMessages
 		}
-		if rDays < 0 || rDays > maxRetentionDays || rMax < 0 {
+		if rDays < 0 || rDays > maxRetentionDays || rMax < 0 || rMax > maxRetentionMessages {
 			http.Error(w, "retention out of range", http.StatusBadRequest)
 			return
 		}

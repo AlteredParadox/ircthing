@@ -28,6 +28,14 @@ test("highlightText: empty and blank patterns ignored", () => {
 	is(highlightText("hi", "", [], "libera"), false, "no nick, no rules");
 });
 
+test("highlightText: mIRC formatting inside a keyword cannot defeat the rule", () => {
+	const rules = [{ pattern: "deploy", network: "" }];
+	is(highlightText("de\x02ploy now", "AlteredParadox", rules, "libera"), true, "bold mid-word");
+	is(highlightText("de\x0304ploy now", "AlteredParadox", rules, "libera"), true, "colour mid-word");
+	is(highlightText("de\x04ploy now", "AlteredParadox", rules, "libera"), true, "bare hex-colour byte");
+	is(highlightText("al\x04ice ping", "alice", [], "libera"), true, "mention with bare \\x04");
+});
+
 test("highlightText: substring keyword match", () => {
 	const rules = [{ pattern: "cat", network: "" }];
 	is(highlightText("i love my cat", "AlteredParadox", rules, "libera"), true);

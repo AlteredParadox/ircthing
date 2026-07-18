@@ -111,13 +111,23 @@ const maxISupportKeys = 256
 // (quadratic CPU). Real values are tens of bytes; 512 is generous.
 const maxISupportValue = 512
 
+// maxISupportKey bounds a token NAME. Real names are short words (CHANMODES,
+// TARGMAX, …); an unbounded name would let 256 near-line-limit keys retain
+// ~16 MiB per connection.
+const maxISupportKey = 64
+
 func (s *isupport) applyToken(name, value string) {
-	if len(value) > maxISupportValue {
+	if len(name) > maxISupportKey || len(value) > maxISupportValue {
 		return // implausibly large — ignore, falling back to defaults
 	}
 	if _, known := s.raw[name]; !known && len(s.raw) >= maxISupportKeys {
 		return // bound the map; ignore further new keys
 	}
+	// Clone both: they are substrings of the parsed 005 line (unescapeValue
+	// returns its input unchanged when there is no escape), and even a short
+	// retained substring pins the whole line's backing array. Cloning before
+	// the switch detaches the parsed views (chanTypes, …) too.
+	name, value = strings.Clone(name), strings.Clone(value)
 	s.raw[name] = value
 	switch name {
 	case "CHANTYPES":

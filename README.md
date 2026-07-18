@@ -66,6 +66,12 @@ $EDITOR config.json                 # set user, networks
 The config file holds credentials, so keep it `0600` (the systemd unit below
 uses a root-owned credential instead).
 
+The example config ships `"secure_cookies": true` — right for the TLS
+deployments below, but for this plain-HTTP local test set it to `false`
+first: a Secure session cookie is never sent over `http://`, so login
+appears to succeed and immediately bounces back (some browsers carve out
+`127.0.0.1`, Safari does not — don't rely on it).
+
 Open http://127.0.0.1:8067 and log in with the user from the config.
 
 ## Configuration
@@ -101,7 +107,7 @@ Per network (`networks[]` seed / edit form):
 | `tls` | Use TLS. Plaintext requires the explicit `allow_plaintext: true` opt-in. |
 | `trusted_fingerprints` | Hex SHA-256 pins of the server's certificate; a match replaces CA verification (self-signed servers). |
 | `proxy` | `socks5://[user:pass@]host:port` (DNS resolves proxy-side) or `http://host:port` (CONNECT tunnel). Proxy auth is transmitted **in cleartext** (SOCKS5 username/password per RFC 1929, HTTP Basic), so only use credentialed proxies whose transport is itself encrypted or local/trusted (e.g. loopback, or inside a VPN tunnel). Mutually exclusive with `wireguard`. |
-| `wireguard` | Egress this network through an in-process userspace WireGuard tunnel (no TUN device, no root) instead of a proxy — its Noise handshake authenticates without the cleartext exposure `proxy` auth has. Object with `private_key`, `peer_public_key`, `endpoint` (`host:port`; a hostname is resolved locally, pre-tunnel), `address` (this client's address inside the tunnel), `dns` (in-tunnel resolver, `ip` or `ip:port`, default `:53`), and optional `preshared_key` / `mtu` (default 1420). Keys are standard WireGuard base64 (as `wg genkey` / Mullvad print them). Target DNS resolves through the tunnel (no local leak). Configurable in the web UI under **Egress → WireGuard tunnel**. Mutually exclusive with `proxy`. |
+| `wireguard` | Egress this network through an in-process userspace WireGuard tunnel (no TUN device, no root) instead of a proxy — its Noise handshake authenticates without the cleartext exposure `proxy` auth has. Object with `private_key`, `peer_public_key`, `endpoint` (`host:port`; a hostname is resolved locally, pre-tunnel), `address` (this client's address inside the tunnel), `dns` (in-tunnel resolver, `ip` or `ip:port`, default `:53`), and optional `preshared_key` / `mtu` (default 1420). Keys are standard WireGuard base64 (as `wg genkey` / Mullvad print them). Target DNS resolves through the tunnel (no local leak). Link previews/thumbnails for links seen in a WireGuard network are **refused** (fail closed): the media fetcher cannot yet ride the in-process tunnel, and fetching directly or via another route would leak your real IP. Configurable in the web UI under **Egress → WireGuard tunnel**. Mutually exclusive with `proxy`. |
 | `nick`, `username`, `realname` | Identity. `username`/`realname` default to the nick. |
 | `pass` | Server password (`PASS`), rarely needed. |
 | `sasl` | `mechanism` `""` picks automatically (EXTERNAL without a password, else SCRAM-SHA-256 when offered, else PLAIN). `cert_file`/`key_file` supply the client certificate for EXTERNAL. SCRAM-SHA-256 does **not** apply SASLprep normalization to either the **login (account name) or the password** (RFC 5802 §2.2), so use ASCII (or already-normalized) values for both — a non-ASCII login or password may not match a server that normalizes it. |
@@ -113,8 +119,10 @@ Link and image previews are fetched server-side, through the **proxy of the
 network the link came from** — a link in a proxied network is previewed over
 that proxy (your egress IP never leaks), one in a direct network goes
 direct, and if the link's network can't be resolved to a direct-or-proxied
-decision the fetch is **refused** rather than sent direct. There is no
-separate media proxy to configure.
+decision the fetch is **refused** rather than sent direct. Links from a
+**WireGuard**-egress network are always refused (fail closed) — the media
+fetcher cannot yet ride the in-process tunnel, and any other route would
+leak the real IP. There is no separate media proxy to configure.
 
 Direct (unproxied) fetches are hardened: the *resolved* IP of every
 connection and redirect hop is checked against a public-address policy at
@@ -153,13 +161,20 @@ session cookie is only ever sent over HTTPS — leave it `false` only for
 plain-HTTP localhost testing, where a secure cookie would never be sent.
 Also enable HSTS at the proxy (e.g. `Strict-Transport-Security:
 max-age=63072000; includeSubDomains`) so browsers refuse to downgrade.
-WebSocket upgrade for `/api/ws` must be allowed through the proxy (Caddy
-does this automatically); rate-limiting `/api/login` at the proxy is also
-recommended (the binary applies its own per-source backoff as a second
-layer). The proxy must **forward the `Origin` and `Sec-Fetch-Site` request
-headers unchanged** — the state-changing/media endpoints use them as a CSRF
-defense and fail closed without them (a proxy that strips both would make
-those endpoints refuse every request).
+The proxy must **preserve the original `Host` header** — the CSRF/WebSocket
+origin check compares it against the browser's `Origin`, so nginx's default
+of passing the upstream address (`$proxy_host`) makes every login and
+WebSocket attempt fail with 403; set `proxy_set_header Host $host;` (Caddy
+preserves it automatically). WebSocket upgrade for `/api/ws` must be allowed
+through the proxy too (Caddy: automatic; nginx: `proxy_http_version 1.1;`
+plus `proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection
+"upgrade";` on that location). Rate-limiting `/api/login` at the proxy is
+also recommended as defense-in-depth (the binary itself enforces a global
+attempt-rate cap plus per-source backoff). The proxy must **forward the
+`Origin` and `Sec-Fetch-Site` request headers unchanged** — the
+state-changing/media endpoints use them as a CSRF defense and fail closed
+without them (a proxy that strips both would make those endpoints refuse
+every request).
 
 A hardened systemd unit ships in [`deploy/ircthing.service`](deploy/ircthing.service).
 It uses `DynamicUser=yes` — no service account to create — and hands the

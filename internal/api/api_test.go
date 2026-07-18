@@ -455,6 +455,10 @@ func TestProxyForNetwork(t *testing.T) {
 		`{"name":"badproxy","addr":"z:6667","allow_plaintext":true,"nick":"a","proxy":"ftp://x:1"}`); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.PutNetworkConfig(ctx, "wgnet",
+		`{"name":"wgnet","addr":"w:6697","tls":true,"nick":"a","wireguard":{"private_key":"AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","peer_public_key":"AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","endpoint":"203.0.113.7:51820","address":"10.64.0.2","dns":"10.64.0.1"}}`); err != nil {
+		t.Fatal(err)
+	}
 
 	if p, ok := srv.proxyForNetwork(ctx, "tornet"); !ok || p == nil || p.Host != "127.0.0.1:9050" {
 		t.Fatalf("tornet = %v,%v; want (127.0.0.1:9050, true)", p, ok)
@@ -463,8 +467,11 @@ func TestProxyForNetwork(t *testing.T) {
 	if p, ok := srv.proxyForNetwork(ctx, "direct"); !ok || p != nil {
 		t.Fatalf("direct = %v,%v; want (nil, true)", p, ok)
 	}
-	// Everything unresolvable must FAIL CLOSED: (nil, false).
-	for _, name := range []string{"nonexistent", "", "malformed", "badproxy"} {
+	// Everything unresolvable must FAIL CLOSED: (nil, false). So must a
+	// WireGuard-egress network ("wgnet"): the media fetcher cannot ride the
+	// in-process tunnel, and a direct or proxied fetch would leak the real
+	// IP the tunnel exists to hide.
+	for _, name := range []string{"nonexistent", "", "malformed", "badproxy", "wgnet"} {
 		if p, ok := srv.proxyForNetwork(ctx, name); ok || p != nil {
 			t.Fatalf("proxyForNetwork(%q) = %v,%v; want (nil, false)", name, p, ok)
 		}
@@ -784,6 +791,43 @@ func TestLoginBackoffGrows(t *testing.T) {
 	}
 	if l.retryAfter("other", now) != 0 {
 		t.Fatal("unrelated source blocked")
+	}
+}
+
+// The global bucket caps total attempt rate regardless of source: rotating
+// source addresses (each getting a free first attempt from the per-source
+// tracker) must not buy unlimited bcrypt work.
+func TestLoginGlobalBucket(t *testing.T) {
+	l := newLoginLimiter()
+	now := time.Now()
+	// The full burst passes, then the bucket is dry.
+	for i := 0; i < int(loginGlobalBurst); i++ {
+		if wait := l.globalAllow(now); wait != 0 {
+			t.Fatalf("burst attempt %d blocked (wait %v)", i, wait)
+		}
+	}
+	wait := l.globalAllow(now)
+	if wait <= 0 || wait > time.Second*2 {
+		t.Fatalf("post-burst wait = %v, want ~1 token interval", wait)
+	}
+	// Refill: after one token interval a single attempt passes again…
+	later := now.Add(time.Duration(float64(time.Second) / loginGlobalRate))
+	if wait := l.globalAllow(later); wait != 0 {
+		t.Fatalf("refilled attempt blocked (wait %v)", wait)
+	}
+	// …but only one — the very next is dry again.
+	if wait := l.globalAllow(later); wait <= 0 {
+		t.Fatal("second attempt after single refill should be blocked")
+	}
+	// A long idle period refills at most to the burst cap.
+	idle := later.Add(time.Hour)
+	for i := 0; i < int(loginGlobalBurst); i++ {
+		if wait := l.globalAllow(idle); wait != 0 {
+			t.Fatalf("post-idle attempt %d blocked (wait %v)", i, wait)
+		}
+	}
+	if wait := l.globalAllow(idle); wait <= 0 {
+		t.Fatal("burst cap not enforced after idle refill")
 	}
 }
 

@@ -1,4 +1,4 @@
-import { mentionsMe, uuid } from "./irc.js";
+import { mentionsMe, stripFormatting, uuid } from "./irc.js";
 
 // Notifications: highlight detection, desktop Web Notifications, and a
 // dynamically-drawn favicon badge. Highlight rules live in localStorage
@@ -10,9 +10,13 @@ import { mentionsMe, uuid } from "./irc.js";
 // global). Pure and testable — the caller handles self-exclusion.
 export function highlightText(text, nick, rules, network) {
 	if (!text) return false;
-	if (nick && mentionsMe(text, nick)) return true;
+	// Strip mIRC formatting first: a colour/bold code inside a keyword
+	// ("de\x02ploy") renders invisibly but would defeat a substring rule.
+	// (mentionsMe strips internally too; passing clean text is harmless.)
+	const clean = stripFormatting(text);
+	if (nick && mentionsMe(clean, nick)) return true;
 	if (!rules) return false;
-	const lower = text.toLowerCase();
+	const lower = clean.toLowerCase();
 	for (const r of rules) {
 		if (!r.pattern) continue;
 		if (r.network && r.network !== network) continue;

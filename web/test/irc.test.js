@@ -49,6 +49,25 @@ test("stripFormatting removes codes; mentionsMe sees through them", () => {
 	is(mentionsMe("hey \x0304alice\x03!", "alice"), true); // colour code must not hide it
 });
 
+test("bare \\x04 strips like it renders: no invisible mention-splitting", () => {
+	// parseFormatting consumes a hex-less \x04 (renders "alice"), so strip
+	// must remove it too — or the visible mention never alerts.
+	is(stripFormatting("al\x04ice"), "alice");
+	is(mentionsMe("al\x04ice", "alice"), true);
+	is(stripFormatting("\x04ff0000red\x04"), "red"); // valid args still stripped
+	const runs = parseFormatting("al\x04ice");
+	is(runs.map((r) => r.text).join(""), "alice");
+});
+
+test("parseFormatting caps runs; the remainder renders plainly, codes stripped", () => {
+	const bomb = "\x02a".repeat(5000); // would be 5000 one-char bold toggle runs
+	const runs = parseFormatting(bomb);
+	is(runs.length <= 1025, true); // MAX_FMT_RUNS + the merged remainder
+	// No content is lost and no control bytes leak into the rendered text.
+	const joined = runs.map((r) => r.text).join("");
+	is(joined, "a".repeat(5000));
+});
+
 test("proxyCredsExposed flags credentials to a non-loopback proxy", () => {
 	is(proxyCredsExposed("socks5://user:pass@proxy.example.com:1080"), true);
 	is(proxyCredsExposed("http://u:p@203.0.113.9:3128"), true);

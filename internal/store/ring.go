@@ -67,7 +67,39 @@ func (r *ring) insert(m Message) int {
 		// The evicted message (possibly m itself, if it predates
 		// everything here) lives only on disk now.
 		r.bytes -= msgBytes(r.msgs[0])
-		r.msgs = append(r.msgs[:0], r.msgs[1:]...)
+		r.dropFirst(1)
+		r.complete = false
+	}
+	return r.bytes - before
+}
+
+// dropFirst removes the oldest n entries, compacting in place and clearing
+// the vacated tail slots: without the clear, the backing array would keep
+// the dropped messages' strings GC-reachable while bytes reports them
+// freed — a pruned-then-quiet buffer would retain its entire dropped
+// prefix indefinitely.
+func (r *ring) dropFirst(n int) {
+	kept := copy(r.msgs, r.msgs[n:])
+	clear(r.msgs[kept:])
+	r.msgs = r.msgs[:kept]
+}
+
+// trimToBytes drops oldest entries until the ring's accounted bytes are at
+// most limit, always keeping the newest message. Returns the (non-positive)
+// byte delta. This exists because evictRings can never evict the in-use
+// ring: with a large configured ring_size and near-clamp-size messages a
+// single buffer could otherwise outgrow the entire global budget.
+func (r *ring) trimToBytes(limit int) int {
+	before := r.bytes
+	n := 0
+	for n < len(r.msgs)-1 && r.bytes > limit {
+		r.bytes -= msgBytes(r.msgs[n])
+		n++
+	}
+	if n > 0 {
+		r.dropFirst(n)
+		// The trimmed prefix still exists on disk (unlike applyRetention,
+		// this mirrors no delete), so the ring is no longer all of history.
 		r.complete = false
 	}
 	return r.bytes - before
@@ -140,7 +172,7 @@ func (r *ring) applyRetention(cutoffMs int64, maxPerBuffer int) int {
 			for j := 0; j < i; j++ {
 				r.bytes -= msgBytes(r.msgs[j])
 			}
-			r.msgs = append(r.msgs[:0], r.msgs[i:]...)
+			r.dropFirst(i)
 		}
 	}
 	if maxPerBuffer > 0 && len(r.msgs) > maxPerBuffer {
@@ -148,7 +180,7 @@ func (r *ring) applyRetention(cutoffMs int64, maxPerBuffer int) int {
 		for j := 0; j < drop; j++ {
 			r.bytes -= msgBytes(r.msgs[j])
 		}
-		r.msgs = append(r.msgs[:0], r.msgs[drop:]...)
+		r.dropFirst(drop)
 	}
 	return r.bytes - before
 }

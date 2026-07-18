@@ -1,7 +1,9 @@
 # ircthing — self-hosted web IRC client.
 #
 # Expects: the binary at /usr/local/bin/ircd-web and config at
-# /etc/ircthing/config.json (with "database": "%S/ircthing/ircthing.db").
+# /etc/ircthing/config.json (with "database": "/var/lib/ircthing/ircthing.db"
+# — spelled out literally: systemd %-specifiers like %S only expand in unit
+# directives, never inside the JSON config the service loads).
 # No user setup needed — DynamicUser allocates one at runtime, and
 # StateDirectory creates /var/lib/ircthing with correct ownership.
 #

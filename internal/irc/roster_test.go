@@ -94,6 +94,71 @@ func TestRosterAggregateBudget(t *testing.T) {
 	}
 }
 
+// The BYTE budget must bind independently of the count caps: clamped fields
+// are up to maxRosterField each, so counts alone would admit ~20x the memory
+// the ~150 B/member estimate suggests. Also checks the running per-channel
+// byte accounting stays exact across joins, NAMES swaps, updates, and
+// departures.
+func TestRosterByteBudget(t *testing.T) {
+	defer func(b int) { maxRosterBytes = b }(maxRosterBytes)
+	maxRosterBytes = 2 * memberOverhead // room for ~2 small members
+
+	r := testRoster()
+	feed(t, r, ":AlteredParadox!u@h JOIN #a", ":u1!u@h JOIN #a")
+	if got := r.totalBytes(); got > maxRosterBytes+2*memberOverhead {
+		t.Fatalf("totalBytes = %d, budget %d wildly exceeded", got, maxRosterBytes)
+	}
+	// Over budget now: further members are refused.
+	feed(t, r, ":u2!u@h JOIN #a", ":u3!u@h JOIN #a")
+	if n := len(members(t, r, "#a")); n != 2 {
+		t.Fatalf("#a has %d members, want 2 (byte budget must bind)", n)
+	}
+	// Over budget, growing field updates are refused; shrinking ones apply.
+	feed(t, r, ":u1!u@h ACCOUNT bigaccountname")
+	for _, m := range members(t, r, "#a") {
+		if m.Account != "" {
+			t.Fatalf("growing ACCOUNT applied over budget: %+v", m)
+		}
+	}
+
+	// Accounting stays exact through the mutation paths.
+	checkExact := func(step string) {
+		t.Helper()
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for _, st := range r.chans {
+			want := len(st.topic)
+			for k, m := range st.members {
+				want += memberBytes(k, m)
+			}
+			for k, m := range st.pending {
+				want += memberBytes(k, m)
+			}
+			if st.bytes != want {
+				t.Fatalf("%s: channel %q bytes %d != recomputed %d", step, st.name, st.bytes, want)
+			}
+		}
+	}
+	r2 := testRoster()
+	maxRosterBytes = 8 << 20 // the outer defer restores the real value
+	feed(t, r2, ":AlteredParadox!u@h JOIN #x",
+		":irc 353 AlteredParadox = #x :@op +voice plain AlteredParadox",
+		":irc 366 AlteredParadox #x :End of /NAMES list")
+	checkExact("after NAMES")
+	feed(t, r2, ":plain!u@h ACCOUNT services-acct")
+	checkExact("after ACCOUNT")
+	feed(t, r2, ":op!u@h NICK operator")
+	checkExact("after NICK")
+	feed(t, r2, ":irc TOPIC #x :a channel topic")
+	checkExact("after TOPIC")
+	feed(t, r2, ":voice!u@h QUIT :bye")
+	checkExact("after QUIT")
+	feed(t, r2, ":plain!u@h PART #x")
+	checkExact("after PART")
+	feed(t, r2, ":irc MODE #x +o operator")
+	checkExact("after MODE")
+}
+
 func TestRoster(t *testing.T) {
 	cases := []struct {
 		name  string

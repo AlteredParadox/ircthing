@@ -1030,7 +1030,7 @@ func (m *Manager) processLine(ctx context.Context, lc *liveConn, in *ircv4.Messa
 	if err := trackChathistoryBatch(in, histBatch); err != nil {
 		return err
 	}
-	playback := in.Tags["batch"] != "" && histBatch[in.Tags["batch"]]
+	playback := in.Tags["batch"] != "" && histBatch[clampBatchRef(in.Tags["batch"])]
 	m.isup.handle(in) // 005, ignored otherwise
 	if in.Command == "005" {
 		// A negotiated LINELEN may legally exceed the default cap; raise
@@ -1164,6 +1164,21 @@ func (m *Manager) serviceLine(ctx context.Context, lc *liveConn, in *ircv4.Messa
 // and grow this map (and the hub's) without bound.
 const maxOpenHistBatches = 256
 
+// maxBatchRefBytes bounds a batch reference used as a map key. Real refs are
+// short opaque tokens; near-line-limit refs would otherwise pin whole parsed
+// lines in the count-capped map. The clamp MUST be applied identically at
+// store, delete, and lookup: clamping only at store would make oversized-ref
+// batches miss at lookup and misclassify their replayed messages as live
+// traffic (notifications, unread counts, roster churn from history).
+const maxBatchRefBytes = 512
+
+func clampBatchRef(ref string) string {
+	if len(ref) > maxBatchRefBytes {
+		return ref[:maxBatchRefBytes]
+	}
+	return ref
+}
+
 func trackChathistoryBatch(in *ircv4.Message, histBatch map[string]bool) error {
 	if in.Command != "BATCH" || len(in.Params) == 0 {
 		return nil
@@ -1174,9 +1189,10 @@ func trackChathistoryBatch(in *ircv4.Message, histBatch map[string]bool) error {
 		if len(histBatch) >= maxOpenHistBatches {
 			return fmt.Errorf("irc: too many open chathistory batches (>%d)", maxOpenHistBatches)
 		}
-		histBatch[ref[1:]] = true
+		// Clone: the ref is a substring of the parsed line and would pin it.
+		histBatch[strings.Clone(clampBatchRef(ref[1:]))] = true
 	case strings.HasPrefix(ref, "-"):
-		delete(histBatch, ref[1:])
+		delete(histBatch, clampBatchRef(ref[1:]))
 	}
 	return nil
 }
@@ -1328,7 +1344,12 @@ func (m *Manager) trackJoinIntent(in *ircv4.Message) error {
 	}
 	switch in.Command {
 	case "JOIN":
-		ch := in.Param(0)
+		// Clone: Param substrings alias the whole parsed line's backing
+		// array, so storing even a 2-byte name in the persistent rejoin map
+		// would pin the full (up to 64 KiB) line — 4096 padded self-JOINs
+		// could pin ~256 MiB. rejoinable bounds the name itself; the clone
+		// detaches it from the line.
+		ch := strings.Clone(in.Param(0))
 		// Only store a channel we could actually rejoin: a spoofed
 		// self-JOIN with framing bytes or an over-length name would
 		// otherwise poison the never-reset rejoin set, and since the

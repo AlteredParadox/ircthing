@@ -11,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 
 	"ircthing/internal/irc"
@@ -90,6 +92,15 @@ func (n *Network) EffectiveName() string {
 func (n *Network) Validate() error {
 	if n.Addr == "" {
 		return errors.New("addr is required")
+	}
+	// Nothing downstream supports a portless addr (dial, TLS SNI, and STS
+	// all SplitHostPort it), so a bare hostname saves fine and then wedges
+	// the network in a reconnect loop with a dial-time error. Reject the
+	// shape here, loudly, like the WireGuard endpoint check does.
+	if host, port, err := net.SplitHostPort(n.Addr); err != nil || host == "" {
+		return fmt.Errorf("addr %q must be host:port", n.Addr)
+	} else if p, perr := strconv.Atoi(port); perr != nil || p < 1 || p > 65535 {
+		return fmt.Errorf("addr %q: port must be a number in 1–65535", n.Addr)
 	}
 	if n.Nick == "" {
 		return errors.New("nick is required")

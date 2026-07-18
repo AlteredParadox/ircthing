@@ -556,8 +556,12 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 		return false, err
 	}
 	if r, ok := s.rings[bufID]; ok {
-		s.ringBytes += int64(r.redact(msgid, reason)) // frees Raw/Text: a net decrease
+		// Usually a net decrease (Raw/Text freed), but a short message
+		// tombstoned with a long reason grows the ring — enforce the
+		// budget either way.
+		s.ringBytes += int64(r.redact(msgid, reason))
 		s.touchRing(r)
+		s.evictRings(bufID)
 	}
 	return true, nil
 }
@@ -890,7 +894,14 @@ func (s *Store) evictRings(keepID int64) {
 			}
 		}
 		if !found {
-			return // only the in-use ring remains; can't evict it
+			// Only the in-use ring remains. It can still be over budget by
+			// itself (large configured ring_size × near-clamp messages), so
+			// trim its oldest entries rather than let one buffer defeat the
+			// whole bound.
+			if r, ok := s.rings[keepID]; ok {
+				s.ringBytes += int64(r.trimToBytes(s.maxRingBytes))
+			}
+			return
 		}
 		s.ringBytes -= int64(s.rings[victim].bytes)
 		delete(s.rings, victim)

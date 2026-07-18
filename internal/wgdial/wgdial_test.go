@@ -5,14 +5,18 @@ import (
 	"testing"
 )
 
-// A valid base64-encoded 32-byte WireGuard key (all zero bytes). Enough to
-// exercise decode/length checks without standing up a device.
+// A base64-encoded 32-byte all-zero key: decodes fine but is rejected by
+// Validate as a placeholder. Kept for the decode-level tests.
 const zeroKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+// A syntactically valid non-zero 32-byte key (0x01 then zeros). Enough to
+// exercise the validation paths without standing up a device.
+const testKey = "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 func goodConfig() Config {
 	return Config{
-		PrivateKey:    zeroKey,
-		PeerPublicKey: zeroKey,
+		PrivateKey:    testKey,
+		PeerPublicKey: testKey,
 		Endpoint:      "203.0.113.7:51820",
 		Address:       "10.64.0.2",
 		DNS:           "10.64.0.1",
@@ -31,8 +35,12 @@ func TestValidate(t *testing.T) {
 		{"empty private key", func(c *Config) { c.PrivateKey = "" }},
 		{"non-base64 key", func(c *Config) { c.PrivateKey = "not!base64!" }},
 		{"short key", func(c *Config) { c.PeerPublicKey = "AAAA" }}, // decodes to 3 bytes
+		{"all-zero private key", func(c *Config) { c.PrivateKey = zeroKey }},
+		{"all-zero peer public key", func(c *Config) { c.PeerPublicKey = zeroKey }},
 		{"bad address", func(c *Config) { c.Address = "not-an-ip" }},
 		{"bad dns", func(c *Config) { c.DNS = "1.2.3" }},
+		{"address/dns family mismatch v4/v6", func(c *Config) { c.DNS = "fd00::1" }},
+		{"address/dns family mismatch v6/v4", func(c *Config) { c.Address = "fd00::2" }},
 		{"endpoint without port", func(c *Config) { c.Endpoint = "203.0.113.7" }},
 		{"empty endpoint", func(c *Config) { c.Endpoint = "" }},
 		{"endpoint non-numeric port", func(c *Config) { c.Endpoint = "203.0.113.7:https" }},

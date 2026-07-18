@@ -168,10 +168,21 @@ func (s *Store) DeleteBuffer(ctx context.Context, network, target string) error 
 	}
 	k := bufKey{network: network, target: target}
 	if id, ok := s.buffers[k]; ok {
-		delete(s.rings, id)
+		s.dropRingLocked(id)
 		delete(s.buffers, k)
 	}
 	return nil
+}
+
+// dropRingLocked removes a resident ring AND subtracts its bytes from the
+// global budget accounting — skipping the subtraction would permanently
+// shrink the effective budget and eventually thrash the cache. Caller
+// holds s.mu.
+func (s *Store) dropRingLocked(id int64) {
+	if r, ok := s.rings[id]; ok {
+		s.ringBytes -= int64(r.bytes)
+		delete(s.rings, id)
+	}
 }
 
 // dropNetworkCachesLocked evicts the in-memory id and ring caches for a
@@ -180,7 +191,7 @@ func (s *Store) dropNetworkCachesLocked(network string) {
 	delete(s.networks, network)
 	for k, id := range s.buffers {
 		if k.network == network {
-			delete(s.rings, id)
+			s.dropRingLocked(id)
 			delete(s.buffers, k)
 		}
 	}

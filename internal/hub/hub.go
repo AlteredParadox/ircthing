@@ -261,7 +261,13 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 	// (guarded below in trackHistoryBatch), and would then classify all
 	// un-batched live traffic as replay — persisted but never
 	// broadcast.
-	batchRef := ev.Msg.Tags["batch"]
+	//
+	// Clamp the lookup EXACTLY like the stored key (trackHistoryBatch
+	// clamps at store): an oversized ref clamped only at store would miss
+	// here and misclassify the batch's replayed messages as live traffic —
+	// notifications, unread counts, and duplicate own messages from
+	// history.
+	batchRef := clampServerInfo(ev.Msg.Tags["batch"])
 	replay := batchRef != "" && histBatches[batchRef] != nil
 	batch := histBatches[batchRef]
 	if replay {
@@ -272,7 +278,11 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 		if t := messageTime(ev); !t.IsZero() {
 			batch.lastTS = t.UnixMilli()
 		}
-		batch.lastID = ev.Msg.Tags["msgid"]
+		// Clamp+detach: tag values are parser-detached but unbounded, so an
+		// oversized msgid retained across 256 open batches is real memory —
+		// and it would be interpolated into the next CHATHISTORY request,
+		// which the writer drops as over-length anyway.
+		batch.lastID = clampDetach(ev.Msg.Tags["msgid"])
 	} else {
 		h.liveHints(ctx, c, ev)
 	}

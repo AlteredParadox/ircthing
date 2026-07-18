@@ -158,17 +158,45 @@ function appendEventMsgs(m, key, ev, keep) {
 	return { ...m, [key]: { ...cur, ...trimBuffer(list, bytes, cur?.reachedTop) } };
 }
 
+// Bounds for the per-network server buffer, which appendInfoLine can create
+// and grow while it sits OUTSIDE the working-set eviction (that only runs on
+// buffer switches / load completion). Much tighter than scrollback buffers:
+// info lines are ephemeral (never persisted, nothing to refetch), so without
+// this an idle client would hold up to 8 MiB of numerics flood per network.
+const INFO_TRIM_AT = 1200, INFO_TRIM_TO = 1000, MAX_INFO_BYTES = 1024 * 1024;
+
 // appendInfoLine appends an ephemeral server_info / whois line. It creates the
 // buffer (MOTD/whois must show even before it's viewed), but the count+byte
 // bound caps its growth, and a recreated-after-eviction buffer is reclaimed on
 // the next buffer switch (the eviction effect), so a server_info flood can't
-// grow it or the buffer set without limit.
-function appendInfoLine(m, key, ev) {
+// grow it or the buffer set without limit. `tight` selects the server-buffer
+// bounds above (a whois card lands in a real query buffer, which keeps the
+// normal scrollback bounds).
+function appendInfoLine(m, key, ev, tight) {
 	const cur = m[key];
 	if (cur?.loaded && cur.atTail === false) return m;
-	const list = [...(cur?.list || []), ev];
-	const bytes = (cur?.bytes ?? listBytes(cur?.list || [])) + evBytes(ev);
-	return { ...m, [key]: { ...cur, ...trimBuffer(list, bytes, cur?.reachedTop) } };
+	let list = [...(cur?.list || []), ev];
+	let bytes = (cur?.bytes ?? listBytes(cur?.list || [])) + evBytes(ev);
+	let { list: l, bytes: b, reachedTop } = trimBuffer(list, bytes, cur?.reachedTop);
+	list = l; bytes = b;
+	if (tight) {
+		if (list.length > INFO_TRIM_AT) {
+			const drop = list.length - INFO_TRIM_TO;
+			for (let i = 0; i < drop; i++) bytes -= evBytes(list[i]);
+			list = list.slice(drop);
+			reachedTop = false;
+		}
+		let i = 0;
+		while (i < list.length - 1 && bytes > MAX_INFO_BYTES) {
+			bytes -= evBytes(list[i]);
+			i++;
+		}
+		if (i > 0) {
+			list = list.slice(i);
+			reachedTop = false;
+		}
+	}
+	return { ...m, [key]: { ...cur, list, bytes, reachedTop } };
 }
 
 // clearTyperFor drops one nick's typing state (they just spoke).
@@ -693,7 +721,7 @@ export function App() {
 				id: `si${++infoSeq}`, network: d.network, buffer: SERVER_BUFFER,
 				time: Date.now(), sender: "", command: "INFO", raw: d.text,
 			};
-			setMsgs((m) => appendInfoLine(m, key, ev));
+			setMsgs((m) => appendInfoLine(m, key, ev, true));
 		});
 
 		// A WHOIS card lands in the target's query buffer; jump there, so

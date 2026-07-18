@@ -359,6 +359,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
 		return
 	}
+	// The global bucket is charged after the per-source check so a source
+	// already in backoff cannot drain tokens from everyone else.
+	if wait := s.login.globalAllow(time.Now()); wait > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds()+1)))
+		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
+		return
+	}
 	// Snapshot the credential generation BEFORE the (slow) bcrypt verify; if a
 	// password change lands during it, the verified hash is stale — refuse to
 	// mint a session that would survive the rotation's session revoke.

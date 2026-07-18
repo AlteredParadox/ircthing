@@ -34,15 +34,32 @@ func clampRoster(s string) string {
 // These bound roster growth against a hostile server spoofing self-JOINs
 // or flooding NAMES; legitimate use stays far below them. The per-channel
 // caps alone don't bound aggregate memory (a server could fill many
-// channels), so maxRosterMembers is a connection-wide budget across every
-// channel's members + pending — the real ceiling. At ~150 B/member, 100k
-// members is ~15 MB, comfortably under the process memory limit.
+// channels), so maxRosterMembers is a connection-wide count budget across
+// every channel's members + pending. Counts alone still don't bound bytes:
+// each stored field is independently clamped to maxRosterField, so 100k
+// hostile members with maxed-out fields would retain ~300 MB — hence
+// maxRosterBytes, the aggregate byte ceiling over members, pending NAMES,
+// and topics. Legitimate heavy use (tens of thousands of members with
+// real-sized fields, ~150 B each) stays a few MB.
 // var (not const) so tests can exercise the bounds at small scale.
 var (
 	maxRosterChannels = 4096
 	maxChannelMembers = 25_000
 	maxRosterMembers  = 100_000
+	maxRosterBytes    = 8 << 20
 )
+
+// memberOverhead approximates a Member's fixed retained cost beyond its
+// string content (struct fields, map entry). Rough is fine — the budget
+// bounds memory, it doesn't bill it (same idea as the store's msgOverhead).
+const memberOverhead = 96
+
+// memberBytes estimates the bytes one membership keeps resident: the folded
+// map key plus every stored string field plus the fixed overhead.
+func memberBytes(key string, m Member) int {
+	return len(key) + len(m.Nick) + len(m.Prefix) + len(m.Account) +
+		len(m.User) + len(m.Host) + memberOverhead
+}
 
 // Sources: NAMES on join (353 accumulated until 366), then live
 // JOIN/PART/KICK/QUIT/NICK/MODE/TOPIC/332/331/AWAY. Status prefixes are
@@ -81,6 +98,45 @@ type channelState struct {
 	topic   string
 	members map[string]Member // folded nick -> member
 	pending map[string]Member // NAMES accumulation until 366
+	// bytes is the running memberBytes sum over members + pending, plus the
+	// topic — this channel's share of the roster byte budget. Kept in step
+	// by put/del/setTopic; recomputed wholesale on the 366 swap.
+	bytes int
+}
+
+// put stores mem under key in mp (one of st's two maps), keeping st.bytes in
+// step. Returns the byte delta. Caller holds r.mu.
+func (st *channelState) put(mp map[string]Member, key string, mem Member) int {
+	delta := memberBytes(key, mem)
+	if old, ok := mp[key]; ok {
+		delta -= memberBytes(key, old)
+	}
+	mp[key] = mem
+	st.bytes += delta
+	return delta
+}
+
+// del removes key from mp (one of st's two maps), keeping st.bytes in step.
+// Safe on a nil map. Caller holds r.mu.
+func (st *channelState) del(mp map[string]Member, key string) {
+	if old, ok := mp[key]; ok {
+		st.bytes -= memberBytes(key, old)
+		delete(mp, key)
+	}
+}
+
+// recomputeBytes rebuilds st.bytes from scratch — used after the 366 swap,
+// where the old members map is dropped and pending values were rewritten in
+// place. Caller holds r.mu.
+func (st *channelState) recomputeBytes() {
+	n := len(st.topic)
+	for k, m := range st.members {
+		n += memberBytes(k, m)
+	}
+	for k, m := range st.pending {
+		n += memberBytes(k, m)
+	}
+	st.bytes = n
 }
 
 // roster is written by the connection's read loop and snapshotted by hub
@@ -168,11 +224,14 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 	case "KICK": // <channel> <victim>
 		r.memberLeft(m.Param(0), m.Param(1), us(m.Param(1)))
 	case "QUIT":
+		// Clamp+fold ONCE, outside the loop: Fold allocates twice per call,
+		// so folding a raw (up to ~64 KiB) spoofed sender per channel across
+		// 4096 channels would be ~0.5 GiB of transient allocation for one
+		// line. Clamping also matches how member keys were stored.
+		qk := fold(clampRoster(sender))
 		for _, st := range r.chans {
-			delete(st.members, fold(sender))
-			if st.pending != nil {
-				delete(st.pending, fold(sender))
-			}
+			st.del(st.members, qk)
+			st.del(st.pending, qk)
 		}
 	case "NICK":
 		r.rename(sender, m.Param(0))
@@ -210,7 +269,9 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 // setTopic updates a known channel's topic. Caller holds r.mu.
 func (r *roster) setTopic(channel, topic string) {
 	if st := r.chans[r.isup.Fold(channel)]; st != nil {
-		st.topic = clampRoster(topic) // bound + detach from the parsed line
+		t := clampRoster(topic) // bound + detach from the parsed line
+		st.bytes += len(t) - len(st.topic)
+		st.topic = t
 	}
 }
 
@@ -223,11 +284,20 @@ func (r *roster) memberLeft(channel, nick string, ours bool) {
 	}
 	if st := r.chans[r.isup.Fold(channel)]; st != nil {
 		fk := r.isup.Fold(nick)
-		delete(st.members, fk)
-		if st.pending != nil {
-			delete(st.pending, fk)
-		}
+		st.del(st.members, fk)
+		st.del(st.pending, fk)
 	}
+}
+
+// totalBytes is the connection-wide roster byte total (every channel's
+// running sum). O(channels), computed on demand at the growth sites like
+// totalMembers. Caller holds r.mu.
+func (r *roster) totalBytes() int {
+	n := 0
+	for _, st := range r.chans {
+		n += st.bytes
+	}
+	return n
 }
 
 // totalMembers is the connection-wide count of held members (every
@@ -253,9 +323,10 @@ func (r *roster) namesReply(m *ircv4.Message) {
 		st.pending = make(map[string]Member)
 	}
 	budget := maxRosterMembers - r.totalMembers() // remaining aggregate room
+	bytesLeft := maxRosterBytes - r.totalBytes()  // remaining aggregate bytes
 	for _, raw := range strings.Fields(m.Param(3)) {
-		if len(st.pending) >= maxChannelMembers || budget <= 0 {
-			break // bound a NAMES flood: per-channel and connection-wide
+		if len(st.pending) >= maxChannelMembers || budget <= 0 || bytesLeft <= 0 {
+			break // bound a NAMES flood: per-channel, count-wide, and byte-wide
 		}
 		prefix, nick, user, host := splitNamesPrefix(r.isup.PrefixSymbols(), raw)
 		// Clamp BEFORE folding: Fold allocates a same-length key, so a hostile
@@ -270,10 +341,10 @@ func (r *roster) namesReply(m *ircv4.Message) {
 		// Clone so the stored Member does not alias the parsed 353 line
 		// (irc.v4 slices every field out of one per-line buffer, which a
 		// short nick would otherwise pin alive in the roster).
-		st.pending[fk] = Member{
+		bytesLeft -= st.put(st.pending, fk, Member{
 			Nick: nick, Prefix: clampRoster(prefix),
 			User: clampRoster(user), Host: clampRoster(host),
-		}
+		})
 	}
 }
 
@@ -298,6 +369,9 @@ func (r *roster) namesEnd(m *ircv4.Message) {
 	}
 	st.members = st.pending
 	st.pending = nil
+	// One O(members) recompute per completed burst: the swap dropped the
+	// old members map and the merge rewrote pending values in place.
+	st.recomputeBytes()
 }
 
 // memberJoin records a JOIN; ours creates the channel. extended-join
@@ -330,8 +404,10 @@ func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
 	// (Fold allocates a same-length string); reuse it as the Member value.
 	cs := clampRoster(sender)
 	k := r.isup.Fold(cs)
-	if _, known := st.members[k]; !known &&
-		(len(st.members) >= maxChannelMembers || r.totalMembers() >= maxRosterMembers) {
+	overBytes := r.totalBytes() >= maxRosterBytes
+	old, known := st.members[k]
+	if !known &&
+		(len(st.members) >= maxChannelMembers || r.totalMembers() >= maxRosterMembers || overBytes) {
 		return
 	}
 	// Clone so the Member doesn't alias the parsed JOIN line's backing buffer.
@@ -343,16 +419,22 @@ func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
 	if acct := m.Param(1); len(m.Params) >= 3 && acct != "*" {
 		mem.Account = clampRoster(acct)
 	}
-	st.members[k] = mem
+	// A re-JOIN of a known member can grow its entry (fresh user/host/
+	// account); over the byte budget, keep the existing entry instead so
+	// replacement floods can't inflate past the ceiling.
+	if known && overBytes && memberBytes(k, mem) > memberBytes(k, old) {
+		return
+	}
+	st.put(st.members, k, mem)
 	// If a NAMES accumulation is in flight for this channel, apply the live
 	// join to the pending snapshot too, so the 366 swap does not revert it
 	// (leaving a ghost/missing member). But a JOIN for an ALREADY-KNOWN member
 	// skips the aggregate guard above, so only grow `pending` with a new key
-	// while under the connection-wide budget — otherwise a flood of re-JOINs
+	// while under the connection-wide budgets — otherwise a flood of re-JOINs
 	// for known members could grow the in-flight snapshot unbounded.
 	if st.pending != nil {
-		if _, inPending := st.pending[k]; inPending || r.totalMembers() < maxRosterMembers {
-			st.pending[k] = mem
+		if _, inPending := st.pending[k]; inPending || (r.totalMembers() < maxRosterMembers && !overBytes) {
+			st.put(st.pending, k, mem)
 		}
 	}
 }
@@ -367,19 +449,16 @@ func (r *roster) rename(from, to string) {
 	fromKey := fold(clampRoster(from))
 	ct := clampRoster(to)
 	toKey := fold(ct)
-	rekey := func(mp map[string]Member) {
-		if mp == nil {
-			return
-		}
+	rekey := func(st *channelState, mp map[string]Member) {
 		if mem, ok := mp[fromKey]; ok {
-			delete(mp, fromKey)
+			st.del(mp, fromKey)
 			mem.Nick = ct
-			mp[toKey] = mem
+			st.put(mp, toKey, mem)
 		}
 	}
 	for _, st := range r.chans {
-		rekey(st.members)
-		rekey(st.pending) // keep an in-flight NAMES snapshot consistent
+		rekey(st, st.members)
+		rekey(st, st.pending) // keep an in-flight NAMES snapshot consistent
 	}
 }
 
@@ -389,14 +468,25 @@ func (r *roster) rename(from, to string) {
 // revert the change to stale data. Caller holds r.mu.
 func (r *roster) updateEverywhere(nick string, fn func(Member) Member) {
 	key := r.isup.Fold(nick)
-	for _, st := range r.chans {
-		if mem, ok := st.members[key]; ok {
-			st.members[key] = fn(mem)
+	// Over the byte budget, accept only non-growing updates: field updates
+	// bypass the admission guards, so a hostile server could otherwise admit
+	// minimal members and then inflate every one to max-clamp fields.
+	over := r.totalBytes() >= maxRosterBytes
+	apply := func(st *channelState, mp map[string]Member) {
+		mem, ok := mp[key]
+		if !ok {
+			return
 		}
+		nm := fn(mem)
+		if over && memberBytes(key, nm) > memberBytes(key, mem) {
+			return
+		}
+		st.put(mp, key, nm)
+	}
+	for _, st := range r.chans {
+		apply(st, st.members)
 		if st.pending != nil {
-			if mem, ok := st.pending[key]; ok {
-				st.pending[key] = fn(mem)
-			}
+			apply(st, st.pending)
 		}
 	}
 }
@@ -511,7 +601,7 @@ func (r *roster) applyStatusMode(st *channelState, nick, sym string, adding bool
 		} else {
 			mem.Prefix = strings.ReplaceAll(mem.Prefix, sym, "")
 		}
-		mp[fk] = mem
+		st.put(mp, fk, mem) // prefix growth is bounded by the PREFIX symbol set
 	}
 	apply(st.members)
 	if st.pending != nil {

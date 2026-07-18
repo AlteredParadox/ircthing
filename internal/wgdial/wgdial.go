@@ -127,11 +127,19 @@ func New(ctx context.Context, cfg Config) (*Tunnel, error) {
 // The manager calls it during config validation on a throwaway manager, so it
 // must have no side effects.
 func Validate(cfg Config) error {
-	if _, err := netip.ParseAddr(cfg.Address); err != nil {
+	addr, err := netip.ParseAddr(cfg.Address)
+	if err != nil {
 		return fmt.Errorf("wgdial: address %q: %w", cfg.Address, err)
 	}
-	if _, _, _, err := parseDNS(cfg.DNS); err != nil {
+	dnsIP, _, _, err := parseDNS(cfg.DNS)
+	if err != nil {
 		return err
+	}
+	// The netstack interface has the single local address above; DNS
+	// traffic of the other family would be unroutable and every in-tunnel
+	// lookup would fail — fail-closed but invisible. Reject at config time.
+	if addr.Unmap().Is4() != dnsIP.Unmap().Is4() {
+		return fmt.Errorf("wgdial: address %q and dns %q must be the same IP family", cfg.Address, cfg.DNS)
 	}
 	host, portStr, err := net.SplitHostPort(cfg.Endpoint)
 	if err != nil {
@@ -151,8 +159,36 @@ func Validate(cfg Config) error {
 	if cfg.MTU != 0 && (cfg.MTU < 1280 || cfg.MTU > 1500) {
 		return fmt.Errorf("wgdial: mtu %d out of range (1280–1500, or 0 for the 1420 default)", cfg.MTU)
 	}
-	_, err = uapiConfig(cfg, cfg.Endpoint) // validates the base64 keys
-	return err
+	if _, err = uapiConfig(cfg, cfg.Endpoint); err != nil { // validates the base64 keys
+		return err
+	}
+	// An all-zero key is never a real key — it is the classic placeholder
+	// mistake — yet it passes every syntactic check and then fails the
+	// Noise handshake forever, visible only as a reconnect loop. Reject it
+	// at config time. (An all-zero preshared key is protocol-equivalent to
+	// omitting it, so it is not checked.)
+	if isZeroKey(cfg.PrivateKey) {
+		return fmt.Errorf("wgdial: private_key is all zeros (placeholder, not a key)")
+	}
+	if isZeroKey(cfg.PeerPublicKey) {
+		return fmt.Errorf("wgdial: peer_public_key is all zeros (placeholder, not a key)")
+	}
+	return nil
+}
+
+// isZeroKey reports whether a base64 key (already validated to decode to 32
+// bytes) is all zero bytes.
+func isZeroKey(b64 string) bool {
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return false
+	}
+	for _, b := range raw {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // DialContext dials a TCP target through the tunnel. With the default DNS port
