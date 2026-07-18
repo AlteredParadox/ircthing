@@ -374,6 +374,41 @@ func (r *roster) namesEnd(m *ircv4.Message) {
 	st.recomputeBytes()
 }
 
+// joinChannel resolves the channel state a JOIN applies to. Only our own
+// JOIN may create it — and only if unknown: a repeat self-JOIN (a
+// buggy/hostile server, or a netsplit rejoin edge) must not wipe the
+// accumulated members and topic. The set is bounded against a server
+// spoofing distinct self-JOINs; nil means unknown (or at the cap). Caller
+// holds r.mu.
+func (r *roster) joinChannel(ch string, ours bool) *channelState {
+	key := r.isup.Fold(ch)
+	if st := r.chans[key]; st != nil {
+		return st
+	}
+	if !ours || len(r.chans) >= maxRosterChannels {
+		return nil
+	}
+	st := &channelState{name: ch, members: make(map[string]Member)}
+	r.chans[key] = st
+	return st
+}
+
+// joinMember builds the Member a JOIN line describes, every field clamped
+// and cloned so it doesn't alias the parsed line's backing buffer. The JOIN
+// prefix carries nick!user@host; extended-join adds <account> <realname>,
+// account "*" when logged out.
+func joinMember(m *ircv4.Message, nick string) Member {
+	mem := Member{Nick: nick}
+	if m.Prefix != nil {
+		mem.User = clampRoster(m.Prefix.User)
+		mem.Host = clampRoster(m.Prefix.Host)
+	}
+	if acct := m.Param(1); len(m.Params) >= 3 && acct != "*" {
+		mem.Account = clampRoster(acct)
+	}
+	return mem
+}
+
 // memberJoin records a JOIN; ours creates the channel. extended-join
 // (spec fetched 2026-07-16) carries <account> <realname>, account "*"
 // when logged out. Caller holds r.mu.
@@ -384,19 +419,7 @@ func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
 	// entries. clampRoster caps to 512 B on a rune boundary and clones off the
 	// parsed line. Applied once here so the key, name, and every Fold(ch) agree.
 	ch := clampRoster(m.Param(0))
-	if ours {
-		// Create the channel only if unknown — a repeat self-JOIN (a
-		// buggy/hostile server, or a netsplit rejoin edge) must not wipe
-		// the accumulated members and topic. Bound the set against a
-		// server spoofing distinct self-JOINs.
-		if _, known := r.chans[r.isup.Fold(ch)]; !known {
-			if len(r.chans) >= maxRosterChannels {
-				return
-			}
-			r.chans[r.isup.Fold(ch)] = &channelState{name: ch, members: make(map[string]Member)}
-		}
-	}
-	st := r.chans[r.isup.Fold(ch)]
+	st := r.joinChannel(ch, ours)
 	if st == nil {
 		return
 	}
@@ -410,15 +433,7 @@ func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
 		(len(st.members) >= maxChannelMembers || r.totalMembers() >= maxRosterMembers || overBytes) {
 		return
 	}
-	// Clone so the Member doesn't alias the parsed JOIN line's backing buffer.
-	mem := Member{Nick: cs}
-	if m.Prefix != nil { // the JOIN prefix carries nick!user@host
-		mem.User = clampRoster(m.Prefix.User)
-		mem.Host = clampRoster(m.Prefix.Host)
-	}
-	if acct := m.Param(1); len(m.Params) >= 3 && acct != "*" {
-		mem.Account = clampRoster(acct)
-	}
+	mem := joinMember(m, cs)
 	// A re-JOIN of a known member can grow its entry (fresh user/host/
 	// account); over the byte budget, keep the existing entry instead so
 	// replacement floods can't inflate past the ceiling.

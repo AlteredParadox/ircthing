@@ -90,6 +90,18 @@ func (n *Network) EffectiveName() string {
 // registration — these go out via PASS/NICK/USER/JOIN and would
 // otherwise inject extra protocol lines on every (re)connect.
 func (n *Network) Validate() error {
+	if err := n.validateIdentity(); err != nil {
+		return err
+	}
+	if err := n.validateFraming(); err != nil {
+		return err
+	}
+	return n.validateSASLExternal()
+}
+
+// validateIdentity checks the fields that name and reach the network: addr
+// shape, nick, egress exclusivity, and the reserved-name set.
+func (n *Network) validateIdentity() error {
 	if n.Addr == "" {
 		return errors.New("addr is required")
 	}
@@ -126,6 +138,18 @@ func (n *Network) Validate() error {
 		"__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__":
 		return fmt.Errorf("network name %q is reserved", n.EffectiveName())
 	}
+	return nil
+}
+
+// validateFraming rejects the IRC framing characters (CR, LF, NUL) in every
+// value that reaches the wire during registration, and spaces where a value
+// is a non-trailing parameter: nick and username are written as NICK <nick>
+// / USER <username> 0 * :realname (username defaulting to nick when unset),
+// so a space there would be re-parsed by the server as a parameter boundary,
+// and the writer's fatal framing guard tears the connection down — wedging
+// the network in a permanent reconnect loop with a misleading error. Reject
+// it at config time instead, loudly.
+func (n *Network) validateFraming() error {
 	fields := map[string]string{
 		"addr": n.Addr, "nick": n.Nick, "username": n.Username,
 		"realname": n.Realname, "pass": n.Pass, "proxy": n.Proxy,
@@ -139,13 +163,6 @@ func (n *Network) Validate() error {
 			return fmt.Errorf("%s must not contain CR, LF, or NUL", name)
 		}
 	}
-	// nick and username are written as NON-trailing parameters of the
-	// registration lines (NICK <nick>; USER <username> 0 * :realname, with
-	// username defaulting to nick when unset). A space there would be
-	// re-parsed by the server as a parameter boundary, and the writer's
-	// fatal framing guard tears the connection down — wedging the network
-	// in a permanent reconnect loop with a misleading error. Reject it at
-	// config time instead, loudly.
 	if strings.IndexByte(n.Nick, ' ') != -1 {
 		return errors.New("nick must not contain spaces")
 	}
@@ -157,19 +174,24 @@ func (n *Network) Validate() error {
 			return fmt.Errorf("channels[%d] must not contain spaces, CR, LF, or NUL", i)
 		}
 	}
-	// SASL EXTERNAL authenticates purely with a client certificate, so a
-	// config that selects it but omits the keypair would connect presenting
-	// no certificate and fail authentication on every attempt (a permanent
-	// backoff loop). Require both files explicitly — against the EFFECTIVE
-	// mechanism: an empty mechanism with no password auto-selects EXTERNAL
-	// (mirrors irc.Config.validateSASL), so checking only the literal string
-	// would let an auto-EXTERNAL config through.
-	if n.SASL != nil {
-		mech := strings.ToUpper(n.SASL.Mechanism)
-		external := mech == "EXTERNAL" || (mech == "" && n.SASL.Password == "")
-		if external && (n.SASL.CertFile == "" || n.SASL.KeyFile == "") {
-			return errors.New("sasl EXTERNAL requires both cert_file and key_file")
-		}
+	return nil
+}
+
+// validateSASLExternal requires the client-certificate keypair whenever the
+// EFFECTIVE mechanism is EXTERNAL: a config that selects it but omits the
+// keypair would connect presenting no certificate and fail authentication
+// on every attempt (a permanent backoff loop). An empty mechanism with no
+// password auto-selects EXTERNAL (mirrors irc.Config.validateSASL), so
+// checking only the literal string would let an auto-EXTERNAL config
+// through.
+func (n *Network) validateSASLExternal() error {
+	if n.SASL == nil {
+		return nil
+	}
+	mech := strings.ToUpper(n.SASL.Mechanism)
+	external := mech == "EXTERNAL" || (mech == "" && n.SASL.Password == "")
+	if external && (n.SASL.CertFile == "" || n.SASL.KeyFile == "") {
+		return errors.New("sasl EXTERNAL requires both cert_file and key_file")
 	}
 	return nil
 }

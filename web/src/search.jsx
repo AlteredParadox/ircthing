@@ -10,10 +10,24 @@ function tombstoneResults(list, redactedIds) {
 	return list.map((ev) => {
 		if (ev.redacted || !ev.msgid) return ev;
 		const set = redactedIds.current.get(bufKey(ev.network, ev.buffer));
-		return set && set.has(ev.msgid)
+		return set?.has(ev.msgid)
 			? { ...ev, redacted: true, redact_reason: set.get(ev.msgid), raw: "" }
 			: ev;
 	});
+}
+
+// tombstoneMatching marks the result matching a live redaction. Match the
+// full identity, not just msgid — the same msgid can exist in another
+// network/buffer and must not be tombstoned here. Returns the input array
+// unchanged when nothing matched (so the state setter is a no-op).
+function tombstoneMatching(rs, d) {
+	let hit = false;
+	const next = rs.map((ev) => {
+		if (ev.redacted || ev.msgid !== d.msgid || ev.network !== d.network || ev.buffer !== d.buffer) return ev;
+		hit = true;
+		return { ...ev, redacted: true, redact_reason: d.reason, raw: "" };
+	});
+	return hit ? next : rs;
 }
 
 // Full-text search overlay. Debounced queries hit the server FTS index;
@@ -42,19 +56,7 @@ export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep, redacte
 	useEffect(() => {
 		const s = sock.current;
 		if (!s) return undefined;
-		const onRedact = (d) => {
-			setResults((rs) => {
-				let hit = false;
-				const next = rs.map((ev) => {
-					// Match the full identity, not just msgid — the same msgid can
-					// exist in another network/buffer and must not be tombstoned here.
-					if (ev.redacted || ev.msgid !== d.msgid || ev.network !== d.network || ev.buffer !== d.buffer) return ev;
-					hit = true;
-					return { ...ev, redacted: true, redact_reason: d.reason, raw: "" };
-				});
-				return hit ? next : rs;
-			});
-		};
+		const onRedact = (d) => setResults((rs) => tombstoneMatching(rs, d));
 		s.on("redact", onRedact);
 		return () => s.off("redact", onRedact);
 	}, []);

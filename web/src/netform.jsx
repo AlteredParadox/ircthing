@@ -28,6 +28,29 @@ function egressChoice(cfg) {
 	return "direct";
 }
 
+// wireguardOut normalizes the typed WG block for storage: the empty optional
+// preshared key is dropped, mtu kept only when it parses as a positive
+// number. Spreading undefined is a no-op, so a never-touched block yields {}
+// and the required-field check (wgReady) still gates save.
+function wireguardOut(wg) {
+	const clean = { ...wg };
+	if (!clean.preshared_key) delete clean.preshared_key;
+	const mtu = Number.parseInt(clean.mtu, 10);
+	if (mtu > 0) clean.mtu = mtu;
+	else delete clean.mtu;
+	return clean;
+}
+
+// saslOut drops empty optional SASL fields so they don't clutter the stored
+// JSON.
+function saslOut(sasl) {
+	const clean = { ...sasl };
+	for (const k of ["mechanism", "login", "password", "cert_file", "key_file"]) {
+		if (!clean[k]) delete clean[k];
+	}
+	return clean;
+}
+
 function Field({ label, children }) {
 	return (
 		<label class="nf-field">
@@ -79,16 +102,8 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 		// Egress is exactly one of direct / proxy / wireguard. The form keeps
 		// typed proxy/WG values across toggles, so submit is the SOLE authority on
 		// what gets stored: keep only the selected mode's block, drop the others.
-		if (egress === "wireguard") {
-			const wg = { ...(out.wireguard || {}) };
-			if (!wg.preshared_key) delete wg.preshared_key;
-			const mtu = parseInt(wg.mtu, 10);
-			if (mtu > 0) wg.mtu = mtu;
-			else delete wg.mtu;
-			out.wireguard = wg;
-		} else {
-			delete out.wireguard;
-		}
+		if (egress === "wireguard") out.wireguard = wireguardOut(out.wireguard);
+		else delete out.wireguard;
 		if (egress !== "proxy") delete out.proxy;
 		// Empty optional strings just clutter the stored JSON.
 		for (const k of ["username", "realname", "pass", "proxy"]) {
@@ -96,15 +111,8 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 		}
 		if (!out.channels.length) delete out.channels;
 		if (!out.trusted_fingerprints.length) delete out.trusted_fingerprints;
-		if (out.sasl) {
-			const s2 = { ...out.sasl };
-			for (const k of ["mechanism", "login", "password", "cert_file", "key_file"]) {
-				if (!s2[k]) delete s2[k];
-			}
-			out.sasl = s2;
-		} else {
-			delete out.sasl;
-		}
+		if (out.sasl) out.sasl = saslOut(out.sasl);
+		else delete out.sasl;
 		onSave(out, oldName);
 	}
 

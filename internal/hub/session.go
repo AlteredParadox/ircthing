@@ -177,20 +177,7 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 	// what this one sent.
 	echo := conn.CapEnabled("echo-message")
 
-	// A genuine multi-line message goes out as one draft/multiline batch
-	// (reconstructed into a single message on echo). The batch preserves
-	// interior blank lines — they are legal, meaningful content (a blank
-	// PRIVMSG line reconstructs to a blank line) — unlike the per-PRIVMSG
-	// fallback below, where an empty PRIVMSG cannot be sent.
-	if full := multilineLines(d.Text); len(full) > 1 && conn.CapEnabled("draft/multiline") {
-		if err := conn.SendMultiline(d.Target, full); err != nil {
-			s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
-			return
-		}
-		if !echo {
-			s.persistOwn(ctx, conn, d.Network, d.Target, strings.Join(full, "\n"))
-		}
-		s.push(envelope("ok", env.Seq, nil))
+	if s.trySendMultiline(ctx, conn, env, d, echo) {
 		return
 	}
 
@@ -206,6 +193,29 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 		}
 	}
 	s.push(envelope("ok", env.Seq, nil))
+}
+
+// trySendMultiline sends a genuinely multi-line message as one
+// draft/multiline batch (reconstructed into a single message on echo) and
+// reports whether it handled the send — the reply envelope is already
+// pushed either way when it did. The batch preserves interior blank lines —
+// they are legal, meaningful content (a blank PRIVMSG line reconstructs to
+// a blank line) — unlike the per-PRIVMSG fallback, where an empty PRIVMSG
+// cannot be sent.
+func (s *Session) trySendMultiline(ctx context.Context, conn Conn, env Envelope, d SendData, echo bool) bool {
+	full := multilineLines(d.Text)
+	if len(full) <= 1 || !conn.CapEnabled("draft/multiline") {
+		return false
+	}
+	if err := conn.SendMultiline(d.Target, full); err != nil {
+		s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
+		return true
+	}
+	if !echo {
+		s.persistOwn(ctx, conn, d.Network, d.Target, strings.Join(full, "\n"))
+	}
+	s.push(envelope("ok", env.Seq, nil))
+	return true
 }
 
 // multilineLines splits text for a draft/multiline batch, preserving

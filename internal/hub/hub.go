@@ -435,23 +435,24 @@ func replayTarget(m *ircv4.Message, batchTarget string, c Conn) (string, bool) {
 	return t, t != ""
 }
 
+// persistBuffer resolves the buffer an event persists into. During replay
+// the buffer is the batch target, which is authoritative and independent of
+// the nick we used when these messages were sent — re-deriving from the
+// CURRENT nick (persistTarget → directTarget) would misfile PM history after
+// a /nick or a reconnect collision-fallback changed our nick since. Live
+// traffic routes by the current nick, correct in the moment.
+func persistBuffer(ev irc.Event, c Conn, replay bool, batch *histBatch) (string, bool) {
+	if replay && batch != nil && batch.target != "" &&
+		(ev.Msg.Command == "PRIVMSG" || ev.Msg.Command == "NOTICE") {
+		return replayTarget(ev.Msg, batch.target, c)
+	}
+	return persistTarget(ev.Msg, c.Nick(), c.IsChannel, c.Fold, c.StatusPrefixes())
+}
+
 // persistEvent stores a message in its buffer and, when live, broadcasts
 // it. Duplicate msgids (overlapping backfill) are silently dropped.
 func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay bool, batch *histBatch) error {
-	// Routing: during replay the buffer is the batch target, which is
-	// authoritative and independent of the nick we used when these messages
-	// were sent. Re-deriving from the CURRENT nick (persistTarget → directTarget)
-	// would misfile PM history after a /nick or a reconnect collision-fallback
-	// changed our nick since. Live traffic routes by the current nick, correct
-	// in the moment.
-	var target string
-	var ok bool
-	if replay && batch != nil && batch.target != "" &&
-		(ev.Msg.Command == "PRIVMSG" || ev.Msg.Command == "NOTICE") {
-		target, ok = replayTarget(ev.Msg, batch.target, c)
-	} else {
-		target, ok = persistTarget(ev.Msg, c.Nick(), c.IsChannel, c.Fold, c.StatusPrefixes())
-	}
+	target, ok := persistBuffer(ev, c, replay, batch)
 	if !ok {
 		return nil
 	}
@@ -1076,6 +1077,22 @@ func newPrivmsg(target, text string) *ircv4.Message {
 	return &ircv4.Message{Command: "PRIVMSG", Params: []string{target, text}}
 }
 
+// redactionBuffer resolves the buffer a REDACT applies to. During replay the
+// batch target is authoritative and nick-independent (a replayed redaction
+// of a PM would otherwise miss after a since-then nick change). Live: a
+// redaction addressed to our nick files under the other party's buffer,
+// mirroring persistTarget.
+func redactionBuffer(ev irc.Event, c Conn, target string, replay bool, batch *histBatch) (buffer string, addressedToUs bool) {
+	if replay && batch != nil && batch.target != "" {
+		return batch.target, false
+	}
+	addressedToUs = !c.IsChannel(target) && ev.Msg.Prefix != nil && c.Fold(target) == c.Fold(c.Nick())
+	if addressedToUs {
+		return ev.Msg.Prefix.Name, true
+	}
+	return target, false
+}
+
 // applyRedaction handles an incoming REDACT (draft/message-redaction):
 // ":nick REDACT <target> <msgid> [:reason]". It marks the referenced
 // message deleted in the store and, unless this is history replay,
@@ -1090,21 +1107,7 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 	if len(ev.Msg.Params) > 2 {
 		reason = ev.Msg.Trailing()
 	}
-	// Resolve the buffer. During replay the batch target is authoritative and
-	// nick-independent (a replayed redaction of a PM would otherwise miss after
-	// a since-then nick change). Live: a redaction addressed to our nick files
-	// under the other party's buffer, mirroring persistTarget.
-	var buffer string
-	addressedToUs := false
-	if replay && batch != nil && batch.target != "" {
-		buffer = batch.target
-	} else {
-		addressedToUs = !c.IsChannel(target) && ev.Msg.Prefix != nil && c.Fold(target) == c.Fold(c.Nick())
-		buffer = target
-		if addressedToUs {
-			buffer = ev.Msg.Prefix.Name
-		}
-	}
+	buffer, addressedToUs := redactionBuffer(ev, c, target, replay, batch)
 	buffer = h.store.CanonicalBuffer(ctx, ev.Network, buffer, c.Fold)
 	ok, err := h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason)
 	if err != nil {

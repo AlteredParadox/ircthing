@@ -155,8 +155,14 @@ func (c *config) validate() error {
 	if c.SessionTTLDays < 0 || c.SessionTTLDays > maxConfigDays {
 		return fmt.Errorf("session_ttl_days %d out of range (0..%d)", c.SessionTTLDays, maxConfigDays)
 	}
+	return validateNetworks(c.Networks)
+}
+
+// validateNetworks checks each seed definition and rejects duplicate
+// effective names (two networks would fight over one stored identity).
+func validateNetworks(nets []netconf.Network) error {
 	seen := make(map[string]bool)
-	for i, n := range c.Networks {
+	for i, n := range nets {
 		if err := n.Validate(); err != nil {
 			return fmt.Errorf("networks[%d]: %w", i, err)
 		}

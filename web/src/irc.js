@@ -252,12 +252,60 @@ const IRC_PALETTE = [
 ];
 
 function paletteColor(digits) {
-	const n = parseInt(digits, 10);
+	const n = Number.parseInt(digits, 10);
 	return n >= 0 && n < IRC_PALETTE.length ? IRC_PALETTE[n] : null; // 99 / OOR = default
 }
 
 const isDigit = (c) => c >= "0" && c <= "9";
 const HEX6 = /^[0-9a-fA-F]{6}$/;
+
+// The simple attribute toggles, by control byte. \x0f (reset) and the two
+// colour codes need their own handling.
+const FMT_TOGGLES = {
+	0x02: "bold", 0x1d: "italic", 0x1f: "underline",
+	0x1e: "strike", 0x11: "mono", 0x16: "reverse",
+};
+
+// parseIndexedColor consumes the digits of a \x03 fg[,bg] code starting at i
+// (just past the control byte), updating st. Returns the next index. A bare
+// \x03 (no digits) resets both colours.
+function parseIndexedColor(text, i, st) {
+	let d = "";
+	while (i < text.length && d.length < 2 && isDigit(text[i])) d += text[i++];
+	if (d === "") {
+		st.fg = null;
+		st.bg = null;
+		return i;
+	}
+	st.fg = paletteColor(d);
+	if (text[i] === "," && isDigit(text[i + 1])) {
+		i++;
+		let e = "";
+		while (i < text.length && e.length < 2 && isDigit(text[i])) e += text[i++];
+		st.bg = paletteColor(e);
+	}
+	return i;
+}
+
+// parseHexColor consumes the arguments of a \x04 RRGGBB[,RRGGBB] code
+// starting at i (just past the control byte), updating st. Returns the next
+// index. A \x04 without six hex digits resets both colours and consumes
+// nothing further (stripFormatting mirrors this).
+function parseHexColor(text, i, st) {
+	const fg = text.slice(i, i + 6);
+	if (!HEX6.test(fg)) {
+		st.fg = null;
+		st.bg = null;
+		return i;
+	}
+	st.fg = "#" + fg;
+	i += 6;
+	if (text[i] === "," && HEX6.test(text.slice(i + 1, i + 7))) {
+		st.bg = "#" + text.slice(i + 1, i + 7);
+		i += 7;
+	}
+	return i;
+}
 
 // parseFormatting turns an IRC message body into styled runs. It consumes mIRC
 // control codes — attributes \x02 bold, \x1d italic, \x1f underline, \x1e
@@ -287,38 +335,24 @@ export function parseFormatting(text) {
 			buf += stripFormatting(text.slice(i));
 			break;
 		}
-		const c = text.charCodeAt(i);
-		switch (c) {
-			case 0x02: flush(); st.bold = !st.bold; i++; continue;
-			case 0x1d: flush(); st.italic = !st.italic; i++; continue;
-			case 0x1f: flush(); st.underline = !st.underline; i++; continue;
-			case 0x1e: flush(); st.strike = !st.strike; i++; continue;
-			case 0x11: flush(); st.mono = !st.mono; i++; continue;
-			case 0x16: flush(); st.reverse = !st.reverse; i++; continue;
-			case 0x0f: flush(); reset(); i++; continue;
-			case 0x03: { // \x03 fg[,bg], up to 2 digits each
-				flush(); i++;
-				let d = "";
-				while (i < text.length && d.length < 2 && isDigit(text[i])) d += text[i++];
-				if (d === "") { st.fg = null; st.bg = null; continue; } // bare \x03 resets colour
-				st.fg = paletteColor(d);
-				if (text[i] === "," && isDigit(text[i + 1])) {
-					i++;
-					let e = "";
-					while (i < text.length && e.length < 2 && isDigit(text[i])) e += text[i++];
-					st.bg = paletteColor(e);
-				}
-				continue;
-			}
-			case 0x04: { // \x04 RRGGBB[,RRGGBB]
-				flush(); i++;
-				const fg = text.slice(i, i + 6);
-				if (!HEX6.test(fg)) { st.fg = null; st.bg = null; continue; }
-				st.fg = "#" + fg; i += 6;
-				if (text[i] === "," && HEX6.test(text.slice(i + 1, i + 7))) { st.bg = "#" + text.slice(i + 1, i + 7); i += 7; }
-				continue;
-			}
-			default: buf += text[i++];
+		const c = text.codePointAt(i);
+		const toggle = FMT_TOGGLES[c];
+		if (toggle) {
+			flush();
+			st[toggle] = !st[toggle];
+			i++;
+		} else if (c === 0x0f) {
+			flush();
+			reset();
+			i++;
+		} else if (c === 0x03) {
+			flush();
+			i = parseIndexedColor(text, i + 1, st);
+		} else if (c === 0x04) {
+			flush();
+			i = parseHexColor(text, i + 1, st);
+		} else {
+			buf += text[i++];
 		}
 	}
 	flush();
@@ -331,7 +365,12 @@ export function parseFormatting(text) {
 // handling of a bare \x04: "al\x04ice" renders as "alice" and must also
 // MATCH as "alice", or the mention is visible but never alerts.
 export function stripFormatting(text) {
-	return text.replace(/[\x02\x0f\x11\x16\x1d\x1e\x1f]|\x03\d{0,2}(?:,\d{1,2})?|\x04(?:[0-9a-fA-F]{6}(?:,[0-9a-fA-F]{6})?)?/g, "");
+	// Two passes (colour codes with their arguments, then the bare attribute
+	// bytes) — the patterns are disjoint by lead byte, so this matches the
+	// single-alternation form exactly while keeping each regex simple.
+	return text
+		.replace(/\x03\d{0,2}(?:,\d{1,2})?|\x04(?:[0-9a-fA-F]{6}(?:,[0-9a-fA-F]{6})?)?/g, "")
+		.replace(/[\x02\x0f\x11\x16\x1d\x1e\x1f]/g, "");
 }
 
 // nickSet builds the lookup for in-body nick highlighting: lowercased nick ->
@@ -359,7 +398,8 @@ export function highlightNicks(text, nickMap) {
 	const parts = text.split(NICK_SPLIT_RE);
 	const out = [];
 	const pushPlain = (t) => {
-		if (out.length && out[out.length - 1].nick === null) out[out.length - 1].text += t;
+		const last = out.at(-1);
+		if (last && last.nick === null) last.text += t;
 		else out.push({ nick: null, text: t });
 	};
 	for (let i = 0; i < parts.length; i++) {

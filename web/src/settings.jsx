@@ -104,6 +104,22 @@ function ChangePassword() {
 	);
 }
 
+// saveConfig PUTs a settings patch and reports whether the server accepted
+// it (2xx). Callers revert their optimistic UI on false so this session
+// can't silently diverge from the persisted state (and other devices).
+async function saveConfig(patch) {
+	try {
+		const r = await fetch("/api/config", {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(patch),
+		});
+		return r.ok;
+	} catch {
+		return false;
+	}
+}
+
 // Settings modal: appearance preferences, desktop-notification
 // permission, and per-network highlight rules. Everything is edited live
 // and persisted by the parent.
@@ -140,22 +156,6 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 			.catch(() => {});
 	}, []);
 
-	// saveConfig PUTs a settings patch and reports whether the server accepted
-	// it (2xx). Callers revert their optimistic UI on false so this session
-	// can't silently diverge from the persisted state (and other devices).
-	async function saveConfig(patch) {
-		try {
-			const r = await fetch("/api/config", {
-				method: "PUT",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify(patch),
-			});
-			return r.ok;
-		} catch {
-			return false;
-		}
-	}
-
 	// Saves are serialized per-setting (saveQueue): the next PUT is not sent
 	// until the previous settles, so an older request can never land after —
 	// and silently overwrite — a newer one server-side. The generation guard
@@ -184,7 +184,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 				if (!ok && gen === sessionGen.current) setSessionDays(prev);
 			});
 	}
-	const retNum = (v) => Math.max(0, parseInt(v, 10) || 0);
+	const retNum = (v) => Math.max(0, Number.parseInt(v, 10) || 0);
 
 	async function togglePreviews(on) {
 		// Only reflect the new state once the server confirms the write.
@@ -442,7 +442,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 									type="number"
 									min="1"
 									value={sessionDays}
-									onChange={(e) => saveSessionDays(Math.max(1, parseInt(e.currentTarget.value, 10) || 1))}
+									onChange={(e) => saveSessionDays(Math.max(1, Number.parseInt(e.currentTarget.value, 10) || 1))}
 								/>
 							</div>
 						)}

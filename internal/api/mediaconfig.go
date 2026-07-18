@@ -75,15 +75,24 @@ func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// configPatch is a PUT /api/config body. Pointer fields so a PUT can update
+// just one setting (the previews toggle and the retention inputs save
+// independently) without clobbering others.
+type configPatch struct {
+	Previews             *bool `json:"previews"`
+	RetentionDays        *int  `json:"retention_days"`
+	RetentionMaxMessages *int  `json:"retention_max_messages"`
+	SessionTTLDays       *int  `json:"session_ttl_days"`
+}
+
+func (p *configPatch) setsRetention() bool {
+	return p.RetentionDays != nil || p.RetentionMaxMessages != nil
+}
+
+const storeConfigFailedMsg = "storing config failed"
+
 func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
-	// Pointer fields so a PUT can update just one setting (the previews toggle
-	// and the retention inputs save independently) without clobbering others.
-	var body struct {
-		Previews             *bool `json:"previews"`
-		RetentionDays        *int  `json:"retention_days"`
-		RetentionMaxMessages *int  `json:"retention_max_messages"`
-		SessionTTLDays       *int  `json:"session_ttl_days"`
-	}
+	var body configPatch
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&body); err != nil {
 		http.Error(w, "malformed config", http.StatusBadRequest)
 		return
@@ -97,62 +106,79 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 	s.settingsMu.Lock()
 	defer s.settingsMu.Unlock()
 
-	// Validate EVERY provided field before applying ANY, so a bad value in one
-	// (e.g. retention_days:-1) can't leave an earlier one (previews) already
-	// changed and then return 400.
-	setRetention := body.RetentionDays != nil || body.RetentionMaxMessages != nil
-	var rDays, rMax int
-	if setRetention {
-		rDays, rMax = s.hub.Store().Retention()
-		if body.RetentionDays != nil {
-			rDays = *body.RetentionDays
-		}
-		if body.RetentionMaxMessages != nil {
-			rMax = *body.RetentionMaxMessages
-		}
-		if rDays < 0 || rDays > maxRetentionDays || rMax < 0 || rMax > maxRetentionMessages {
-			http.Error(w, "retention out of range", http.StatusBadRequest)
-			return
-		}
-	}
-	if body.SessionTTLDays != nil && (*body.SessionTTLDays < 1 || *body.SessionTTLDays > maxRetentionDays) {
-		http.Error(w, "session_ttl_days out of range", http.StatusBadRequest)
+	rDays, rMax, badField := s.validateConfigPatch(&body)
+	if badField != "" {
+		http.Error(w, badField, http.StatusBadRequest)
 		return
 	}
-
-	// All validated — apply.
-	if body.Previews != nil {
-		val := "0"
-		if *body.Previews {
-			val = "1"
-		}
-		// Persist and update the in-memory flag under one lock so two concurrent
-		// PUTs cannot interleave into disagreeing persisted/live states.
-		s.mediaMu.Lock()
-		err := s.hub.Store().SetSetting(r.Context(), previewsKey, val)
-		if err == nil {
-			s.previewsOn = *body.Previews
-		}
-		s.mediaMu.Unlock()
-		if err != nil {
-			http.Error(w, "storing config failed", http.StatusInternalServerError)
-			return
-		}
-	}
-	if setRetention {
-		if err := s.hub.Store().SetRetention(r.Context(), rDays, rMax); err != nil {
-			http.Error(w, "storing config failed", http.StatusInternalServerError)
-			return
-		}
-	}
-	if body.SessionTTLDays != nil {
-		if err := s.hub.Store().SetSetting(r.Context(), sessionTTLKey, strconv.Itoa(*body.SessionTTLDays)); err != nil {
-			http.Error(w, "storing config failed", http.StatusInternalServerError)
-			return
-		}
-		s.sessionTTL.Store(int64(time.Duration(*body.SessionTTLDays) * 24 * time.Hour))
+	if err := s.applyConfigPatch(r.Context(), &body, rDays, rMax); err != nil {
+		http.Error(w, storeConfigFailedMsg, http.StatusInternalServerError)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// validateConfigPatch checks EVERY provided field before anything is applied,
+// so a bad value in one (e.g. retention_days:-1) can't leave an earlier one
+// (previews) already changed and then return 400. It resolves the effective
+// retention pair (current values overlaid with the patch); badField is the
+// 400 message, "" when valid. Caller holds settingsMu.
+func (s *Server) validateConfigPatch(p *configPatch) (rDays, rMax int, badField string) {
+	if p.setsRetention() {
+		rDays, rMax = s.hub.Store().Retention()
+		if p.RetentionDays != nil {
+			rDays = *p.RetentionDays
+		}
+		if p.RetentionMaxMessages != nil {
+			rMax = *p.RetentionMaxMessages
+		}
+		if rDays < 0 || rDays > maxRetentionDays || rMax < 0 || rMax > maxRetentionMessages {
+			return 0, 0, "retention out of range"
+		}
+	}
+	if p.SessionTTLDays != nil && (*p.SessionTTLDays < 1 || *p.SessionTTLDays > maxRetentionDays) {
+		return 0, 0, "session_ttl_days out of range"
+	}
+	return rDays, rMax, ""
+}
+
+// applyConfigPatch persists each provided setting. Caller holds settingsMu
+// and has validated the patch.
+func (s *Server) applyConfigPatch(ctx context.Context, p *configPatch, rDays, rMax int) error {
+	if p.Previews != nil {
+		if err := s.applyPreviews(ctx, *p.Previews); err != nil {
+			return err
+		}
+	}
+	if p.setsRetention() {
+		if err := s.hub.Store().SetRetention(ctx, rDays, rMax); err != nil {
+			return err
+		}
+	}
+	if p.SessionTTLDays != nil {
+		if err := s.hub.Store().SetSetting(ctx, sessionTTLKey, strconv.Itoa(*p.SessionTTLDays)); err != nil {
+			return err
+		}
+		s.sessionTTL.Store(int64(time.Duration(*p.SessionTTLDays) * 24 * time.Hour))
+	}
+	return nil
+}
+
+// applyPreviews persists and updates the in-memory previews flag under one
+// lock, so two concurrent PUTs cannot interleave into disagreeing
+// persisted/live states.
+func (s *Server) applyPreviews(ctx context.Context, on bool) error {
+	val := "0"
+	if on {
+		val = "1"
+	}
+	s.mediaMu.Lock()
+	defer s.mediaMu.Unlock()
+	err := s.hub.Store().SetSetting(ctx, previewsKey, val)
+	if err == nil {
+		s.previewsOn = on
+	}
+	return err
 }
 
 func proxyString(u *url.URL) string {

@@ -149,7 +149,7 @@ func Validate(cfg Config) error {
 		return fmt.Errorf("wgdial: endpoint %q: host is required", cfg.Endpoint)
 	}
 	if _, err := endpointPort(portStr); err != nil {
-		return fmt.Errorf("wgdial: endpoint %q: %w", cfg.Endpoint, err)
+		return fmt.Errorf(errEndpointFmt, cfg.Endpoint, err)
 	}
 	// Bound the MTU. 0 means the 1420 default; otherwise require a sane
 	// WireGuard range. An unbounded value reaches netstack, which int32-truncates
@@ -247,6 +247,10 @@ func (t *Tunnel) Close() {
 	}
 }
 
+// errEndpointFmt wraps every endpoint-shaped failure identically:
+// "wgdial: endpoint %q: <cause>".
+const errEndpointFmt = "wgdial: endpoint %q: %w"
+
 // resolveEndpoint turns the peer endpoint host:port into ip:port. A literal IP
 // is returned unchanged. A hostname is resolved via the LOCAL resolver — the
 // ONE intentional exception to the no-local-DNS rule (see the package doc):
@@ -256,11 +260,11 @@ func (t *Tunnel) Close() {
 func resolveEndpoint(ctx context.Context, endpoint string) (string, error) {
 	host, portStr, err := net.SplitHostPort(endpoint)
 	if err != nil {
-		return "", fmt.Errorf("wgdial: endpoint %q: %w", endpoint, err)
+		return "", fmt.Errorf(errEndpointFmt, endpoint, err)
 	}
 	port, err := endpointPort(portStr)
 	if err != nil {
-		return "", fmt.Errorf("wgdial: endpoint %q: %w", endpoint, err)
+		return "", fmt.Errorf(errEndpointFmt, endpoint, err)
 	}
 	// Always reconstruct the returned endpoint from a parsed netip.AddrPort, for
 	// BOTH the literal-IP and resolved paths: it yields a canonical ip:port with

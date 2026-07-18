@@ -8,7 +8,7 @@ import { anchorId, Geometry, prependedCount } from "./vmath.js";
 // heights — the estimate ignores density and font, so estimate-based anchoring
 // overshoots (compact + mono rows are ~20px, the estimate assumes ~27+) and the
 // async ResizeObserver correction otherwise shows up as a jarring scroll jump.
-function computeWindow(geo, items, viewTop, viewH, overscan, pinned, focusing, focusIdx, k) {
+function computeWindow(geo, items, { viewTop, viewH, overscan, pinned, focusing, focusIdx, prepended }) {
 	let { start, end } = geo.range(viewTop - overscan, viewTop + viewH + overscan);
 	if (pinned && items.length) {
 		// While pinned the tail must be in the window even before the scroll
@@ -25,9 +25,9 @@ function computeWindow(geo, items, viewTop, viewH, overscan, pinned, focusing, f
 		start = Math.min(start, Math.max(0, focusIdx - 12));
 		end = Math.max(end, Math.min(items.length, focusIdx + 12));
 	}
-	if (k > 0) {
+	if (prepended > 0) {
 		start = 0;
-		end = Math.max(end, Math.min(items.length, k));
+		end = Math.max(end, Math.min(items.length, prepended));
 	}
 	return { start, end };
 }
@@ -104,10 +104,10 @@ export function VirtualList({
 	const headerH = headerEl.current?.offsetHeight || 0;
 	const viewTop = el ? el.scrollTop - headerH : 0;
 	const viewH = el ? el.clientHeight : 800;
-	const { start, end } = computeWindow(
-		geo, items, viewTop, viewH, overscan,
-		pinned.current, pendingFocus.current, focusIdx, k,
-	);
+	const { start, end } = computeWindow(geo, items, {
+		viewTop, viewH, overscan,
+		pinned: pinned.current, focusing: pendingFocus.current, focusIdx, prepended: k,
+	});
 
 	const topPad = geo.offsetOf(start);
 	const bottomPad = geo.total() - geo.offsetOf(end);

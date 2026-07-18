@@ -1458,49 +1458,47 @@ func (m *Manager) writeLoop(ctx context.Context, cancel context.CancelCauseFunc,
 		}
 		return true
 	}
-	// Priority: urgent (PONG) > internal (handshake/rejoins) > m.out (user/hub).
-	// A PONG is never overtaken by a rate-paced JOIN, and neither is overtaken
-	// by a queued user message.
 	for {
-		select {
-		case <-ctx.Done():
+		out, throttle, ok := nextOutbound(ctx, urgent, internal, m.out)
+		if !ok || !writeOne(out, throttle) {
 			return
-		case out := <-urgent:
-			if !writeOne(out, false) {
-				return
-			}
-			continue
-		default:
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case out := <-urgent:
-			if !writeOne(out, false) {
-				return
-			}
-		case out := <-internal:
-			if !writeOne(out, true) {
-				return
-			}
-		default:
-			select {
-			case <-ctx.Done():
-				return
-			case out := <-urgent:
-				if !writeOne(out, false) {
-					return
-				}
-			case out := <-internal:
-				if !writeOne(out, true) {
-					return
-				}
-			case out := <-m.out:
-				if !writeOne(out, true) {
-					return
-				}
-			}
-		}
+	}
+}
+
+// nextOutbound blocks for the next message to write, by priority: urgent
+// (PONG) > internal (handshake/rejoins) > out (user/hub). The staged
+// selects — a non-blocking poll of each higher tier before widening — give
+// strict priority: a PONG is never overtaken by a rate-paced JOIN, and
+// neither is overtaken by a queued user message. throttle is false only
+// for urgent messages (PONGs bypass the flood bucket); ok is false when
+// ctx ended.
+func nextOutbound(ctx context.Context, urgent, internal, out <-chan *ircv4.Message) (*ircv4.Message, bool, bool) {
+	select {
+	case <-ctx.Done():
+		return nil, false, false
+	case msg := <-urgent:
+		return msg, false, true
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return nil, false, false
+	case msg := <-urgent:
+		return msg, false, true
+	case msg := <-internal:
+		return msg, true, true
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return nil, false, false
+	case msg := <-urgent:
+		return msg, false, true
+	case msg := <-internal:
+		return msg, true, true
+	case msg := <-out:
+		return msg, true, true
 	}
 }
 
