@@ -53,6 +53,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	// Server-side settings, loaded on open and applied on change.
 	const [previewsOn, setPreviewsOn] = useState(null); // null while loading
 	const [retention, setRetention] = useState(null); // { days, max } | null
+	const [sessionDays, setSessionDays] = useState(null); // login cookie lifetime
 
 	useEffect(() => {
 		const onKey = (e) => e.key === "Escape" && onClose();
@@ -67,22 +68,31 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 				if (!d) return;
 				setPreviewsOn(!!d.previews);
 				setRetention({ days: d.retention_days | 0, max: d.retention_max_messages | 0 });
+				setSessionDays(d.session_ttl_days | 0);
 			})
 			.catch(() => {});
 	}, []);
 
-	async function saveRetention(patch) {
-		const next = { ...retention, ...patch };
-		setRetention(next);
+	async function saveConfig(patch) {
 		try {
 			await fetch("/api/config", {
 				method: "PUT",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ retention_days: next.days, retention_max_messages: next.max }),
+				body: JSON.stringify(patch),
 			});
 		} catch {
-			/* leave the optimistic value; a reopen reloads the server truth */
+			/* leave optimistic UI; a reopen reloads the server truth */
 		}
+	}
+
+	function saveRetention(patch) {
+		const next = { ...retention, ...patch };
+		setRetention(next);
+		saveConfig({ retention_days: next.days, retention_max_messages: next.max });
+	}
+	function saveSessionDays(days) {
+		setSessionDays(days);
+		saveConfig({ session_ttl_days: days });
 	}
 	const retNum = (v) => Math.max(0, parseInt(v, 10) || 0);
 
@@ -325,6 +335,26 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 									/>
 								</div>
 							</>
+						)}
+					</section>
+
+					<section class="settings-section">
+						<div class="settings-label">Session</div>
+						<div class="settings-note">
+							How long a login stays valid before you have to sign in again. Applies
+							to new logins.
+						</div>
+						{sessionDays !== null && (
+							<div class="pref-row">
+								<span class="pref-name">Stay signed in (days)</span>
+								<input
+									class="pref-input"
+									type="number"
+									min="1"
+									value={sessionDays}
+									onChange={(e) => saveSessionDays(Math.max(1, parseInt(e.currentTarget.value, 10) || 1))}
+								/>
+							</div>
 						)}
 					</section>
 

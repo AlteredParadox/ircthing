@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -81,6 +82,11 @@ type Server struct {
 
 	mu     sync.Mutex
 	tokens map[string]time.Time // session token -> expiry
+
+	// sessionTTL is the effective session-cookie lifetime in nanoseconds,
+	// runtime-settable (Settings → Session). Atomic so the login path reads it
+	// without the token lock.
+	sessionTTL atomic.Int64
 }
 
 func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
@@ -106,6 +112,7 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		login:        newLoginLimiter(),
 		tokens:       make(map[string]time.Time),
 	}
+	s.sessionTTL.Store(int64(loadSessionTTL(context.Background(), h.Store(), cfg)))
 	// State-changing and media endpoints require a same-origin request (the
 	// WebSocket does its own Origin check in handleWS). GET /api/config is
 	// read-only and needs no CSRF guard.
@@ -288,7 +295,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Name:     s.cookieName(),
 		Value:    token,
 		Path:     "/",
-		MaxAge:   int(s.cfg.SessionTTL.Seconds()),
+		MaxAge:   int(s.sessionTTLDur().Seconds()),
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 		// Secure follows config: on when TLS terminates in front of the
@@ -321,6 +328,9 @@ func (s *Server) authenticate(ctx context.Context, source, username, password st
 // issueToken mints a session token, pruning expired sessions and
 // evicting the oldest once the live set is at capacity, so repeated
 // logins cannot grow the map without bound.
+// sessionTTLDur is the effective (runtime-settable) session-cookie lifetime.
+func (s *Server) sessionTTLDur() time.Duration { return time.Duration(s.sessionTTL.Load()) }
+
 func (s *Server) issueToken() (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
@@ -344,7 +354,7 @@ func (s *Server) issueToken() (string, error) {
 		}
 		delete(s.tokens, oldest)
 	}
-	s.tokens[token] = now.Add(s.cfg.SessionTTL)
+	s.tokens[token] = now.Add(s.sessionTTLDur())
 	return token, nil
 }
 

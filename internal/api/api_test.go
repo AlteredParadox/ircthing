@@ -266,6 +266,58 @@ func TestPreviewsToggleRuntime(t *testing.T) {
 	}
 }
 
+// Retention and session TTL are runtime-editable via PUT /api/config, reflect
+// in GET, update the store / effective TTL, and reject out-of-range values.
+func TestConfigRetentionAndSessionRuntime(t *testing.T) {
+	ts, srv := newTestServerWithRef(t)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	do := func(method, path, body string) *http.Response {
+		req, _ := http.NewRequest(method, ts.URL+path, strings.NewReader(body))
+		req.AddCookie(cookie)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	resp := do("PUT", "/api/config", `{"retention_days":7,"retention_max_messages":500,"session_ttl_days":14}`)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("PUT = %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	var cfg struct {
+		RetentionDays        int `json:"retention_days"`
+		RetentionMaxMessages int `json:"retention_max_messages"`
+		SessionTTLDays       int `json:"session_ttl_days"`
+	}
+	resp = do("GET", "/api/config", "")
+	decodeJSON(t, resp, &cfg)
+	resp.Body.Close()
+	if cfg.RetentionDays != 7 || cfg.RetentionMaxMessages != 500 || cfg.SessionTTLDays != 14 {
+		t.Fatalf("config = %+v, want 7/500/14", cfg)
+	}
+	if d, m := srv.hub.Store().Retention(); d != 7 || m != 500 {
+		t.Fatalf("store retention = %d/%d, want 7/500", d, m)
+	}
+	if srv.sessionTTLDur() != 14*24*time.Hour {
+		t.Fatalf("session TTL = %v, want 14d", srv.sessionTTLDur())
+	}
+
+	// Out-of-range values are refused (no partial write).
+	if resp = do("PUT", "/api/config", `{"retention_days":-1}`); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("negative retention = %d, want 400", resp.StatusCode)
+	} else {
+		resp.Body.Close()
+	}
+	if resp = do("PUT", "/api/config", `{"session_ttl_days":0}`); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("zero session_ttl = %d, want 400", resp.StatusCode)
+	} else {
+		resp.Body.Close()
+	}
+}
+
 // Previews use the source network's proxy: proxyForNetwork resolves it from
 // the stored config, and the per-proxy fetcher pool builds + reuses one
 // fetcher per distinct proxy.

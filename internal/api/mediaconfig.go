@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"strconv"
+	"time"
 
 	"ircthing/internal/proxydial"
 	"ircthing/internal/store"
@@ -36,6 +38,21 @@ func loadPreviews(ctx context.Context, st *store.Store, cfg Config) bool {
 // future and would delete all history.
 const maxRetentionDays = 36500
 
+// sessionTTLKey stores the runtime session-cookie lifetime, in days.
+const sessionTTLKey = "session_ttl_days"
+
+// loadSessionTTL resolves the effective session lifetime: the settings-table
+// value (runtime-set via the UI, in days) when present, else the config value
+// (which New already defaulted to 30 days).
+func loadSessionTTL(ctx context.Context, st *store.Store, cfg Config) time.Duration {
+	if v, err := st.Setting(ctx, sessionTTLKey); err == nil && v != "" {
+		if days, err := strconv.Atoi(v); err == nil && days > 0 {
+			return time.Duration(days) * 24 * time.Hour
+		}
+	}
+	return cfg.SessionTTL
+}
+
 func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
 	days, maxPer := s.hub.Store().Retention()
 	w.Header().Set("Content-Type", "application/json")
@@ -43,10 +60,12 @@ func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
 		Previews             bool `json:"previews"`
 		RetentionDays        int  `json:"retention_days"`
 		RetentionMaxMessages int  `json:"retention_max_messages"`
+		SessionTTLDays       int  `json:"session_ttl_days"`
 	}{
 		Previews:             s.previewsEnabled(),
 		RetentionDays:        days,
 		RetentionMaxMessages: maxPer,
+		SessionTTLDays:       int(s.sessionTTLDur() / (24 * time.Hour)),
 	})
 }
 
@@ -57,6 +76,7 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 		Previews             *bool `json:"previews"`
 		RetentionDays        *int  `json:"retention_days"`
 		RetentionMaxMessages *int  `json:"retention_max_messages"`
+		SessionTTLDays       *int  `json:"session_ttl_days"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&body); err != nil {
 		http.Error(w, "malformed config", http.StatusBadRequest)
@@ -96,6 +116,18 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "storing config failed", http.StatusInternalServerError)
 			return
 		}
+	}
+	if body.SessionTTLDays != nil {
+		days := *body.SessionTTLDays
+		if days < 1 || days > maxRetentionDays {
+			http.Error(w, "session_ttl_days out of range", http.StatusBadRequest)
+			return
+		}
+		if err := s.hub.Store().SetSetting(r.Context(), sessionTTLKey, strconv.Itoa(days)); err != nil {
+			http.Error(w, "storing config failed", http.StatusInternalServerError)
+			return
+		}
+		s.sessionTTL.Store(int64(time.Duration(days) * 24 * time.Hour))
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
