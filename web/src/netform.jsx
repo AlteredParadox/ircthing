@@ -14,6 +14,20 @@ function saslChoice(cfg) {
 	return cfg.sasl.mechanism || "auto";
 }
 
+// Egress: direct, a SOCKS5/HTTP proxy, or an in-process WireGuard tunnel.
+// proxy and wireguard are mutually exclusive (the server rejects both).
+const EGRESS_CHOICES = [
+	["direct", "Direct"],
+	["proxy", "Proxy (SOCKS5 / HTTP)"],
+	["wireguard", "WireGuard tunnel"],
+];
+
+function egressChoice(cfg) {
+	if (cfg.wireguard) return "wireguard";
+	if (cfg.proxy) return "proxy";
+	return "direct";
+}
+
 function Field({ label, children }) {
 	return (
 		<label class="nf-field">
@@ -31,8 +45,19 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 	const [channels, setChannels] = useState((initial?.channels || []).join(" "));
 	const [fingerprints, setFingerprints] = useState((initial?.trusted_fingerprints || []).join("\n"));
 	const [confirmDel, setConfirmDel] = useState(false);
+	const [egress, setEgress] = useState(() => egressChoice(initial || {}));
 	const set = (patch) => setCfg((c) => ({ ...c, ...patch }));
+	const setWG = (patch) => setCfg((c) => ({ ...c, wireguard: { ...c.wireguard, ...patch } }));
 	const sasl = saslChoice(cfg);
+
+	// pickEgress switches egress mode and keeps proxy/wireguard mutually
+	// exclusive: only the selected one survives into the saved config.
+	function pickEgress(mode) {
+		setEgress(mode);
+		if (mode === "direct") set({ proxy: undefined, wireguard: undefined });
+		else if (mode === "proxy") set({ wireguard: undefined });
+		else set({ proxy: undefined, wireguard: cfg.wireguard || {} });
+	}
 
 	function pickSASL(choice) {
 		if (choice === "none") set({ sasl: undefined });
@@ -51,6 +76,19 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 		const out = { ...cfg };
 		out.channels = channels.split(/[\s,]+/).filter(Boolean);
 		out.trusted_fingerprints = fingerprints.split(/[\s,]+/).filter(Boolean);
+		// Egress is exactly one of direct / proxy / wireguard — drop the others
+		// so a stale value from a mode the user switched away from isn't stored.
+		if (egress === "wireguard") {
+			delete out.proxy;
+			const wg = { ...(out.wireguard || {}) };
+			if (!wg.preshared_key) delete wg.preshared_key;
+			const mtu = parseInt(wg.mtu, 10);
+			if (mtu > 0) wg.mtu = mtu;
+			else delete wg.mtu;
+			out.wireguard = wg;
+		} else {
+			delete out.wireguard;
+		}
 		// Empty optional strings just clutter the stored JSON.
 		for (const k of ["username", "realname", "pass", "proxy"]) {
 			if (!out[k]) delete out[k];
@@ -69,7 +107,10 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 		onSave(out, oldName);
 	}
 
-	const valid = (cfg.addr || "").includes(":") && (cfg.nick || "").trim();
+	const wg = cfg.wireguard || {};
+	const wgReady = egress !== "wireguard" ||
+		(wg.private_key && wg.peer_public_key && wg.endpoint && wg.address && wg.dns);
+	const valid = (cfg.addr || "").includes(":") && (cfg.nick || "").trim() && wgReady;
 	return (
 		<div class="search-scrim" aria-hidden="true" onClick={(e) => e.target === e.currentTarget && onClose()}>
 			<form class="settings-panel net-form" onSubmit={submit}>
@@ -156,19 +197,59 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 					</section>
 
 					<section class="settings-section">
-						<Field label="Proxy">
-							<input type="password" autocomplete="off" class="rule-input" value={cfg.proxy || ""} onInput={(e) => set({ proxy: e.currentTarget.value })} placeholder="socks5://127.0.0.1:9050 (optional)" />
+						<div class="settings-label">Egress</div>
+						<Field label="Route through">
+							<select class="rule-input" value={egress} onChange={(e) => pickEgress(e.currentTarget.value)}>
+								{EGRESS_CHOICES.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
+							</select>
 						</Field>
-						{proxyCredsExposed(cfg.proxy) && (
-							<div class="nf-warn">
-								⚠ This proxy sends a username/password to a non-loopback host. SOCKS5
-								and HTTP proxy auth are transmitted <b>unencrypted</b>, so the
-								credentials travel in the clear unless the connection to the proxy is
-								itself protected (a VPN or SSH tunnel).{" "}
-								{cfg.tls
-									? "Your IRC traffic still runs TLS inside the tunnel, so only the proxy login is exposed."
-									: "This network is plaintext (no TLS), so the proxy also sees your IRC traffic itself — enable TLS."}
-							</div>
+						{egress === "proxy" && (
+							<>
+								<Field label="Proxy URL">
+									<input type="password" autocomplete="off" class="rule-input" value={cfg.proxy || ""} onInput={(e) => set({ proxy: e.currentTarget.value })} placeholder="socks5://127.0.0.1:9050" />
+								</Field>
+								{proxyCredsExposed(cfg.proxy) && (
+									<div class="nf-warn">
+										⚠ This proxy sends a username/password to a non-loopback host. SOCKS5
+										and HTTP proxy auth are transmitted <b>unencrypted</b>, so the
+										credentials travel in the clear unless the connection to the proxy is
+										itself protected (a VPN or SSH tunnel).{" "}
+										{cfg.tls
+											? "Your IRC traffic still runs TLS inside the tunnel, so only the proxy login is exposed."
+											: "This network is plaintext (no TLS), so the proxy also sees your IRC traffic itself — enable TLS."}
+									</div>
+								)}
+							</>
+						)}
+						{egress === "wireguard" && (
+							<>
+								<Field label="Private key">
+									<input class="rule-input" type="password" autocomplete="new-password" value={wg.private_key || ""} onInput={(e) => setWG({ private_key: e.currentTarget.value })} placeholder="base64 (wg genkey)" />
+								</Field>
+								<Field label="Peer public key">
+									<input class="rule-input" autocomplete="off" value={wg.peer_public_key || ""} onInput={(e) => setWG({ peer_public_key: e.currentTarget.value })} placeholder="base64" />
+								</Field>
+								<Field label="Preshared key">
+									<input class="rule-input" type="password" autocomplete="new-password" value={wg.preshared_key || ""} onInput={(e) => setWG({ preshared_key: e.currentTarget.value })} placeholder="base64 (optional)" />
+								</Field>
+								<Field label="Endpoint">
+									<input class="rule-input" autocomplete="off" value={wg.endpoint || ""} onInput={(e) => setWG({ endpoint: e.currentTarget.value })} placeholder="peer.example:51820" />
+								</Field>
+								<Field label="Tunnel address">
+									<input class="rule-input" autocomplete="off" value={wg.address || ""} onInput={(e) => setWG({ address: e.currentTarget.value })} placeholder="10.64.0.2" />
+								</Field>
+								<Field label="Tunnel DNS">
+									<input class="rule-input" autocomplete="off" value={wg.dns || ""} onInput={(e) => setWG({ dns: e.currentTarget.value })} placeholder="10.64.0.1 (or 10.64.0.1:5353)" />
+								</Field>
+								<Field label="MTU">
+									<input class="rule-input" type="number" value={wg.mtu || ""} onInput={(e) => setWG({ mtu: e.currentTarget.value })} placeholder="1420 (optional)" />
+								</Field>
+								<div class="nf-note">
+									Egresses this network through an in-process userspace WireGuard
+									tunnel. Its Noise handshake authenticates without a cleartext proxy
+									login, and target DNS resolves through the tunnel.
+								</div>
+							</>
 						)}
 					</section>
 
