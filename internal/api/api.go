@@ -269,8 +269,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Frame-Options", "DENY")
+	// img-src includes blob: for thumbnails: they are fetched from the media
+	// proxy as blobs and rendered from object URLs (preview.jsx), which
+	// Firefox blocks under 'self' unless blob: is listed explicitly.
 	h.Set("Content-Security-Policy",
-		"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		"default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 	s.mux.ServeHTTP(w, r)
 }
 
