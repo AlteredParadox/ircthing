@@ -290,16 +290,21 @@ func (s *Server) sameOrigin(origin string, r *http.Request) bool {
 	if err != nil || u.Host != r.Host {
 		return false
 	}
-	scheme := "http"
+	// Verify the scheme ONLY when ours is reliably known: a direct TLS listener
+	// (r.TLS), or X-Forwarded-Proto from a trusted proxy. Behind a TLS-terminating
+	// proxy that doesn't set that header — or when behind_proxy is off — we cannot
+	// know our external scheme (r.TLS is nil even though the browser reached us
+	// over https), so we do NOT reject on it: host match plus the authenticated
+	// SameSite=Strict session cookie remain the guard. Otherwise a normal Caddy /
+	// nginx WSS deployment would be locked out of the WebSocket entirely. When the
+	// scheme IS known, an http Origin on an https deployment is still refused.
+	scheme := ""
 	if r.TLS != nil {
 		scheme = "https"
+	} else if s.cfg.TrustProxyForwarded {
+		scheme = r.Header.Get("X-Forwarded-Proto")
 	}
-	if s.cfg.TrustProxyForwarded {
-		if xfp := r.Header.Get("X-Forwarded-Proto"); xfp != "" {
-			scheme = xfp
-		}
-	}
-	return u.Scheme == scheme
+	return scheme == "" || u.Scheme == scheme
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -543,11 +548,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	// Same-origin, scheme AND host. The coder/websocket default Origin check
-	// (websocket.Accept with nil opts) compares only the Origin HOST to Host and
-	// allows an absent Origin, so an http Origin passes on an https deployment.
-	// Browsers always send Origin on a WS handshake, so we require it and vet it
-	// with our own scheme+host check, disabling the library's weaker one below.
+	// Same-origin check (host always, scheme when determinable — see sameOrigin).
+	// The coder/websocket default (Accept with nil opts) allows an ABSENT Origin,
+	// which a browser never sends on a WS handshake, so we require it and run our
+	// own check, disabling the library's weaker one below.
 	if origin := r.Header.Get("Origin"); origin == "" || !s.sameOrigin(origin, r) {
 		http.Error(w, "cross-origin request refused", http.StatusForbidden)
 		return

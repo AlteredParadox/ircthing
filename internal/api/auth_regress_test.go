@@ -2,12 +2,55 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"golang.org/x/crypto/bcrypt"
 )
+
+// sameOrigin (the WebSocket handshake guard) must reject a cross-HOST request
+// and an http Origin when we KNOW we're https, but must NOT lock out a
+// reverse-proxy WSS deployment when our own scheme is indeterminate (TLS
+// terminated at the proxy, r.TLS nil). That last case is the Caddy-in-front
+// regression that 403'd every WebSocket.
+func TestSameOrigin(t *testing.T) {
+	req := func(host string, isTLS bool, xfp string) *http.Request {
+		r := httptest.NewRequest("GET", "http://"+host+"/api/ws", nil)
+		if isTLS {
+			r.TLS = &tls.ConnectionState{}
+		}
+		if xfp != "" {
+			r.Header.Set("X-Forwarded-Proto", xfp)
+		}
+		return r
+	}
+	cases := []struct {
+		name         string
+		trustProxy   bool
+		host, origin string
+		isTLS        bool
+		xfp          string
+		want         bool
+	}{
+		{"direct tls, https origin", false, "h.example", "https://h.example", true, "", true},
+		{"direct tls, http origin refused", false, "h.example", "http://h.example", true, "", false},
+		{"proxy + xfp=https, https origin", true, "h.example", "https://h.example", false, "https", true},
+		{"proxy + xfp=https, http origin refused", true, "h.example", "http://h.example", false, "https", false},
+		{"proxy, no xfp -> scheme unknown, https accepted", true, "h.example", "https://h.example", false, "", true},
+		{"caddy in front, behind_proxy off -> https accepted (the regression)", false, "h.example", "https://h.example", false, "", true},
+		{"cross host refused", false, "h.example", "https://evil.example", true, "", false},
+	}
+	for _, tc := range cases {
+		s := &Server{cfg: Config{TrustProxyForwarded: tc.trustProxy}}
+		r := req(tc.host, tc.isTLS, tc.xfp)
+		if got := s.sameOrigin(tc.origin, r); got != tc.want {
+			t.Errorf("%s: sameOrigin = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
 
 // forwardedClientIP must key on the LAST X-Forwarded-For hop (the one a trusted
 // single-hop proxy appends) and must NOT trust X-Real-IP, which the recommended
