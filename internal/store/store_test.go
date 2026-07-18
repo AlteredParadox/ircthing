@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -631,5 +632,30 @@ func TestRefusesNewerSchema(t *testing.T) {
 	s.Close()
 	if _, err := Open(path, Options{}); err == nil {
 		t.Fatal("opened a database from the future without error")
+	}
+}
+
+// A database path containing a URI-special character (%, ?, #) must open — and
+// secure to 0600 — exactly the literal file, not a percent-decoded one. Under
+// umask 022 a mismatch leaves the real credential DB at 0644 (see the audit).
+func TestOpenSecuresLiteralPathWithSpecialChars(t *testing.T) {
+	if got := encodeDBPath("a%3fb?c#d"); got != "a%253fb%3Fc%23d" {
+		t.Fatalf("encodeDBPath = %q", got)
+	}
+	dir := t.TempDir()
+	for _, name := range []string{"a%3fb.db", "q?x.db", "h#y.db"} {
+		path := filepath.Join(dir, name)
+		s, err := Open(path, Options{})
+		if err != nil {
+			t.Fatalf("Open(%q): %v", name, err)
+		}
+		s.Close()
+		fi, err := os.Stat(path) // the LITERAL path must exist and be 0600
+		if err != nil {
+			t.Fatalf("literal file %q not created (SQLite opened a decoded name?): %v", path, err)
+		}
+		if fi.Mode().Perm() != 0o600 {
+			t.Fatalf("literal file %q mode = %o, want 0600", path, fi.Mode().Perm())
+		}
 	}
 }

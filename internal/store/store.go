@@ -152,6 +152,16 @@ type Store struct {
 // umask, and an existing group/world-accessible file is tightened. A
 // loose file that cannot be tightened fails the open. In-memory
 // databases have no file and are skipped.
+// encodeDBPath percent-encodes the characters SQLite's file: URI parser
+// decodes (%, ?, #) so the file it opens is exactly the literal path
+// secureDBFile hardened — otherwise "a%3fb.db" would chmod that literal name
+// while SQLite decoded it to "a?b.db" and created THAT one under the umask.
+// '%' must be listed first so its replacement isn't itself re-encoded (the
+// Replacer scans once, non-overlapping).
+func encodeDBPath(path string) string {
+	return strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23").Replace(path)
+}
+
 func secureDBFile(path string) error {
 	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file::memory:") {
 		return nil
@@ -218,7 +228,7 @@ func Open(path string, opts Options) (*Store, error) {
 	if err := secureDBFile(path); err != nil {
 		return nil, err
 	}
-	dsn := "file:" + path +
+	dsn := "file:" + encodeDBPath(path) +
 		"?_pragma=journal_mode(WAL)" +
 		"&_pragma=synchronous(NORMAL)" +
 		"&_pragma=busy_timeout(5000)" +

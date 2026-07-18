@@ -129,12 +129,13 @@ func (c *config) validate() error {
 	if c.User.Username == "" || c.User.PasswordHash == "" {
 		return errors.New("user.username and user.password_hash are required (generate the hash with -hash-password)")
 	}
-	// A '?' or '#' in the database path would terminate the path component of
-	// the file: URI the store builds, so SQLite would open a DIFFERENT file
-	// than the one secureDBFile chmods to 0600 — the real database (holding
-	// plaintext credentials) could then be created under the umask.
-	if strings.ContainsAny(c.Database, "?#\n\r\x00") {
-		return fmt.Errorf("database path %q must not contain '?', '#', or control characters", c.Database)
+	// The store percent-encodes '?'/'#'/'%' when building its file: URI so the
+	// opened file matches the secured literal path, but a database value that
+	// is itself a "file:" URI (e.g. "file::memory:x") would slip past the
+	// in-memory skip and create an unsecured on-disk file. Config takes a plain
+	// filesystem path, so reject the URI form and control characters.
+	if strings.HasPrefix(c.Database, "file:") || strings.ContainsAny(c.Database, "\n\r\x00") {
+		return fmt.Errorf("database %q must be a plain filesystem path (no 'file:' URI, no control characters)", c.Database)
 	}
 	if c.RingSize < 0 || c.RingSize > maxConfigRingSize {
 		return fmt.Errorf("ring_size %d out of range (0..%d)", c.RingSize, maxConfigRingSize)
