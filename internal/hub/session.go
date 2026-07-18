@@ -646,8 +646,9 @@ func (s *Session) handleSetMarker(ctx context.Context, env Envelope) {
 	s.hub.broadcastExcept(s, envelope("read_marker", 0, data))
 	// Bridge to draft/read-marker: other clients of this account (e.g.
 	// on a bouncer) learn our read position. The authoritative value is
-	// sent, never a regression.
-	if conn := s.hub.network(d.Network); conn != nil && conn.CapEnabled("draft/read-marker") && !t.IsZero() {
+	// sent, never a regression. The synthetic server buffer is local-only —
+	// never emit MARKREAD * upstream (it is not a real IRC target).
+	if conn := s.hub.network(d.Network); conn != nil && conn.CapEnabled("draft/read-marker") && !t.IsZero() && !isServerBuffer(d.Buffer) {
 		_ = conn.Send(&ircv4.Message{
 			Command: "MARKREAD",
 			Params:  []string{d.Buffer, "timestamp=" + t.UTC().Format(markreadTimeLayout)},

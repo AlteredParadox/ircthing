@@ -32,14 +32,21 @@ import (
 // value ("user:pass@host") that bypassed the scheme check, so a malformed
 // config can't echo credentials back through a validation error.
 func redactProxy(s string) string {
+	// Mask the userinfo (user:pass@). Go/net-url treats the LAST '@' in the
+	// authority as the delimiter, so masking only through the FIRST '@' would
+	// leak a password containing a literal '@'. Restrict the search to the
+	// authority (before the first '/') so an '@' in a path isn't mistaken for
+	// userinfo. Handles the scheme and scheme-less forms alike.
+	start := 0
 	if i := strings.Index(s, "://"); i != -1 {
-		if at := strings.IndexByte(s[i+3:], '@'); at != -1 {
-			return s[:i+3] + "<redacted>@" + s[i+3+at+1:]
-		}
-		return s
+		start = i + 3
 	}
-	if at := strings.LastIndexByte(s, '@'); at != -1 {
-		return "<redacted>@" + s[at+1:]
+	authEnd := len(s)
+	if slash := strings.IndexByte(s[start:], '/'); slash != -1 {
+		authEnd = start + slash
+	}
+	if at := strings.LastIndexByte(s[start:authEnd], '@'); at != -1 {
+		return s[:start] + "<redacted>@" + s[start+at+1:]
 	}
 	return s
 }

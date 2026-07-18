@@ -109,10 +109,16 @@ func (n *Network) Validate() error {
 	// SASL EXTERNAL authenticates purely with a client certificate, so a
 	// config that selects it but omits the keypair would connect presenting
 	// no certificate and fail authentication on every attempt (a permanent
-	// backoff loop). Require both files explicitly.
-	if n.SASL != nil && strings.EqualFold(n.SASL.Mechanism, "EXTERNAL") &&
-		(n.SASL.CertFile == "" || n.SASL.KeyFile == "") {
-		return errors.New("sasl EXTERNAL requires both cert_file and key_file")
+	// backoff loop). Require both files explicitly — against the EFFECTIVE
+	// mechanism: an empty mechanism with no password auto-selects EXTERNAL
+	// (mirrors irc.Config.validateSASL), so checking only the literal string
+	// would let an auto-EXTERNAL config through.
+	if n.SASL != nil {
+		mech := strings.ToUpper(n.SASL.Mechanism)
+		external := mech == "EXTERNAL" || (mech == "" && n.SASL.Password == "")
+		if external && (n.SASL.CertFile == "" || n.SASL.KeyFile == "") {
+			return errors.New("sasl EXTERNAL requires both cert_file and key_file")
+		}
 	}
 	return nil
 }

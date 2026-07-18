@@ -27,6 +27,8 @@ func TestParse(t *testing.T) {
 		{"EXTERNAL without keypair", `{"addr": "a:1", "nick": "me", "sasl": {"mechanism": "EXTERNAL"}}`, "cert_file and key_file"},
 		{"EXTERNAL missing key", `{"addr": "a:1", "nick": "me", "sasl": {"mechanism": "EXTERNAL", "cert_file": "/c.pem"}}`, "cert_file and key_file"},
 		{"EXTERNAL with keypair", `{"addr": "a:1", "nick": "me", "sasl": {"mechanism": "EXTERNAL", "cert_file": "/c.pem", "key_file": "/k.pem"}}`, ""},
+		// Empty mechanism + no password auto-selects EXTERNAL, so it needs a keypair too.
+		{"auto-EXTERNAL without keypair", `{"addr": "a:1", "nick": "me", "sasl": {}}`, "cert_file and key_file"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

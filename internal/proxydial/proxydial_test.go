@@ -30,6 +30,12 @@ func TestParseRedactsCredentials(t *testing.T) {
 	if _, err := Parse("carol:hunter2@host:1080"); err == nil || strings.Contains(err.Error(), "hunter2") || strings.Contains(err.Error(), "carol") {
 		t.Fatalf("scheme-less URL leaked credentials: %v", err)
 	}
+
+	// A password containing '@' (multiple '@' in the authority): Go uses the
+	// LAST '@' as the userinfo delimiter, so masking must reach it.
+	if _, err := Parse("socks5://u:first@SECRET@host:1080/path"); err == nil || strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("multi-@ URL leaked credentials: %v", err)
+	}
 }
 
 func TestParse(t *testing.T) {
