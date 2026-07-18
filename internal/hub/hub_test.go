@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -10,10 +11,56 @@ import (
 	"time"
 
 	"ircthing/internal/irc"
+	"ircthing/internal/netconf"
 	"ircthing/internal/store"
 
 	ircv4 "gopkg.in/irc.v4"
 )
+
+// TestPersistAutojoinMirrorsMembership checks that our own live JOIN/PART is
+// mirrored into the stored network definition's channel list (so a restart
+// rejoins it / stops), that a repeat or a different-casing JOIN is a no-op,
+// and that another user's membership change is ignored.
+func TestPersistAutojoinMirrorsMembership(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	raw, err := json.Marshal(netconf.Network{Name: "libera", Addr: "irc.test:6697", Nick: "AlteredParadox"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.PutNetworkConfig(ctx, "libera", string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	c := &fakeConn{name: "libera", nick: "AlteredParadox"}
+	channels := func() []string {
+		got, ok, err := h.store.NetworkConfig(ctx, "libera")
+		if err != nil || !ok {
+			t.Fatalf("read config: ok=%v err=%v", ok, err)
+		}
+		var parsed netconf.Network
+		if err := json.Unmarshal([]byte(got.Config), &parsed); err != nil {
+			t.Fatal(err)
+		}
+		return parsed.Channels
+	}
+	feed := func(line string) {
+		h.persistAutojoin(ctx, c, irc.Event{Network: "libera", Msg: ircv4.MustParseMessage(line)})
+	}
+
+	feed(":AlteredParadox!u@h JOIN #go")
+	if ch := channels(); len(ch) != 1 || ch[0] != "#go" {
+		t.Fatalf("after JOIN: channels = %v, want [#go]", ch)
+	}
+	feed(":ALTEREDPARADOX!u@h JOIN #GO") // same channel, different casing -> no-op
+	feed(":bob!u@h JOIN #other") // someone else -> ignored
+	if ch := channels(); len(ch) != 1 || ch[0] != "#go" {
+		t.Fatalf("dup/other JOIN changed channels: %v", ch)
+	}
+	feed(":AlteredParadox!u@h PART #go")
+	if ch := channels(); len(ch) != 0 {
+		t.Fatalf("after PART: channels = %v, want []", ch)
+	}
+}
 
 func TestPersistTarget(t *testing.T) {
 	cases := []struct {

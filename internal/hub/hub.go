@@ -332,6 +332,36 @@ func (h *Hub) liveHints(ctx context.Context, c Conn, ev irc.Event) {
 			c.RequestChatHistory(ev.Msg.Param(0), ts, msgid)
 		}
 	}
+	h.persistAutojoin(ctx, c, ev)
+}
+
+// persistAutojoin keeps the stored network definition's channel list in step
+// with our own live JOIN/PART, so a channel joined at runtime — via the UI, a
+// typed /join, or a server forward — is rejoined after a restart, and a PART
+// stops it. A KICK is intentionally NOT removed: it stays in the rejoin intent
+// (matching the manager's `joined` set, which rejoins kicked channels).
+// Best-effort — a failure leaves the stored list stale but never drops the
+// event; editChannelList makes a repeat (initial rejoin echo) a no-op.
+func (h *Hub) persistAutojoin(ctx context.Context, c Conn, ev irc.Event) {
+	if ev.Msg.Prefix == nil || c.Nick() == "" || c.Fold(ev.Msg.Prefix.Name) != c.Fold(c.Nick()) {
+		return // not our own membership change
+	}
+	var add bool
+	switch ev.Msg.Command {
+	case "JOIN":
+		add = true
+	case "PART":
+		add = false
+	default:
+		return
+	}
+	ch := ev.Msg.Param(0)
+	if ch == "" || !c.IsChannel(ch) {
+		return
+	}
+	if err := h.updateAutojoin(ctx, ev.Network, ch, add, c.Fold); err != nil {
+		log.Printf("irc[%s]: persist autojoin %s %q: %v", ev.Network, ev.Msg.Command, ch, err)
+	}
 }
 
 // adoptReplayedOwn handles a chathistory replay of one of our own messages
