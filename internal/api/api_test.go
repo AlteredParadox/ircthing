@@ -104,6 +104,24 @@ func sessionCookieOf(t *testing.T, resp *http.Response) *http.Cookie {
 	return nil
 }
 
+// mediaPost sends an authenticated POST to a media endpoint (/api/preview or
+// /api/thumb), which now take {url, net} in the JSON body (keeping the target
+// URL out of query-string access logs). A nil cookie sends none.
+func mediaPost(t *testing.T, ts *httptest.Server, cookie *http.Cookie, path, target, net string) *http.Response {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"url": target, "net": net})
+	req, _ := http.NewRequest("POST", ts.URL+path, strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
 func TestClientConfigPreviewsEnabled(t *testing.T) {
 	ts, _ := newTestServer(t)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
@@ -202,12 +220,12 @@ func TestPreviewsDisabledGate(t *testing.T) {
 		t.Fatal("config.previews = true, want false when disabled")
 	}
 
-	resp = do("/api/preview?url=http://example.com")
+	resp = mediaPost(t, ts, cookie, "/api/preview", "http://example.com", "")
 	resp.Body.Close()
 	if resp.StatusCode == http.StatusOK {
 		t.Fatalf("preview endpoint served while disabled: %d", resp.StatusCode)
 	}
-	resp = do("/api/thumb?url=http://example.com/x.png")
+	resp = mediaPost(t, ts, cookie, "/api/thumb", "http://example.com/x.png", "")
 	resp.Body.Close()
 	if resp.StatusCode == http.StatusOK {
 		t.Fatalf("thumb endpoint served while disabled: %d", resp.StatusCode)
@@ -249,7 +267,7 @@ func TestPreviewsToggleRuntime(t *testing.T) {
 	if cfg.Previews {
 		t.Fatal("previews still on after disable")
 	}
-	resp = do("GET", "/api/preview?url=http://example.com", "")
+	resp = mediaPost(t, ts, cookie, "/api/preview", "http://example.com", "")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("preview while disabled = %d, want 403", resp.StatusCode)
@@ -451,20 +469,16 @@ func TestMediaFailsClosedOnUnknownNetwork(t *testing.T) {
 	ts, srvObj := newTestServerWithRef(t)
 	permit(srvObj)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
-	for _, path := range []string{
-		"/api/preview?url=http://example.com&net=ghostnet",
-		"/api/preview?url=http://example.com", // no net at all
-		"/api/thumb?url=http://example.com/x.png&net=ghostnet",
-	} {
-		req, _ := http.NewRequest("GET", ts.URL+path, nil)
-		req.AddCookie(cookie)
-		resp, err := ts.Client().Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
+	cases := []struct{ path, target, net string }{
+		{"/api/preview", "http://example.com", "ghostnet"},
+		{"/api/preview", "http://example.com", ""}, // no net at all
+		{"/api/thumb", "http://example.com/x.png", "ghostnet"},
+	}
+	for _, tc := range cases {
+		resp := mediaPost(t, ts, cookie, tc.path, tc.target, tc.net)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusBadGateway {
-			t.Fatalf("%s = %d, want 502 (fail closed)", path, resp.StatusCode)
+			t.Fatalf("%s net=%q = %d, want 502 (fail closed)", tc.path, tc.net, resp.StatusCode)
 		}
 	}
 }

@@ -132,8 +132,11 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 	s.mux.HandleFunc("POST /api/password", s.sameSiteOnly(s.requireAuth(s.handleChangePassword)))
 	// The media endpoints are always registered; they refuse (403) at
 	// runtime when previews are disabled, so the switch is editable live.
-	s.mux.HandleFunc("GET /api/preview", s.sameSiteOnly(s.requireAuth(s.handlePreview)))
-	s.mux.HandleFunc("GET /api/thumb", s.sameSiteOnly(s.requireAuth(s.handleThumb)))
+	// POST, not GET: the target URL travels in the request body so it never
+	// reaches a reverse-proxy access log's query string (may carry userinfo /
+	// signed params). sameSiteOnly still guards them.
+	s.mux.HandleFunc("POST /api/preview", s.sameSiteOnly(s.requireAuth(s.handlePreview)))
+	s.mux.HandleFunc("POST /api/thumb", s.sameSiteOnly(s.requireAuth(s.handleThumb)))
 	if assets != nil {
 		s.mux.Handle("/", http.FileServerFS(assets))
 	}

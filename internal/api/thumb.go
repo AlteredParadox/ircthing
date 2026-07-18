@@ -146,21 +146,13 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "previews disabled", http.StatusForbidden)
 		return
 	}
-	target := r.URL.Query().Get("url")
-	if len(target) == 0 || len(target) > 2048 {
-		http.Error(w, "bad url", http.StatusBadRequest)
+	target, net, ok := mediaRequest(w, r)
+	if !ok {
 		return
 	}
-	net := r.URL.Query().Get("net")
 	ck := net + "\x00" + target
 	if t, ok := s.thumbCache.get(ck); ok {
 		writeThumb(w, t)
-		return
-	}
-	// Fail closed on an unresolvable network (see proxyForNetwork).
-	proxy, ok := s.proxyForNetwork(r.Context(), net)
-	if !ok {
-		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
 		return
 	}
 
@@ -176,6 +168,14 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// request was parked, and it must not fetch after that.
 	if !s.previewsEnabled() {
 		http.Error(w, "previews disabled", http.StatusForbidden)
+		return
+	}
+	// Resolve the proxy AFTER the wait so a proxy configured on the network
+	// while we were parked is honored (a stale direct resolution would leak the
+	// IP). Fail closed on an unresolvable network (see proxyForNetwork).
+	proxy, ok := s.proxyForNetwork(r.Context(), net)
+	if !ok {
+		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
 		return
 	}
 

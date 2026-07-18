@@ -5,9 +5,12 @@
 // re-inserting; when full, the oldest entry is evicted.
 
 export class LRU {
-	constructor(max, ttlMs) {
+	// onEvict(value) is called when an entry leaves the cache (evicted, expired,
+	// or replaced) — used to revoke blob object URLs so they don't leak.
+	constructor(max, ttlMs, onEvict) {
 		this.max = max;
 		this.ttlMs = ttlMs;
+		this.onEvict = onEvict;
 		this.map = new Map(); // key -> { v, exp }
 	}
 
@@ -18,6 +21,7 @@ export class LRU {
 		if (!e) return undefined;
 		if (Date.now() > e.exp) {
 			this.map.delete(key);
+			this.onEvict?.(e.v);
 			return undefined;
 		}
 		// Refresh recency.
@@ -31,9 +35,15 @@ export class LRU {
 	}
 
 	set(key, v, ttlMs = this.ttlMs) {
-		if (this.map.has(key)) this.map.delete(key);
-		else if (this.map.size >= this.max) {
-			this.map.delete(this.map.keys().next().value);
+		const prev = this.map.get(key);
+		if (prev) {
+			this.map.delete(key);
+			this.onEvict?.(prev.v);
+		} else if (this.map.size >= this.max) {
+			const oldestKey = this.map.keys().next().value;
+			const oldest = this.map.get(oldestKey);
+			this.map.delete(oldestKey);
+			this.onEvict?.(oldest.v);
 		}
 		this.map.set(key, { v, exp: Date.now() + ttlMs });
 	}

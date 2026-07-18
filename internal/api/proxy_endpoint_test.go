@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
 )
 
@@ -37,21 +36,13 @@ func TestPreviewEndpoint(t *testing.T) {
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
 
 	// Unauthenticated is rejected.
-	resp, err := http.Get(ts.URL + "/api/preview?url=" + url.QueryEscape(origin.URL))
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := mediaPost(t, ts, nil, "/api/preview", origin.URL, "")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("no-auth status = %d", resp.StatusCode)
 	}
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/preview?url="+url.QueryEscape(origin.URL)+"&net="+testNet, nil)
-	req.AddCookie(cookie)
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp = mediaPost(t, ts, cookie, "/api/preview", origin.URL, testNet)
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d", resp.StatusCode)
@@ -83,12 +74,7 @@ func TestThumbEndpoint(t *testing.T) {
 	permit(srvObj)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/thumb?url="+url.QueryEscape(origin.URL)+"&net="+testNet, nil)
-	req.AddCookie(cookie)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := mediaPost(t, ts, cookie, "/api/thumb", origin.URL, testNet)
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d", resp.StatusCode)
@@ -116,12 +102,7 @@ func TestThumbRejectsNonImage(t *testing.T) {
 	permit(srvObj)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/thumb?url="+url.QueryEscape(origin.URL)+"&net="+testNet, nil)
-	req.AddCookie(cookie)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := mediaPost(t, ts, cookie, "/api/thumb", origin.URL, testNet)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnsupportedMediaType {
 		t.Fatalf("status = %d, want 415", resp.StatusCode)
@@ -154,12 +135,7 @@ func TestThumbRejectsHugeDimensions(t *testing.T) {
 	permit(srvObj)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
 
-	req, _ := http.NewRequest("GET", ts.URL+"/api/thumb?url="+url.QueryEscape(origin.URL)+"&net="+testNet, nil)
-	req.AddCookie(cookie)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := mediaPost(t, ts, cookie, "/api/thumb", origin.URL, testNet)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnsupportedMediaType {
 		t.Fatalf("status = %d, want 415 (rejected before decode)", resp.StatusCode)
@@ -169,16 +145,17 @@ func TestThumbRejectsHugeDimensions(t *testing.T) {
 func TestProxyRejectsBadURL(t *testing.T) {
 	ts, _ := newTestServerWithRef(t)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
-	for _, path := range []string{"/api/preview", "/api/preview?url=", "/api/thumb?url=notaurl"} {
-		req, _ := http.NewRequest("GET", ts.URL+path, nil)
-		req.AddCookie(cookie)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
+	cases := []struct{ path, target string }{
+		{"/api/preview", ""},        // empty url -> 400
+		{"/api/preview", "notaurl"}, // unfetchable -> 502
+		{"/api/thumb", ""},
+		{"/api/thumb", "notaurl"},
+	}
+	for _, tc := range cases {
+		resp := mediaPost(t, ts, cookie, tc.path, tc.target, "")
 		resp.Body.Close()
 		if resp.StatusCode == 200 {
-			t.Fatalf("%s returned 200 for bad input", path)
+			t.Fatalf("%s url=%q returned 200 for bad input", tc.path, tc.target)
 		}
 	}
 }

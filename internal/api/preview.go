@@ -34,32 +34,41 @@ type PreviewData struct {
 	SiteName    string `json:"site_name,omitempty"`
 }
 
+// mediaRequest reads the {url, net} POST body for the media endpoints. The
+// target is sent in the body, not a query string, so a URL carrying userinfo
+// or signed parameters never lands in a reverse-proxy access log.
+func mediaRequest(w http.ResponseWriter, r *http.Request) (target, net string, ok bool) {
+	var body struct {
+		URL string `json:"url"`
+		Net string `json:"net"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return "", "", false
+	}
+	if len(body.URL) == 0 || len(body.URL) > 2048 {
+		http.Error(w, "bad url", http.StatusBadRequest)
+		return "", "", false
+	}
+	return body.URL, body.Net, true
+}
+
 func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	if !s.previewsEnabled() {
 		http.Error(w, "previews disabled", http.StatusForbidden)
 		return
 	}
-	target := r.URL.Query().Get("url")
-	if len(target) == 0 || len(target) > 2048 {
-		http.Error(w, "bad url", http.StatusBadRequest)
+	target, net, ok := mediaRequest(w, r)
+	if !ok {
 		return
 	}
 	// The link's network selects the proxy, so cache per (network, url): the
 	// same URL in a Tor'd network and a direct one must fetch independently.
-	net := r.URL.Query().Get("net")
 	ck := net + "\x00" + target
 	if pv, ok := s.previewCache.get(ck); ok {
 		writeJSON(w, pv)
 		return
 	}
-	// Fail closed: if we can't confirm the link's network is direct or has a
-	// valid proxy, refuse rather than risk a direct fetch that leaks the IP.
-	proxy, ok := s.proxyForNetwork(r.Context(), net)
-	if !ok {
-		http.Error(w, "preview unavailable", http.StatusBadGateway)
-		return
-	}
-
 	if !s.acquireMedia(r.Context()) {
 		http.Error(w, "busy, retry later", http.StatusServiceUnavailable)
 		return
@@ -69,6 +78,14 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	// while this request was parked, and it must not fetch after that.
 	if !s.previewsEnabled() {
 		http.Error(w, "previews disabled", http.StatusForbidden)
+		return
+	}
+	// Resolve the proxy AFTER the wait: a proxy may have been configured on the
+	// network while we were parked, and a stale (direct) resolution would leak
+	// the IP. Fail closed if we can't confirm a direct-or-valid-proxy network.
+	proxy, ok := s.proxyForNetwork(r.Context(), net)
+	if !ok {
+		http.Error(w, "preview unavailable", http.StatusBadGateway)
 		return
 	}
 	ct, body, err := s.htmlFetcherFor(proxy).get(r.Context(), target)

@@ -14,17 +14,33 @@ const cache = new LRU(300, 60 * 60 * 1000); // url -> PreviewData | null
 const FAIL_TTL = 5 * 60 * 1000;
 const inflight = new Map(); // url -> Promise
 
+// Thumbnails are fetched as blobs and cached as object URLs (revoked on
+// eviction) so the target URL travels in a POST body, not a query string an
+// <img src> would put in reverse-proxy access logs.
+const thumbCache = new LRU(200, 60 * 60 * 1000, (u) => u && URL.revokeObjectURL(u));
+const thumbInflight = new Map();
+
 // Cache/fetch key by (network, url): the network selects the server-side
 // proxy, so the same URL in two networks is fetched independently.
 function ck(url, net) {
 	return (net || "") + "\n" + url;
 }
 
+// mediaFetch POSTs {url, net} to a media endpoint — the target URL in the body,
+// never a logged query string.
+function mediaFetch(path, url, net) {
+	return fetch(path, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ url, net: net || "" }),
+	});
+}
+
 function fetchPreview(url, net) {
 	const key = ck(url, net);
 	if (cache.has(key)) return Promise.resolve(cache.get(key));
 	if (inflight.has(key)) return inflight.get(key);
-	const p = fetch("/api/preview?url=" + encodeURIComponent(url) + "&net=" + encodeURIComponent(net || ""))
+	const p = mediaFetch("/api/preview", url, net)
 		.then((r) => (r.ok ? r.json() : null))
 		.catch(() => null)
 		.then((data) => {
@@ -36,8 +52,45 @@ function fetchPreview(url, net) {
 	return p;
 }
 
-function thumbSrc(url, net) {
-	return "/api/thumb?url=" + encodeURIComponent(url) + "&net=" + encodeURIComponent(net || "");
+// fetchThumb resolves to an object URL for the thumbnail, or null on failure.
+function fetchThumb(url, net) {
+	const key = ck(url, net);
+	const cached = thumbCache.get(key);
+	if (cached !== undefined) return Promise.resolve(cached); // objURL or cached null
+	if (thumbInflight.has(key)) return thumbInflight.get(key);
+	const p = mediaFetch("/api/thumb", url, net)
+		.then((r) => (r.ok ? r.blob() : null))
+		.catch(() => null)
+		.then((blob) => {
+			const obj = blob ? URL.createObjectURL(blob) : null;
+			thumbCache.set(key, obj, obj === null ? FAIL_TTL : undefined);
+			thumbInflight.delete(key);
+			return obj;
+		});
+	thumbInflight.set(key, p);
+	return p;
+}
+
+// useThumb fetches a thumbnail's object URL, null while loading or on failure.
+function useThumb(url, net) {
+	const [src, setSrc] = useState(() => {
+		const c = thumbCache.get(ck(url, net));
+		return c === undefined ? null : c;
+	});
+	useEffect(() => {
+		let alive = true;
+		const c = thumbCache.get(ck(url, net));
+		if (c !== undefined) {
+			setSrc(c);
+			return undefined;
+		}
+		setSrc(null);
+		fetchThumb(url, net).then((u) => alive && setSrc(u));
+		return () => {
+			alive = false;
+		};
+	}, [url, net]);
+	return src;
 }
 
 // LinkPreview renders one URL's preview: an inline thumbnail for images,
@@ -72,7 +125,7 @@ export function LinkPreview({ url, net }) {
 
 	return (
 		<a class="preview-card" href={url} target="_blank" rel="noopener noreferrer">
-			{data.image && <img class="preview-card-img" src={thumbSrc(data.image, net)} alt="" loading="lazy" />}
+			{data.image && <CardImg url={data.image} net={net} />}
 			<div class="preview-card-body">
 				<div class="preview-card-site">{data.site_name || hostOf(url)}</div>
 				{data.title && <div class="preview-card-title">{data.title}</div>}
@@ -82,14 +135,17 @@ export function LinkPreview({ url, net }) {
 	);
 }
 
+function CardImg({ url, net }) {
+	const src = useThumb(url, net);
+	return src ? <img class="preview-card-img" src={src} alt="" /> : null;
+}
+
 function ImageThumb({ url, net }) {
-	const [failed, setFailed] = useState(false);
-	// A failure belongs to one url; reset when the component is reused.
-	useEffect(() => setFailed(false), [url]);
-	if (failed) return null;
+	const src = useThumb(url, net);
+	if (!src) return null;
 	return (
 		<a class="preview-thumb" href={url} target="_blank" rel="noopener noreferrer">
-			<img src={thumbSrc(url, net)} alt="" loading="lazy" onError={() => setFailed(true)} />
+			<img src={src} alt="" />
 		</a>
 	);
 }
