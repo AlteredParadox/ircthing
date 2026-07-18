@@ -10,6 +10,8 @@ import (
 	"time"
 
 	ircv4 "gopkg.in/irc.v4"
+
+	"ircthing/internal/wgdial"
 )
 
 // Config describes one IRC network connection.
@@ -39,6 +41,14 @@ type Config struct {
 	// "http://host:port" (CONNECT tunnel). Empty connects directly. TLS
 	// to the IRC server runs inside the tunnel as usual.
 	Proxy string
+
+	// WireGuard, when non-nil, routes this network's egress through an
+	// in-process userspace WireGuard tunnel (SPIKE, phase-4 candidate —
+	// see internal/wgdial). Mutually exclusive with Proxy. The tunnel is
+	// built lazily on first dial and reused across reconnects; the IRC
+	// TLS handshake still runs inside it, and target DNS resolves via the
+	// tunnel's in-band resolver (no local leak).
+	WireGuard *wgdial.Config
 
 	Nick     string
 	Username string // defaults to Nick
@@ -112,6 +122,14 @@ func (c *Config) validate() error {
 	}
 	if c.Proxy != "" {
 		if _, err := parseProxyURL(c.Proxy); err != nil {
+			return err
+		}
+	}
+	if c.WireGuard != nil {
+		if c.Proxy != "" {
+			return errors.New("irc: config: Proxy and WireGuard are mutually exclusive")
+		}
+		if err := wgdial.Validate(*c.WireGuard); err != nil {
 			return err
 		}
 	}

@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"ircthing/internal/irc"
+	"ircthing/internal/wgdial"
 )
 
 // Network is one IRC network definition. Stored as JSON both in the
@@ -34,7 +35,12 @@ type Network struct {
 	// (DNS resolved proxy-side, Tor-friendly) or "http://host:port"
 	// (CONNECT tunnel). Empty connects directly.
 	Proxy    string   `json:"proxy,omitempty"`
-	Nick     string   `json:"nick"`
+	// WireGuard optionally routes this network's egress through an
+	// in-process userspace WireGuard tunnel (SPIKE, phase-4 candidate).
+	// Its presence is the config flag that turns the tunnel on for this
+	// network; mutually exclusive with Proxy.
+	WireGuard *WireGuard `json:"wireguard,omitempty"`
+	Nick      string     `json:"nick"`
 	Username string   `json:"username,omitempty"`
 	Realname string   `json:"realname,omitempty"`
 	Pass     string   `json:"pass,omitempty"`
@@ -52,6 +58,20 @@ type SASL struct {
 	// CertFile/KeyFile provide the TLS client certificate for EXTERNAL.
 	CertFile string `json:"cert_file,omitempty"`
 	KeyFile  string `json:"key_file,omitempty"`
+}
+
+// WireGuard is one network's in-process WireGuard egress (SPIKE). Keys are
+// standard base64 (as `wg`/Mullvad print them); endpoint is the peer's
+// host:port, address is our address inside the tunnel, and dns is the
+// in-tunnel resolver (all target lookups go there, not the local resolver).
+type WireGuard struct {
+	PrivateKey    string `json:"private_key"`
+	PeerPublicKey string `json:"peer_public_key"`
+	PresharedKey  string `json:"preshared_key,omitempty"`
+	Endpoint      string `json:"endpoint"`
+	Address       string `json:"address"`
+	DNS           string `json:"dns"`
+	MTU           int    `json:"mtu,omitempty"`
 }
 
 // EffectiveName mirrors irc.Config's Name default so name-keyed lookups
@@ -171,6 +191,17 @@ func (n *Network) IRCConfig() (irc.Config, error) {
 		Realname:            n.Realname,
 		Pass:                n.Pass,
 		Channels:            n.Channels,
+	}
+	if n.WireGuard != nil {
+		cfg.WireGuard = &wgdial.Config{
+			PrivateKey:    n.WireGuard.PrivateKey,
+			PeerPublicKey: n.WireGuard.PeerPublicKey,
+			PresharedKey:  n.WireGuard.PresharedKey,
+			Endpoint:      n.WireGuard.Endpoint,
+			Address:       n.WireGuard.Address,
+			DNS:           n.WireGuard.DNS,
+			MTU:           n.WireGuard.MTU,
+		}
 	}
 	if n.SASL != nil {
 		cfg.SASL = &irc.SASLConfig{

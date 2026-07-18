@@ -20,6 +20,8 @@ import (
 	"unicode/utf8"
 
 	ircv4 "gopkg.in/irc.v4"
+
+	"ircthing/internal/wgdial"
 )
 
 // State of a network connection, reported via Event.
@@ -128,6 +130,12 @@ type Manager struct {
 	stsLastDur time.Duration
 
 	batchSeq atomic.Uint64 // outgoing multiline batch reference counter
+
+	// wgMu guards wgTun, the lazily-built WireGuard egress tunnel (SPIKE).
+	// Built on first dial when cfg.WireGuard != nil, reused across
+	// reconnects, torn down when Run returns.
+	wgMu  sync.Mutex
+	wgTun *wgdial.Tunnel
 }
 
 // Name returns the configured network label.
@@ -614,6 +622,7 @@ func (m *Manager) setRegistered(v bool) {
 
 // Run connects and reconnects until ctx is canceled.
 func (m *Manager) Run(ctx context.Context) error {
+	defer m.wgClose()
 	m.loadSTS(ctx)
 	bo := newBackoff(m.cfg.Backoff)
 	for {
@@ -1519,7 +1528,9 @@ func connError(cctx context.Context, readErr error) error {
 func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn, error) {
 	var conn net.Conn
 	var err error
-	if m.cfg.Proxy != "" {
+	if m.cfg.WireGuard != nil {
+		conn, err = m.dialWireGuard(ctx, addr)
+	} else if m.cfg.Proxy != "" {
 		// Validated by NewManager; a parse error here cannot happen.
 		proxy, perr := parseProxyURL(m.cfg.Proxy)
 		if perr != nil {
@@ -1537,6 +1548,47 @@ func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn,
 		return conn, nil
 	}
 	return m.wrapTLS(ctx, conn, addr)
+}
+
+// dialWireGuard dials addr through this network's in-process WireGuard tunnel
+// (SPIKE). The tunnel is expensive to stand up (userspace device + Noise
+// handshake), so it is built once on first use and reused across reconnects.
+// A build failure leaves wgTun nil so the next reconnect retries under backoff
+// rather than caching the error forever. Target DNS resolves through the
+// tunnel's in-band resolver — no local-resolver leak.
+func (m *Manager) dialWireGuard(ctx context.Context, addr string) (net.Conn, error) {
+	m.wgMu.Lock()
+	if m.wgTun == nil {
+		t, err := wgdial.New(*m.cfg.WireGuard)
+		if err != nil {
+			m.wgMu.Unlock()
+			return nil, err
+		}
+		m.wgTun = t
+	}
+	tun := m.wgTun
+	m.wgMu.Unlock()
+
+	dctx := ctx
+	if m.cfg.DialTimeout > 0 {
+		var cancel context.CancelFunc
+		dctx, cancel = context.WithTimeout(ctx, m.cfg.DialTimeout)
+		defer cancel()
+	}
+	return tun.DialContext(dctx, addr)
+}
+
+// wgClose tears down the WireGuard tunnel if one was built. Called when Run
+// returns (context cancelled), so a removed/stopped network doesn't leak the
+// userspace device goroutines or its UDP socket.
+func (m *Manager) wgClose() {
+	m.wgMu.Lock()
+	t := m.wgTun
+	m.wgTun = nil
+	m.wgMu.Unlock()
+	if t != nil {
+		t.Close()
+	}
 }
 
 // wrapTLS negotiates TLS over an already-connected raw conn for addr. When
