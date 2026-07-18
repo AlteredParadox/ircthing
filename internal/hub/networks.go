@@ -13,6 +13,7 @@ import (
 
 	"ircthing/internal/irc"
 	"ircthing/internal/netconf"
+	"ircthing/internal/proxydial"
 	"ircthing/internal/store"
 )
 
@@ -43,6 +44,9 @@ func (h *Hub) StartNetwork(nc *netconf.Network) error {
 	icfg, err := nc.IRCConfig()
 	if err != nil {
 		return err
+	}
+	if proxydial.CredsOverCleartext(nc.Proxy) {
+		log.Printf("network %q: proxy credentials are sent UNENCRYPTED to a non-loopback host (SOCKS5/HTTP proxy auth is cleartext); only use this if the connection to the proxy is itself protected (VPN/SSH tunnel). IRC traffic stays TLS end-to-end.", nc.EffectiveName())
 	}
 	// STS policies persist in the store so upgrade-to-TLS survives
 	// restarts.

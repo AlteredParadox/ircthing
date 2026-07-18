@@ -1,4 +1,5 @@
 import { useState } from "preact/hooks";
+import { proxyCredsExposed } from "./irc.js";
 
 // NetworkForm: add/edit a network (The Lounge-style form). `initial` is
 // the stored config object when editing (spread so any field this form does
@@ -158,6 +159,15 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 						<Field label="Proxy">
 							<input type="password" autocomplete="off" class="rule-input" value={cfg.proxy || ""} onInput={(e) => set({ proxy: e.currentTarget.value })} placeholder="socks5://127.0.0.1:9050 (optional)" />
 						</Field>
+						{proxyCredsExposed(cfg.proxy) && (
+							<div class="nf-warn">
+								⚠ This proxy sends a username/password to a non-loopback host. SOCKS5
+								and HTTP proxy auth are transmitted <b>unencrypted</b>, so the
+								credentials travel in the clear unless the connection to the proxy is
+								itself protected (a VPN or SSH tunnel). Your IRC traffic stays TLS
+								end-to-end regardless — only the proxy login is exposed.
+							</div>
+						)}
 					</section>
 
 					{error && <div class="cmd-error">{error}</div>}

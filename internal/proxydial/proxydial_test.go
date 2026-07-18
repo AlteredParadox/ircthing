@@ -63,3 +63,24 @@ func TestParse(t *testing.T) {
 		}
 	}
 }
+
+func TestCredsOverCleartext(t *testing.T) {
+	cases := []struct {
+		in   string
+		warn bool
+	}{
+		{"socks5://user:pass@proxy.example.com:1080", true}, // remote + creds
+		{"socks5://user:pass@203.0.113.9:1080", true},
+		{"http://u:p@proxy.example:3128", true},
+		{"socks5://user:pass@127.0.0.1:9050", false}, // loopback
+		{"socks5://user:pass@localhost:9050", false},
+		{"socks5://user:pass@[::1]:9050", false},
+		{"socks5://proxy.example.com:1080", false}, // no creds
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := CredsOverCleartext(tc.in); got != tc.warn {
+			t.Errorf("CredsOverCleartext(%q) = %v, want %v", tc.in, got, tc.warn)
+		}
+	}
+}

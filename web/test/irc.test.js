@@ -3,8 +3,18 @@ import { test } from "node:test";
 import {
 	bufKey, firstURL, fmtTime, hostOf, linkify, looksLikeImageURL,
 	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash, applyStatusMode, mergeById, mergeServerBuffers,
-	applyTombstones, rememberRedaction, nickSet, highlightNicks,
+	applyTombstones, rememberRedaction, nickSet, highlightNicks, proxyCredsExposed,
 } from "../src/irc.js";
+
+test("proxyCredsExposed flags credentials to a non-loopback proxy", () => {
+	is(proxyCredsExposed("socks5://user:pass@proxy.example.com:1080"), true);
+	is(proxyCredsExposed("http://u:p@203.0.113.9:3128"), true);
+	is(proxyCredsExposed("socks5://user:pass@127.0.0.1:9050"), false); // loopback
+	is(proxyCredsExposed("socks5://user:pass@localhost:9050"), false);
+	is(proxyCredsExposed("socks5://user:pass@[::1]:9050"), false);
+	is(proxyCredsExposed("socks5://proxy.example.com:1080"), false); // no creds
+	is(proxyCredsExposed(""), false);
+});
 
 test("highlightNicks matches whole tokens, not substrings", () => {
 	const m = nickSet(["bob", "Alice", "me"], "me"); // own nick excluded

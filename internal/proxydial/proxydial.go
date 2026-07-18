@@ -51,6 +51,26 @@ func redactProxy(s string) string {
 	return s
 }
 
+// CredsOverCleartext reports whether a proxy URL carries authentication to a
+// non-loopback host. SOCKS5 (RFC 1929) and HTTP Basic proxy auth are sent
+// unencrypted, so credentials to a remote proxy travel in the clear unless the
+// transport to it is itself protected (VPN / SSH tunnel). Loopback is exempt.
+// Used only to emit an advisory warning, not to reject.
+func CredsOverCleartext(proxyURL string) bool {
+	u, err := url.Parse(proxyURL)
+	if err != nil || u.User == nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" || host == "localhost" {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return false
+	}
+	return true
+}
+
 // Parse validates a proxy configuration string and returns the parsed URL.
 func Parse(s string) (*url.URL, error) {
 	u, err := url.Parse(s)

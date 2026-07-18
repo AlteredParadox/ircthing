@@ -272,6 +272,22 @@ export function highlightNicks(text, nickMap) {
 	return out;
 }
 
+// proxyCredsExposed reports whether a proxy URL carries credentials to a
+// non-loopback host. SOCKS5 (RFC 1929) and HTTP Basic proxy auth are sent
+// unencrypted, so credentials to a remote proxy travel in the clear unless the
+// transport to it is itself protected (VPN / SSH tunnel). Loopback is exempt.
+export function proxyCredsExposed(proxy) {
+	if (!proxy) return false;
+	const rest = proxy.replace(/^[a-zA-Z0-9]+:\/\//, ""); // drop scheme
+	const auth = rest.split("/")[0]; // authority only
+	const at = auth.lastIndexOf("@");
+	if (at === -1) return false; // no userinfo -> no proxy auth
+	let host = auth.slice(at + 1);
+	host = host.startsWith("[") ? host.slice(1, host.indexOf("]")) : host.split(":")[0];
+	host = host.toLowerCase();
+	return !(host === "localhost" || host === "::1" || /^127\./.test(host));
+}
+
 // isChannelName follows the network's ISUPPORT CHANTYPES (sent with the
 // buffer list); "#&" is the RFC 1459 default for networks we have not
 // heard from yet.
