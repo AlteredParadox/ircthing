@@ -285,7 +285,22 @@ export function proxyCredsExposed(proxy) {
 	let host = auth.slice(at + 1);
 	host = host.startsWith("[") ? host.slice(1, host.indexOf("]")) : host.split(":")[0];
 	host = host.toLowerCase();
-	return !(host === "localhost" || host === "::1" || /^127\./.test(host));
+	// 127.0.0.0/8 only as a real IPv4 literal — a prefix test (/^127\./) would
+	// wrongly treat a public name like "127.attacker.example" as loopback and
+	// suppress the warning.
+	const v4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+	const isLoopbackV4 = !!v4 && v4.slice(1).every((o) => +o <= 255) && +v4[1] === 127;
+	return !(host === "localhost" || host === "::1" || isLoopbackV4);
+}
+
+// foldNick applies an RFC1459-superset case fold for keying nick comparisons
+// client-side (we don't know the network's exact CASEMAPPING): lowercase, plus
+// the []\~ -> {}|^ mapping rfc1459/-strict treat as case-equivalent. Folding a
+// superset never fails to match equivalent nicks; at worst it over-matches two
+// the server keeps distinct, harmless for the /whois reply correlation.
+export function foldNick(s) {
+	const m = { "[": "{", "]": "}", "\\": "|", "~": "^" };
+	return String(s).toLowerCase().replace(/[[\]\\~]/g, (c) => m[c]);
 }
 
 // isChannelName follows the network's ISUPPORT CHANTYPES (sent with the

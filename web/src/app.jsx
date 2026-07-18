@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
-import { applyTombstones, bufferOrder, bufKey, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, rememberRedaction, renderable, SERVER_BUFFER, toHash, typingExpired } from "./irc.js";
+import { applyTombstones, bufferOrder, bufKey, foldNick, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, rememberRedaction, renderable, SERVER_BUFFER, toHash, typingExpired } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
 import { Login } from "./login.jsx";
 import { applyPrefs, loadPrefs, normalizePrefs, resolveTheme, savePrefs } from "./prefs.js";
@@ -257,14 +257,19 @@ function mergeHistoryPage(m, key, page, tombstones) {
 	// in-flight load early; this guards the re-dispatch race belt-and-braces.)
 	if (cur?.loaded && cur.atTail === false) return m;
 	const pageMsgs = page.messages || [];
-	const list = applyTombstones(mergeById(cur?.list || [], pageMsgs), tombstones);
+	const merged = applyTombstones(mergeById(cur?.list || [], pageMsgs), tombstones);
+	// Enforce the byte/count budget here too: prev.list (≤ budget) plus a fresh
+	// page can exceed MAX_BUFFER_BYTES, and although a live append re-trims, a
+	// quiet buffer would sit oversized until then. This is a tail load, so
+	// front-trimming (oldest) is correct; reachedTop clears if anything dropped.
+	const t = trimBuffer(merged, listBytes(merged), pageMsgs.length < PAGE);
 	return {
 		...m,
 		[key]: {
-			list,
-			bytes: listBytes(list),
+			list: t.list,
+			bytes: t.bytes,
 			loaded: true,
-			reachedTop: pageMsgs.length < PAGE,
+			reachedTop: t.reachedTop,
 			atTail: true,
 		},
 	};
@@ -698,7 +703,7 @@ export function App() {
 			// Only a whois WE asked for opens/selects a buffer. Drop an
 			// unsolicited server-pushed card so a hostile server can't spawn a
 			// buffer per nick or repeatedly steal focus (browser-memory + UX DoS).
-			if (!pendingWhois.current.delete(d.network + "\n" + String(d.nick).toLowerCase())) return;
+			if (!pendingWhois.current.delete(d.network + "\n" + foldNick(d.nick))) return;
 			const key = bufKey(d.network, d.nick);
 			setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(d.network, d.nick) }));
 			const ev = {
@@ -952,7 +957,7 @@ export function App() {
 	function rememberPendingWhois(network, nick) {
 		if (!nick) return;
 		const s = pendingWhois.current;
-		s.add(network + "\n" + String(nick).toLowerCase());
+		s.add(network + "\n" + foldNick(nick));
 		if (s.size > 100) s.delete(s.values().next().value);
 	}
 

@@ -162,14 +162,15 @@ func proxyString(u *url.URL) string {
 //   - (nil, true)   the network is known and configured for DIRECT access
 //   - (u,   true)   the network is known with a valid proxy
 //   - (nil, false)  cannot determine — no network, unknown/deleted/renamed
-//                   network, store error, malformed stored config, or a
-//                   stored proxy that no longer parses
+//                   network, store error, malformed stored config, a stored
+//                   proxy that no longer parses, OR a WireGuard network (its
+//                   egress is an in-process tunnel this path can't reach)
 //
 // The caller must FAIL CLOSED on ok==false: falling back to a direct fetch
 // there would leak the server's egress IP for a link that belongs to a
-// proxied network (e.g. a UI request racing a network delete/rename, or a
-// transient store error). Only a network known to be direct permits a
-// direct fetch.
+// proxied or WireGuard network (e.g. a UI request racing a network
+// delete/rename, or a transient store error). Only a network known to be
+// direct permits a direct fetch.
 func (s *Server) proxyForNetwork(ctx context.Context, name string) (*url.URL, bool) {
 	if name == "" {
 		return nil, false
@@ -179,9 +180,18 @@ func (s *Server) proxyForNetwork(ctx context.Context, name string) (*url.URL, bo
 		return nil, false
 	}
 	var cfg struct {
-		Proxy string `json:"proxy"`
+		Proxy     string          `json:"proxy"`
+		WireGuard json.RawMessage `json:"wireguard"`
 	}
 	if json.Unmarshal([]byte(nc.Config), &cfg) != nil {
+		return nil, false
+	}
+	// A WireGuard network egresses through an in-process userspace tunnel that
+	// the media path has no handle on (it lives in the per-network irc.Manager).
+	// A direct fetch would leak the server's real IP and resolve the target on
+	// the local resolver — exactly what the tunnel prevents — so fail closed
+	// (the caller turns this into a 502) until media can share the tunnel.
+	if len(cfg.WireGuard) > 0 && string(cfg.WireGuard) != "null" {
 		return nil, false
 	}
 	if cfg.Proxy == "" {

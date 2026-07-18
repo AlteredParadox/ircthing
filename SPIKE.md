@@ -1,6 +1,12 @@
-# SPIKE: in-process WireGuard egress (phase-4 candidate)
+# SPIKE: in-process WireGuard egress
 
-**Branch:** `spike/wireguard-egress` · **Status:** measurement only — do NOT merge to main.
+**Status: SHIPPED on `main` (2026-07-18).** This document is the historical spike
+record — the cost investigation and the 1 vCPU / 1 GB target-box validation
+(§6). The feature, its **web UI** (Egress → WireGuard tunnel), the approved
+dependencies, and the pre-merge fixes are all merged; the shipped design is
+documented in `CLAUDE.md` and `README.md`. Earlier "measurement only / do NOT
+merge / no UI / deferred" notes below are preserved as they were written and are
+superseded by this status.
 
 Goal: measure the cost of routing a network's egress through an in-process
 userspace WireGuard tunnel (wireguard-go + gVisor netstack — no TUN device, no

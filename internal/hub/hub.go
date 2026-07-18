@@ -771,7 +771,9 @@ func (h *Hub) accumulateWhois(ev irc.Event, whois map[string]*WhoisData) bool {
 	m := ev.Msg
 	switch m.Command {
 	case "311", "312", "313", "317", "319", "330", "335", "338", "378", "379", "671":
-		nick := m.Param(1)
+		// Clamp+detach the key: it is a retained map key AND the card's Nick, so a
+		// hostile ~64 KiB nick must not pin the parsed line for the card's life.
+		nick := clampDetach(m.Param(1))
 		if nick == "" {
 			return true
 		}
@@ -784,19 +786,20 @@ func (h *Hub) accumulateWhois(ev irc.Event, whois map[string]*WhoisData) bool {
 			whois[nick] = w
 		}
 		applyWhois(w, m)
+		clampWhois(w) // bound+detach fields now — the server may never send 318
 		return true
 	case "301": // away — part of a whois only if one is open
-		if w := whois[m.Param(1)]; w != nil {
-			w.Away = m.Trailing()
+		if w := whois[clampServerInfo(m.Param(1))]; w != nil {
+			w.Away = clampDetach(m.Trailing())
 			return true
 		}
 		return false
 	case "318": // end of /WHOIS: flush the card
-		nick := m.Param(1)
+		nick := clampServerInfo(m.Param(1)) // same value as the stored key
 		if w := whois[nick]; w != nil {
 			delete(whois, nick)
 			w.Network = ev.Network
-			clampWhois(w) // bound server-controlled fields the client then retains
+			clampWhois(w) // idempotent re-clamp before broadcast
 			h.broadcast(envelope("whois", 0, w))
 		}
 		return true
@@ -804,19 +807,29 @@ func (h *Hub) accumulateWhois(ev irc.Event, whois map[string]*WhoisData) bool {
 	return false
 }
 
-// clampWhois bounds every server-controlled string field of a whois card
-// before it is broadcast — a hostile server can pack ~64 KiB into each, and
-// the client keeps completed cards in scrollback.
+// clampDetach bounds s to maxServerInfoBytes AND copies it into a fresh
+// allocation, so a short result no longer pins the ~64 KiB parsed-line buffer it
+// was sliced from. Use it wherever a server-controlled string is RETAINED (map
+// keys, in-progress cards); clampServerInfo alone shares the backing array,
+// which is fine only for values broadcast and immediately dropped.
+func clampDetach(s string) string {
+	return strings.Clone(clampServerInfo(s))
+}
+
+// clampWhois bounds AND detaches every server-controlled field of a whois card.
+// It runs at accumulation (each numeric), not just at flush, because a hostile
+// server can withhold the 318 terminator and leave the card resident — so the
+// raw ~64 KiB fields must not stay pinned while it's held.
 func clampWhois(w *WhoisData) {
-	w.Nick = clampServerInfo(w.Nick)
-	w.User = clampServerInfo(w.User)
-	w.Host = clampServerInfo(w.Host)
-	w.Realname = clampServerInfo(w.Realname)
-	w.Server = clampServerInfo(w.Server)
-	w.Channels = clampServerInfo(w.Channels)
-	w.Account = clampServerInfo(w.Account)
-	w.Actual = clampServerInfo(w.Actual)
-	w.Away = clampServerInfo(w.Away)
+	w.Nick = clampDetach(w.Nick)
+	w.User = clampDetach(w.User)
+	w.Host = clampDetach(w.Host)
+	w.Realname = clampDetach(w.Realname)
+	w.Server = clampDetach(w.Server)
+	w.Channels = clampDetach(w.Channels)
+	w.Account = clampDetach(w.Account)
+	w.Actual = clampDetach(w.Actual)
+	w.Away = clampDetach(w.Away)
 }
 
 // applyWhois sets the field one WHOIS numeric carries.
@@ -905,15 +918,19 @@ func (h *Hub) trackHistoryBatch(ctx context.Context, ev irc.Event, c Conn, batch
 			return // empty reference: ignore, or it becomes histBatches[""]
 		}
 		if len(batches) >= maxOpenHistBatches {
-			return // bound the map; the manager tears the connection down at this cap
+			return // bound the map at maxOpenHistBatches
 		}
-		batches[ref[1:]] = &histBatch{target: ev.Msg.Param(2)}
+		// Clamp+detach the retained ref key and target: both are server-controlled
+		// and otherwise pin the ~64 KiB BATCH line, and the target further seeds
+		// the folded backfillPages key below (bounded by count, not length).
+		batches[clampDetach(ref[1:])] = &histBatch{target: clampDetach(ev.Msg.Param(2))}
 	case strings.HasPrefix(ref, "-"):
-		b := batches[ref[1:]]
+		id := clampServerInfo(ref[1:]) // same value as the stored (clamped) key
+		b := batches[id]
 		if b == nil {
 			return
 		}
-		delete(batches, ref[1:])
+		delete(batches, id)
 		key := c.Fold(b.target)
 		// Cap the number of distinct targets tracked, not just the pages per
 		// target: a hostile server can close a chathistory batch for an

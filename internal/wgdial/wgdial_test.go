@@ -38,6 +38,10 @@ func TestValidate(t *testing.T) {
 		{"endpoint non-numeric port", func(c *Config) { c.Endpoint = "203.0.113.7:https" }},
 		{"endpoint port out of range", func(c *Config) { c.Endpoint = "203.0.113.7:99999" }},
 		{"endpoint newline-injected port", func(c *Config) { c.Endpoint = "203.0.113.7:51820\npublic_key=x" }},
+		{"endpoint empty host", func(c *Config) { c.Endpoint = ":51820" }},
+		{"mtu negative", func(c *Config) { c.MTU = -1 }},
+		{"mtu absurdly large", func(c *Config) { c.MTU = 3000000000 }},
+		{"mtu too small", func(c *Config) { c.MTU = 500 }},
 	}
 	for _, tc := range bad {
 		c := goodConfig()

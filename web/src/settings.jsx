@@ -1,4 +1,4 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { ACCENT_RGB, ACCENTS, CLOCKS, MAX_NICK_SEP } from "./prefs.js";
 import { uuid } from "./irc.js";
 
@@ -42,7 +42,7 @@ function Seg({ value, options, labels, onPick }) {
 	);
 }
 
-// ChangePassword posts to /api/password: verify current, set new (min 8 chars,
+// ChangePassword posts to /api/password: verify current, set new (8–72 bytes,
 // confirmed). The server rotates the stored login hash and revokes other
 // sessions.
 function ChangePassword() {
@@ -54,8 +54,10 @@ function ChangePassword() {
 	async function submit(e) {
 		e.preventDefault();
 		setMsg(null);
-		if (next.length < 8) {
-			setMsg({ ok: false, text: "New password must be at least 8 characters." });
+		// bcrypt (and the server) bound the password in BYTES, not JS code units.
+		const bytes = new TextEncoder().encode(next).length;
+		if (bytes < 8 || bytes > 72) {
+			setMsg({ ok: false, text: "New password must be 8–72 bytes." });
 			return;
 		}
 		if (next !== confirm) {
@@ -114,6 +116,8 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	const [previewsOn, setPreviewsOn] = useState(null); // null while loading
 	const [retention, setRetention] = useState(null); // { days, max } | null
 	const [sessionDays, setSessionDays] = useState(null); // login cookie lifetime
+	const retentionGen = useRef(0); // latest-save guards (see saveRetention)
+	const sessionGen = useRef(0);
 
 	useEffect(() => {
 		const onKey = (e) => e.key === "Escape" && onClose();
@@ -149,19 +153,24 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 		}
 	}
 
+	// Revert only if THIS is still the latest in-flight save (generation guard):
+	// otherwise an older request that fails could clobber a newer request that
+	// already succeeded.
 	function saveRetention(patch) {
 		const prev = retention;
 		const next = { ...retention, ...patch };
 		setRetention(next);
+		const gen = ++retentionGen.current;
 		saveConfig({ retention_days: next.days, retention_max_messages: next.max }).then((ok) => {
-			if (!ok) setRetention(prev); // revert so the UI matches the server
+			if (!ok && gen === retentionGen.current) setRetention(prev);
 		});
 	}
 	function saveSessionDays(days) {
 		const prev = sessionDays;
 		setSessionDays(days);
+		const gen = ++sessionGen.current;
 		saveConfig({ session_ttl_days: days }).then((ok) => {
-			if (!ok) setSessionDays(prev);
+			if (!ok && gen === sessionGen.current) setSessionDays(prev);
 		});
 	}
 	const retNum = (v) => Math.max(0, parseInt(v, 10) || 0);

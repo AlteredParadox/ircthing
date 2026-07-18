@@ -75,8 +75,12 @@ func New(ctx context.Context, cfg Config) (*Tunnel, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Clamp defensively: Validate rejects an out-of-range MTU, but a config
+	// predating the validator must never reach netstack with a value it would
+	// int32-truncate into a panic (see Validate). 0 or anything out of the sane
+	// range falls back to the 1420 default.
 	mtu := cfg.MTU
-	if mtu == 0 {
+	if mtu < 1280 || mtu > 1500 {
 		mtu = 1420
 	}
 	tun, tnet, err := netstack.CreateNetTUN([]netip.Addr{addr}, []netip.Addr{dnsIP}, mtu)
@@ -129,12 +133,23 @@ func Validate(cfg Config) error {
 	if _, _, _, err := parseDNS(cfg.DNS); err != nil {
 		return err
 	}
-	_, portStr, err := net.SplitHostPort(cfg.Endpoint)
+	host, portStr, err := net.SplitHostPort(cfg.Endpoint)
 	if err != nil {
 		return fmt.Errorf("wgdial: endpoint %q: not host:port: %w", cfg.Endpoint, err)
 	}
+	if host == "" {
+		return fmt.Errorf("wgdial: endpoint %q: host is required", cfg.Endpoint)
+	}
 	if _, err := endpointPort(portStr); err != nil {
 		return fmt.Errorf("wgdial: endpoint %q: %w", cfg.Endpoint, err)
+	}
+	// Bound the MTU. 0 means the 1420 default; otherwise require a sane
+	// WireGuard range. An unbounded value reaches netstack, which int32-truncates
+	// it in device setup — a negative or >MaxInt32 MTU then yields a negative
+	// padding length and panics an encryption worker (crashing the whole process)
+	// on the first packet. New clamps too, as belt-and-suspenders.
+	if cfg.MTU != 0 && (cfg.MTU < 1280 || cfg.MTU > 1500) {
+		return fmt.Errorf("wgdial: mtu %d out of range (1280–1500, or 0 for the 1420 default)", cfg.MTU)
 	}
 	_, err = uapiConfig(cfg, cfg.Endpoint) // validates the base64 keys
 	return err

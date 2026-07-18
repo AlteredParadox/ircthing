@@ -1557,15 +1557,6 @@ func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn,
 // rather than caching the error forever. Target DNS resolves through the
 // tunnel's in-band resolver — no local-resolver leak.
 func (m *Manager) dialWireGuard(ctx context.Context, addr string) (net.Conn, error) {
-	// Bound the whole operation — endpoint (re)resolution AND the dial — by
-	// DialTimeout, so a WireGuard endpoint whose hostname stops resolving can't
-	// stall a reconnect on the OS resolver's own (much longer) timeout.
-	dctx := ctx
-	if m.cfg.DialTimeout > 0 {
-		var cancel context.CancelFunc
-		dctx, cancel = context.WithTimeout(ctx, m.cfg.DialTimeout)
-		defer cancel()
-	}
 	// Invariant: dialWireGuard and wgClose both run ONLY on the single Run
 	// goroutine (dial <- runOnce <- Run; wgClose is Run's defer), so wgMu is
 	// uncontended and a dial can never race the teardown or double-build. Keep it
@@ -1573,21 +1564,44 @@ func (m *Manager) dialWireGuard(ctx context.Context, addr string) (net.Conn, err
 	// tunnel after wgClose (which nothing would ever Close).
 	m.wgMu.Lock()
 	if m.wgTun == nil {
-		t, err := wgdial.New(dctx, *m.cfg.WireGuard)
+		// Build (incl. endpoint resolution) gets its OWN DialTimeout budget.
+		bctx, cancel := m.dialCtx(ctx)
+		t, err := wgdial.New(bctx, *m.cfg.WireGuard)
+		cancel()
 		if err != nil {
 			m.wgMu.Unlock()
 			return nil, err
 		}
 		m.wgTun = t
-	} else if err := m.wgTun.Reresolve(dctx); err != nil {
-		// Reconnect: refresh the endpoint IP (DNS failover / dynamic endpoint).
-		// Best-effort — keep the current endpoint if re-resolution fails.
-		log.Printf("irc[%s]: wireguard re-resolve endpoint: %v", m.cfg.Name, err)
+	} else {
+		// Reconnect: best-effort endpoint refresh (DNS failover / dynamic
+		// endpoint), bounded by its OWN timeout so a stalled lookup can't consume
+		// the dial's budget below — on failure the existing endpoint is kept.
+		rctx, cancel := m.dialCtx(ctx)
+		if err := m.wgTun.Reresolve(rctx); err != nil {
+			log.Printf("irc[%s]: wireguard re-resolve endpoint: %v", m.cfg.Name, err)
+		}
+		cancel()
 	}
 	tun := m.wgTun
 	m.wgMu.Unlock()
 
+	// The dial gets a FRESH DialTimeout, independent of whatever the build or
+	// re-resolve above consumed — a slow endpoint lookup must never hand the dial
+	// an already-expired context (which would fail every reconnect identically).
+	dctx, cancel := m.dialCtx(ctx)
+	defer cancel()
 	return tun.DialContext(dctx, addr)
+}
+
+// dialCtx derives a DialTimeout-bounded child of ctx (or a plain cancellable
+// child when no timeout is configured), so each WireGuard phase — build,
+// re-resolve, dial — gets its own independent budget.
+func (m *Manager) dialCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if m.cfg.DialTimeout > 0 {
+		return context.WithTimeout(ctx, m.cfg.DialTimeout)
+	}
+	return context.WithCancel(ctx)
 }
 
 // wgClose tears down the WireGuard tunnel if one was built. Called when Run

@@ -258,6 +258,11 @@ func (r *roster) namesReply(m *ircv4.Message) {
 			break // bound a NAMES flood: per-channel and connection-wide
 		}
 		prefix, nick, user, host := splitNamesPrefix(r.isup.PrefixSymbols(), raw)
+		// Clamp BEFORE folding: Fold allocates a same-length key, so a hostile
+		// ~64 KiB nick would otherwise pin a 64 KiB map key even though the Member
+		// value is clamped — defeating the count-based member budget (mirrors the
+		// channel-name clamp in memberJoin).
+		nick = clampRoster(nick)
 		fk := r.isup.Fold(nick)
 		if _, exists := st.pending[fk]; !exists {
 			budget-- // only a new nick consumes the aggregate budget
@@ -266,7 +271,7 @@ func (r *roster) namesReply(m *ircv4.Message) {
 		// (irc.v4 slices every field out of one per-line buffer, which a
 		// short nick would otherwise pin alive in the roster).
 		st.pending[fk] = Member{
-			Nick: clampRoster(nick), Prefix: clampRoster(prefix),
+			Nick: nick, Prefix: clampRoster(prefix),
 			User: clampRoster(user), Host: clampRoster(host),
 		}
 	}
@@ -321,13 +326,16 @@ func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
 	if st == nil {
 		return
 	}
-	k := r.isup.Fold(sender)
+	// Clamp before folding so a ~64 KiB nick can't pin a full-length map key
+	// (Fold allocates a same-length string); reuse it as the Member value.
+	cs := clampRoster(sender)
+	k := r.isup.Fold(cs)
 	if _, known := st.members[k]; !known &&
 		(len(st.members) >= maxChannelMembers || r.totalMembers() >= maxRosterMembers) {
 		return
 	}
 	// Clone so the Member doesn't alias the parsed JOIN line's backing buffer.
-	mem := Member{Nick: clampRoster(sender)}
+	mem := Member{Nick: cs}
 	if m.Prefix != nil { // the JOIN prefix carries nick!user@host
 		mem.User = clampRoster(m.Prefix.User)
 		mem.Host = clampRoster(m.Prefix.Host)
@@ -353,14 +361,20 @@ func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
 // holds r.mu.
 func (r *roster) rename(from, to string) {
 	fold := r.isup.Fold
+	// Clamp before folding: the new key fold(to) must stay bounded (a hostile
+	// ~64 KiB new nick would otherwise pin a full-length key), and clamping the
+	// old nick keeps its fold in step with how it was stored.
+	fromKey := fold(clampRoster(from))
+	ct := clampRoster(to)
+	toKey := fold(ct)
 	rekey := func(mp map[string]Member) {
 		if mp == nil {
 			return
 		}
-		if mem, ok := mp[fold(from)]; ok {
-			delete(mp, fold(from))
-			mem.Nick = clampRoster(to) // don't retain/overgrow a slice of the NICK line
-			mp[fold(to)] = mem
+		if mem, ok := mp[fromKey]; ok {
+			delete(mp, fromKey)
+			mem.Nick = ct
+			mp[toKey] = mem
 		}
 	}
 	for _, st := range r.chans {

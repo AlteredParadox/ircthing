@@ -209,9 +209,17 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "encode failed", http.StatusInternalServerError)
 		return
 	}
-	if len(res.data) <= maxThumbCacheEntry { // keep worst-case cache residency small
-		s.thumbCache.put(ck, res)
+	// Hard SERVING cap, not just cache admission: the browser's thumbnail cache
+	// is bounded by count, not bytes, so serving an oversized thumbnail (a
+	// high-entropy 400×400 re-encode can reach ~640 KB) would let it bloat far
+	// past the intended budget. Refuse it — the client falls back to no
+	// thumbnail, exactly as it does for any thumb failure — which keeps browser
+	// blob residency at count × maxThumbCacheEntry.
+	if len(res.data) > maxThumbCacheEntry {
+		http.Error(w, "thumbnail too large", http.StatusRequestEntityTooLarge)
+		return
 	}
+	s.thumbCache.put(ck, res)
 	writeThumb(w, res)
 }
 

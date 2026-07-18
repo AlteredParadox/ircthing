@@ -3,7 +3,7 @@ import { test } from "node:test";
 import {
 	bufKey, firstURL, fmtTime, hostOf, linkify, looksLikeImageURL,
 	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash, applyStatusMode, mergeById, mergeServerBuffers,
-	applyTombstones, rememberRedaction, nickSet, highlightNicks, proxyCredsExposed,
+	applyTombstones, rememberRedaction, nickSet, highlightNicks, proxyCredsExposed, foldNick,
 } from "../src/irc.js";
 
 test("proxyCredsExposed flags credentials to a non-loopback proxy", () => {
@@ -14,6 +14,17 @@ test("proxyCredsExposed flags credentials to a non-loopback proxy", () => {
 	is(proxyCredsExposed("socks5://user:pass@[::1]:9050"), false);
 	is(proxyCredsExposed("socks5://proxy.example.com:1080"), false); // no creds
 	is(proxyCredsExposed(""), false);
+	// A public host that merely STARTS with "127." must not be treated as
+	// loopback (the warning must still show).
+	is(proxyCredsExposed("socks5://u:p@127.attacker.example:1080"), true);
+	is(proxyCredsExposed("socks5://u:p@127.0.0.1.evil.com:1080"), true);
+	is(proxyCredsExposed("socks5://u:p@127.5.6.7:1080"), false); // real 127/8
+});
+
+test("foldNick applies an rfc1459-superset case fold", () => {
+	is(foldNick("Nick"), "nick");
+	is(foldNick("Foo[]\\~"), "foo{}|^"); // []\~ -> {}|^
+	is(foldNick("nick[]"), foldNick("NICK{}")); // equivalent under rfc1459
 });
 
 test("highlightNicks matches whole tokens, not substrings", () => {

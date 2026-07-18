@@ -24,6 +24,12 @@ func (s *Store) Retention() (days, maxPerBuffer int) {
 
 // SetRetention updates the policy, persists it, and prunes once promptly so a
 // tighter policy applies without waiting for the next hourly tick.
+//
+// NOTE: persist and live-state install happen under separate lock acquisitions
+// (SetSettings takes s.mu itself), so this method is NOT internally
+// linearizable — concurrent callers could leave the persisted and in-memory
+// policies disagreeing. Callers MUST serialize it; the only caller (the API's
+// handleSetConfig) does, holding settingsMu across the whole read-modify-write.
 func (s *Store) SetRetention(ctx context.Context, days, maxPerBuffer int) error {
 	// Both keys in one transaction: a partial write would leave the two
 	// dimensions inconsistent across a restart.
@@ -56,11 +62,11 @@ func (s *Store) loadRetention(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
-	if dv == "" && mv == "" { // first run: seed from config
-		if err := s.SetSetting(ctx, retentionDaysKey, strconv.Itoa(opts.RetentionDays)); err != nil {
-			return err
-		}
-		return s.SetSetting(ctx, retentionMaxKey, strconv.Itoa(opts.RetentionMaxMessages))
+	if dv == "" && mv == "" { // first run: seed from config, both keys atomically
+		return s.SetSettings(ctx, map[string]string{
+			retentionDaysKey: strconv.Itoa(opts.RetentionDays),
+			retentionMaxKey:  strconv.Itoa(opts.RetentionMaxMessages),
+		})
 	}
 	days, _ := strconv.Atoi(dv)
 	maxPer, _ := strconv.Atoi(mv)
