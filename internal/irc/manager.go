@@ -835,7 +835,8 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 		}
 	}
 	internal := make(chan *ircv4.Message, 16)
-	go m.writeLoop(cctx, cancel, conn, w, internal)
+	urgent := make(chan *ircv4.Message, 8)
+	go m.writeLoop(cctx, cancel, conn, w, urgent, internal)
 
 	send := func(msgs []*ircv4.Message) error {
 		for _, out := range msgs {
@@ -847,7 +848,7 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 		}
 		return nil
 	}
-	lc := &liveConn{conn: conn, cctx: cctx, r: r, blr: blr, send: send, internal: internal, addr: addr, secure: secure}
+	lc := &liveConn{conn: conn, cctx: cctx, r: r, blr: blr, send: send, internal: internal, urgent: urgent, addr: addr, secure: secure}
 
 	hs, err := m.register(ctx, lc)
 	if err != nil {
@@ -905,8 +906,19 @@ type liveConn struct {
 	blr      *boundedLineReader
 	send     func([]*ircv4.Message) error
 	internal chan *ircv4.Message
+	urgent   chan *ircv4.Message // top-priority, unthrottled lane (PONG)
 	addr     string
 	secure   bool
+}
+
+// sendUrgent queues a keepalive on the unthrottled top-priority lane so a PONG
+// is never stuck behind rate-paced rejoin JOINs in the internal lane (which
+// could delay it past a strict server's ping timeout). Best-effort.
+func (lc *liveConn) sendUrgent(msg *ircv4.Message) {
+	select {
+	case lc.urgent <- msg:
+	case <-lc.cctx.Done():
+	}
 }
 
 // flushParting waits (briefly) for queued messages to reach the wire
@@ -1111,9 +1123,8 @@ func boundedPong(in *ircv4.Message, limit int) *ircv4.Message {
 // post-registration cap-notify (including its STS refresh).
 func (m *Manager) serviceLine(ctx context.Context, lc *liveConn, in *ircv4.Message) error {
 	if in.Command == "PING" {
-		if err := lc.send([]*ircv4.Message{boundedPong(in, m.lineLen())}); err != nil {
-			return err
-		}
+		// Urgent lane: a PONG must not queue behind rate-paced rejoin JOINs.
+		lc.sendUrgent(boundedPong(in, m.lineLen()))
 	}
 	if in.Command == "CAP" { // cap-notify: NEW/DEL after registration
 		if out := m.handleCapNotify(in); len(out) > 0 {
@@ -1367,55 +1378,82 @@ func redactRaw(line string) string {
 // handshake/PONG traffic and user messages onto the socket through the
 // flood-protection token bucket. On write failure it cancels the
 // connection context with the error, which the read loop reports.
-func (m *Manager) writeLoop(ctx context.Context, cancel context.CancelCauseFunc, conn net.Conn, w *ircv4.Writer, internal <-chan *ircv4.Message) {
+func (m *Manager) writeLoop(ctx context.Context, cancel context.CancelCauseFunc, conn net.Conn, w *ircv4.Writer, urgent, internal <-chan *ircv4.Message) {
 	tb := newTokenBucket(m.cfg.SendBurst, m.cfg.SendInterval)
-	for {
-		var out *ircv4.Message
-		// Internal traffic (handshake, PONG, autojoin rejoins) gets
-		// deterministic priority over user/hub traffic in m.out: a PONG
-		// or a JOIN is never overtaken by a queued user message that
-		// would otherwise reach the server first.
-		select {
-		case <-ctx.Done():
-			return
-		case out = <-internal:
-		default:
-			select {
-			case <-ctx.Done():
-				return
-			case out = <-internal:
-			case out = <-m.out:
+	// writeOne emits one message and returns false on a fatal error (the loop
+	// then exits). throttle applies the flood token bucket — NEVER to urgent
+	// PONGs, which must go out immediately regardless of the rejoin pacing.
+	writeOne := func(out *ircv4.Message, throttle bool) bool {
+		if throttle {
+			if err := tb.wait(ctx); err != nil {
+				return false
 			}
 		}
-		if err := tb.wait(ctx); err != nil {
-			return
-		}
-		// Last-resort framing guard: no message reaches the wire with
-		// CR/LF/NUL, even the internally-queued handshake/PONG lines that
-		// never pass through sendAll. A tainted message tears the
-		// connection down rather than emitting an injected line.
+		// Last-resort framing guard: no message reaches the wire with CR/LF/NUL,
+		// even the internally-queued handshake/PONG lines that never pass
+		// through sendAll. A tainted message tears the connection down.
 		if err := checkFraming(out); err != nil {
 			cancel(err)
-			return
+			return false
 		}
-		// Final line-length backstop, after UTF-8 scrubbing (which can
-		// grow a line by replacing invalid bytes with U+FFFD): internal
-		// handshake/PONG/rejoin lines never pass through sendAll's check, so
-		// enforce it here too. Unlike framing, an over-length line is DROPPED
-		// (not fatal): a message that sendAll accepted can still fail here if
-		// a mid-session 005 lowers LINELEN while it waited in the throttled
-		// queue, and killing the connection over that would lose more than the
-		// one line. The server would reject/truncate an over-length line
-		// anyway, so dropping it is the safe outcome.
+		// Line-length backstop after UTF-8 scrubbing (which can grow a line via
+		// U+FFFD). Unlike framing, an over-length line is DROPPED, not fatal: a
+		// mid-session 005 can lower LINELEN while a line waited in the queue,
+		// and the server would reject/truncate it anyway.
 		scrubbed := m.scrubUTF8(out)
 		if err := checkLineLen(scrubbed, m.lineLen()); err != nil {
 			log.Printf("irc[%s]: dropping over-length %s line: %v", m.cfg.Name, out.Command, err)
-			continue
+			return true
 		}
 		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		if err := w.WriteMessage(scrubbed); err != nil {
 			cancel(fmt.Errorf("write: %w", err))
+			return false
+		}
+		return true
+	}
+	// Priority: urgent (PONG) > internal (handshake/rejoins) > m.out (user/hub).
+	// A PONG is never overtaken by a rate-paced JOIN, and neither is overtaken
+	// by a queued user message.
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case out := <-urgent:
+			if !writeOne(out, false) {
+				return
+			}
+			continue
+		default:
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case out := <-urgent:
+			if !writeOne(out, false) {
+				return
+			}
+		case out := <-internal:
+			if !writeOne(out, true) {
+				return
+			}
+		default:
+			select {
+			case <-ctx.Done():
+				return
+			case out := <-urgent:
+				if !writeOne(out, false) {
+					return
+				}
+			case out := <-internal:
+				if !writeOne(out, true) {
+					return
+				}
+			case out := <-m.out:
+				if !writeOne(out, true) {
+					return
+				}
+			}
 		}
 	}
 }
