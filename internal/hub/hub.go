@@ -958,7 +958,7 @@ func membersHint(m *ircv4.Message) (buffer string, affected bool) {
 		return m.Param(1), true
 	case "315": // end of WHO: away/account discovery finished (WHOX)
 		return m.Param(1), true
-	case "QUIT", "NICK", "AWAY", "ACCOUNT": // span channels the hub doesn't track
+	case "QUIT", "NICK", "AWAY", "ACCOUNT", "CHGHOST": // span channels the hub doesn't track
 		return "", true
 	}
 	return "", false

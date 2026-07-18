@@ -408,6 +408,10 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 	m.Text = strings.Clone(clampUTF8(m.Text, maxStoredMessageBytes))
 	m.Sender = strings.Clone(clampUTF8(m.Sender, maxStoredFieldBytes))
 	m.MsgID = strings.Clone(clampUTF8(m.MsgID, maxStoredFieldBytes))
+	// Command is also a substring of the parsed line (irc.v4 returns the raw
+	// uppercase token unchanged), so a 7-byte "PRIVMSG" would pin the whole
+	// 64 KiB line — clone it too.
+	m.Command = strings.Clone(clampUTF8(m.Command, maxStoredFieldBytes))
 	m.RedactReason = strings.Clone(clampUTF8(m.RedactReason, maxStoredFieldBytes))
 	target = strings.Clone(clampUTF8(target, maxStoredFieldBytes))
 	s.mu.Lock()
@@ -471,6 +475,10 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 	if err != nil || bufID == 0 {
 		return false, err
 	}
+	// Bound + detach the server-supplied reason like an append field: it is
+	// written to SQLite and the hot ring, so an oversized reason would bypass
+	// the append-time clamps and pin/retain the parsed line.
+	reason = strings.Clone(clampUTF8(reason, maxStoredFieldBytes))
 	var reasonArg any
 	if reason != "" {
 		reasonArg = reason

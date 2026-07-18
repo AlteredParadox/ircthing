@@ -4,9 +4,30 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	ircv4 "gopkg.in/irc.v4"
 )
+
+// maxRosterField bounds a stored roster string (nick/user/host/account/topic).
+// Real values are tiny; the cap stops a hostile server's oversized field from
+// bloating the roster even after cloning detaches it from the parsed line.
+const maxRosterField = 512
+
+// clampRoster bounds s to maxRosterField bytes (trimming a trailing partial
+// rune) AND detaches it from the parsed IRC line via a fresh copy.
+func clampRoster(s string) string {
+	if len(s) > maxRosterField {
+		s = s[:maxRosterField]
+		for len(s) > 0 {
+			if r, size := utf8.DecodeLastRuneInString(s); r != utf8.RuneError || size != 1 {
+				break
+			}
+			s = s[:len(s)-1]
+		}
+	}
+	return strings.Clone(s)
+}
 
 // Channel membership and topic tracking for one connection.
 //
@@ -156,7 +177,7 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 	case "NICK":
 		r.rename(sender, m.Param(0))
 	case "CHGHOST": // chghost: ":nick!user@host CHGHOST <newuser> <newhost>"
-		user, host := strings.Clone(m.Param(0)), strings.Clone(m.Param(1))
+		user, host := clampRoster(m.Param(0)), clampRoster(m.Param(1))
 		r.updateEverywhere(sender, func(mem Member) Member {
 			mem.User, mem.Host = user, host
 			return mem
@@ -172,6 +193,7 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 		if acct == "*" {
 			acct = ""
 		}
+		acct = clampRoster(acct) // bound + detach the server-supplied account
 		r.updateEverywhere(sender, func(mem Member) Member {
 			mem.Account = acct
 			return mem
@@ -188,7 +210,7 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 // setTopic updates a known channel's topic. Caller holds r.mu.
 func (r *roster) setTopic(channel, topic string) {
 	if st := r.chans[r.isup.Fold(channel)]; st != nil {
-		st.topic = topic
+		st.topic = clampRoster(topic) // bound + detach from the parsed line
 	}
 }
 
@@ -244,8 +266,8 @@ func (r *roster) namesReply(m *ircv4.Message) {
 		// (irc.v4 slices every field out of one per-line buffer, which a
 		// short nick would otherwise pin alive in the roster).
 		st.pending[fk] = Member{
-			Nick: strings.Clone(nick), Prefix: strings.Clone(prefix),
-			User: strings.Clone(user), Host: strings.Clone(host),
+			Nick: clampRoster(nick), Prefix: clampRoster(prefix),
+			User: clampRoster(user), Host: clampRoster(host),
 		}
 	}
 }
@@ -300,13 +322,13 @@ func (r *roster) memberJoin(m *ircv4.Message, sender string, ours bool) {
 		return
 	}
 	// Clone so the Member doesn't alias the parsed JOIN line's backing buffer.
-	mem := Member{Nick: strings.Clone(sender)}
+	mem := Member{Nick: clampRoster(sender)}
 	if m.Prefix != nil { // the JOIN prefix carries nick!user@host
-		mem.User = strings.Clone(m.Prefix.User)
-		mem.Host = strings.Clone(m.Prefix.Host)
+		mem.User = clampRoster(m.Prefix.User)
+		mem.Host = clampRoster(m.Prefix.Host)
 	}
 	if acct := m.Param(1); len(m.Params) >= 3 && acct != "*" {
-		mem.Account = strings.Clone(acct)
+		mem.Account = clampRoster(acct)
 	}
 	st.members[k] = mem
 	// If a NAMES accumulation is in flight for this channel, apply the live
@@ -332,7 +354,7 @@ func (r *roster) rename(from, to string) {
 		}
 		if mem, ok := mp[fold(from)]; ok {
 			delete(mp, fold(from))
-			mem.Nick = strings.Clone(to) // don't retain a slice of the NICK line
+			mem.Nick = clampRoster(to) // don't retain/overgrow a slice of the NICK line
 			mp[fold(to)] = mem
 		}
 	}
@@ -342,13 +364,20 @@ func (r *roster) rename(from, to string) {
 	}
 }
 
-// updateEverywhere applies fn to nick's membership in every channel —
-// the shape of nick-level facts (AWAY, ACCOUNT, WHOX). Caller holds r.mu.
+// updateEverywhere applies fn to nick's membership in every channel — the
+// shape of nick-level facts (AWAY, ACCOUNT, WHOX, CHGHOST). It also updates the
+// in-flight NAMES `pending` snapshot so a 366 swap arriving mid-update does not
+// revert the change to stale data. Caller holds r.mu.
 func (r *roster) updateEverywhere(nick string, fn func(Member) Member) {
 	key := r.isup.Fold(nick)
 	for _, st := range r.chans {
 		if mem, ok := st.members[key]; ok {
 			st.members[key] = fn(mem)
+		}
+		if st.pending != nil {
+			if mem, ok := st.pending[key]; ok {
+				st.pending[key] = fn(mem)
+			}
 		}
 	}
 }
@@ -365,7 +394,7 @@ func (r *roster) whoxReply(m *ircv4.Message) {
 	if acct == "0" { // logged out, per the WHOX spec
 		acct = ""
 	}
-	acct = strings.Clone(acct) // don't retain a slice of the 354 line
+	acct = clampRoster(acct) // don't retain/overgrow a slice of the 354 line
 	away := strings.ContainsRune(flags, 'G')
 	// Bot mode (https://ircv3.net/specs/extensions/bot-mode, fetched
 	// 2026-07-16): the ISUPPORT BOT letter appears in WHO flags.
