@@ -38,6 +38,7 @@
   ],
   "session_ttl_days": 30,
   "secure_cookies": true,
+  "behind_proxy": true,
   "disable_previews": true,
   "retention_days": 365,
   "retention_max_messages": 100000

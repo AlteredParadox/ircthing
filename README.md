@@ -56,10 +56,15 @@ Requires Go ≥ 1.25 and Node (for the frontend build) — build-time only.
 
 ```sh
 make build                          # builds web assets + bin/ircd-web
-./bin/ircd-web -hash-password       # type a login password, copy the hash
-cp config.example.json config.json  # then edit: user, networks
+./bin/ircd-web -hash-password       # type a login password (8–72 chars), copy the hash
+cp config.example.json config.json
+chmod 600 config.json               # it holds the password hash + IRC/SASL/proxy secrets
+$EDITOR config.json                 # set user, networks
 ./bin/ircd-web -config config.json
 ```
+
+The config file holds credentials, so keep it `0600` (the systemd unit below
+uses a root-owned credential instead).
 
 Open http://127.0.0.1:8067 and log in with the user from the config.
 
@@ -76,7 +81,8 @@ loudly. See `config.example.json` for a complete example.
 | `session_ttl_days` | Login cookie lifetime. Default 30. |
 | `ring_size` | Hot scrollback kept in memory per buffer. Default 200; older history is read from SQLite. |
 | `retention_days` | Prune stored messages older than this many days. Default 0 (keep forever). Pruning runs hourly and keeps the search index in step. A hot buffer's in-memory ring may briefly still show just-pruned messages until they evict. |
-| `retention_max_messages` | Keep at most this many messages per buffer; older ones are pruned. Default 0 (unlimited). |
+| `retention_max_messages` | Keep at most this many messages per buffer; older ones are pruned. Default 0 (unlimited). Retention is **per buffer**, not an aggregate disk cap: a server that opens many buffers can still grow the database. For production, put the database on a volume with a filesystem quota (or a dedicated volume) and monitor disk — the systemd unit bounds memory, not disk. Editable live in **Settings → History retention** (the stored value then wins over this seed). |
+| `behind_proxy` | Set `true` when a **trusted** reverse proxy fronts the binary and sets `X-Real-IP` / `X-Forwarded-For`. The login rate-limit then keys on the real client IP instead of the shared proxy address, so one attacker can't lock out everyone. Leave `false` for direct/loopback deployments — otherwise a client could spoof those headers to evade the backoff. |
 | `disable_previews` | **Initial default** for the previews switch (tri-state). **Omit it and previews start OFF** — the privacy-first default, since an auto-fetched preview is a tracking beacon (a poster learns when a buffer is viewed) and the server makes **zero** outbound fetches. Set it to `false` to start with previews **on**, or `true` to be explicit about off. Toggle it live in **Settings → Link previews** (the saved value wins over this). Previews are fetched through **each link's own network proxy** — see [Preview fetches & the proxy SSRF caveat](#preview-fetches--the-proxy-ssrf-caveat). |
 
 Networks are managed from the web UI: the **+** button in the sidebar
@@ -94,10 +100,10 @@ Per network (`networks[]` seed / edit form):
 | `addr` | `host:port` of the IRC server. |
 | `tls` | Use TLS. Plaintext requires the explicit `allow_plaintext: true` opt-in. |
 | `trusted_fingerprints` | Hex SHA-256 pins of the server's certificate; a match replaces CA verification (self-signed servers). |
-| `proxy` | `socks5://[user:pass@]host:port` (DNS resolves proxy-side) or `http://host:port` (CONNECT tunnel). |
+| `proxy` | `socks5://[user:pass@]host:port` (DNS resolves proxy-side) or `http://host:port` (CONNECT tunnel). Proxy auth is transmitted **in cleartext** (SOCKS5 username/password per RFC 1929, HTTP Basic), so only use credentialed proxies whose transport is itself encrypted or local/trusted (e.g. loopback, or inside a VPN tunnel). |
 | `nick`, `username`, `realname` | Identity. `username`/`realname` default to the nick. |
 | `pass` | Server password (`PASS`), rarely needed. |
-| `sasl` | `mechanism` `""` picks automatically (EXTERNAL without a password, else SCRAM-SHA-256 when offered, else PLAIN). `cert_file`/`key_file` supply the client certificate for EXTERNAL. |
+| `sasl` | `mechanism` `""` picks automatically (EXTERNAL without a password, else SCRAM-SHA-256 when offered, else PLAIN). `cert_file`/`key_file` supply the client certificate for EXTERNAL. SCRAM-SHA-256 does **not** apply SASLprep normalization, so use an ASCII (or already-normalized) password — a non-ASCII password may not match a server that normalizes it. |
 | `channels` | Joined after every registration, so they come back on reconnect. The UI keeps this in sync: joining via the network menu adds to it, the *Leave channel* action removes. |
 
 ### Preview fetches & the proxy SSRF caveat
@@ -118,11 +124,12 @@ can only block *literal* private-IP targets — a hostname that resolves
 *proxy-side* to an internal address is reachable through the proxy. Whether
 that matters depends on **where the proxy runs**:
 
-- **A commercial VPN's SOCKS5 (Mullvad, TorGuard, …), or Tor — safe.** The
-  fetch egresses from the provider's network, not yours, so it cannot reach
-  your LAN, loopback, or cloud metadata; those are exactly what the proxy
-  shields. The only theoretical target is the provider's own infrastructure,
-  which reputable providers isolate — you gain no exposure. (Tor also refuses
+- **A commercial VPN's SOCKS5 (Mullvad, TorGuard, …), or Tor — low exposure,
+  but the provider is a trust boundary.** The fetch egresses from the
+  provider's network, not yours, so it cannot reach your LAN, loopback, or
+  cloud metadata; those are exactly what the proxy shields. What remains
+  reachable is the provider's own internal infrastructure — reputable
+  providers isolate it, but you are trusting them to. (Tor also refuses
   private-IP destinations by exit policy.)
 - **A SOCKS proxy on your own machine or LAN** (self-hosted `dante`,
   `ssh -D`, a local daemon) — **the case to watch.** There `127.0.0.1` and
