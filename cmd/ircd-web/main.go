@@ -235,8 +235,11 @@ func runHashPassword() error {
 		}
 		pw = strings.TrimRight(sc.Text(), "\r\n")
 	}
-	if pw == "" {
-		return fmt.Errorf("empty password")
+	// Enforce the same policy as the in-UI change-password flow so the
+	// bootstrap credential isn't weaker than one set later. bcrypt silently
+	// ignores input past 72 bytes, so cap it rather than hash a truncated form.
+	if n := len(pw); n < 8 || n > 72 {
+		return fmt.Errorf("password must be 8–72 characters (got %d)", n)
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
 	if err != nil {

@@ -93,6 +93,13 @@ type Server struct {
 	// Atomic so login reads it lock-free. The config file may be a read-only
 	// systemd credential, so a UI change lives in the DB, not the file.
 	passwordHash atomic.Pointer[string]
+	// passwordMu serializes change-password so two rotations can't both verify
+	// the old password and clobber each other (leaving DB and runtime hashes
+	// disagreeing). credGen bumps on every rotation; a login rechecks it before
+	// issuing a token so a login that verified the just-superseded password
+	// doesn't slip a session through the rotation's revoke.
+	passwordMu sync.Mutex
+	credGen    atomic.Uint64
 }
 
 func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
@@ -295,12 +302,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
 		return
 	}
+	// Snapshot the credential generation BEFORE the (slow) bcrypt verify; if a
+	// password change lands during it, the verified hash is stale — refuse to
+	// mint a session that would survive the rotation's session revoke.
+	gen := s.credGen.Load()
 	ok, busy := s.authenticate(r.Context(), source, req.Username, req.Password)
 	if busy {
 		http.Error(w, "busy, retry later", http.StatusTooManyRequests)
 		return
 	}
-	if !ok {
+	if !ok || s.credGen.Load() != gen {
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}

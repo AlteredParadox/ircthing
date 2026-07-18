@@ -50,6 +50,11 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
 		return
 	}
+	// Serialize the whole verify→store→revoke: two concurrent rotations must
+	// not both verify the (same) old password and then race their writes.
+	s.passwordMu.Lock()
+	defer s.passwordMu.Unlock()
+
 	if !s.login.acquire(r.Context()) {
 		http.Error(w, "busy, retry later", http.StatusTooManyRequests)
 		return
@@ -78,6 +83,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	nh := string(newHash)
 	s.passwordHash.Store(&nh)
+	s.credGen.Add(1) // invalidate any login that verified the old hash
 
 	// Revoke every OTHER session — a compromised old password must not keep
 	// them alive — while the browser making the change stays signed in.
