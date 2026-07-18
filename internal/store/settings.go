@@ -32,6 +32,28 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 	return err
 }
 
+// SetSettings stores several key/value pairs atomically — all commit or none
+// do — so a caller updating a related group (e.g. the two retention keys)
+// can't leave them half-written on a mid-write error or concurrent request.
+func (s *Store) SetSettings(ctx context.Context, kv map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	for k, v := range kv {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO settings (key, value) VALUES (?, ?)
+			 ON CONFLICT (key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // DeleteSetting removes key; deleting an absent key is not an error.
 func (s *Store) DeleteSetting(ctx context.Context, key string) error {
 	s.mu.Lock()

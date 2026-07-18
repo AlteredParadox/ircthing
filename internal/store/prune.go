@@ -25,10 +25,12 @@ func (s *Store) Retention() (days, maxPerBuffer int) {
 // SetRetention updates the policy, persists it, and prunes once promptly so a
 // tighter policy applies without waiting for the next hourly tick.
 func (s *Store) SetRetention(ctx context.Context, days, maxPerBuffer int) error {
-	if err := s.SetSetting(ctx, retentionDaysKey, strconv.Itoa(days)); err != nil {
-		return err
-	}
-	if err := s.SetSetting(ctx, retentionMaxKey, strconv.Itoa(maxPerBuffer)); err != nil {
+	// Both keys in one transaction: a partial write would leave the two
+	// dimensions inconsistent across a restart.
+	if err := s.SetSettings(ctx, map[string]string{
+		retentionDaysKey: strconv.Itoa(days),
+		retentionMaxKey:  strconv.Itoa(maxPerBuffer),
+	}); err != nil {
 		return err
 	}
 	s.mu.Lock()

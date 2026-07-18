@@ -82,6 +82,31 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "malformed config", http.StatusBadRequest)
 		return
 	}
+
+	// Validate EVERY provided field before applying ANY, so a bad value in one
+	// (e.g. retention_days:-1) can't leave an earlier one (previews) already
+	// changed and then return 400.
+	setRetention := body.RetentionDays != nil || body.RetentionMaxMessages != nil
+	var rDays, rMax int
+	if setRetention {
+		rDays, rMax = s.hub.Store().Retention()
+		if body.RetentionDays != nil {
+			rDays = *body.RetentionDays
+		}
+		if body.RetentionMaxMessages != nil {
+			rMax = *body.RetentionMaxMessages
+		}
+		if rDays < 0 || rDays > maxRetentionDays || rMax < 0 {
+			http.Error(w, "retention out of range", http.StatusBadRequest)
+			return
+		}
+	}
+	if body.SessionTTLDays != nil && (*body.SessionTTLDays < 1 || *body.SessionTTLDays > maxRetentionDays) {
+		http.Error(w, "session_ttl_days out of range", http.StatusBadRequest)
+		return
+	}
+
+	// All validated — apply.
 	if body.Previews != nil {
 		val := "0"
 		if *body.Previews {
@@ -100,34 +125,18 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if body.RetentionDays != nil || body.RetentionMaxMessages != nil {
-		days, maxPer := s.hub.Store().Retention()
-		if body.RetentionDays != nil {
-			days = *body.RetentionDays
-		}
-		if body.RetentionMaxMessages != nil {
-			maxPer = *body.RetentionMaxMessages
-		}
-		if days < 0 || days > maxRetentionDays || maxPer < 0 {
-			http.Error(w, "retention out of range", http.StatusBadRequest)
-			return
-		}
-		if err := s.hub.Store().SetRetention(r.Context(), days, maxPer); err != nil {
+	if setRetention {
+		if err := s.hub.Store().SetRetention(r.Context(), rDays, rMax); err != nil {
 			http.Error(w, "storing config failed", http.StatusInternalServerError)
 			return
 		}
 	}
 	if body.SessionTTLDays != nil {
-		days := *body.SessionTTLDays
-		if days < 1 || days > maxRetentionDays {
-			http.Error(w, "session_ttl_days out of range", http.StatusBadRequest)
-			return
-		}
-		if err := s.hub.Store().SetSetting(r.Context(), sessionTTLKey, strconv.Itoa(days)); err != nil {
+		if err := s.hub.Store().SetSetting(r.Context(), sessionTTLKey, strconv.Itoa(*body.SessionTTLDays)); err != nil {
 			http.Error(w, "storing config failed", http.StatusInternalServerError)
 			return
 		}
-		s.sessionTTL.Store(int64(time.Duration(days) * 24 * time.Hour))
+		s.sessionTTL.Store(int64(time.Duration(*body.SessionTTLDays) * 24 * time.Hour))
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

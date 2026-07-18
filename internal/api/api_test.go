@@ -353,6 +353,18 @@ func TestConfigRetentionAndSessionRuntime(t *testing.T) {
 	} else {
 		resp.Body.Close()
 	}
+
+	// Validate-before-apply: a bad field must NOT let a valid one in the same
+	// PUT take effect. previews starts on; disabling it alongside a bad
+	// retention must 400 and leave previews on.
+	if resp = do("PUT", "/api/config", `{"previews":false,"retention_days":-5}`); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("mixed valid/invalid PUT = %d, want 400", resp.StatusCode)
+	} else {
+		resp.Body.Close()
+	}
+	if !srv.previewsEnabled() {
+		t.Fatal("previews were disabled by a PUT that returned 400 (not atomic)")
+	}
 }
 
 // Change-password verifies the current password, stores a new bcrypt hash as
