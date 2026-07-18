@@ -2,6 +2,8 @@
 // labelled card in the target's query buffer, instead of a scatter of
 // cryptic numeric lines.
 
+import { stripFormatting } from "./irc.js";
+
 // fmtIdle turns seconds of idle time into "3d 4h", "12m 30s", etc.
 function fmtIdle(secs) {
 	if (secs <= 0) return "0s";
@@ -26,13 +28,17 @@ function fmtSignon(unixSecs) {
 }
 
 export function WhoisCard({ whois: w, focused }) {
+	// Strip mIRC formatting: these are plain-text card fields (no styled-run
+	// rendering), and a colored gecos/away string would otherwise leak its
+	// code digits — the same digit-leak fixed for other non-body surfaces.
+	const s = stripFormatting;
 	const fields = [];
-	if (w.realname) fields.push(["Real name", w.realname]);
-	if (w.account) fields.push(["Account", w.account]);
-	if (w.user || w.host) fields.push(["Host", `${w.user || "?"}@${w.host || "?"}`]);
-	if (w.actual) fields.push(["Connecting from", w.actual]);
-	if (w.server) fields.push(["Server", w.server]);
-	if (w.channels) fields.push(["Channels", w.channels]);
+	if (w.realname) fields.push(["Real name", s(w.realname)]);
+	if (w.account) fields.push(["Account", s(w.account)]);
+	if (w.user || w.host) fields.push(["Host", `${s(w.user) || "?"}@${s(w.host) || "?"}`]);
+	if (w.actual) fields.push(["Connecting from", s(w.actual)]);
+	if (w.server) fields.push(["Server", s(w.server)]);
+	if (w.channels) fields.push(["Channels", s(w.channels)]);
 	if (w.idle) fields.push(["Idle", fmtIdle(w.idle)]);
 	if (w.signon) fields.push(["Signed on", fmtSignon(w.signon)]);
 
@@ -46,7 +52,7 @@ export function WhoisCard({ whois: w, focused }) {
 					{w.secure && <span class="whois-badge secure">secure</span>}
 					{w.away && <span class="whois-badge away">away</span>}
 				</div>
-				{w.away && <div class="whois-away">{w.away}</div>}
+				{w.away && <div class="whois-away">{s(w.away)}</div>}
 				<dl class="whois-fields">
 					{fields.map(([k, v]) => (
 						<div class="whois-field" key={k}>

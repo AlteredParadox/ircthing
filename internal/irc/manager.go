@@ -558,6 +558,10 @@ func (m *Manager) applyCapChange(enable bool, list string) {
 		} else {
 			delete(vals, name)
 			delete(caps, name)
+			// Drop any stashed pending value too: otherwise a later CAP NEW for
+			// the same cap WITHOUT a value (e.g. a bouncer restart with changed
+			// config) would publish this stale value on its ACK.
+			delete(m.pendingCapVals, name)
 		}
 	}
 	m.capVals.Store(vals)

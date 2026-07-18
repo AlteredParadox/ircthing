@@ -175,11 +175,17 @@ func (s *Server) loginSourceKey(r *http.Request) string {
 // behind_proxy only with a proxy that appends the client to X-Forwarded-For
 // (Caddy does by default; nginx: proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for).
 func forwardedClientIP(r *http.Request) string {
-	xff := r.Header.Get("X-Forwarded-For")
-	if xff == "" {
+	// Take the last entry of the LAST X-Forwarded-For header line. Get returns
+	// only the first line, so a proxy that appends the client as a SEPARATE
+	// header line (HAProxy's default) would otherwise leave the attacker's
+	// own first line as the key — letting them charge a victim's backoff
+	// bucket. On a single trusted hop the last hop the proxy adds is the real
+	// client, whichever style it uses.
+	vals := r.Header.Values("X-Forwarded-For")
+	if len(vals) == 0 {
 		return ""
 	}
-	parts := strings.Split(xff, ",")
+	parts := strings.Split(vals[len(vals)-1], ",")
 	last := strings.TrimSpace(parts[len(parts)-1])
 	if net.ParseIP(last) == nil {
 		return ""

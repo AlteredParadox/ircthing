@@ -39,6 +39,7 @@ func reopen(t *testing.T, path string, ringSize int) *Store {
 // deterministically via pruneOnce. Idempotent: Close then skips it.
 func haltPruner(s *Store) {
 	if s.stopPruner != nil {
+		s.prunerCancel() // release the pruner context (no leak) and stop it
 		close(s.stopPruner)
 		s.prunerDone.Wait()
 		s.stopPruner = nil

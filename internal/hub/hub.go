@@ -435,16 +435,20 @@ func replayTarget(m *ircv4.Message, batchTarget string, c Conn) (string, bool) {
 	if t == "" {
 		return "", false
 	}
-	// Mirror live NOTICE routing (noticeTarget): an incoming private NOTICE
-	// from the correspondent is filed in the network server buffer, not the
-	// query. Without this a reconnect replay files it in the query buffer
-	// while the live copy went to "*", and per-buffer msgid dedup lets both
-	// persist — a duplicated row and phantom unread after every reconnect.
-	// Channel notices, and our OWN echoed notice (sender is us, not the
-	// correspondent), keep the batch target.
-	if m.Command == "NOTICE" && !c.IsChannel(t) && m.Prefix != nil &&
-		c.Fold(m.Prefix.Name) == c.Fold(t) {
-		return serverBufferTarget, true
+	// Mirror live NOTICE routing (noticeTarget), which classifies by the
+	// message's TARGET, not its sender: an incoming private NOTICE addressed
+	// to us is filed in the network server buffer, not the query. Key on the
+	// replayed line's own target param (chathistory preserves it) so this
+	// stays correct even when the correspondent's send-time nick differs from
+	// the batch/buffer name (a rename between the notice and the replay) —
+	// keying on the sender would refile it into the query and duplicate it
+	// against the live "*" copy. Our own echoed notice has target == the
+	// correspondent (the batch target), so it stays in the query.
+	if m.Command == "NOTICE" && !c.IsChannel(t) {
+		notifTarget := stripStatusPrefix(m.Param(0), c.StatusPrefixes(), c.IsChannel)
+		if c.Fold(notifTarget) != c.Fold(t) {
+			return serverBufferTarget, true
+		}
 	}
 	return t, true
 }
@@ -518,6 +522,11 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	}
 	if !replay {
 		h.broadcast(envelope("event", 0, eventData(stored)))
+	} else if batch != nil && isServerBuffer(target) {
+		// A replayed event rerouted to "*" (a correspondent's private NOTICE):
+		// the batch-close hint names only batch.target, so flag "*" for its own
+		// history_changed or the client's cached "*" list never refreshes.
+		batch.starTouched = true
 	}
 	return nil
 }
@@ -708,6 +717,11 @@ type histBatch struct {
 	count  int
 	lastTS int64  // unix ms of the batch's newest message
 	lastID string // its msgid, "" when it has none
+	// starTouched records that a replayed event in this batch was rerouted to
+	// the server buffer "*" (a correspondent's private NOTICE, or a redaction
+	// of one). The batch-close hint names only `target`, so "*" needs its own
+	// history_changed or the client's cached "*" list is never invalidated.
+	starTouched bool
 }
 
 // maxBackfillPages bounds paginated backfill per target per connection:
@@ -981,6 +995,14 @@ func (h *Hub) trackHistoryBatch(ctx context.Context, ev irc.Event, c Conn, batch
 		h.broadcast(envelope("history_changed", 0, HistoryChangedData{
 			Network: ev.Network, Buffer: h.store.CanonicalBuffer(ctx, ev.Network, b.target, c.Fold),
 		}))
+		// If a replayed event in this batch was rerouted to the server buffer
+		// (a correspondent's private NOTICE or its redaction), "*" changed too
+		// but the hint above named only b.target — invalidate "*" as well.
+		if b.starTouched {
+			h.broadcast(envelope("history_changed", 0, HistoryChangedData{
+				Network: ev.Network, Buffer: serverBufferTarget,
+			}))
+		}
 	}
 }
 
@@ -1146,6 +1168,11 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 		if ok, err = h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason); err != nil {
 			log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)
 			return
+		}
+		// A replayed scrub that landed in "*": flag it so the batch close
+		// invalidates the client's cached "*" list (see histBatch.starTouched).
+		if ok && replay && batch != nil {
+			batch.starTouched = true
 		}
 	}
 	if !ok || replay {

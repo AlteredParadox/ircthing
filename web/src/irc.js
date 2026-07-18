@@ -367,9 +367,13 @@ export function parseFormatting(text) {
 export function stripFormatting(text) {
 	// Two passes (colour codes with their arguments, then the bare attribute
 	// bytes) — the patterns are disjoint by lead byte, so this matches the
-	// single-alternation form exactly while keeping each regex simple.
+	// single-alternation form exactly while keeping each regex simple. The
+	// \x03 form consumes the ",BG" part ONLY when a foreground digit precedes
+	// it, mirroring parseIndexedColor: a bare "\x03,5" is a colour reset plus
+	// the literal ",5", so strip must leave ",5" or mention detection diverges
+	// from what the body renders.
 	return text
-		.replace(/\x03\d{0,2}(?:,\d{1,2})?|\x04(?:[0-9a-fA-F]{6}(?:,[0-9a-fA-F]{6})?)?/g, "")
+		.replace(/\x03(?:\d{1,2}(?:,\d{1,2})?)?|\x04(?:[0-9a-fA-F]{6}(?:,[0-9a-fA-F]{6})?)?/g, "")
 		.replace(/[\x02\x0f\x11\x16\x1d\x1e\x1f]/g, "");
 }
 

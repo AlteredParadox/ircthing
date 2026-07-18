@@ -49,6 +49,23 @@ test("stripFormatting removes codes; mentionsMe sees through them", () => {
 	is(mentionsMe("hey \x0304alice\x03!", "alice"), true); // colour code must not hide it
 });
 
+test("bare \\x03 + comma-digits strips exactly as parseFormatting renders it", () => {
+	// A bare \x03 (no fg digit) is a colour RESET; the following ",5" is literal
+	// text, so strip must keep it — matching what the body shows — or mention
+	// detection diverges from the rendered text.
+	is(stripFormatting("al\x03,1ice"), "al,1ice");
+	is(mentionsMe("al\x03,1ice", "alice"), false); // visibly "al,1ice", not a mention
+	is(stripFormatting("\x03,5 o'clock"), ",5 o'clock");
+	// A real fg (with or without bg) is still fully stripped.
+	is(stripFormatting("\x0304,05red\x03"), "red");
+	is(stripFormatting("\x034warm"), "warm");
+	// Parity with parseFormatting's visible text on the tricky forms.
+	for (const t of ["al\x03,1ice", "\x03,5x", "\x0312,34y", "\x033z", "\x03w"]) {
+		const rendered = parseFormatting(t).map((r) => r.text).join("");
+		is(stripFormatting(t), rendered);
+	}
+});
+
 test("bare \\x04 strips like it renders: no invisible mention-splitting", () => {
 	// parseFormatting consumes a hex-less \x04 (renders "alice"), so strip
 	// must remove it too — or the visible mention never alerts.

@@ -98,6 +98,8 @@ type retentionPolicy struct {
 // wall-clock time, so the goroutine owns the clock (pruneOnce takes now as
 // a parameter to stay testable).
 func (s *Store) startPruner(interval time.Duration) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.prunerCancel = cancel
 	s.stopPruner = make(chan struct{})
 	s.pruneNow = make(chan struct{}, 1)
 	s.prunerDone.Add(1)
@@ -106,7 +108,9 @@ func (s *Store) startPruner(interval time.Duration) {
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
-			if n, err := s.pruneOnce(context.Background(), time.Now()); err != nil {
+			// ctx is canceled by Close, so the chunk loops stop promptly and
+			// shutdown doesn't block on a long in-flight prune.
+			if n, err := s.pruneOnce(ctx, time.Now()); err != nil && !errors.Is(err, context.Canceled) {
 				log.Printf("store: prune: %v", err)
 			} else if n > 0 {
 				log.Printf("store: pruned %d message(s) past retention", n)

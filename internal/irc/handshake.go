@@ -256,9 +256,10 @@ func (h *handshake) handleWelcome(m *ircv4.Message) (out []*ircv4.Message, done 
 	}
 	h.phase = hsDone
 	// 001's first param is the nick the server knows us by — authoritative if
-	// it truncated or otherwise changed ours.
+	// it truncated or otherwise changed ours. Clone: it aliases the parsed
+	// welcome line and is retained in m.nick for the connection's life.
 	if p := m.Param(0); p != "" && p != "*" {
-		h.nick = p
+		h.nick = strings.Clone(p)
 	}
 	return nil, true, nil
 }
@@ -395,8 +396,12 @@ func (h *handshake) handleCapACK(m *ircv4.Message) ([]*ircv4.Message, bool, erro
 	for _, tok := range strings.Fields(m.Params[len(m.Params)-1]) {
 		if name, ok := strings.CutPrefix(tok, "-"); ok {
 			delete(h.enabled, name)
-		} else {
-			h.enabled[tok] = true
+		} else if wantedCapSet[tok] || tok == "sasl" {
+			// Accept only a cap we actually requested (wanted set, plus sasl
+			// which is negotiated separately), and clone it off the parsed ACK
+			// line: a hostile server could otherwise ACK an unbounded stream of
+			// junk names, each pinning its ~16 KiB line and seeding m.caps.
+			h.enabled[strings.Clone(tok)] = true
 		}
 	}
 	if h.cfg.SASL != nil && h.enabled["sasl"] && h.mechErr != nil {

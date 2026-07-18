@@ -474,12 +474,23 @@ func (r *roster) rename(from, to string) {
 	fromKey := fold(clampRoster(from))
 	ct := clampRoster(to)
 	toKey := fold(ct)
+	// Over the byte budget, accept a rename only when it does not grow the
+	// entry: NICK bypasses the admission guards, so a hostile server could
+	// otherwise admit minimal members and then inflate each to a max-clamp
+	// key+Nick via rename (same class updateEverywhere already guards).
+	over := r.totalBytes() >= maxRosterBytes
 	rekey := func(st *channelState, mp map[string]Member) {
-		if mem, ok := mp[fromKey]; ok {
-			st.del(mp, fromKey)
-			mem.Nick = ct
-			st.put(mp, toKey, mem)
+		mem, ok := mp[fromKey]
+		if !ok {
+			return
 		}
+		renamed := mem
+		renamed.Nick = ct
+		if over && memberBytes(toKey, renamed) > memberBytes(fromKey, mem) {
+			return // keep the old entry rather than inflate past the ceiling
+		}
+		st.del(mp, fromKey)
+		st.put(mp, toKey, renamed)
 	}
 	for _, st := range r.chans {
 		rekey(st, st.members)

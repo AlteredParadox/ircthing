@@ -226,6 +226,18 @@ export function VirtualList({
 			if (pinned.current) sc.scrollTop = sc.scrollHeight;
 			bump();
 		}
+		// A list whose content is shorter than the viewport never fires a scroll
+		// event, so handleScroll can't flip `pinned` true. Signal it here so a
+		// search-jump into a buffer whose whole window fits on screen still
+		// reports pinned — otherwise the parent never reloads the live tail and
+		// incoming messages are silently blocked (atTail stays false) until the
+		// buffer is manually re-selected. Harmless when already at the tail
+		// (the parent's reloadTail no-ops on an atTail buffer).
+		if (!pendingFocus.current && !pinned.current &&
+			sc.scrollHeight - sc.clientHeight < 40) {
+			pinned.current = true;
+			onPinned?.(true);
+		}
 	});
 
 	return (

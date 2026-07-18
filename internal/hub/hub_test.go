@@ -181,6 +181,10 @@ func TestReplayTargetNoticeRouting(t *testing.T) {
 	}{
 		{"incoming private notice -> server buffer", ":alice!u@h NOTICE AlteredParadox :ping", "alice", "*", true},
 		{"incoming private notice, case-variant batch", ":Alice!u@h NOTICE AlteredParadox :ping", "alice", "*", true},
+		// The correspondent renamed between the notice and the replay: routing
+		// keys on the message's target (our nick), not the sender, so it still
+		// lands in "*" instead of duplicating into the query buffer.
+		{"incoming notice, sender renamed since -> server buffer", ":alice2!u@h NOTICE AlteredParadox :ping", "alice", "*", true},
 		{"our own echoed notice -> recipient query", ":AlteredParadox!u@h NOTICE alice :psst", "alice", "alice", true},
 		{"channel notice -> the channel", ":alice!u@h NOTICE #go :psst", "#go", "#go", true},
 		{"private message -> the query", ":alice!u@h PRIVMSG AlteredParadox :hi", "alice", "alice", true},

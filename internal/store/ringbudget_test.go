@@ -60,6 +60,42 @@ func TestTrimmedRingNoHoleOnBackwardInsert(t *testing.T) {
 	}
 }
 
+// applyRetention must clear `complete` whenever it drops entries: pruning is
+// no longer atomic with the disk delete (pruneOnce releases s.mu between
+// chunks), so a mid-prune append could make the in-memory filter drop a row
+// the disk kept — and a still-`complete` ring would serve that hole
+// authoritatively. Clearing forces a disk fallback.
+func TestApplyRetentionClearsComplete(t *testing.T) {
+	mk := func(i int) Message {
+		return Message{ID: int64(i), Time: time.UnixMilli(int64(i) * 1000), Raw: "x"}
+	}
+	// Age drop clears complete.
+	r := newRing(20)
+	for i := 1; i <= 10; i++ {
+		r.insert(mk(i))
+	}
+	r.complete = true
+	r.applyRetention(5_000, 0) // drops ts < 5s
+	if r.complete {
+		t.Fatal("complete not cleared after age drop")
+	}
+	// A no-op retention (nothing matches) leaves complete untouched.
+	r2 := newRing(20)
+	for i := 1; i <= 5; i++ {
+		r2.insert(mk(i))
+	}
+	r2.complete = true
+	r2.applyRetention(0, 100) // maxPerBuffer > len: no drop
+	if !r2.complete {
+		t.Fatal("complete wrongly cleared when nothing was dropped")
+	}
+	// Count drop clears complete.
+	r2.applyRetention(0, 3)
+	if r2.complete {
+		t.Fatal("complete not cleared after count drop")
+	}
+}
+
 // The global hot-ring byte budget must bound total resident ring bytes by
 // evicting least-recently-used rings, keep its running total exactly in step
 // with the rings, and re-warm an evicted buffer from disk on next access.

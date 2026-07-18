@@ -157,9 +157,10 @@ type Store struct {
 		ringPages, dbPages, ringEvictions int // observability for tests
 	}
 
-	stopPruner chan struct{}  // closed by Close to end the pruner
-	pruneNow   chan struct{}  // buffered(1) nudge: prune promptly after a policy change
-	prunerDone sync.WaitGroup // waits for the pruner goroutine to exit
+	stopPruner   chan struct{}      // closed by Close to end the pruner
+	pruneNow     chan struct{}      // buffered(1) nudge: prune promptly after a policy change
+	prunerCancel context.CancelFunc // cancels an in-flight chunked prune on Close
+	prunerDone   sync.WaitGroup     // waits for the pruner goroutine to exit
 }
 
 // secureDBFile ensures the database file (and any pre-existing WAL/SHM
@@ -339,6 +340,7 @@ func ensureIncrementalVacuum(db *sql.DB) error {
 
 func (s *Store) Close() error {
 	if s.stopPruner != nil {
+		s.prunerCancel() // interrupt an in-flight chunked prune so Close doesn't block on it
 		close(s.stopPruner)
 		s.prunerDone.Wait()
 		s.stopPruner = nil

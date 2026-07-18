@@ -121,6 +121,15 @@ func TestRosterByteBudget(t *testing.T) {
 			t.Fatalf("growing ACCOUNT applied over budget: %+v", m)
 		}
 	}
+	// Over budget, a NICK to a much longer name must NOT inflate the entry
+	// (same guard as field updates) — else NICK is an unbounded growth path.
+	longNick := strings.Repeat("z", 300)
+	feed(t, r, ":u1!u@h NICK "+longNick)
+	for _, m := range members(t, r, "#a") {
+		if len(m.Nick) > 50 {
+			t.Fatalf("growing NICK applied over budget: nick len %d", len(m.Nick))
+		}
+	}
 
 	// Accounting stays exact through the mutation paths.
 	checkExact := func(step string) {

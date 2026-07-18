@@ -168,12 +168,16 @@ func (r *ring) adoptMsgID(id int64, msgid string) int {
 // (ts < cutoffMs, matching the DELETE); maxPerBuffer > 0 keeps only the
 // newest N.
 //
-// complete is left unchanged, which is always safe: filtering a complete
-// ring in step with the identical disk delete keeps it a faithful complete
-// view, and leaving a non-complete ring non-complete only means reads may
-// still fall back to disk (which now returns the same rows).
+// Any drop clears `complete`: pruning is no longer atomic with the disk
+// delete (pruneOnce releases s.mu between chunks), so a message appended
+// mid-prune can shift what "newest maxPerBuffer" means and make this
+// in-memory filter drop an entry the disk delete kept. A `complete` ring is
+// served authoritatively, so leaving it complete after a possibly-divergent
+// drop would hide persisted rows; clearing it forces a disk fallback (the
+// source of truth). The lost `complete` optimization re-warms on next read.
 func (r *ring) applyRetention(cutoffMs int64, maxPerBuffer int) int {
 	before := r.bytes
+	dropped := false
 	if cutoffMs > 0 {
 		// msgs are ascending by (ts, id): find the first kept entry.
 		i := sort.Search(len(r.msgs), func(i int) bool {
@@ -184,6 +188,7 @@ func (r *ring) applyRetention(cutoffMs int64, maxPerBuffer int) int {
 				r.bytes -= msgBytes(r.msgs[j])
 			}
 			r.dropFirst(i)
+			dropped = true
 		}
 	}
 	if maxPerBuffer > 0 && len(r.msgs) > maxPerBuffer {
@@ -192,6 +197,10 @@ func (r *ring) applyRetention(cutoffMs int64, maxPerBuffer int) int {
 			r.bytes -= msgBytes(r.msgs[j])
 		}
 		r.dropFirst(drop)
+		dropped = true
+	}
+	if dropped {
+		r.complete = false
 	}
 	return r.bytes - before
 }
