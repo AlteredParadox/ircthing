@@ -70,6 +70,36 @@ func TestPreviewEndpoint(t *testing.T) {
 	}
 }
 
+// An image served with a generic content type (application/octet-stream, an
+// extensionless CDN URL) must classify as an image by sniffing the body, not
+// cache an empty link card for 30 minutes.
+func TestPreviewSniffsGenericContentType(t *testing.T) {
+	var raw bytes.Buffer
+	if err := png.Encode(&raw, image.NewRGBA(image.Rect(0, 0, 4, 4))); err != nil {
+		t.Fatal(err)
+	}
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(raw.Bytes())
+	}))
+	defer origin.Close()
+
+	ts, srvObj := newTestServerWithRef(t)
+	permit(srvObj)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	resp := mediaPost(t, ts, cookie, "/api/preview", origin.URL, testNet)
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var pv PreviewData
+	decodeJSON(t, resp, &pv)
+	if pv.Kind != "image" || pv.Image != origin.URL {
+		t.Fatalf("preview = %+v, want image kind pointing at the origin", pv)
+	}
+}
+
 func TestThumbEndpoint(t *testing.T) {
 	img := image.NewRGBA(image.Rect(0, 0, 800, 800))
 	for y := 0; y < 800; y++ {

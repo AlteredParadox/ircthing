@@ -148,6 +148,21 @@ func TestExtractMeta(t *testing.T) {
 	}
 }
 
+// titleElement must cap the raw <title> text before unescaping: a hostile
+// ~1 MiB title of tiny whitespace-separated fields used to cost ~16 MiB of
+// transient allocations in UnescapeString + clip's strings.Fields.
+func TestTitleElementCapped(t *testing.T) {
+	huge := strings.Repeat("a ", 500_000) // ~1 MiB of half-space fields
+	got := titleElement("<title>" + huge + "</title>")
+	if len(got) > maxTitleElBytes {
+		t.Fatalf("title not capped: %d bytes", len(got))
+	}
+	// The normal path is unaffected: entities still unescape.
+	if got := titleElement("<title>Tom &amp; Jerry</title>"); got != "Tom & Jerry" {
+		t.Fatalf("normal title broken by the cap: %q", got)
+	}
+}
+
 func TestClip(t *testing.T) {
 	if got := clip("short", 100); got != "short" {
 		t.Errorf("got %q", got)

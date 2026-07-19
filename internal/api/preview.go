@@ -57,6 +57,15 @@ const (
 	// carries 2–4 (property/name, content, maybe charset); this cap only
 	// bites hostile attribute stuffing.
 	maxMetaAttrs = 32
+	// maxTitleElBytes bounds the raw <title> text BEFORE unescaping and
+	// whitespace normalization. The regex submatch itself is a no-copy slice
+	// of the document, but html.UnescapeString materializes it and clip's
+	// strings.Fields then allocates a slice entry per whitespace-separated
+	// field — a hostile ~1 MiB title of tiny fields cost ~16 MiB transient
+	// per request, ×previewSlots against MemoryMax. The visible result is
+	// clipped to previewMaxTitle anyway; 8 KiB leaves generous room for
+	// entity expansion shrinkage.
+	maxTitleElBytes = 8 * 1024
 )
 
 // wantedMeta is the exact set of head-metadata keys extractMeta consumes;
@@ -167,7 +176,12 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pv := PreviewData{URL: target, Kind: "link"}
-	if isImageType(ct) {
+	// Classify by the declared Content-Type, then by sniffing the body: an
+	// image served as application/octet-stream (or no type at all) would
+	// otherwise fall through to meta extraction, find nothing, and cache an
+	// empty link card for 30 minutes. The thumbnail endpoint sniffs the same
+	// way, so a sniffed image here always routes to a decodable path.
+	if isImageType(ct) || isImageType(http.DetectContentType(body)) {
 		pv.Kind = "image"
 		pv.Image = target
 	} else {
@@ -249,9 +263,15 @@ func parseHeadMeta(doc string) map[string]string {
 	return meta
 }
 
+// titleElement extracts the <title> text, capped to maxTitleElBytes before
+// any allocation-heavy processing (see the constant).
 func titleElement(doc string) string {
 	if m := reTitleEl.FindStringSubmatch(doc); m != nil {
-		return html.UnescapeString(m[1])
+		t := m[1]
+		if len(t) > maxTitleElBytes {
+			t = t[:maxTitleElBytes] // may cut mid-entity/rune; clip re-trims
+		}
+		return html.UnescapeString(t)
 	}
 	return ""
 }
