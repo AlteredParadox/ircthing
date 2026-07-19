@@ -1352,9 +1352,12 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 // landed in; when starBatch is non-nil (a replay), flags its starTouched if
 // the scrub landed in "*".
 func (h *Hub) scrubRedaction(ctx context.Context, ev irc.Event, buffer, msgid, reason string, retryStar bool, starBatch *histBatch) (bool, string) {
+	// %.100q, not %s: msgid is server-controlled and IRC tag escapes can
+	// smuggle control characters into it — clamp and quote it like every
+	// other server-derived log field.
 	ok, err := h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason)
 	if err != nil {
-		log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)
+		log.Printf("irc[%s]: redact %.100q in %q: %v", ev.Network, msgid, buffer, err)
 		return false, buffer
 	}
 	if ok || !retryStar {
@@ -1363,7 +1366,7 @@ func (h *Hub) scrubRedaction(ctx context.Context, ev irc.Event, buffer, msgid, r
 	buffer = serverBufferTarget
 	ok, err = h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason)
 	if err != nil {
-		log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)
+		log.Printf("irc[%s]: redact %.100q in %q: %v", ev.Network, msgid, buffer, err)
 		return false, buffer
 	}
 	// A replayed scrub that landed in "*": flag it so the batch close
