@@ -72,11 +72,14 @@ $EDITOR config.json                 # set user, networks
 The config file holds credentials, so keep it `0600` (the systemd unit below
 uses a root-owned credential instead).
 
-The example config ships `"secure_cookies": true` — right for the TLS
-deployments below, but for this plain-HTTP local test set it to `false`
-first: a Secure session cookie is never sent over `http://`, so login
-appears to succeed and immediately bounces back (some browsers carve out
-`127.0.0.1`, Safari does not — don't rely on it).
+The example config is written for a **proxy-fronted** deployment (loopback
+listen, `"secure_cookies": true`, `"behind_proxy": true`). For this plain-HTTP
+local test with **no** reverse proxy, flip both: set `"secure_cookies": false`
+(a Secure cookie is never sent over `http://`, so login appears to succeed then
+immediately bounces back — some browsers carve out `127.0.0.1`, Safari does
+not) and `"behind_proxy": false` (with no proxy appending `X-Forwarded-For`,
+trusting it would let anyone spoof the login rate-limit key). The binary warns
+at startup if these disagree with the listen address.
 
 Open http://127.0.0.1:8067 and log in with the user from the config.
 
@@ -255,10 +258,15 @@ WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero
 General Public License for more details.
 
-Because this is an AGPL network service, the running binary serves its own
-license at `/license` and the notices for every bundled dependency (Go modules
-linked into the binary plus the embedded Preact frontend) at
-`/third-party-licenses` — both unauthenticated, so anyone using a deployment
-can reach them (AGPL §13). Regenerate the notices after any dependency change
-with `scripts/gen-third-party-licenses.sh`; the Settings → About panel links
-both.
+Because this is an AGPL network service, the running binary offers its
+Corresponding Source to every user (AGPL §13): `/source` redirects to the
+repository **pinned to the exact built commit** (from the `vcs.revision` the
+Go toolchain stamps in), so a downstream fork that rebuilds points its users at
+*its* source, not this one. The binary also serves its own license at
+`/license` and the notices for every bundled dependency (Go modules linked into
+the binary plus the embedded Preact frontend) at `/third-party-licenses`. All
+three are unauthenticated so anyone using a deployment can reach them; the
+Settings → About panel links them. **Downstream:** change `sourceBaseURL` in
+`internal/api/api.go` to your fork before distributing binaries, and regenerate
+the notices after any dependency change with
+`scripts/gen-third-party-licenses.sh` (`make check` fails if they drift).

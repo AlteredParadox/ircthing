@@ -21,7 +21,7 @@ ESBUILD_FLAGS := --bundle --minify --format=esm \
 	--jsx=automatic --jsx-import-source=preact \
 	--target=es2020
 
-.PHONY: build build-debug frontend check vet staticcheck test binary-size-gate bundle-size-gate go-version-gate integration irctest memcheck clean
+.PHONY: build build-debug frontend check vet staticcheck test binary-size-gate bundle-size-gate go-version-gate notices-check integration irctest memcheck clean
 
 # The go.mod toolchain directive is the minimum Go patch level a release may
 # be built with (stdlib CVE fixes ship in patch releases; an older toolchain
@@ -52,8 +52,20 @@ web/node_modules: web/package.json web/package-lock.json
 	cd web && npm ci --no-fund --no-audit
 	touch web/node_modules
 
-check: vet staticcheck test frontend-test build binary-size-gate bundle-size-gate
+check: vet staticcheck test frontend-test build binary-size-gate bundle-size-gate notices-check
 	@echo "check: OK"
+
+# THIRD_PARTY_LICENSES.md is embedded in the binary and must stay in step with
+# the dependency graph. Regenerate to a temp file and diff, so a stale committed
+# copy (a dep add/bump without re-running the generator) fails the build.
+notices-check:
+	@tmp=$$(mktemp); \
+	./scripts/gen-third-party-licenses.sh "$$tmp" >/dev/null; \
+	if ! diff -q THIRD_PARTY_LICENSES.md "$$tmp" >/dev/null; then \
+		echo "FAIL: THIRD_PARTY_LICENSES.md is stale — run scripts/gen-third-party-licenses.sh"; \
+		rm -f "$$tmp"; exit 1; \
+	fi; \
+	rm -f "$$tmp"
 
 # Pure frontend logic (parsers, formatting) tested with node's built-in
 # runner — no extra test dependencies.

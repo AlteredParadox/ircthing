@@ -32,6 +32,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -229,15 +230,40 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 	// signed params). sameSiteOnly still guards them.
 	s.mux.HandleFunc("POST /api/preview", s.sameSiteOnly(s.requireAuth(s.handlePreview)))
 	s.mux.HandleFunc("POST /api/thumb", s.sameSiteOnly(s.requireAuth(s.handleThumb)))
-	// Legal texts are deliberately UNauthenticated: the AGPL §13 source offer
-	// and the bundled third-party notices must reach every network user, not
-	// just logged-in ones. Read-only, embedded at build time.
+	// AGPL §13 requires OFFERING THE SOURCE to every network user. These three
+	// are deliberately UNauthenticated so anyone using a deployment can reach
+	// them: /license and /third-party-licenses serve the embedded license TEXTS;
+	// /source is the actual source offer — it redirects to the Corresponding
+	// Source, pinned to the exact built commit when the build stamped one.
 	s.mux.HandleFunc("GET /license", serveText(ircthing.License))
 	s.mux.HandleFunc("GET /third-party-licenses", serveText(ircthing.ThirdPartyLicenses))
+	s.mux.HandleFunc("GET /source", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, sourceURL(), http.StatusFound)
+	})
 	if assets != nil {
 		s.mux.Handle("/", http.FileServerFS(assets))
 	}
 	return s, nil
+}
+
+// sourceBaseURL is where the Corresponding Source is published. A downstream
+// fork that changes this (and rebuilds) makes /source point at ITS source, as
+// AGPL §13 requires; the vcs.revision pin means users get the exact revision
+// running, not a moving branch tip.
+const sourceBaseURL = "https://github.com/AlteredParadox/ircthing"
+
+// sourceURL returns the Corresponding Source location, pinned to the built
+// commit when the build embedded one (go build stamps vcs.revision unless
+// -buildvcs=false), else the repository root.
+func sourceURL() string {
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range bi.Settings {
+			if s.Key == "vcs.revision" && s.Value != "" {
+				return sourceBaseURL + "/tree/" + s.Value
+			}
+		}
+	}
+	return sourceBaseURL
 }
 
 // serveText serves a static embedded text (license notices) as plain UTF-8.
