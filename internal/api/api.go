@@ -304,11 +304,11 @@ func (s *Server) previewsEnabled() bool {
 // direct), building and caching one per distinct proxy. The pool is small
 // (one entry per network proxy plus direct).
 func (s *Server) htmlFetcherFor(proxy *url.URL) *fetcher {
-	return s.cachedFetcher(s.htmlByProxy, maxHTMLBytes, proxy)
+	return s.cachedFetcher(s.htmlByProxy, maxHTMLBytes, proxy, true)
 }
 
 func (s *Server) imageFetcherFor(proxy *url.URL) *fetcher {
-	return s.cachedFetcher(s.imageByProxy, maxImageBytes, proxy)
+	return s.cachedFetcher(s.imageByProxy, maxImageBytes, proxy, false)
 }
 
 // htmlFetcherForNetwork / imageFetcherForNetwork resolve how a media fetch for
@@ -323,7 +323,7 @@ func (s *Server) htmlFetcherForNetwork(ctx context.Context, network string) *fet
 		return nil
 	}
 	if e.tunnel {
-		return s.cachedTunnelFetcher(s.tunnelHTMLByNet, maxHTMLBytes, e.network)
+		return s.cachedTunnelFetcher(s.tunnelHTMLByNet, maxHTMLBytes, e.network, true)
 	}
 	return s.htmlFetcherFor(e.proxy) // nil proxy => direct
 }
@@ -334,7 +334,7 @@ func (s *Server) imageFetcherForNetwork(ctx context.Context, network string) *fe
 		return nil
 	}
 	if e.tunnel {
-		return s.cachedTunnelFetcher(s.tunnelImageByNet, maxImageBytes, e.network)
+		return s.cachedTunnelFetcher(s.tunnelImageByNet, maxImageBytes, e.network, false)
 	}
 	return s.imageFetcherFor(e.proxy)
 }
@@ -343,7 +343,7 @@ func (s *Server) imageFetcherForNetwork(ctx context.Context, network string) *fe
 // through the network's live WireGuard tunnel. The dial func resolves the
 // tunnel fresh on every dial via the hub, so the cached fetcher transparently
 // follows the network across reconnects and fails closed when it is down.
-func (s *Server) cachedTunnelFetcher(pool map[string]*fetcher, maxBytes int64, network string) *fetcher {
+func (s *Server) cachedTunnelFetcher(pool map[string]*fetcher, maxBytes int64, network string, truncate bool) *fetcher {
 	s.mediaMu.RLock()
 	f := pool[network]
 	s.mediaMu.RUnlock()
@@ -359,6 +359,7 @@ func (s *Server) cachedTunnelFetcher(pool map[string]*fetcher, maxBytes int64, n
 		f = newTunnelFetcher(maxBytes, func(ctx context.Context, addr string) (net.Conn, error) {
 			return s.hub.NetworkTunnelDial(ctx, network, addr)
 		})
+		f.truncate = truncate // set before publish (under lock) — race-free
 		pool[network] = f
 	}
 	return f
@@ -373,7 +374,7 @@ func (s *Server) cachedTunnelFetcher(pool map[string]*fetcher, maxBytes int64, n
 // fetcher pointer and are unaffected).
 const maxProxyFetchers = 32
 
-func (s *Server) cachedFetcher(pool map[string]*fetcher, maxBytes int64, proxy *url.URL) *fetcher {
+func (s *Server) cachedFetcher(pool map[string]*fetcher, maxBytes int64, proxy *url.URL, truncate bool) *fetcher {
 	key := proxyString(proxy)
 	s.mediaMu.RLock()
 	f := pool[key]
@@ -388,6 +389,7 @@ func (s *Server) cachedFetcher(pool map[string]*fetcher, maxBytes int64, proxy *
 			clear(pool)
 		}
 		f = newFetcher(maxBytes, proxy)
+		f.truncate = truncate // set before publish (under lock) — race-free
 		pool[key] = f
 	}
 	return f

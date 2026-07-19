@@ -253,6 +253,44 @@ func TestFetcherRejects(t *testing.T) {
 	})
 }
 
+// TestFetcherTruncatesHTML: an HTML fetcher (truncate=true) must keep the
+// head-bearing prefix of an over-cap page rather than fail closed — real
+// preview pages (Next.js/GitBook) routinely exceed the 512 KiB HTML cap while
+// the og/title tags sit in the first tens of KiB. An image fetcher (default)
+// still rejects an over-cap body as a corrupt image.
+func TestFetcherTruncatesHTML(t *testing.T) {
+	// Body: og:title in the head, then padding well past the cap.
+	head := `<html><head><meta property="og:title" content="Kept"></head><body>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(head))
+		w.Write(make([]byte, 4096))
+	}))
+	defer srv.Close()
+
+	t.Run("html truncates", func(t *testing.T) {
+		f := permissiveFetcher(t, 1024)
+		f.truncate = true
+		_, _, body, err := f.get(context.Background(), srv.URL)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if int64(len(body)) != f.maxBytes {
+			t.Fatalf("body len = %d, want cap %d", len(body), f.maxBytes)
+		}
+		var pv PreviewData
+		extractMeta(string(body), srv.URL, &pv)
+		if pv.Title != "Kept" {
+			t.Fatalf("title = %q, want Kept", pv.Title)
+		}
+	})
+	t.Run("image still rejects", func(t *testing.T) {
+		f := permissiveFetcher(t, 1024) // truncate defaults false
+		if _, _, _, err := f.get(context.Background(), srv.URL); !errors.Is(err, errTooLarge) {
+			t.Fatalf("err = %v, want too large", err)
+		}
+	})
+}
+
 func TestFetcherRevalidatesEveryHop(t *testing.T) {
 	// A public host redirecting to an internal one is the classic SSRF
 	// bypass. The dialer's Control hook must run per hop, so the target

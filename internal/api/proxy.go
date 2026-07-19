@@ -104,6 +104,13 @@ type fetcher struct {
 	// IP, so hostAllowed is applied to literal-IP targets in get and on
 	// redirects instead. Direct fetches rely solely on the Control hook.
 	proxied bool
+	// truncate reads at most maxBytes and USES that prefix instead of failing
+	// when the body is larger. Set for HTML link-preview fetches: the og/title
+	// metadata lives in <head> at the top of the document, so a large page
+	// (Next.js/GitBook sites routinely exceed 512 KiB) yields a good preview
+	// from its head. Left false for image fetches, where a truncated body is a
+	// corrupt image and must be rejected (errTooLarge).
+	truncate bool
 	// allowIP decides whether a resolved address may be dialed. Field so
 	// tests can permit loopback (httptest listens on 127.0.0.1, which the
 	// real policy blocks).
@@ -249,7 +256,12 @@ func (f *fetcher) get(ctx context.Context, rawURL string) (contentType, finalURL
 		return "", "", nil, err
 	}
 	if int64(len(body)) > f.maxBytes {
-		return "", "", nil, errTooLarge
+		if !f.truncate {
+			return "", "", nil, errTooLarge
+		}
+		// HTML preview: keep the head-bearing prefix rather than dropping the
+		// whole page. extractMeta only scans up to </head> anyway.
+		body = body[:f.maxBytes]
 	}
 	finalURL = rawURL
 	if resp.Request != nil && resp.Request.URL != nil {
