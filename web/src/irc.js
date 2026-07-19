@@ -211,8 +211,14 @@ export function mentionsMe(text, nick) {
 	return new RegExp(`(^|[^${NICK_CHARS}])${esc}($|[^${NICK_CHARS}])`, "i").test(text);
 }
 
-// linkify splits text into { link: bool, text } segments.
-const URL_RE = /https?:\/\/[^\s<>"'`]+/g;
+// linkify splits text into { link: bool, text } segments. The character class
+// also excludes C0 control bytes (\x00-\x1f) so a mIRC formatting code adjacent
+// to a URL — e.g. a colour reset in "\x0312http://x/path\x0f" — is not captured
+// into the match. firstURL runs on the raw (still-formatted) body, and a URL
+// carrying a control byte fails the preview endpoint's url.Parse (silently no
+// preview) and the image fast-path; inside Body, linkify sees per-run text that
+// parseFormatting already stripped, so it is unaffected either way.
+const URL_RE = /https?:\/\/[^\s<>"'`\x00-\x1f]+/g;
 export function linkify(text) {
 	const out = [];
 	let last = 0;

@@ -375,6 +375,11 @@ test("firstURL", () => {
 	is(firstURL("see https://example.com/x thanks"), "https://example.com/x");
 	is(firstURL("two https://a.com and https://b.com"), "https://a.com");
 	is(firstURL("http://plain.example works"), "http://plain.example");
+	// A mIRC formatting code adjacent to the URL must NOT be captured — else the
+	// preview endpoint's url.Parse rejects it and the colored link never previews.
+	is(firstURL("\x0312http://example.com/path\x0f"), "http://example.com/path");
+	is(firstURL("\x02\x0304https://a.com/x\x0f rest"), "https://a.com/x");
+	is(looksLikeImageURL(firstURL("\x0312https://x.com/cat.png\x0f")), true);
 });
 
 test("looksLikeImageURL", () => {
