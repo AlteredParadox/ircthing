@@ -1605,11 +1605,14 @@ func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn,
 // rather than caching the error forever. Target DNS resolves through the
 // tunnel's in-band resolver — no local-resolver leak.
 func (m *Manager) dialWireGuard(ctx context.Context, addr string) (net.Conn, error) {
-	// Invariant: dialWireGuard and wgClose both run ONLY on the single Run
-	// goroutine (dial <- runOnce <- Run; wgClose is Run's defer), so wgMu is
-	// uncontended and a dial can never race the teardown or double-build. Keep it
-	// that way — an off-Run-goroutine dial would need a guard against rebuilding a
-	// tunnel after wgClose (which nothing would ever Close).
+	// Invariant: the tunnel is BUILT and TORN DOWN only on the single Run
+	// goroutine — dialWireGuard (dial <- runOnce <- Run) builds; wgClose (Run's
+	// defer) closes. So wgTun is written only here and in wgClose, both under
+	// wgMu. wgMu IS contended: MediaDialContext reads wgTun from the media
+	// (HTTP) goroutine — but READ-ONLY, so it can't double-build or leak a
+	// tunnel past wgClose. Keep the build/teardown Run-goroutine-only: an
+	// off-Run path that BUILT a tunnel could do so after wgClose, leaking a
+	// device nothing would ever Close. wgMu therefore guards every wgTun access.
 	m.wgMu.Lock()
 	if m.wgTun == nil {
 		// Build (incl. endpoint resolution) gets its OWN DialTimeout budget.

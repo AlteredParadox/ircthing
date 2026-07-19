@@ -433,10 +433,11 @@ func TestChangePasswordWrongCurrent(t *testing.T) {
 	}
 }
 
-// Previews use the source network's proxy: proxyForNetwork resolves it from
-// the stored config, and the per-proxy fetcher pool builds + reuses one
-// fetcher per distinct proxy.
-func TestProxyForNetwork(t *testing.T) {
+// Previews use the source network's egress: egressForNetwork resolves
+// direct/proxy/tunnel from the stored config, the per-proxy and per-network
+// fetcher pools build + reuse one fetcher each, and a WireGuard network's
+// fetch fails closed (never falls back to direct) when its tunnel is down.
+func TestEgressForNetwork(t *testing.T) {
 	_, srv := newTestServerWithRef(t)
 	ctx := context.Background()
 	st := srv.hub.Store()

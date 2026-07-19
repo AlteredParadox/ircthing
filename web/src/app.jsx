@@ -637,15 +637,21 @@ export function App() {
 			const highlight = isMsg && !mine &&
 				(chanLike ? highlightText(r.text, nick, rulesRef.current, ev.network) : true);
 			// Ignored senders never alert (and are hidden at render); muted
-			// buffers never alert either. Both still COUNT toward unread, so the
-			// badge matches the server's authoritative count (which can't know
-			// client-local ignores) — otherwise a reconnect's get_buffers would
-			// overwrite the badge with a higher number that never clears.
+			// buffers never alert either.
 			const ignored = isIgnored(ignoresRef.current, ev.network, ev.sender);
 			const muted = isMuted(mutesRef.current, key);
 			const alert = highlight && !ignored && !muted;
 
-			setBuffers((b) => bumpBufferActivity(b, key, ev, isMsg && !mine, alert));
+			// Count EVERY message (incl. own and ignored) toward unread so the
+			// badge matches the server's authoritative, nick-agnostic count
+			// (command IN PRIVMSG/NOTICE > marker) — otherwise a get_buffers on
+			// reconnect overwrites the badge with a higher number that "jumps".
+			// In the normal case markRead advances the marker past your own send
+			// (you're pinned+focused), so this shows no badge; it only shows one
+			// for a send made while scrolled up, which then clears on read —
+			// consistent, not a surprise jump. `alert` still excludes own so you
+			// never notify yourself.
+			setBuffers((b) => bumpBufferActivity(b, key, ev, isMsg, alert));
 
 			// Desktop notification when an alert lands somewhere the user
 			// isn't looking (tab hidden, or a different buffer active).
