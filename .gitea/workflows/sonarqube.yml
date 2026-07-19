@@ -18,19 +18,22 @@ jobs:
     steps:
       # NOTE: pin these to full commit SHAs (esp. sonarqube-scan-action, which
       # receives SONAR_TOKEN) so a retagged action can't exfiltrate the secret.
-      - uses: actions/checkout@v4
+      #- uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           # Full history: SonarQube needs blame data for new-code periods.
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      #- uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
 
       - name: Go tests with coverage
         run: go test -covermode=atomic -coverprofile=coverage.out ./...
 
-      - uses: actions/setup-node@v4
+      #- uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
 
@@ -38,7 +41,8 @@ jobs:
         run: cd web && node --test
 
       - name: SonarQube scan
-        uses: sonarsource/sonarqube-scan-action@v6
+        #uses: sonarsource/sonarqube-scan-action@v6
+        uses: sonarsource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
