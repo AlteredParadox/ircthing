@@ -483,14 +483,21 @@ func (s *Session) handleCommand(ctx context.Context, env Envelope) {
 	if !ok {
 		return
 	}
-	if err := conn.Send(&ircv4.Message{Command: cmd, Params: d.Params}); err != nil {
-		s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
-		return
-	}
 	// MOTD replies also arrive unsolicited at every (re)connect; only an
 	// explicit /motd opens the gate for forwarding them (see serverInfo).
+	// Arm the gate BEFORE the command is queued — a fast server can reply
+	// before a gate armed afterwards opens, leaving a stale gate that would
+	// expose the next unsolicited MOTD instead — and roll it back if the
+	// send fails.
 	if cmd == "MOTD" {
 		s.hub.expectMOTD(d.Network)
+	}
+	if err := conn.Send(&ircv4.Message{Command: cmd, Params: d.Params}); err != nil {
+		if cmd == "MOTD" {
+			s.hub.retractMOTD(d.Network)
+		}
+		s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
+		return
 	}
 	s.push(envelope("ok", env.Seq, nil))
 }

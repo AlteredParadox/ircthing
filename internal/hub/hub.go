@@ -1075,6 +1075,15 @@ func (h *Hub) expectMOTD(network string) {
 	h.mu.Unlock()
 }
 
+// retractMOTD closes an expectMOTD gate that never had its command sent
+// (the send failed). Without the rollback, the stale gate would expose the
+// next UNSOLICITED MOTD burst — e.g. a reconnect's — as if requested.
+func (h *Hub) retractMOTD(network string) {
+	h.mu.Lock()
+	delete(h.motdWanted, network)
+	h.mu.Unlock()
+}
+
 func (h *Hub) motdExpected(network, cmd string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
