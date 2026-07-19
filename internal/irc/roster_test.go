@@ -1,3 +1,19 @@
+// ircthing — a self-hosted, always-connected web IRC client.
+// Copyright (C) 2026 AlteredParadox
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or (at your
+// option) any later version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
+// for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package irc
 
 import (
@@ -78,7 +94,7 @@ func TestRosterAggregateBudget(t *testing.T) {
 	maxRosterMembers = 3
 
 	r := testRoster()
-	feed(t, r, ":AlteredParadox!u@h JOIN #a")                  // our own join: 1 member
+	feed(t, r, ":AlteredParadox!u@h JOIN #a")                   // our own join: 1 member
 	feed(t, r, ":u1!u@h JOIN #a", ":u2!u@h JOIN #a") // -> 3 members (aggregate cap)
 	if got := r.totalMembers(); got != 3 {
 		t.Fatalf("totalMembers = %d, want 3", got)

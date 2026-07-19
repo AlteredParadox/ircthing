@@ -1,7 +1,22 @@
+// ircthing — a self-hosted, always-connected web IRC client.
+// Copyright (C) 2026 AlteredParadox
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or (at your
+// option) any later version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
+// for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package irc
 
 import (
-	"strconv"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -11,6 +26,7 @@ import (
 	"crypto/x509/pkix"
 	"math/big"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1266,7 +1282,7 @@ func TestReadLoopNotBlockedDuringRejoin(t *testing.T) {
 	}
 	conns := listen(t, ln)
 	cfg := testCfg(ln.Addr().String())
-	cfg.SendBurst = 1                     // no burst: JOINs pace one at a time
+	cfg.SendBurst = 1 // no burst: JOINs pace one at a time
 	cfg.SendInterval = 25 * time.Millisecond
 	chans := make([]string, 40)
 	for i := range chans {
@@ -1627,10 +1643,10 @@ func TestTrackJoinRejectsPoisonedChannel(t *testing.T) {
 	m.nick.Store("AlteredParadox")
 
 	bad := []string{
-		"#" + strings.Repeat("A", 600),    // over the 512 line limit at rejoin
-		"#chan\r\nOPER a b",               // framing injection
-		"#nul\x00byte",                    // NUL
-		"notachannel",                     // not a channel name
+		"#" + strings.Repeat("A", 600), // over the 512 line limit at rejoin
+		"#chan\r\nOPER a b",            // framing injection
+		"#nul\x00byte",                 // NUL
+		"notachannel",                  // not a channel name
 	}
 	for _, ch := range bad {
 		if err := m.trackJoinIntent(ircv4.MustParseMessage(":AlteredParadox!u@h JOIN " + ch)); err != nil {

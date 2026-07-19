@@ -1,3 +1,19 @@
+// ircthing — a self-hosted, always-connected web IRC client.
+// Copyright (C) 2026 AlteredParadox
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or (at your
+// option) any later version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
+// for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package store
 
 import (
@@ -102,7 +118,7 @@ func TestPruneByAge(t *testing.T) {
 	base := time.UnixMilli(1_700_000_000_000)
 	for i := 0; i < 5; i++ { // one message per day, days 0..4
 		if _, err := s.Append(ctx, "net", "#c", Message{
-			Time: base.Add(time.Duration(i) * 24 * time.Hour),
+			Time:   base.Add(time.Duration(i) * 24 * time.Hour),
 			Sender: "a", Command: "PRIVMSG",
 			Raw:  fmt.Sprintf(":a PRIVMSG #c :m%d", i),
 			Text: fmt.Sprintf("body%d", i),
@@ -146,7 +162,7 @@ func TestPruneReconcilesCompleteRing(t *testing.T) {
 	base := time.UnixMilli(1_700_000_000_000)
 	for i := 0; i < 5; i++ {
 		if _, err := s.Append(ctx, "net", "#c", Message{
-			Time: base.Add(time.Duration(i) * 24 * time.Hour),
+			Time:   base.Add(time.Duration(i) * 24 * time.Hour),
 			Sender: "a", Command: "PRIVMSG", Raw: fmt.Sprintf("m%d", i),
 		}); err != nil {
 			t.Fatal(err)
@@ -174,7 +190,7 @@ func TestPruneByCount(t *testing.T) {
 	s, _ := openTest(t, 100)
 	for i := 0; i < 10; i++ {
 		if _, err := s.Append(ctx, "net", "#c", Message{
-			Time: time.UnixMilli(int64(i+1) * 1000),
+			Time:   time.UnixMilli(int64(i+1) * 1000),
 			Sender: "a", Command: "PRIVMSG", Raw: fmt.Sprintf("m%d", i),
 		}); err != nil {
 			t.Fatal(err)
@@ -183,7 +199,7 @@ func TestPruneByCount(t *testing.T) {
 	// A second buffer is capped independently.
 	for i := 0; i < 3; i++ {
 		if _, err := s.Append(ctx, "net", "#d", Message{
-			Time: time.UnixMilli(int64(i+1) * 1000),
+			Time:   time.UnixMilli(int64(i+1) * 1000),
 			Sender: "a", Command: "PRIVMSG", Raw: fmt.Sprintf("d%d", i),
 		}); err != nil {
 			t.Fatal(err)
@@ -207,7 +223,7 @@ func TestPruneDisabledIsNoop(t *testing.T) {
 	s, _ := openTest(t, 100)
 	for i := 0; i < 3; i++ {
 		if _, err := s.Append(ctx, "net", "#c", Message{
-			Time: time.UnixMilli(int64(i+1) * 1000),
+			Time:   time.UnixMilli(int64(i+1) * 1000),
 			Sender: "a", Command: "PRIVMSG", Raw: fmt.Sprintf("m%d", i),
 		}); err != nil {
 			t.Fatal(err)
@@ -235,7 +251,7 @@ func TestPruneChunkedMultiBatch(t *testing.T) {
 	// #c: 20 messages, one per hour.
 	for i := 0; i < 20; i++ {
 		if _, err := s.Append(ctx, "net", "#c", Message{
-			Time: base.Add(time.Duration(i) * time.Hour),
+			Time:   base.Add(time.Duration(i) * time.Hour),
 			Sender: "a", Command: "PRIVMSG", Raw: fmt.Sprintf("c%d", i),
 		}); err != nil {
 			t.Fatal(err)
@@ -244,7 +260,7 @@ func TestPruneChunkedMultiBatch(t *testing.T) {
 	// #d: 14 messages, so the per-buffer cap prunes it independently.
 	for i := 0; i < 14; i++ {
 		if _, err := s.Append(ctx, "net", "#d", Message{
-			Time: base.Add(time.Duration(i) * time.Hour),
+			Time:   base.Add(time.Duration(i) * time.Hour),
 			Sender: "a", Command: "PRIVMSG", Raw: fmt.Sprintf("d%d", i),
 		}); err != nil {
 			t.Fatal(err)

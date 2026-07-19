@@ -1,3 +1,19 @@
+// ircthing — a self-hosted, always-connected web IRC client.
+// Copyright (C) 2026 AlteredParadox
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or (at your
+// option) any later version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
+// for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package api
 
 import (
@@ -143,11 +159,11 @@ func TestIsPublicIP(t *testing.T) {
 		{"2620:fe::fe", true},         // Quad9 — ordinary global unicast
 		// Non-global IPv6 the stdlib helpers do not classify: the
 		// 2000::/3 allowlist backstop must reject these.
-		{"fec0::1", false},  // deprecated site-local (RFC 3879)
-		{"febf::1", false},  // top of fec0::/10
-		{"5000::1", false},  // outside global unicast 2000::/3
-		{"1000::1", false},  // below global unicast
-		{"3000::1", true},   // still within 2000::/3 (2000::–3fff::)
+		{"fec0::1", false}, // deprecated site-local (RFC 3879)
+		{"febf::1", false}, // top of fec0::/10
+		{"5000::1", false}, // outside global unicast 2000::/3
+		{"1000::1", false}, // below global unicast
+		{"3000::1", true},  // still within 2000::/3 (2000::–3fff::)
 	}
 	for _, tc := range cases {
 		ip := net.ParseIP(tc.ip)

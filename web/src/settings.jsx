@@ -1,3 +1,19 @@
+// ircthing — a self-hosted, always-connected web IRC client.
+// Copyright (C) 2026 AlteredParadox
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or (at your
+// option) any later version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
+// for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 import { useEffect, useRef, useState } from "preact/hooks";
 import { ACCENT_RGB, ACCENTS, CLOCKS, MAX_NICK_SEP } from "./prefs.js";
 import { uuid } from "./irc.js";
@@ -496,6 +512,19 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 							</div>
 						))}
 						<button class="settings-add" onClick={addRule}>+ Add keyword</button>
+					</section>
+
+					<section class="settings-section">
+						<div class="settings-label">About</div>
+						<div class="settings-note">
+							ircthing is free software, licensed under the{" "}
+							<a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener noreferrer">
+								GNU AGPL v3 or later
+							</a>. Get the{" "}
+							<a href="https://github.com/AlteredParadox/ircthing" target="_blank" rel="noopener noreferrer">
+								source code
+							</a>.
+						</div>
 					</section>
 				</div>
 			</div>

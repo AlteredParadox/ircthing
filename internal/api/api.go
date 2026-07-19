@@ -1,3 +1,19 @@
+// ircthing — a self-hosted, always-connected web IRC client.
+// Copyright (C) 2026 AlteredParadox
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or (at your
+// option) any later version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
+// for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 // Package api provides the HTTP layer: session-cookie auth, the
 // WebSocket sync endpoint (bridging connections to hub.Sessions), and the
 // embedded frontend. HTTP fallbacks (media proxy, search) come later.
@@ -171,19 +187,19 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		cfg.SessionTTL = 30 * 24 * time.Hour
 	}
 	s := &Server{
-		cfg:          cfg,
-		hub:          h,
-		mux:          http.NewServeMux(),
-		previewsOn:   loadPreviews(context.Background(), h.Store(), cfg),
+		cfg:              cfg,
+		hub:              h,
+		mux:              http.NewServeMux(),
+		previewsOn:       loadPreviews(context.Background(), h.Store(), cfg),
 		htmlByProxy:      make(map[string]*fetcher),
 		imageByProxy:     make(map[string]*fetcher),
 		tunnelHTMLByNet:  make(map[string]*fetcher),
 		tunnelImageByNet: make(map[string]*fetcher),
-		previewCache: newTTLCache[PreviewData](30*time.Minute, 512),
-		thumbCache:   newTTLCache[thumbResult](24*time.Hour, maxThumbCache),
-		mediaSem:     make(chan struct{}, mediaSlots),
-		login:        newLoginLimiter(),
-		tokens:       make(map[string]time.Time),
+		previewCache:     newTTLCache[PreviewData](30*time.Minute, 512),
+		thumbCache:       newTTLCache[thumbResult](24*time.Hour, maxThumbCache),
+		mediaSem:         make(chan struct{}, mediaSlots),
+		login:            newLoginLimiter(),
+		tokens:           make(map[string]time.Time),
 	}
 	s.sessionTTL.Store(int64(loadSessionTTL(context.Background(), h.Store(), cfg)))
 	initHash, err := loadPasswordHash(context.Background(), h.Store(), cfg)

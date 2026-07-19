@@ -1,3 +1,19 @@
+// ircthing — a self-hosted, always-connected web IRC client.
+// Copyright (C) 2026 AlteredParadox
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or (at your
+// option) any later version.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
+// for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 package api
 
 import (
@@ -34,8 +50,8 @@ const (
 	// byte product overflows ("dimension overflow"), so this is belt-and-
 	// suspenders and rejects absurd (but Go-accepted, e.g. 100000^2) dims
 	// before the area math. 65535 admits every realistic image.
-	maxImageDim     = 65535
-	maxThumbCache   = 128
+	maxImageDim   = 65535
+	maxThumbCache = 128
 	// maxThumbCacheEntry bounds a single cached thumbnail. 128 entries x
 	// 48 KiB ~ 6 MiB worst-case resident cache — a small fraction of the
 	// 72 MiB RSS target — vs ~64 MiB at the old 512 KiB per-entry cap.
