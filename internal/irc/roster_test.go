@@ -111,6 +111,36 @@ func TestRosterAggregateBudget(t *testing.T) {
 	}
 }
 
+// One hostile near-64-KiB modestring must not be processed letter by letter:
+// each status letter used to cost an O(channels) budget scan under the roster
+// lock (~268M map visits at the 4,096-channel cap). Letters past the cap are
+// dropped; a normal-sized MODE line still applies fully.
+func TestRosterModeLetterCap(t *testing.T) {
+	r := testRoster()
+	feed(t, r,
+		joinGo,
+		":srv 353 AlteredParadox = #go :alice bob",
+		":srv 366 AlteredParadox #go :end",
+	)
+	// A hostile line: cap+ letters of a status mode aimed at one nick.
+	// Only maxModeLettersPerLine letters are examined, so this returns
+	// quickly; the grants inside the cap still apply.
+	feed(t, r, ":srv MODE #go +"+strings.Repeat("o", maxModeLettersPerLine+1000)+" alice")
+	for _, m := range members(t, r, "#go") {
+		if m.Nick == "alice" && m.Prefix != "@" {
+			t.Fatalf("alice prefix = %q, want @ (in-cap grant must apply)", m.Prefix)
+		}
+	}
+	// Grants past the cap are ignored.
+	modes := strings.Repeat("i", maxModeLettersPerLine) + "o" // 'i' is type D: no argument
+	feed(t, r, ":srv MODE #go +"+modes+" bob")
+	for _, m := range members(t, r, "#go") {
+		if m.Nick == "bob" && m.Prefix != "" {
+			t.Fatalf("bob prefix = %q, want none (past-cap letters must be dropped)", m.Prefix)
+		}
+	}
+}
+
 // The BYTE budget must bind independently of the count caps: clamped fields
 // are up to maxRosterField each, so counts alone would admit ~20x the memory
 // the ~150 B/member estimate suggests. Also checks the running per-channel

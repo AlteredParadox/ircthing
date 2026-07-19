@@ -651,6 +651,15 @@ func splitNamesPrefix(symbols, raw string) (prefixes, nick, user, host string) {
 	return prefixes, nick, user, host
 }
 
+// maxModeLettersPerLine bounds how many mode letters one MODE line is
+// processed for. Real servers batch at most ISUPPORT MODES (single digits
+// to ~20) mode changes per line; only a hostile server (or plaintext MITM)
+// sends a near-64-KiB modestring, each status letter of which costs map
+// work under the roster lock. Letters past the cap are ignored — argument
+// pairing is already garbage on such a line, so there is nothing coherent
+// to preserve.
+const maxModeLettersPerLine = 64
+
 // applyChannelMode parses a channel MODE change (params: channel,
 // modestring, args...) and updates member status prefixes. Argument
 // consumption follows the ISUPPORT CHANMODES classification; status
@@ -671,6 +680,7 @@ func (r *roster) applyChannelMode(st *channelState, params []string) {
 		return ""
 	}
 	adding := true
+	letters := 0
 	for i := 0; i < len(params[1]); i++ {
 		c := params[1][i]
 		switch c {
@@ -679,6 +689,9 @@ func (r *roster) applyChannelMode(st *channelState, params []string) {
 		case '-':
 			adding = false
 		default:
+			if letters++; letters > maxModeLettersPerLine {
+				return // hostile/degenerate modestring — see the constant
+			}
 			switch cls.chanModeType(c) {
 			case 'P': // status mode
 				r.applyStatusMode(st, takeArg(), string(cls.symbolForMode(c)), adding)
@@ -701,8 +714,18 @@ func (r *roster) applyStatusMode(st *channelState, nick, sym string, adding bool
 	// A hostile server can advertise a ~254-symbol PREFIX and MODE-grant them all
 	// across 100k members (~25 MiB), past the 8 MiB ceiling — so refuse a GROWING
 	// prefix when already over budget, mirroring the join/rename/topic guards.
-	// Revocation only shrinks and is always allowed.
-	over := r.totalBytes() >= maxRosterBytes
+	// Revocation only shrinks and is always allowed. The check is LAZY (computed
+	// at most once, and only when a grant would actually grow a present member's
+	// prefix): totalBytes is O(channels), and paying it unconditionally per
+	// status letter let one hostile modestring full of unknown nicks cost
+	// letters × channels map visits under the roster lock.
+	over, overKnown := false, false
+	isOver := func() bool {
+		if !overKnown {
+			over, overKnown = r.totalBytes() >= maxRosterBytes, true
+		}
+		return over
+	}
 	// Apply to whichever map holds the member: during a NAMES burst the
 	// member is in st.pending (not yet swapped into st.members), so a
 	// MODE between 353 and 366 must land in pending to survive the swap.
@@ -713,7 +736,7 @@ func (r *roster) applyStatusMode(st *channelState, nick, sym string, adding bool
 		}
 		if adding {
 			np := addPrefix(r.isup.PrefixSymbols(), mem.Prefix, sym)
-			if over && len(np) > len(mem.Prefix) {
+			if len(np) > len(mem.Prefix) && isOver() {
 				return // don't grow the roster past the byte ceiling
 			}
 			mem.Prefix = np
