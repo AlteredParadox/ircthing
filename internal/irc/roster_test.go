@@ -516,6 +516,41 @@ func TestRosterOversizedNameNoGhost(t *testing.T) {
 	}
 }
 
+// Multi-target PART/KICK (comma-lists, RFC 2812 §3.2.2/§3.2.8) must remove
+// the member from every named channel — a server that doesn't split them
+// would otherwise leave ghosts.
+func TestRosterMultiTargetPartKick(t *testing.T) {
+	r := testRoster()
+	feed(t, r,
+		":AlteredParadox!u@h JOIN #a", ":AlteredParadox!u@h JOIN #b", ":AlteredParadox!u@h JOIN #c",
+		":bob!u@h JOIN #a", ":bob!u@h JOIN #b",
+		":carol!u@h JOIN #c", ":dave!u@h JOIN #c")
+
+	// bob parts #a and #b in one line.
+	feed(t, r, ":bob!u@h PART #a,#b :bye")
+	for _, ch := range []string{"#a", "#b"} {
+		for _, m := range members(t, r, ch) {
+			if m.Nick == "bob" {
+				t.Fatalf("bob ghosted in %s after multi-PART", ch)
+			}
+		}
+	}
+
+	// One channel, two victims kicked in one line.
+	feed(t, r, ":op!u@h KICK #c carol,dave :out")
+	if ms := members(t, r, "#c"); len(ms) != 1 || ms[0].Nick != "AlteredParadox" {
+		t.Fatalf("#c after multi-KICK = %v, want just AlteredParadox", rosterNicks(ms))
+	}
+}
+
+func rosterNicks(ms []Member) []string {
+	out := make([]string, len(ms))
+	for i, m := range ms {
+		out[i] = m.Nick
+	}
+	return out
+}
+
 func TestRosterClear(t *testing.T) {
 	r := testRoster()
 	feed(t, r, joinGo, ":alice!u@h JOIN #go")

@@ -230,9 +230,22 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 	case "JOIN":
 		r.memberJoin(m, sender, us(sender))
 	case "PART":
-		r.memberLeft(m.Param(0), sender, us(sender))
-	case "KICK": // <channel> <victim>
-		r.memberLeft(m.Param(0), m.Param(1), us(m.Param(1)))
+		// PART takes a comma-list of channels (RFC 2812 §3.2.2). Mainstream
+		// servers split these before relaying, but handle the multi form so a
+		// server that doesn't leaves no ghost members.
+		for _, ch := range strings.Split(m.Param(0), ",") {
+			r.memberLeft(ch, sender, us(sender))
+		}
+	case "KICK": // <channel>{,<channel>} <user>{,<user>} (RFC 2812 §3.2.8)
+		chans := strings.Split(m.Param(0), ",")
+		victims := strings.Split(m.Param(1), ",")
+		for i, victim := range victims {
+			ch := chans[0] // 1 channel, N victims: all from that channel
+			if len(chans) == len(victims) {
+				ch = chans[i] // parallel channel[i]/victim[i] form
+			}
+			r.memberLeft(ch, victim, us(victim))
+		}
 	case "QUIT":
 		// Clamp+fold ONCE, outside the loop: Fold allocates twice per call,
 		// so folding a raw (up to ~64 KiB) spoofed sender per channel across

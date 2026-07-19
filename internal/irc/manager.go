@@ -1190,6 +1190,14 @@ func clampBatchRef(ref string) string {
 	return ref
 }
 
+// The BATCH open declares its reference as a plain PARAM (raw), while messages
+// carry it as the `@batch` TAG, which the parser tag-UNescapes (\s->space,
+// \:->; , \\->\ ...). The two forms are identical for the spec's batch-reference
+// charset ([A-Za-z0-9], all escape-invariant), so a compliant server always
+// correlates. Only a malformed server whose ref param contains a literal
+// backslash-escape (e.g. "+a\sb" vs a message tag "a\sb" that unescapes to
+// "a b") diverges; its batch then fails to correlate and its messages fall back
+// to being treated as live — the same benign default as any unknown batch.
 func trackChathistoryBatch(in *ircv4.Message, histBatch map[string]bool) error {
 	if in.Command != "BATCH" || len(in.Params) == 0 {
 		return nil
@@ -1384,12 +1392,16 @@ func (m *Manager) trackJoinIntent(in *ircv4.Message) error {
 		delete(m.namesReq, m.isup.Fold(ch))
 		m.namesMu.Unlock()
 	case "PART":
-		// Remove by the network's casemapping so a PART in any
-		// equivalent casing clears the rejoin intent.
-		part := in.Param(0)
-		for key := range m.joined {
-			if m.isup.FoldEqual(key, part) {
-				delete(m.joined, key)
+		// Remove by the network's casemapping so a PART in any equivalent
+		// casing clears the rejoin intent. PART carries a comma-list of
+		// channels (RFC 2812 §3.2.2); clear every one, or a multi-channel
+		// self-PART would leave the un-cleared channels to rejoin on the
+		// next reconnect against the user's intent.
+		for _, part := range strings.Split(in.Param(0), ",") {
+			for key := range m.joined {
+				if m.isup.FoldEqual(key, part) {
+					delete(m.joined, key)
+				}
 			}
 		}
 	}

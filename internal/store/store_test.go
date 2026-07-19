@@ -607,6 +607,40 @@ func TestBuffers(t *testing.T) {
 	}
 }
 
+// Unread must count only conversation lines (PRIVMSG/NOTICE), matching what
+// the client counts live — presence/system rows (JOIN/PART/QUIT/NICK/MODE/
+// TOPIC/KICK) are stored but must not bump the badge, or the two disagree the
+// moment a client fetches buffers.
+func TestBuffersUnreadCountsOnlyMessages(t *testing.T) {
+	s, _ := openTest(t, 50)
+	mk := func(cmd, raw string, tsSec int64) {
+		if _, err := s.Append(ctx, "net", "#c", Message{
+			Time: time.UnixMilli(tsSec * 1000), Sender: "a", Command: cmd, Raw: raw,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("PRIVMSG", ":a PRIVMSG #c :hi", 1)     // counts
+	mk("JOIN", ":b JOIN #c", 2)               // system, no count
+	mk("PART", ":b PART #c :bye", 3)          // system, no count
+	mk("NICK", ":b NICK bb", 4)               // system, no count
+	mk("MODE", ":a MODE #c +o b", 5)          // system, no count
+	mk("NOTICE", ":a NOTICE #c :heads up", 6) // counts
+	mk("QUIT", ":b QUIT :bye", 7)             // system, no count
+
+	infos, err := s.Buffers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("got %d buffers, want 1", len(infos))
+	}
+	// Marker unset -> everything after 0; only the PRIVMSG and NOTICE count.
+	if infos[0].Unread != 2 {
+		t.Fatalf("unread = %d, want 2 (PRIVMSG+NOTICE only, not the 5 system rows)", infos[0].Unread)
+	}
+}
+
 func TestDefaultUserSeededAndScoped(t *testing.T) {
 	s, _ := openTest(t, 10)
 	var username string

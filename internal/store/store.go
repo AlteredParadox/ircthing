@@ -808,11 +808,19 @@ type BufferInfo struct {
 // Buffers lists every buffer with its activity and read state, ordered by
 // network then target.
 func (s *Store) Buffers(ctx context.Context) ([]BufferInfo, error) {
+	// The unread count must match what the client counts as unread live, or the
+	// two disagree the moment a client fetches buffers (the badge jumps). The
+	// client counts only conversation lines (renderable kind != "system"), i.e.
+	// PRIVMSG/NOTICE — presence traffic (JOIN/PART/QUIT/NICK/MODE/TOPIC/KICK)
+	// renders as a system row and never bumps unread. Filter to the same set
+	// here. (Non-ACTION CTCP is never persisted, and a redacted row keeps its
+	// PRIVMSG/NOTICE command, so it counts consistently on both sides.)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT n.name, b.name,
 			COALESCE((SELECT MAX(ts) FROM messages WHERE buffer_id = b.id), 0),
 			COALESCE((SELECT ts FROM read_markers WHERE buffer_id = b.id), 0),
 			(SELECT COUNT(*) FROM messages WHERE buffer_id = b.id
+				AND command IN ('PRIVMSG','NOTICE')
 				AND ts > COALESCE((SELECT ts FROM read_markers WHERE buffer_id = b.id), 0))
 		FROM buffers b
 		JOIN networks n ON n.id = b.network_id

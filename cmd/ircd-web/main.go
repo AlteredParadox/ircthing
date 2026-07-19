@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -134,6 +135,10 @@ func run(cfg *config) error {
 		WriteTimeout:      60 * time.Second, // media proxy fetches cap at 15s
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    32 << 10,
+		// Derive every request context (including the hijacked WebSocket ones,
+		// which Shutdown does not track) from the signal context, so SIGTERM
+		// cancels the WS read loops and their handlers unwind for the drain below.
+		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 
 	serveErr := make(chan error, 1)
@@ -156,6 +161,10 @@ func run(cfg *config) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	srv.Shutdown(shutdownCtx)
+	// Drain live WebSocket handlers (their contexts were just canceled via
+	// BaseContext) before the deferred Store.Close, so no session goroutine
+	// races the store shutdown. Bounded so a wedged handler can't hang exit.
+	handler.WaitSessions(3 * time.Second)
 	wg.Wait()
 	return nil
 }

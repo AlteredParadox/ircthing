@@ -132,6 +132,24 @@ type Server struct {
 	// SetRetention's persist-then-install could interleave into disagreeing DB
 	// and live state. One writer at a time closes both.
 	settingsMu sync.Mutex
+
+	// wsWG tracks live WebSocket handler goroutines so shutdown can drain them
+	// before the store is closed (a hijacked WS is not tracked by http.Server
+	// and its store reads/writes would otherwise race Store.Close).
+	wsWG sync.WaitGroup
+}
+
+// WaitSessions blocks until every live WebSocket handler has returned, or the
+// timeout elapses. Call it during shutdown AFTER the base context is canceled
+// (which unblocks the read loops) and BEFORE closing the store, so no session
+// goroutine touches the store after it is closed.
+func (s *Server) WaitSessions(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() { s.wsWG.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
 }
 
 func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
@@ -569,6 +587,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	// Track this handler so shutdown can drain it before Store.Close (the
+	// connection is hijacked at upgrade, so http.Server.Shutdown won't wait).
+	s.wsWG.Add(1)
+	defer s.wsWG.Done()
 	// Same-origin check (host always, scheme when determinable — see sameOrigin).
 	// The coder/websocket default (Accept with nil opts) allows an ABSENT Origin,
 	// which a browser never sends on a WS handshake, so we require it and run our
