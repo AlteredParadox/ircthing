@@ -460,32 +460,51 @@ func TestProxyForNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if p, ok := srv.proxyForNetwork(ctx, "tornet"); !ok || p == nil || p.Host != "127.0.0.1:9050" {
-		t.Fatalf("tornet = %v,%v; want (127.0.0.1:9050, true)", p, ok)
+	if e := srv.egressForNetwork(ctx, "tornet"); !e.ok || e.proxy == nil || e.proxy.Host != "127.0.0.1:9050" || e.tunnel {
+		t.Fatalf("tornet = %+v; want proxy 127.0.0.1:9050", e)
 	}
-	// Known direct network: (nil, true) — a direct fetch is intended.
-	if p, ok := srv.proxyForNetwork(ctx, "direct"); !ok || p != nil {
-		t.Fatalf("direct = %v,%v; want (nil, true)", p, ok)
+	// Known direct network: ok, no proxy, no tunnel.
+	if e := srv.egressForNetwork(ctx, "direct"); !e.ok || e.proxy != nil || e.tunnel {
+		t.Fatalf("direct = %+v; want direct (ok, no proxy/tunnel)", e)
 	}
-	// Everything unresolvable must FAIL CLOSED: (nil, false). So must a
-	// WireGuard-egress network ("wgnet"): the media fetcher cannot ride the
-	// in-process tunnel, and a direct or proxied fetch would leak the real
-	// IP the tunnel exists to hide.
-	for _, name := range []string{"nonexistent", "", "malformed", "badproxy", "wgnet"} {
-		if p, ok := srv.proxyForNetwork(ctx, name); ok || p != nil {
-			t.Fatalf("proxyForNetwork(%q) = %v,%v; want (nil, false)", name, p, ok)
+	// A WireGuard network resolves to TUNNEL egress — the fetch dials through
+	// the tunnel, never directly, so the real IP is never leaked.
+	if e := srv.egressForNetwork(ctx, "wgnet"); !e.ok || !e.tunnel || e.network != "wgnet" || e.proxy != nil {
+		t.Fatalf("wgnet = %+v; want tunnel egress for wgnet", e)
+	}
+	// Everything unresolvable must FAIL CLOSED (ok=false).
+	for _, name := range []string{"nonexistent", "", "malformed", "badproxy"} {
+		if e := srv.egressForNetwork(ctx, name); e.ok {
+			t.Fatalf("egressForNetwork(%q) = %+v; want fail-closed (ok=false)", name, e)
 		}
 	}
-	p, _ := srv.proxyForNetwork(ctx, "tornet")
-	f1 := srv.htmlFetcherFor(p)
-	if !f1.proxied {
-		t.Fatal("tornet fetcher not proxied")
+	// Fetcher selection by egress.
+	if f := srv.htmlFetcherForNetwork(ctx, "tornet"); f == nil || !f.proxied {
+		t.Fatalf("tornet html fetcher = %v; want proxied", f)
 	}
-	if f2 := srv.htmlFetcherFor(p); f2 != f1 {
+	if f := srv.htmlFetcherForNetwork(ctx, "tornet"); f != srv.htmlFetcherForNetwork(ctx, "tornet") {
 		t.Fatal("per-proxy fetcher not cached/reused")
 	}
-	if fd := srv.htmlFetcherFor(nil); fd.proxied {
+	if f := srv.htmlFetcherForNetwork(ctx, "direct"); f == nil || f.proxied {
 		t.Fatal("direct fetcher must not be proxied")
+	}
+	for _, name := range []string{"nonexistent", "malformed", "badproxy"} {
+		if f := srv.htmlFetcherForNetwork(ctx, name); f != nil {
+			t.Fatalf("fetcher for %q = %v; want nil (fail closed)", name, f)
+		}
+	}
+	// The WireGuard network's fetcher exists (tunnel egress) and is cached,
+	// but with no network actually running its dial fails closed — it must
+	// NEVER fall back to a direct fetch (which would leak the real IP).
+	wgf := srv.htmlFetcherForNetwork(ctx, "wgnet")
+	if wgf == nil || !wgf.proxied {
+		t.Fatalf("wgnet fetcher = %v; want a proxied-mode tunnel fetcher", wgf)
+	}
+	if wgf != srv.htmlFetcherForNetwork(ctx, "wgnet") {
+		t.Fatal("per-network tunnel fetcher not cached/reused")
+	}
+	if _, _, err := wgf.get(ctx, "https://example.com/"); err == nil {
+		t.Fatal("wgnet fetch with no running tunnel must fail closed, not fall back to direct")
 	}
 }
 

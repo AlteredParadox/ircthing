@@ -109,6 +109,33 @@ func newFetcher(maxBytes int64, proxy *url.URL) *fetcher {
 	return f
 }
 
+// newTunnelFetcher builds a media fetcher that dials every target through the
+// supplied dial function — a network's in-process WireGuard tunnel. Like the
+// proxied path, the tunnel owns egress AND DNS (targets resolve in-tunnel), so
+// the connect-time Control hook can't see the resolved IP: SSRF handling is the
+// proxied mode (literal non-public IPs refused up front and on redirects,
+// hostname resolution deferred to the tunnel — the same trust model as a
+// SOCKS5 proxy). The dial func is tunnel-only: if the tunnel is down it returns
+// an error and the fetch fails closed, never falling back to a direct dial.
+func newTunnelFetcher(maxBytes int64, dial func(ctx context.Context, addr string) (net.Conn, error)) *fetcher {
+	f := &fetcher{maxBytes: maxBytes, allowIP: isPublicIP, proxied: true}
+	f.client = &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			Proxy: nil,
+			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				return dial(ctx, addr)
+			},
+			TLSHandshakeTimeout:   8 * time.Second,
+			ResponseHeaderTimeout: 8 * time.Second,
+			DisableKeepAlives:     true,
+			MaxIdleConns:          0,
+		},
+		CheckRedirect: f.checkRedirect,
+	}
+	return f
+}
+
 // dialContext returns the transport dialer. Proxied: tunnel through the
 // proxy (which owns egress + DNS); direct: a plain dialer whose Control
 // hook re-validates the resolved IP at connect time (rebinding-safe).

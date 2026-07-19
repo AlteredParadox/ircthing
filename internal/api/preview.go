@@ -80,15 +80,15 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "previews disabled", http.StatusForbidden)
 		return
 	}
-	// Resolve the proxy AFTER the wait: a proxy may have been configured on the
-	// network while we were parked, and a stale (direct) resolution would leak
-	// the IP. Fail closed if we can't confirm a direct-or-valid-proxy network.
-	proxy, ok := s.proxyForNetwork(r.Context(), net)
-	if !ok {
+	// Resolve egress AFTER the wait: a proxy/tunnel may have been configured on
+	// the network while we were parked, and a stale (direct) resolution would
+	// leak the IP. Fail closed if we can't confirm a direct/proxy/tunnel egress.
+	f := s.htmlFetcherForNetwork(r.Context(), net)
+	if f == nil {
 		http.Error(w, "preview unavailable", http.StatusBadGateway)
 		return
 	}
-	ct, body, err := s.htmlFetcherFor(proxy).get(r.Context(), target)
+	ct, body, err := f.get(r.Context(), target)
 	if err != nil {
 		http.Error(w, "preview unavailable", http.StatusBadGateway)
 		return

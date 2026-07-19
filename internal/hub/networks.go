@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,24 @@ const errLoadNetworks = "loading networks failed"
 type netProc struct {
 	cancel context.CancelFunc
 	done   chan struct{} // closed when both goroutines have exited
+	mgr    *irc.Manager  // for the media proxy's tunnel dial (WireGuard networks)
+}
+
+// NetworkTunnelDial dials addr through the named network's LIVE WireGuard
+// tunnel, for the media proxy fetching a link/image preview for a link seen on
+// that network. It returns an error when the network isn't running or its
+// tunnel isn't up (the media path then refuses the preview) — it NEVER dials
+// directly, so a WireGuard network's real IP is never leaked to a preview
+// target. Safe for concurrent use; the manager reads its tunnel under a lock
+// and never lets this path build or tear one down.
+func (h *Hub) NetworkTunnelDial(ctx context.Context, name, addr string) (net.Conn, error) {
+	h.mu.Lock()
+	p := h.procs[name]
+	h.mu.Unlock()
+	if p == nil || p.mgr == nil {
+		return nil, fmt.Errorf("hub: network %q not running", name)
+	}
+	return p.mgr.MediaDialContext(ctx, addr)
 }
 
 // UseRoot supplies the process-lifetime context and waitgroup network
@@ -61,7 +80,7 @@ func (h *Hub) StartNetwork(nc *netconf.Network) error {
 	}
 	name := nc.EffectiveName()
 	nctx, cancel := context.WithCancel(h.rootCtx)
-	p := &netProc{cancel: cancel, done: make(chan struct{})}
+	p := &netProc{cancel: cancel, done: make(chan struct{}), mgr: m}
 	h.mu.Lock()
 	h.procs[name] = p
 	h.mu.Unlock()

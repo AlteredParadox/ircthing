@@ -107,7 +107,7 @@ Per network (`networks[]` seed / edit form):
 | `tls` | Use TLS. Plaintext requires the explicit `allow_plaintext: true` opt-in. |
 | `trusted_fingerprints` | Hex SHA-256 pins of the server's certificate; a match replaces CA verification (self-signed servers). |
 | `proxy` | `socks5://[user:pass@]host:port` (DNS resolves proxy-side) or `http://host:port` (CONNECT tunnel). Proxy auth is transmitted **in cleartext** (SOCKS5 username/password per RFC 1929, HTTP Basic), so only use credentialed proxies whose transport is itself encrypted or local/trusted (e.g. loopback, or inside a VPN tunnel). Mutually exclusive with `wireguard`. |
-| `wireguard` | Egress this network through an in-process userspace WireGuard tunnel (no TUN device, no root) instead of a proxy — its Noise handshake authenticates without the cleartext exposure `proxy` auth has. Object with `private_key`, `peer_public_key`, `endpoint` (`host:port`; a hostname is resolved locally, pre-tunnel), `address` (this client's address inside the tunnel), `dns` (in-tunnel resolver, `ip` or `ip:port`, default `:53`), and optional `preshared_key` / `mtu` (default 1420). Keys are standard WireGuard base64 (as `wg genkey` / Mullvad print them). Target DNS resolves through the tunnel (no local leak). Link previews/thumbnails for links seen in a WireGuard network are **refused** (fail closed): the media fetcher cannot yet ride the in-process tunnel, and fetching directly or via another route would leak your real IP. Configurable in the web UI under **Egress → WireGuard tunnel**. Mutually exclusive with `proxy`. |
+| `wireguard` | Egress this network through an in-process userspace WireGuard tunnel (no TUN device, no root) instead of a proxy — its Noise handshake authenticates without the cleartext exposure `proxy` auth has. Object with `private_key`, `peer_public_key`, `endpoint` (`host:port`; a hostname is resolved locally, pre-tunnel), `address` (this client's address inside the tunnel), `dns` (in-tunnel resolver, `ip` or `ip:port`, default `:53`), and optional `preshared_key` / `mtu` (default 1420). Keys are standard WireGuard base64 (as `wg genkey` / Mullvad print them). Target DNS resolves through the tunnel (no local leak). Link previews/thumbnails for links seen in a WireGuard network are fetched **through the same tunnel** (in-tunnel DNS, tunnel egress), so they inherit the network's IP — and fail closed (no preview) whenever the tunnel is down rather than ever fetching directly. Configurable in the web UI under **Egress → WireGuard tunnel**. Mutually exclusive with `proxy`. |
 | `nick`, `username`, `realname` | Identity. `username`/`realname` default to the nick. |
 | `pass` | Server password (`PASS`), rarely needed. |
 | `sasl` | `mechanism` `""` picks automatically (EXTERNAL without a password, else SCRAM-SHA-256 when offered, else PLAIN). `cert_file`/`key_file` supply the client certificate for EXTERNAL. SCRAM-SHA-256 does **not** apply SASLprep normalization to either the **login (account name) or the password** (RFC 5802 §2.2), so use ASCII (or already-normalized) values for both — a non-ASCII login or password may not match a server that normalizes it. |
@@ -115,14 +115,15 @@ Per network (`networks[]` seed / edit form):
 
 ### Preview fetches & the proxy SSRF caveat
 
-Link and image previews are fetched server-side, through the **proxy of the
+Link and image previews are fetched server-side, through the **egress of the
 network the link came from** — a link in a proxied network is previewed over
-that proxy (your egress IP never leaks), one in a direct network goes
-direct, and if the link's network can't be resolved to a direct-or-proxied
-decision the fetch is **refused** rather than sent direct. Links from a
-**WireGuard**-egress network are always refused (fail closed) — the media
-fetcher cannot yet ride the in-process tunnel, and any other route would
-leak the real IP. There is no separate media proxy to configure.
+that proxy, one in a **WireGuard** network is previewed through that tunnel
+(in-tunnel DNS, tunnel egress), one in a direct network goes direct, and if
+the link's network can't be resolved to a known egress the fetch is
+**refused** rather than sent direct. A WireGuard preview also fails closed
+(no preview) whenever the tunnel is down, so it never leaks your real IP. In
+every case your egress IP matches the network's own. There is no separate
+media proxy to configure.
 
 Direct (unproxied) fetches are hardened: the *resolved* IP of every
 connection and redirect hop is checked against a public-address policy at
@@ -133,10 +134,13 @@ could translate a blocked IPv4 destination through that prefix — such prefixes
 can't be enumerated statically. If you deploy on a NAT64 network with a custom
 NSP, confirm the host has no such route, or leave previews off.
 
-The one nuance is on the **proxied** path: the proxy owns DNS, so the server
-can only block *literal* private-IP targets — a hostname that resolves
-*proxy-side* to an internal address is reachable through the proxy. Whether
-that matters depends on **where the proxy runs**:
+The one nuance is on the **proxied and WireGuard** paths: the proxy/tunnel
+owns DNS (a WireGuard target resolves through the in-tunnel resolver), so the
+server can only block *literal* private-IP targets — a hostname that resolves
+*egress-side* to an internal address is reachable through the proxy/tunnel. A
+WireGuard tunnel egresses to your WireGuard peer (typically a commercial VPN),
+so it carries the same trust boundary as that provider's SOCKS5 below. Whether
+this matters depends on **where the proxy/tunnel egresses**:
 
 - **A commercial VPN's SOCKS5 (Mullvad, TorGuard, …), or Tor — low exposure,
   but the provider is a trust boundary.** The fetch egresses from the

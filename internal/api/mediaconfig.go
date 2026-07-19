@@ -18,10 +18,11 @@ import (
 // initial default, used until something is saved. That default is off
 // (privacy-first) unless the config explicitly enables previews.
 //
-// The media *proxy* is not a global setting: preview/thumbnail fetches use
-// the proxy of the network the link came from (proxyForNetwork), so they
-// automatically inherit that network's anonymity posture — a link in a
-// Tor'd network is previewed over Tor, one in a direct network goes direct.
+// The media egress is not a global setting: preview/thumbnail fetches use the
+// egress of the network the link came from (egressForNetwork), so they
+// automatically inherit that network's anonymity posture — a link in a Tor'd
+// network is previewed over Tor, one in a WireGuard network over the tunnel,
+// one in a direct network goes direct.
 const previewsKey = "previews_enabled"
 
 // loadPreviews resolves the effective previews switch: the stored value if
@@ -188,50 +189,56 @@ func proxyString(u *url.URL) string {
 	return u.String()
 }
 
-// proxyForNetwork resolves the proxy a media fetch for network name must
-// use. It returns (proxy, ok):
+// mediaEgress is how a media fetch for a network must leave the box, so a
+// link's preview fetch matches the network's own egress and never leaks its
+// real IP. Exactly one of direct/proxy/tunnel is set when ok is true.
+type mediaEgress struct {
+	proxy   *url.URL // via a SOCKS5/HTTP proxy (nil with ok+!tunnel => direct)
+	tunnel  bool     // via the network's in-process WireGuard tunnel
+	network string   // the network name, when tunnel
+	ok      bool     // false => cannot determine safely => fail closed (502)
+}
+
+// egressForNetwork resolves how a media fetch for network `name` must egress:
 //
-//   - (nil, true)   the network is known and configured for DIRECT access
-//   - (u,   true)   the network is known with a valid proxy
-//   - (nil, false)  cannot determine — no network, unknown/deleted/renamed
-//                   network, store error, malformed stored config, a stored
-//                   proxy that no longer parses, OR a WireGuard network (its
-//                   egress is an in-process tunnel this path can't reach)
+//   - {ok}                 known, DIRECT access
+//   - {proxy, ok}          known, via a valid SOCKS5/HTTP proxy
+//   - {tunnel, network, ok} a WireGuard network — dial through its tunnel
+//   - {} (ok=false)        cannot determine: no/unknown/deleted/renamed
+//                          network, store error, malformed config, or a proxy
+//                          that no longer parses
 //
-// The caller must FAIL CLOSED on ok==false: falling back to a direct fetch
-// there would leak the server's egress IP for a link that belongs to a
-// proxied or WireGuard network (e.g. a UI request racing a network
-// delete/rename, or a transient store error). Only a network known to be
-// direct permits a direct fetch.
-func (s *Server) proxyForNetwork(ctx context.Context, name string) (*url.URL, bool) {
+// The caller must FAIL CLOSED on ok==false: a direct fetch there would leak the
+// server's egress IP for a link belonging to a proxied/tunneled network (e.g. a
+// UI request racing a network delete/rename, or a transient store error).
+func (s *Server) egressForNetwork(ctx context.Context, name string) mediaEgress {
 	if name == "" {
-		return nil, false
+		return mediaEgress{}
 	}
 	nc, found, err := s.hub.Store().NetworkConfig(ctx, name)
 	if err != nil || !found {
-		return nil, false
+		return mediaEgress{}
 	}
 	var cfg struct {
 		Proxy     string          `json:"proxy"`
 		WireGuard json.RawMessage `json:"wireguard"`
 	}
 	if json.Unmarshal([]byte(nc.Config), &cfg) != nil {
-		return nil, false
+		return mediaEgress{}
 	}
-	// A WireGuard network egresses through an in-process userspace tunnel that
-	// the media path has no handle on (it lives in the per-network irc.Manager).
-	// A direct fetch would leak the server's real IP and resolve the target on
-	// the local resolver — exactly what the tunnel prevents — so fail closed
-	// (the caller turns this into a 502) until media can share the tunnel.
+	// A WireGuard network egresses through its in-process userspace tunnel; the
+	// media fetch dials through that same tunnel (NetworkTunnelDial), so the
+	// preview shares the network's IP and in-tunnel DNS. If the tunnel is down
+	// the tunnel fetcher fails closed — it never falls back to a direct dial.
 	if len(cfg.WireGuard) > 0 && string(cfg.WireGuard) != "null" {
-		return nil, false
+		return mediaEgress{tunnel: true, network: name, ok: true}
 	}
 	if cfg.Proxy == "" {
-		return nil, true // known, direct
+		return mediaEgress{ok: true} // known, direct
 	}
 	u, err := proxydial.Parse(cfg.Proxy)
 	if err != nil {
-		return nil, false // configured a proxy, but it no longer parses
+		return mediaEgress{} // configured a proxy, but it no longer parses
 	}
-	return u, true
+	return mediaEgress{proxy: u, ok: true}
 }

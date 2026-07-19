@@ -170,16 +170,16 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "previews disabled", http.StatusForbidden)
 		return
 	}
-	// Resolve the proxy AFTER the wait so a proxy configured on the network
+	// Resolve egress AFTER the wait so a proxy/tunnel configured on the network
 	// while we were parked is honored (a stale direct resolution would leak the
-	// IP). Fail closed on an unresolvable network (see proxyForNetwork).
-	proxy, ok := s.proxyForNetwork(r.Context(), net)
-	if !ok {
+	// IP). Fail closed on an unresolvable network (see egressForNetwork).
+	f := s.imageFetcherForNetwork(r.Context(), net)
+	if f == nil {
 		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
 		return
 	}
 
-	ct, body, err := s.imageFetcherFor(proxy).get(r.Context(), target)
+	ct, body, err := f.get(r.Context(), target)
 	if err != nil {
 		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
 		return

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -88,9 +89,10 @@ type Server struct {
 	hub *hub.Hub
 	mux *http.ServeMux
 
-	// Media proxy: fetchers are per-proxy (previews use the source
-	// network's proxy — proxyForNetwork), built lazily and cached by proxy
-	// URL, so a handful of networks share a small pool. The result caches
+	// Media proxy: fetchers match the source network's egress (see
+	// egressForNetwork) — direct/proxy fetchers cached by proxy URL, WireGuard
+	// tunnel fetchers cached by network — built lazily, so a handful of
+	// networks share a small pool. The result caches
 	// and the request-wide semaphore (bounding the memory-heavy fetch +
 	// decode + encode span) are process-wide. mediaMu guards the fetcher
 	// maps and the runtime-editable previews switch.
@@ -98,9 +100,15 @@ type Server struct {
 	previewsOn   bool
 	htmlByProxy  map[string]*fetcher
 	imageByProxy map[string]*fetcher
-	previewCache *ttlCache[PreviewData]
-	thumbCache   *ttlCache[thumbResult]
-	mediaSem     chan struct{}
+	// Tunnel fetchers for WireGuard networks, keyed by network name (their
+	// dial func resolves the network's LIVE tunnel per dial, so they survive
+	// reconnects). Separate from the proxy pools since they key by network,
+	// not proxy URL.
+	tunnelHTMLByNet  map[string]*fetcher
+	tunnelImageByNet map[string]*fetcher
+	previewCache     *ttlCache[PreviewData]
+	thumbCache       *ttlCache[thumbResult]
+	mediaSem         chan struct{}
 
 	login *loginLimiter
 
@@ -167,8 +175,10 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		hub:          h,
 		mux:          http.NewServeMux(),
 		previewsOn:   loadPreviews(context.Background(), h.Store(), cfg),
-		htmlByProxy:  make(map[string]*fetcher),
-		imageByProxy: make(map[string]*fetcher),
+		htmlByProxy:      make(map[string]*fetcher),
+		imageByProxy:     make(map[string]*fetcher),
+		tunnelHTMLByNet:  make(map[string]*fetcher),
+		tunnelImageByNet: make(map[string]*fetcher),
 		previewCache: newTTLCache[PreviewData](30*time.Minute, 512),
 		thumbCache:   newTTLCache[thumbResult](24*time.Hour, maxThumbCache),
 		mediaSem:     make(chan struct{}, mediaSlots),
@@ -222,6 +232,59 @@ func (s *Server) htmlFetcherFor(proxy *url.URL) *fetcher {
 
 func (s *Server) imageFetcherFor(proxy *url.URL) *fetcher {
 	return s.cachedFetcher(s.imageByProxy, maxImageBytes, proxy)
+}
+
+// htmlFetcherForNetwork / imageFetcherForNetwork resolve how a media fetch for
+// a link seen on `network` must egress and return the matching fetcher: direct,
+// through the network's proxy, or through its WireGuard tunnel. They return nil
+// to FAIL CLOSED (the caller sends 502) when the egress can't be safely
+// determined — never a direct fetch that would leak a proxied/tunneled
+// network's real IP.
+func (s *Server) htmlFetcherForNetwork(ctx context.Context, network string) *fetcher {
+	e := s.egressForNetwork(ctx, network)
+	if !e.ok {
+		return nil
+	}
+	if e.tunnel {
+		return s.cachedTunnelFetcher(s.tunnelHTMLByNet, maxHTMLBytes, e.network)
+	}
+	return s.htmlFetcherFor(e.proxy) // nil proxy => direct
+}
+
+func (s *Server) imageFetcherForNetwork(ctx context.Context, network string) *fetcher {
+	e := s.egressForNetwork(ctx, network)
+	if !e.ok {
+		return nil
+	}
+	if e.tunnel {
+		return s.cachedTunnelFetcher(s.tunnelImageByNet, maxImageBytes, e.network)
+	}
+	return s.imageFetcherFor(e.proxy)
+}
+
+// cachedTunnelFetcher returns a fetcher (per network, per size) that dials
+// through the network's live WireGuard tunnel. The dial func resolves the
+// tunnel fresh on every dial via the hub, so the cached fetcher transparently
+// follows the network across reconnects and fails closed when it is down.
+func (s *Server) cachedTunnelFetcher(pool map[string]*fetcher, maxBytes int64, network string) *fetcher {
+	s.mediaMu.RLock()
+	f := pool[network]
+	s.mediaMu.RUnlock()
+	if f != nil {
+		return f
+	}
+	s.mediaMu.Lock()
+	defer s.mediaMu.Unlock()
+	if f = pool[network]; f == nil {
+		if len(pool) >= maxProxyFetchers {
+			clear(pool)
+		}
+		f = newTunnelFetcher(maxBytes, func(ctx context.Context, addr string) (net.Conn, error) {
+			return s.hub.NetworkTunnelDial(ctx, network, addr)
+		})
+		pool[network] = f
+	}
+	return f
 }
 
 // maxProxyFetchers bounds a fetcher pool. Real deployments use a handful of

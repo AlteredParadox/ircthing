@@ -1646,6 +1646,25 @@ func (m *Manager) dialCtx(ctx context.Context) (context.Context, context.CancelF
 	return context.WithCancel(ctx)
 }
 
+// MediaDialContext dials addr through this network's LIVE WireGuard tunnel for
+// an off-Run-goroutine caller (the media proxy fetching a link/image preview
+// for a link seen on this network). It only READS the current tunnel under
+// wgMu — it never builds or re-resolves one (that stays Run-goroutine-only, per
+// the dialWireGuard invariant), so it can't leak a tunnel past wgClose. Returns
+// an error when no tunnel is up yet (network connecting / between reconnects)
+// or if it was torn down concurrently (DialContext then fails gracefully, not
+// a panic); the media path turns that into a refused (no) preview rather than
+// ever falling back to a direct fetch that would leak the real IP.
+func (m *Manager) MediaDialContext(ctx context.Context, addr string) (net.Conn, error) {
+	m.wgMu.Lock()
+	tun := m.wgTun
+	m.wgMu.Unlock()
+	if tun == nil {
+		return nil, errors.New("irc: wireguard tunnel not available")
+	}
+	return tun.DialContext(ctx, addr)
+}
+
 // wgClose tears down the WireGuard tunnel if one was built. Called when Run
 // returns (context cancelled), so a removed/stopped network doesn't leak the
 // userspace device goroutines or its UDP socket.
