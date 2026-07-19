@@ -135,57 +135,6 @@ func skipSegment(b []byte, i int) int {
 	return i + segLen
 }
 
-// jpegAdobeRGB reports whether b is a 3-component JPEG that Go decodes to RGBA
-// rather than YCbCr: one carrying an Adobe APP14 marker with transform==0 (RGB).
-// For those, image/jpeg holds the decoded component planes AND a separate RGBA
-// result live SIMULTANEOUSLY (reader.go's RGB conversion), so the decode costs
-// an extra ~4 B/px over the YCbCr planes — which a plain 4 B/px model misses,
-// letting a max-dimension RGB JPEG decode to ~63 MiB while passing the gate.
-// Normal JFIF/YCbCr JPEGs (no Adobe marker, or transform 1/2) decode straight
-// to *image.YCbCr with no such copy. Walks the marker segments like
-// isProgressiveJPEG, stopping at SOS.
-func jpegAdobeRGB(b []byte) bool {
-	if !bytes.HasPrefix(b, []byte{0xFF, 0xD8}) { // SOI
-		return false
-	}
-	for i := 2; i+1 < len(b); {
-		if b[i] != 0xFF || b[i+1] == 0xFF { // not a marker start, or a fill byte
-			i++
-			continue
-		}
-		marker := b[i+1]
-		i += 2
-		if marker == 0xDA { // SOS: header done, no APP14 past here
-			return false
-		}
-		if isStandaloneJPEGMarker(marker) { // no length-prefixed payload
-			continue
-		}
-		next := skipSegment(b, i)
-		if next < 0 {
-			return false
-		}
-		if marker == 0xEE && isAdobeRGB(b[i+2:min(next, len(b))]) { // APP14
-			return true
-		}
-		i = next
-	}
-	return false
-}
-
-// isStandaloneJPEGMarker reports a marker that carries no length-prefixed
-// payload (TEM, RST0-7, SOI, EOI) — the walk skips past it by marker byte alone.
-func isStandaloneJPEGMarker(m byte) bool {
-	return m == 0x01 || (m >= 0xD0 && m <= 0xD9)
-}
-
-// isAdobeRGB reports whether an APP14 segment payload is an Adobe marker
-// declaring RGB (transform 0). Layout: "Adobe"(5) version(2) flags0(2)
-// flags1(2) transform(1).
-func isAdobeRGB(payload []byte) bool {
-	return len(payload) >= 12 && string(payload[:5]) == "Adobe" && payload[11] == 0
-}
-
 // isAdam7PNG reports whether a PNG body is Adam7-interlaced (IHDR interlace
 // byte == 1). Go's PNG decoder holds the full destination image AND the current
 // pass image at once, so an interlaced PNG needs an extra copy charged. The
@@ -242,8 +191,8 @@ func decodePerPixel(format string, model color.Model, body []byte) int64 {
 }
 
 // jpegDecodeSurcharge is the extra per-pixel memory a JPEG decode holds beyond
-// the output planes: progressive coefficients, and the RGBA copy an RGB/Adobe
-// JPEG builds while the component planes are still live.
+// the output bitmap: progressive coefficients, and — for an RGB/Adobe JPEG — the
+// component planes that stay live while the RGBA result is built.
 func jpegDecodeSurcharge(model color.Model, body []byte) int64 {
 	var extra int64
 	if isProgressiveJPEG(body) {
@@ -255,9 +204,13 @@ func jpegDecodeSurcharge(model color.Model, body []byte) int64 {
 		}
 		extra += 4 * comps
 	}
-	// A 3-component RGB/Adobe JPEG (YCbCrModel from DecodeConfig, but decoded to
-	// RGBA) holds the component planes AND the RGBA result at once.
-	if model == color.YCbCrModel && jpegAdobeRGB(body) {
+	// DecodeConfig reports RGBAModel for a 3-component RGB/Adobe JPEG (isRGB):
+	// image/jpeg decodes it by building an RGBA image WHILE the YCbCr-structured
+	// component planes are still live (reader.go). bytesPerPixel(RGBAModel) counts
+	// the 4 B/px RGBA output; add ~4 B/px more for those coexisting planes, or a
+	// max-dimension RGB JPEG decodes to ~63 MiB while passing a 4 B/px gate. This
+	// is the AUTHORITATIVE signal — no header scanning needed.
+	if model == color.RGBAModel {
 		extra += 4
 	}
 	return extra

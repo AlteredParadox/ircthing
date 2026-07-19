@@ -1209,19 +1209,20 @@ const maxOpenHistBatches = 256
 // would otherwise pin whole parsed lines in the count-capped map.
 const maxBatchRefBytes = 512
 
-// clampBatchRef returns the reference to use as a map key, or "" if it is
-// unusable. An over-limit ref is REJECTED (→ ""), not truncated: truncation
-// would alias two distinct over-limit refs to one key (refs are opaque and
-// case-sensitive), so a colliding close could end the wrong batch and its
-// remaining replayed messages would classify as live. Callers never store or
-// match "" (an over-limit ref thus behaves as "no batch" → live, the benign
-// default). Must reject IDENTICALLY here and in internal/hub or the two layers'
-// state splits. Normal refs (≤512) pass through unchanged.
+// clampBatchRef returns the map key for a batch reference. A short ref (≤512,
+// every real one) is used verbatim; an over-limit ref is HASHED to a bounded key
+// rather than truncated OR rejected. Truncation would alias two distinct opaque
+// refs to one key; rejecting (an earlier attempt) turned a legitimate long-ref
+// batch into live traffic (its open discarded, its @batch messages unmatched →
+// spurious notifications). Hashing keeps distinct refs distinct AND bounded, so
+// a long batch still correlates. The "\x00" prefix can't collide with a raw ref
+// (NUL is forbidden in an IRC parameter). Must match internal/hub byte-for-byte.
 func clampBatchRef(ref string) string {
-	if len(ref) > maxBatchRefBytes {
-		return ""
+	if len(ref) <= maxBatchRefBytes {
+		return ref
 	}
-	return ref
+	sum := sha256.Sum256([]byte(ref))
+	return "\x00" + hex.EncodeToString(sum[:])
 }
 
 // The BATCH open declares its reference as a plain PARAM (raw), while messages

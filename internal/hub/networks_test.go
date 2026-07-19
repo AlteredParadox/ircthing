@@ -77,10 +77,10 @@ func TestEditChannelList(t *testing.T) {
 }
 
 // The hub keys histBatches by a rule that must match internal/irc's
-// clampBatchRef exactly: a normal ref passes through, an over-512 ref is
-// REJECTED (→ ""), never truncated (truncation would alias distinct opaque
-// refs). If the two layers disagreed, a ref would classify as replay to one and
-// live to the other. This locks the hub side of that contract.
+// clampBatchRef exactly: a normal ref passes through; an over-512 ref is HASHED
+// to a bounded key (not truncated — that aliases distinct refs — nor rejected —
+// that turned a long batch into live traffic). Distinct over-limit refs must map
+// to distinct keys so a long batch still correlates. Locks the hub side.
 func TestClampBatchRef(t *testing.T) {
 	if maxBatchRefBytes != 512 {
 		t.Fatalf("maxBatchRefBytes = %d, must stay 512 to match internal/irc", maxBatchRefBytes)
@@ -91,8 +91,15 @@ func TestClampBatchRef(t *testing.T) {
 	if got := clampBatchRef(strings.Repeat("a", 512)); len(got) != 512 {
 		t.Fatalf("at-limit ref must pass through: len=%d", len(got))
 	}
-	if got := clampBatchRef(strings.Repeat("a", 513)); got != "" {
-		t.Fatalf("over-limit ref must be rejected (empty), got len=%d", len(got))
+	// Over-limit refs are hashed: bounded, non-empty, and distinct refs stay
+	// distinct (two refs sharing a 512-byte prefix must NOT collide).
+	k1 := clampBatchRef(strings.Repeat("a", 600) + "X")
+	k2 := clampBatchRef(strings.Repeat("a", 600) + "Y")
+	if k1 == "" || len(k1) > 128 {
+		t.Fatalf("over-limit ref key = %q (want bounded, non-empty)", k1)
+	}
+	if k1 == k2 {
+		t.Fatal("distinct over-limit refs collided to one key")
 	}
 }
 

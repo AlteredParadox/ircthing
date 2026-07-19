@@ -24,6 +24,8 @@ package hub
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"log"
 	"strconv"
 	"strings"
@@ -861,16 +863,17 @@ func clampServerInfo(s string) string {
 // splitting hub vs manager state. Real refs are short.
 const maxBatchRefBytes = 512
 
-// clampBatchRef returns the batch reference to use as a key, or "" if it is
-// unusable (over maxBatchRefBytes). It REJECTS over-limit refs rather than
-// truncating — see internal/irc.clampBatchRef for why (truncation aliases
-// distinct opaque refs). Callers never store or match "" (over-limit ⇒ no
-// batch ⇒ live). Must match internal/irc byte-for-byte. Normal refs pass through.
+// clampBatchRef returns the histBatches key for a batch reference: a short ref
+// (≤512) verbatim, an over-limit ref HASHED to a bounded "\x00"+sha256 key
+// (never truncated — that aliases distinct refs — nor rejected — that turned a
+// long-ref batch into live traffic). See internal/irc.clampBatchRef; must match
+// it byte-for-byte so the two layers agree.
 func clampBatchRef(s string) string {
-	if len(s) > maxBatchRefBytes {
-		return ""
+	if len(s) <= maxBatchRefBytes {
+		return s
 	}
-	return s
+	sum := sha256.Sum256([]byte(s))
+	return "\x00" + hex.EncodeToString(sum[:])
 }
 
 // accumulateWhois collects the WHOIS reply numerics into one card, keyed
