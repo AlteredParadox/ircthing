@@ -184,31 +184,49 @@ func TestIsProgressiveJPEG(t *testing.T) {
 	}
 }
 
-// The decode surcharges keep an RGB/Adobe JPEG or Adam7 PNG from decoding past
-// maxDecodeBytes (F3). An RGB JPEG is signalled by DecodeConfig reporting
-// RGBAModel (isRGB), so the surcharge keys on the model, not a header scan.
+// The decode surcharge keeps an RGB/Adobe JPEG (Go decodes it to RGBA while the
+// component planes are live) from decoding past maxDecodeBytes. Crucially it must
+// catch an Adobe APP14 placed AFTER the first scan — DecodeConfig stops there and
+// reports YCbCr, so the gate must scan the whole file, not trust the model (F3).
 func TestCoexistingBufferSurcharges(t *testing.T) {
-	// Real path: a stdlib-encoded JPEG is YCbCr (JFIF) → YCbCrModel → NO RGBA
+	// An Adobe APP14 segment: FF EE, len=0x000E (2 len + 12 payload), "Adobe",
+	// version(2) flags0(2) flags1(2) transform(1).
+	adobeSeg := func(transform byte) []byte {
+		seg := append([]byte{0xFF, 0xEE, 0x00, 0x0E}, []byte("Adobe")...)
+		return append(seg, 0, 0, 0, 0, 0, 0, transform)
+	}
+	if !jpegDecodesToRGBA(adobeSeg(0)) {
+		t.Error("Adobe transform 0 (RGB) not detected")
+	}
+	if jpegDecodesToRGBA(adobeSeg(1)) || jpegDecodesToRGBA(adobeSeg(2)) {
+		t.Error("Adobe transform 1/2 (YCbCr/YCCK) wrongly detected as RGB")
+	}
+
+	// A stdlib JPEG is plain YCbCr (JFIF, no Adobe marker) → YCbCrModel, NO
 	// surcharge; the common case keeps the full 4 B/px budget.
 	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, img, nil); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(buf.Bytes()))
+	if got := jpegDecodeSurcharge(color.YCbCrModel, buf.Bytes()); got != 0 {
+		t.Fatalf("plain YCbCr JPEG surcharge = %d, want 0", got)
+	}
+
+	// THE MEDIUM-1 CASE: append the Adobe RGB marker after the encoded stream (a
+	// late APP14). DecodeConfig still reports YCbCr (it stopped at the first
+	// scan), but the surcharge must STILL fire because the full decode produces
+	// RGBA — the gate can't trust DecodeConfig's model.
+	late := append(append([]byte{}, buf.Bytes()...), adobeSeg(0)...)
+	lcfg, _, err := image.DecodeConfig(bytes.NewReader(late))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ColorModel != color.YCbCrModel {
-		t.Fatalf("stdlib jpeg.Encode should report YCbCrModel, got %T", cfg.ColorModel)
+	if lcfg.ColorModel != color.YCbCrModel {
+		t.Fatalf("late-APP14 DecodeConfig model = %T, want YCbCrModel (proves it misses the marker)", lcfg.ColorModel)
 	}
-	if got := jpegDecodeSurcharge(cfg.ColorModel, buf.Bytes()); got != 0 {
-		t.Fatalf("YCbCr JPEG surcharge = %d, want 0", got)
-	}
-	// An RGB/Adobe JPEG (RGBAModel from DecodeConfig) is charged the coexisting
-	// component planes.
-	if got := jpegDecodeSurcharge(color.RGBAModel, buf.Bytes()); got != 4 {
-		t.Fatalf("RGB JPEG surcharge = %d, want 4 (coexisting planes)", got)
+	if got := jpegDecodeSurcharge(lcfg.ColorModel, late); got != 4 {
+		t.Fatalf("late-APP14 RGB JPEG surcharge = %d, want 4 (whole-file scan must catch it)", got)
 	}
 
 	// PNG interlace byte at offset 28 drives the Adam7 surcharge.
@@ -222,10 +240,10 @@ func TestCoexistingBufferSurcharges(t *testing.T) {
 		t.Error("isAdam7PNG detection wrong")
 	}
 
-	// The surcharge bites: an 8 MP RGB JPEG (RGBAModel, 4+4=8 B/px) exceeds the
+	// The surcharge bites: an 8 MP RGB JPEG (late marker, 4+4=8 B/px) exceeds the
 	// cap where the same pixels as plain YCbCr (4 B/px) pass.
 	const px = 8_000_000
-	if int64(px)*decodePerPixel("jpeg", color.RGBAModel, nil) <= maxDecodeBytes {
+	if int64(px)*decodePerPixel("jpeg", color.YCbCrModel, late) <= maxDecodeBytes {
 		t.Fatal("RGB-JPEG per-pixel too low to bound the coexisting RGBA copy")
 	}
 	if int64(px)*decodePerPixel("jpeg", color.YCbCrModel, buf.Bytes()) > maxDecodeBytes {

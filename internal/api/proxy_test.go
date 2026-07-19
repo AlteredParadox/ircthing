@@ -87,7 +87,7 @@ func TestFetcherUsesProxy(t *testing.T) {
 
 	f := newFetcher(maxHTMLBytes, fakeConnectProxy(t))
 	f.allowIP = func(net.IP) bool { return true } // permit the loopback target
-	_, body, err := f.get(context.Background(), target.URL)
+	_, _, body, err := f.get(context.Background(), target.URL)
 	if err != nil {
 		t.Fatalf("proxied fetch: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestFetcherUsesProxy(t *testing.T) {
 func TestProxiedFetcherBlocksLiteralPrivateIP(t *testing.T) {
 	f := newFetcher(maxHTMLBytes, fakeConnectProxy(t)) // default allowIP = isPublicIP
 	for _, u := range []string{"http://10.0.0.1/x", "http://169.254.169.254/latest", "http://[::1]/"} {
-		if _, _, err := f.get(context.Background(), u); !errors.Is(err, errBlocked) {
+		if _, _, _, err := f.get(context.Background(), u); !errors.Is(err, errBlocked) {
 			t.Fatalf("get(%q) = %v, want errBlocked", u, err)
 		}
 	}
@@ -185,7 +185,7 @@ func TestFetcherBlocksLoopbackByDefault(t *testing.T) {
 	defer srv.Close()
 
 	f := newFetcher(maxHTMLBytes, nil)
-	_, _, err := f.get(context.Background(), srv.URL)
+	_, _, _, err := f.get(context.Background(), srv.URL)
 	if err == nil {
 		t.Fatal("fetcher connected to loopback")
 	}
@@ -224,12 +224,12 @@ func TestFetcherRejects(t *testing.T) {
 	f := permissiveFetcher(t, 1024)
 
 	t.Run("non-http scheme", func(t *testing.T) {
-		if _, _, err := f.get(context.Background(), "file:///etc/passwd"); !errors.Is(err, errBadURL) {
+		if _, _, _, err := f.get(context.Background(), "file:///etc/passwd"); !errors.Is(err, errBadURL) {
 			t.Fatalf("err = %v", err)
 		}
 	})
 	t.Run("relative url", func(t *testing.T) {
-		if _, _, err := f.get(context.Background(), "/just/a/path"); !errors.Is(err, errBadURL) {
+		if _, _, _, err := f.get(context.Background(), "/just/a/path"); !errors.Is(err, errBadURL) {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -238,7 +238,7 @@ func TestFetcherRejects(t *testing.T) {
 			w.Write(make([]byte, 4096))
 		}))
 		defer srv.Close()
-		if _, _, err := f.get(context.Background(), srv.URL); !errors.Is(err, errTooLarge) {
+		if _, _, _, err := f.get(context.Background(), srv.URL); !errors.Is(err, errTooLarge) {
 			t.Fatalf("err = %v, want too large", err)
 		}
 	})
@@ -247,7 +247,7 @@ func TestFetcherRejects(t *testing.T) {
 			http.Error(w, "nope", http.StatusForbidden)
 		}))
 		defer srv.Close()
-		if _, _, err := f.get(context.Background(), srv.URL); err == nil {
+		if _, _, _, err := f.get(context.Background(), srv.URL); err == nil {
 			t.Fatal("expected error on 403")
 		}
 	})
@@ -275,11 +275,35 @@ func TestFetcherRevalidatesEveryHop(t *testing.T) {
 		dials++
 		return dials == 1 // allow the redirector, block the target
 	}
-	_, body, err := f.get(context.Background(), redirector.URL)
+	_, _, body, err := f.get(context.Background(), redirector.URL)
 	if err == nil {
 		t.Fatalf("second hop was not revalidated; got body %q", body)
 	}
 	if dials < 2 {
 		t.Fatalf("redirect target was never dialed (dials=%d)", dials)
+	}
+}
+
+// get returns the FINAL URL after redirects, so the caller resolves relative
+// og:image against the page they actually landed on (finding 10).
+func TestFetcherReturnsFinalURL(t *testing.T) {
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html></html>"))
+	}))
+	defer final.Close()
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL+"/landed", http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	f := newFetcher(maxHTMLBytes, nil)
+	f.allowIP = func(net.IP) bool { return true } // allow both loopback hops
+	_, finalURL, _, err := f.get(context.Background(), redirector.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := final.URL + "/landed"; finalURL != want {
+		t.Fatalf("finalURL = %q, want %q (post-redirect)", finalURL, want)
 	}
 }

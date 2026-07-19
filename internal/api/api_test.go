@@ -520,7 +520,7 @@ func TestEgressForNetwork(t *testing.T) {
 	if wgf != srv.htmlFetcherForNetwork(ctx, "wgnet") {
 		t.Fatal("per-network tunnel fetcher not cached/reused")
 	}
-	if _, _, err := wgf.get(ctx, "https://example.com/"); err == nil {
+	if _, _, _, err := wgf.get(ctx, "https://example.com/"); err == nil {
 		t.Fatal("wgnet fetch with no running tunnel must fail closed, not fall back to direct")
 	}
 }

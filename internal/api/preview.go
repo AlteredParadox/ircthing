@@ -38,7 +38,20 @@ const (
 	// maxImageURL matches the /api/thumb URL limit; a longer og:image is
 	// useless (the proxy rejects it) and dangerous to cache.
 	maxImageURL = 2048
+	// maxMetaTags bounds how many <meta> tags parseHeadMeta scans — real pages
+	// carry a few dozen; a hostile one could carry tens of thousands.
+	maxMetaTags = 256
 )
+
+// wantedMeta is the exact set of head-metadata keys extractMeta consumes;
+// parseHeadMeta retains only these, so an attacker's unbounded distinct keys
+// can't grow the map.
+var wantedMeta = map[string]bool{
+	"og:title": true, "twitter:title": true,
+	"og:description": true, "twitter:description": true, "description": true,
+	"og:site_name": true,
+	"og:image":     true, "og:image:url": true, "twitter:image": true,
+}
 
 // PreviewData is the /api/preview JSON response.
 type PreviewData struct {
@@ -90,6 +103,11 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.releasePreview()
+	// Re-check the cache: another request may have populated it during the wait.
+	if pv, ok := s.previewCache.get(ck); ok {
+		writeJSON(w, pv)
+		return
+	}
 	// Re-check after the (up to 5s) slot wait: previews may have been disabled
 	// while this request was parked, and it must not fetch after that.
 	if !s.previewsEnabled() {
@@ -98,15 +116,19 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 	// Resolve egress AFTER the wait: a proxy/tunnel may have been configured on
 	// the network while we were parked, and a stale (direct) resolution would
-	// leak the IP. Fail closed if we can't confirm a direct/proxy/tunnel egress.
+	// leak the IP. A nil fetcher means the egress is UNRESOLVABLE (unknown/deleted
+	// network or unparseable proxy) — fail closed, 502.
 	f := s.htmlFetcherForNetwork(r.Context(), net)
 	if f == nil {
 		http.Error(w, "preview unavailable", http.StatusBadGateway)
 		return
 	}
-	ct, body, err := f.get(r.Context(), target)
+	// A fetch/dial error is often TRANSIENT (a WireGuard tunnel still coming up
+	// dials-fail here) — 503 (retryable) so the client retries a few times rather
+	// than caching a 5-minute failure. Still fail closed: no direct fetch.
+	ct, finalURL, body, err := f.get(r.Context(), target)
 	if err != nil {
-		http.Error(w, "preview unavailable", http.StatusBadGateway)
+		http.Error(w, "preview fetch failed", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -115,7 +137,9 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		pv.Kind = "image"
 		pv.Image = target
 	} else {
-		extractMeta(string(body), target, &pv)
+		// Resolve relative og:image against the FINAL (post-redirect) URL, or a
+		// redirect would resolve them against the wrong origin/path.
+		extractMeta(string(body), finalURL, &pv)
 	}
 	s.previewCache.put(ck, pv)
 	writeJSON(w, pv)
@@ -156,10 +180,14 @@ func extractMeta(doc, pageURL string, pv *PreviewData) {
 }
 
 // parseHeadMeta collects <meta property|name=… content=…> pairs (first
-// value wins), unescaped.
+// value wins), unescaped. Only the handful of keys extractMeta reads are
+// retained (wantedMeta), and at most maxMetaTags tags are scanned — a hostile
+// page could otherwise carry tens of thousands of distinct meta keys and blow
+// the map (and the materialized match slice) to tens of MiB, overlapping the
+// image decoder against MemoryMax.
 func parseHeadMeta(doc string) map[string]string {
 	meta := map[string]string{}
-	for _, tag := range reMeta.FindAllString(doc, -1) {
+	for _, tag := range reMeta.FindAllString(doc, maxMetaTags) {
 		var key, content string
 		for _, a := range reAttr.FindAllStringSubmatch(tag, -1) {
 			name := strings.ToLower(a[1])
@@ -171,10 +199,11 @@ func parseHeadMeta(doc string) map[string]string {
 				content = val
 			}
 		}
-		if key != "" && content != "" {
-			if _, seen := meta[key]; !seen {
-				meta[key] = html.UnescapeString(content)
-			}
+		if content == "" || !wantedMeta[key] {
+			continue // ignore keys extractMeta never reads
+		}
+		if _, seen := meta[key]; !seen {
+			meta[key] = html.UnescapeString(content)
 		}
 	}
 	return meta

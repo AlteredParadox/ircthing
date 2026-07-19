@@ -69,7 +69,13 @@ function mediaFetch(path, url, net, signal) {
 async function mediaFetch503(path, url, net, signal) {
 	let r = await mediaFetch(path, url, net, signal);
 	for (let attempt = 0; r.status === 503 && attempt < 3 && !signal.aborted; attempt++) {
-		await new Promise((res) => setTimeout(res, 1200 * (attempt + 1))); // 1.2s, 2.4s, 3.6s
+		// Abort-aware backoff: a row scrolled away mid-wait resolves immediately
+		// (and its abort tears the fetch down) instead of holding the inflight
+		// entry for the full delay.
+		await new Promise((res) => {
+			const t = setTimeout(res, 1200 * (attempt + 1)); // 1.2s, 2.4s, 3.6s
+			signal.addEventListener("abort", () => { clearTimeout(t); res(); }, { once: true });
+		});
 		if (signal.aborted) break;
 		r = await mediaFetch(path, url, net, signal);
 	}
@@ -174,15 +180,25 @@ function useThumb(url, net) {
 	return src;
 }
 
-// LinkPreview renders one URL's preview: an inline thumbnail for images,
-// or a compact card (image + title + description) for pages. Renders
-// nothing until data resolves, and nothing at all on failure.
+// LinkPreview renders one URL's preview. An OBVIOUS image URL goes straight to a
+// thumbnail — no /api/preview round-trip, which would only tell us it's an image
+// (a second remote request to the same target, a second tracking hit). Anything
+// else fetches page metadata via LinkCard. (No hooks here, so the branch is a
+// legal conditional render; each sub-component owns its own effects.)
 export function LinkPreview({ url, net }) {
+	if (looksLikeImageURL(url)) return <ImageThumb url={url} net={net} />;
+	return <LinkCard url={url} net={net} />;
+}
+
+// LinkCard fetches page metadata for a non-obvious-image URL and renders a card
+// (or an inline thumbnail if the server reports the target is actually an image,
+// e.g. an extension-less image URL). Renders nothing until data resolves, and
+// nothing at all on failure.
+function LinkCard({ url, net }) {
 	const [data, setData] = useState(() => (cache.has(ck(url, net)) ? cache.get(ck(url, net)) : undefined));
 
-	// Re-resolve whenever url or net changes: a reused component must not
-	// keep rendering the previous url's preview, and the network selects the
-	// fetch's proxy.
+	// Re-resolve whenever url or net changes: a reused component must not keep
+	// rendering the previous url's preview, and the network selects the proxy.
 	useEffect(() => {
 		let alive = true;
 		const cached = cache.has(ck(url, net)) ? cache.get(ck(url, net)) : undefined;
@@ -200,12 +216,7 @@ export function LinkPreview({ url, net }) {
 		};
 	}, [url, net]);
 
-	// Fast path: obvious image URLs render a thumbnail without waiting for
-	// the preview metadata round-trip.
-	if (data === undefined) {
-		return looksLikeImageURL(url) ? <ImageThumb url={url} net={net} /> : null;
-	}
-	if (!data) return looksLikeImageURL(url) ? <ImageThumb url={url} net={net} /> : null;
+	if (!data) return null; // loading or failed: no card (not an obvious image)
 	if (data.kind === "image") return <ImageThumb url={data.image || url} net={net} />;
 	if (!data.title && !data.description && !data.image) return null;
 

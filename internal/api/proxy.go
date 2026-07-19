@@ -214,42 +214,48 @@ func (f *fetcher) hostAllowed(host string) bool {
 	return ip == nil || f.allowIP(ip)
 }
 
-// get fetches rawURL, returning its content type and body (capped at
-// maxBytes). Only absolute http(s) URLs are allowed.
-func (f *fetcher) get(ctx context.Context, rawURL string) (contentType string, body []byte, err error) {
+// get fetches rawURL, returning its content type, the FINAL URL after any
+// redirects, and body (capped at maxBytes). Only absolute http(s) URLs are
+// allowed. The final URL lets the caller resolve relative assets (og:image)
+// against the page they actually came from, not the pre-redirect target.
+func (f *fetcher) get(ctx context.Context, rawURL string) (contentType, finalURL string, body []byte, err error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return "", nil, errBadURL
+		return "", "", nil, errBadURL
 	}
 	// Proxied path: refuse a literal non-public IP up front, since the
 	// Control hook can't re-check the proxy-resolved address at dial time.
 	// (Direct fetches are covered by that hook.)
 	if f.proxied && !f.hostAllowed(u.Hostname()) {
-		return "", nil, errBlocked
+		return "", "", nil, errBlocked
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 	req.Header.Set("User-Agent", proxyUserAgent)
 	req.Header.Set("Accept", "*/*")
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", nil, fmt.Errorf("proxy: upstream status %d", resp.StatusCode)
+		return "", "", nil, fmt.Errorf("proxy: upstream status %d", resp.StatusCode)
 	}
 	body, err = io.ReadAll(io.LimitReader(resp.Body, f.maxBytes+1))
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 	if int64(len(body)) > f.maxBytes {
-		return "", nil, errTooLarge
+		return "", "", nil, errTooLarge
 	}
-	return resp.Header.Get("Content-Type"), body, nil
+	finalURL = rawURL
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String() // the URL after redirects
+	}
+	return resp.Header.Get("Content-Type"), finalURL, body, nil
 }
 
 // specialPurposePrefixes are the IANA special-purpose registry blocks

@@ -144,6 +144,30 @@ func isAdam7PNG(b []byte) bool {
 	return len(b) >= 29 && b[28] == 1
 }
 
+// jpegDecodesToRGBA reports whether Go decodes a 3-component JPEG to RGBA (isRGB):
+// one carrying an Adobe APP14 marker with transform 0 (RGB). Go then allocates an
+// RGBA result WHILE the component planes are still live (~2x). DecodeConfig stops
+// at the first scan and so can MISS an APP14 placed AFTER it — its ColorModel is
+// therefore NOT authoritative — so scan the WHOLE file. An APP14 marker
+// (0xFF 0xEE) can't occur in entropy-coded data (a data 0xFF is byte-stuffed to
+// 0xFF 0x00), so any occurrence is a real marker; a rare non-marker false match
+// only over-charges, which is safe.
+func jpegDecodesToRGBA(b []byte) bool {
+	for base := 0; ; {
+		rel := bytes.Index(b[base:], []byte{0xFF, 0xEE})
+		if rel < 0 {
+			return false
+		}
+		i := base + rel
+		// Adobe APP14 payload: "Adobe"(5) version(2) flags0(2) flags1(2)
+		// transform(1); transform 0 == RGB. (i+2..i+3 is the segment length.)
+		if i+4+12 <= len(b) && string(b[i+4:i+9]) == "Adobe" && b[i+4+11] == 0 {
+			return true
+		}
+		base = i + 2
+	}
+}
+
 // decodableFormat validates that body is an image we are willing to fully
 // decode within maxDecodeBytes, returning its format. ok is false when the
 // header is unreadable, the dimensions are out of range, or the modeled
@@ -165,7 +189,15 @@ func decodableFormat(body []byte) (format string, ok bool) {
 	// entirely separate from the result. Modeling only the output bitmap lets
 	// a small progressive JPEG blow past maxDecodeBytes at image.Decode time.
 	perPixel := decodePerPixel(format, cfg.ColorModel, body)
-	if int64(cfg.Width)*int64(cfg.Height)*perPixel > maxDecodeBytes {
+	// A JPEG decoder allocates its planes/coefficients on MCU boundaries (up to
+	// 16 px for 4:2:0), so round each dimension up to 16 — a boundary image
+	// otherwise decodes slightly (~1-2 MiB) above the area-based estimate.
+	w, h := int64(cfg.Width), int64(cfg.Height)
+	if format == "jpeg" {
+		w = (w + 15) &^ 15
+		h = (h + 15) &^ 15
+	}
+	if w*h*perPixel > maxDecodeBytes {
 		return "", false
 	}
 	return format, true
@@ -204,13 +236,13 @@ func jpegDecodeSurcharge(model color.Model, body []byte) int64 {
 		}
 		extra += 4 * comps
 	}
-	// DecodeConfig reports RGBAModel for a 3-component RGB/Adobe JPEG (isRGB):
-	// image/jpeg decodes it by building an RGBA image WHILE the YCbCr-structured
-	// component planes are still live (reader.go). bytesPerPixel(RGBAModel) counts
-	// the 4 B/px RGBA output; add ~4 B/px more for those coexisting planes, or a
-	// max-dimension RGB JPEG decodes to ~63 MiB while passing a 4 B/px gate. This
-	// is the AUTHORITATIVE signal — no header scanning needed.
-	if model == color.RGBAModel {
+	// A 3-component JPEG (YCbCrModel or RGBAModel per DecodeConfig) that Go decodes
+	// to RGBA holds the component planes AND the RGBA result at once — charge the
+	// coexisting planes (~4 B/px on top of the RGBA output). DecodeConfig's model
+	// is NOT authoritative (a late Adobe APP14 is invisible to it), so detect RGB
+	// by scanning the whole file. Normal YCbCr JPEGs (no Adobe marker) get no
+	// surcharge, keeping their 9 MP budget.
+	if (model == color.YCbCrModel || model == color.RGBAModel) && jpegDecodesToRGBA(body) {
 		extra += 4
 	}
 	return extra
@@ -239,6 +271,12 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.releaseMedia()
+	// Re-check the cache: another request for the same target may have populated
+	// it while we waited for the slot, so we needn't refetch AND redecode it.
+	if t, ok := s.thumbCache.get(ck); ok {
+		writeThumb(w, t)
+		return
+	}
 	// Re-check after the slot wait: previews may have been disabled while this
 	// request was parked, and it must not fetch after that.
 	if !s.previewsEnabled() {
@@ -247,16 +285,20 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	}
 	// Resolve egress AFTER the wait so a proxy/tunnel configured on the network
 	// while we were parked is honored (a stale direct resolution would leak the
-	// IP). Fail closed on an unresolvable network (see egressForNetwork).
+	// IP). A nil fetcher means the egress is UNRESOLVABLE (unknown/deleted network
+	// or unparseable proxy) — fail closed, 502 (see egressForNetwork).
 	f := s.imageFetcherForNetwork(r.Context(), net)
 	if f == nil {
 		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
 		return
 	}
-
-	ct, body, err := f.get(r.Context(), target)
+	// A fetch/dial error is often TRANSIENT — a WireGuard tunnel still coming up
+	// dials-fail here — so 503 (retryable), not 502, so the client retries a few
+	// times instead of caching a 5-minute failure. Still fail closed: no direct
+	// fetch, just a retry hint.
+	ct, _, body, err := f.get(r.Context(), target)
 	if err != nil {
-		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
+		http.Error(w, "thumbnail fetch failed", http.StatusServiceUnavailable)
 		return
 	}
 	if !isImageType(ct) && !isImageType(http.DetectContentType(body)) {
