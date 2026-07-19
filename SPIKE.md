@@ -171,7 +171,7 @@ Example network config (config-file only, no UI):
   "wireguard": {
     "private_key": "<base64>",
     "peer_public_key": "<base64>",
-    "endpoint": "203.0.113.x:51820",
+    "endpoint": "203.0.113.7:51820",
     "address": "10.64.0.2",
     "dns": "10.64.0.1"
   }
@@ -215,12 +215,12 @@ for approval with these numbers on record.
 
 ---
 
-## 6. Target-box validation (host-a, 2026-07-18)
+## 6. Target-box validation (2026-07-18)
 
 **Environment:** 1 vCPU / 1 GB VPS, Debian 13 (6.12 cloud kernel),
 `GOMEMLIMIT=64MiB`, `GODEBUG=gctrace=1`, hardened DynamicUser unit. Real WG
-peer on a fleet host (host-b, port 51821 — a resident WireGuard service owns 51820), tunnel
-DNS = 9.9.9.9 resolved in-tunnel, client-side only (unlike §2's
+peer on a second host (port 51821 — another WireGuard service already owned
+51820), tunnel DNS = 9.9.9.9 resolved in-tunnel, client-side only (unlike §2's
 both-sides-in-process bench). Network: libera/#linux via hostname, TLS.
 
 | metric | result | budget/req |
@@ -251,15 +251,17 @@ live heap confirms ~zero retention. Effective settled cost ≈ idle + noise.
    path. Update deploy/ unit with a do-not-remove comment; failure mode
    (EAFNOSUPPORT) only manifests on WG-enabled networks.
 4. **`dns` field should accept host:port** (default :53). Port 53 isn't
-   always usable at the far end (a resident WireGuard service DNS handling, port squatters).
+   always usable at the far end (another resident WireGuard service's DNS
+   handling, port squatters).
 5. **Replay churn:** ~25 MB transient alloc per replay stream, zero
    retained. Consider pooling encode/send buffers to flatten the transient;
    low priority, no leak.
 
 ### Rig notes (for future spikes)
 
-- a resident WireGuard service hosts: 51820/udp is taken; a resident WireGuard service's DNS machinery affects port 53
-  handling — run any test resolver off-port, or skip resolver infra entirely.
+- Hosts already running a WireGuard service: 51820/udp is taken; that service's
+  DNS machinery can affect port 53 handling — run any test resolver off-port, or
+  skip resolver infra entirely.
 - The leak oracle is client-side tcpdump. Don't build peer-side resolver
   infrastructure to prove a client-side property (a public resolver dialed
   through the tunnel tests the same thing, harder).

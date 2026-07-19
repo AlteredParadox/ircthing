@@ -323,7 +323,7 @@ test("mentionsMe", () => {
 		{ text: "AlteredParadox: hello", nick: "AlteredParadox", want: true },
 		{ text: "hey AlteredParadox", nick: "AlteredParadox", want: true },
 		{ text: "ALTEREDPARADOX ping", nick: "AlteredParadox", want: true },
-		{ text: "mAlteredParadoxat", nick: "AlteredParadox", want: false },
+		{ text: "unAlteredParadoxed", nick: "AlteredParadox", want: false },
 		{ text: "AlteredParadox_ is someone else", nick: "AlteredParadox", want: false },
 		{ text: "ping AlteredParadox[]", nick: "AlteredParadox[]", want: true },
 		{ text: "nothing here", nick: "AlteredParadox", want: false },

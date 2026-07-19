@@ -67,8 +67,8 @@ func TestPersistAutojoinMirrorsMembership(t *testing.T) {
 	if ch := channels(); len(ch) != 1 || ch[0] != "#go" {
 		t.Fatalf("after JOIN: channels = %v, want [#go]", ch)
 	}
-	feed(":ALTEREDPARADOX!u@h JOIN #GO")    // same channel, different casing -> no-op
-	feed(":bob!u@h JOIN #other") // someone else -> ignored
+	feed(":ALTEREDPARADOX!u@h JOIN #GO") // same channel, different casing -> no-op
+	feed(":bob!u@h JOIN #other")         // someone else -> ignored
 	if ch := channels(); len(ch) != 1 || ch[0] != "#go" {
 		t.Fatalf("dup/other JOIN changed channels: %v", ch)
 	}
@@ -455,7 +455,7 @@ func TestHubPersistsEvents(t *testing.T) {
 		"@msgid=m1 :alice!u@h PRIVMSG #go :hello channel",
 		":bob!u@h PRIVMSG AlteredParadox :hello query",
 		":irc.test 372 AlteredParadox :- motd line", // must be dropped
-		"PING :x",                        // must be dropped
+		"PING :x", // must be dropped
 	}
 	for _, l := range lines {
 		conn.ch <- irc.Event{

@@ -25,8 +25,12 @@ scrollback runs in ~32 MB of RSS.
   `no-implicit-names`. CTCP VERSION/PING/TIME/CLIENTINFO are answered;
   DCC is deliberately out of scope.
 - **Connectivity**: TLS with client certificates, certificate
-  fingerprint pinning for self-signed servers, SOCKS5 (Tor-friendly:
-  DNS resolves proxy-side) and HTTP CONNECT proxies per network.
+  fingerprint pinning for self-signed servers, and per-network egress —
+  SOCKS5 (Tor-friendly: DNS resolves proxy-side), HTTP CONNECT, or an
+  in-process userspace **WireGuard** tunnel (no TUN device, no root; DNS
+  resolves in-tunnel so nothing leaks pre-tunnel except the peer endpoint's
+  own hostname). Link previews for a WireGuard network are fetched through
+  that same tunnel and fail closed if it's down.
 - **Web UI**: virtualized message list (smooth at 50k+ messages),
   full-text search (FTS5), link previews and image thumbnails through a
   server-side proxy, desktop notifications with per-network highlight
@@ -52,7 +56,9 @@ scrollback runs in ~32 MB of RSS.
 
 ## Quick start
 
-Requires Go ≥ 1.25 and Node (for the frontend build) — build-time only.
+Requires Go ≥ 1.25.12 (the `go.mod` toolchain floor — `make build` refuses an
+older patch level, which would reintroduce fixed stdlib CVEs) and Node (for the
+frontend build) — both build-time only.
 
 ```sh
 make build                          # builds web assets + bin/ircd-web
@@ -248,3 +254,11 @@ This program is distributed in the hope that it will be useful, but
 WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero
 General Public License for more details.
+
+Because this is an AGPL network service, the running binary serves its own
+license at `/license` and the notices for every bundled dependency (Go modules
+linked into the binary plus the embedded Preact frontend) at
+`/third-party-licenses` — both unauthenticated, so anyone using a deployment
+can reach them (AGPL §13). Regenerate the notices after any dependency change
+with `scripts/gen-third-party-licenses.sh`; the Settings → About panel links
+both.

@@ -71,9 +71,9 @@ func TestRosterUserHost(t *testing.T) {
 		got[m.Nick] = m.User + "@" + m.Host
 	}
 	want := map[string]string{
-		"AlteredParadox":   "u@h",             // from the JOIN prefix
-		"alice": "auser@ahost",     // from userhost-in-names 353 (prefix stripped)
-		"bob":   "newuser@newhost", // CHGHOST overrides the 353 user@host
+		"AlteredParadox": "u@h",             // from the JOIN prefix
+		"alice":          "auser@ahost",     // from userhost-in-names 353 (prefix stripped)
+		"bob":            "newuser@newhost", // CHGHOST overrides the 353 user@host
 	}
 	for nick, uh := range want {
 		if got[nick] != uh {
@@ -94,7 +94,7 @@ func TestRosterAggregateBudget(t *testing.T) {
 	maxRosterMembers = 3
 
 	r := testRoster()
-	feed(t, r, ":AlteredParadox!u@h JOIN #a")                   // our own join: 1 member
+	feed(t, r, ":AlteredParadox!u@h JOIN #a")        // our own join: 1 member
 	feed(t, r, ":u1!u@h JOIN #a", ":u2!u@h JOIN #a") // -> 3 members (aggregate cap)
 	if got := r.totalMembers(); got != 3 {
 		t.Fatalf("totalMembers = %d, want 3", got)
