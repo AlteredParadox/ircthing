@@ -426,6 +426,46 @@ func TestManagerAutojoinsAfterRegistration(t *testing.T) {
 	}
 }
 
+// A read-loop failure must tear down the whole connection scope — including
+// the paced rejoin producer. A protocol-fatal line arriving while rejoin
+// JOINs are still trickling through the flood limiter must reconnect
+// promptly, not after every remaining JOIN has been paced out (which took
+// ~2s per channel: over two hours at the 4,096-channel cap).
+func TestReadFailureStopsPacedRejoins(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	cfg := testCfg(ln.Addr().String())
+	// Slow pacing, with more channels than the 16-entry internal queue plus
+	// the token burst can absorb, so the producer actually blocks mid-drain:
+	// the ~24 JOINs it cannot enqueue would pace out at 400ms each (~10s) —
+	// past accept's 5s deadline — so the old wait-for-the-producer behavior
+	// fails this test.
+	cfg.SendBurst = 8
+	cfg.SendInterval = 400 * time.Millisecond
+	for i := 0; i < 48; i++ {
+		cfg.Channels = append(cfg.Channels, "#ch"+strconv.Itoa(i))
+	}
+	m := startManager(t, cfg)
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+	s.readCmd("JOIN") // the producer is running
+
+	// An application-level fatal (server-set nick over the authoritative
+	// cap) makes serveLoop return while the socket stays open and writable.
+	s.send(":AlteredParadox!u@h NICK :" + strings.Repeat("n", maxAuthoritativeNickBytes+1))
+
+	// The reconnect must arrive long before the remaining JOINs could have
+	// been paced out.
+	s2 := accept(t, conns)
+	s2.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+}
+
 func TestManagerRejoinsRuntimeChannels(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
