@@ -1058,6 +1058,17 @@ func (s *Store) canonicalLocked(ctx context.Context, network, target string, fol
 // and would miss the rfc1459 []\^ pairs), preserving its stored casing.
 // ok is false when no such buffer exists. The hub uses it to route
 // QUIT/NICK lines into an open query buffer.
+//
+// This scans the network's buffer names and folds each in Go rather than
+// filtering in SQL: the store is deliberately casemapping-agnostic (fold is
+// a per-connection parameter, not stored), so the fold cannot live in an
+// index. The cost is O(buffers per network) per live QUIT/NICK — an ACCEPTED
+// bounded tradeoff: buffers are capped at maxBuffersPerNetwork, s.mu is
+// released between calls, and a real user has tens of buffers (microseconds).
+// A hostile server that first opens thousands of buffers could turn this into
+// a throughput drag, but not a stall or exhaustion. If that ever matters, an
+// ASCII-NOCASE indexed lookup would fast-path the common (special-char-free)
+// target and fall back to this scan only for names containing []\~{}|^.
 func (s *Store) FindBuffer(ctx context.Context, network, target string, fold func(string) string) (name string, ok bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
