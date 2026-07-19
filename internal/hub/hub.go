@@ -311,8 +311,16 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 func (h *Hub) liveHints(ctx context.Context, c Conn, ev irc.Event) {
 	if hint, affected := membersHint(ev.Msg); affected {
 		// Canonical spelling: clients key buffers by it (see history_changed).
+		// An empty hint (the channel-spanning QUIT/NICK/AWAY/ACCOUNT/CHGHOST)
+		// stays empty — skip CanonicalBuffer, which would otherwise run a full
+		// O(buffers) name scan under the store lock for every one of these
+		// high-volume lines (a netsplit QUIT burst) only to return "".
+		buffer := ""
+		if hint != "" {
+			buffer = h.store.CanonicalBuffer(ctx, ev.Network, hint, c.Fold)
+		}
 		h.broadcast(envelope("members_changed", 0, MembersChangedData{
-			Network: ev.Network, Buffer: h.store.CanonicalBuffer(ctx, ev.Network, hint, c.Fold),
+			Network: ev.Network, Buffer: buffer,
 		}))
 	}
 	// An INVITE has no reply numeric to forward — surface it directly
@@ -371,27 +379,35 @@ func (h *Hub) persistAutojoin(ctx context.Context, c Conn, ev irc.Event) {
 	default:
 		return
 	}
-	ch := ev.Msg.Param(0)
-	if ch == "" || !c.IsChannel(ch) {
-		return
-	}
-	// Never persist a channel we could not validly rejoin: a spoofed self-JOIN
-	// for an over-long name or one carrying framing bytes would make
-	// netconf.Validate fail on every restart (bricking the network). A PART
-	// (remove) is always allowed, so an already-stored bad entry can be cleared.
-	if add && (len(ch) > maxPersistedChannelLen || strings.ContainsAny(ch, " \r\n\x00")) {
+	if ev.Msg.Param(0) == "" {
 		return
 	}
 	// TryLock, never Lock: this runs on the Hub event goroutine, and a network
 	// edit/delete holds netOps while StopNetwork waits for THIS goroutine to
 	// exit — a blocking Lock here would deadlock. Best-effort: skip persisting
-	// this one membership change while a network operation is in progress.
+	// this membership change while a network operation is in progress.
 	if !h.netOps.TryLock() {
 		return
 	}
 	defer h.netOps.Unlock()
-	if err := h.updateAutojoinLocked(ctx, ev.Network, ch, add, c.Fold); err != nil {
-		log.Printf("irc[%s]: persist autojoin %s %q: %v", ev.Network, ev.Msg.Command, ch, err)
+	// JOIN/PART carry a comma-list of channels (RFC 2812); update each, or a
+	// combined self-PART ("PART #a,#b") would leave the stored list with #a,#b
+	// still present and rejoin them after a restart against the user's intent.
+	for _, ch := range strings.Split(ev.Msg.Param(0), ",") {
+		if ch == "" || !c.IsChannel(ch) {
+			continue
+		}
+		// Never persist a channel we could not validly rejoin: a spoofed
+		// self-JOIN for an over-long name or one carrying framing bytes would
+		// make netconf.Validate fail on every restart (bricking the network). A
+		// PART (remove) is always allowed, so an already-stored bad entry can be
+		// cleared.
+		if add && (len(ch) > maxPersistedChannelLen || strings.ContainsAny(ch, " \r\n\x00")) {
+			continue
+		}
+		if err := h.updateAutojoinLocked(ctx, ev.Network, ch, add, c.Fold); err != nil {
+			log.Printf("irc[%s]: persist autojoin %s %q: %v", ev.Network, ev.Msg.Command, ch, err)
+		}
 	}
 }
 

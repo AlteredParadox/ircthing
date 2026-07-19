@@ -627,17 +627,25 @@ export function App() {
 				select(ev.network, ev.buffer);
 			}
 			// Highlight = a mention/keyword in a channel, or any message in
-			// a query (PM) buffer. PMs always alert.
+			// a query (PM) buffer. PMs always alert. The synthetic server
+			// buffer ("*", where service/server NOTICEs land) is treated like a
+			// channel, NOT a PM — otherwise every NickServ/"*** Notice" line
+			// would alert (favicon red + a desktop-notification storm on a
+			// connect burst); only a real nick/keyword match in it alerts.
 			const isChan = isChannelName(ev.buffer, networksRef.current[ev.network]?.chantypes);
+			const chanLike = isChan || ev.buffer === SERVER_BUFFER;
 			const highlight = isMsg && !mine &&
-				(isChan ? highlightText(r.text, nick, rulesRef.current, ev.network) : true);
-			// Ignored senders never count or alert (and are hidden at
-			// render); muted buffers still count unread but never alert.
+				(chanLike ? highlightText(r.text, nick, rulesRef.current, ev.network) : true);
+			// Ignored senders never alert (and are hidden at render); muted
+			// buffers never alert either. Both still COUNT toward unread, so the
+			// badge matches the server's authoritative count (which can't know
+			// client-local ignores) — otherwise a reconnect's get_buffers would
+			// overwrite the badge with a higher number that never clears.
 			const ignored = isIgnored(ignoresRef.current, ev.network, ev.sender);
 			const muted = isMuted(mutesRef.current, key);
 			const alert = highlight && !ignored && !muted;
 
-			setBuffers((b) => bumpBufferActivity(b, key, ev, isMsg && !mine && !ignored, alert));
+			setBuffers((b) => bumpBufferActivity(b, key, ev, isMsg && !mine, alert));
 
 			// Desktop notification when an alert lands somewhere the user
 			// isn't looking (tab hidden, or a different buffer active).

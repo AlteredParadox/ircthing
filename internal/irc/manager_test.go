@@ -1590,6 +1590,33 @@ func TestManagerBoundsJoinedSet(t *testing.T) {
 	}
 }
 
+// A combined self-PART (comma-list) clears every listed channel from the
+// rejoin set — not just the literal comma-joined string.
+func TestTrackJoinIntentMultiPart(t *testing.T) {
+	m, err := NewManager(Config{Addr: "x:1", Nick: "AlteredParadox", AllowPlaintext: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.nick.Store("AlteredParadox")
+	for _, ch := range []string{"#a", "#b", "#c"} {
+		if err := m.trackJoinIntent(ircv4.MustParseMessage(":AlteredParadox!u@h JOIN " + ch)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(m.joined) != 3 {
+		t.Fatalf("joined = %d, want 3", len(m.joined))
+	}
+	if err := m.trackJoinIntent(ircv4.MustParseMessage(":AlteredParadox!u@h PART #a,#c :bye")); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.joined) != 1 {
+		t.Fatalf("joined = %d after multi-PART, want 1", len(m.joined))
+	}
+	if _, ok := m.joined["#b"]; !ok {
+		t.Fatalf("joined = %v after multi-PART, want just #b", m.joined)
+	}
+}
+
 // A spoofed self-JOIN with a framing or over-length channel name is not
 // stored as rejoin intent, so it cannot brick the network on reconnect.
 func TestTrackJoinRejectsPoisonedChannel(t *testing.T) {

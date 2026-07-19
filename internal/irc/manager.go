@@ -1396,12 +1396,18 @@ func (m *Manager) trackJoinIntent(in *ircv4.Message) error {
 		// casing clears the rejoin intent. PART carries a comma-list of
 		// channels (RFC 2812 §3.2.2); clear every one, or a multi-channel
 		// self-PART would leave the un-cleared channels to rejoin on the
-		// next reconnect against the user's intent.
+		// next reconnect against the user's intent. Fold each part ONCE into a
+		// set, then fold each joined key once — O(parts+joined), not the
+		// O(parts×joined) double-fold a nested loop would do (a spoofed
+		// self-PART with thousands of comma channels is otherwise a fold bomb,
+		// the same class the QUIT handler guards).
+		parted := make(map[string]bool)
 		for _, part := range strings.Split(in.Param(0), ",") {
-			for key := range m.joined {
-				if m.isup.FoldEqual(key, part) {
-					delete(m.joined, key)
-				}
+			parted[m.isup.Fold(part)] = true
+		}
+		for key := range m.joined {
+			if parted[m.isup.Fold(key)] {
+				delete(m.joined, key)
 			}
 		}
 	}

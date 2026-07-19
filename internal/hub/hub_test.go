@@ -61,6 +61,21 @@ func TestPersistAutojoinMirrorsMembership(t *testing.T) {
 		t.Fatalf("after PART: channels = %v, want []", ch)
 	}
 
+	// A combined self-JOIN then a combined self-PART (comma-lists) must add and
+	// then clear EVERY listed channel — not the literal "#a,#b" string.
+	feed(":AlteredParadox!u@h JOIN #a,#b,#c")
+	if ch := channels(); len(ch) != 3 {
+		t.Fatalf("after multi-JOIN: channels = %v, want 3", ch)
+	}
+	feed(":AlteredParadox!u@h PART #a,#c")
+	if ch := channels(); len(ch) != 1 || ch[0] != "#b" {
+		t.Fatalf("after multi-PART: channels = %v, want [#b]", ch)
+	}
+	feed(":AlteredParadox!u@h PART #b")
+	if ch := channels(); len(ch) != 0 {
+		t.Fatalf("after final PART: channels = %v, want []", ch)
+	}
+
 	// An oversized channel name is NOT persisted (it would fail restart
 	// validation); a framing byte likewise.
 	feed(":AlteredParadox!u@h JOIN #" + strings.Repeat("x", maxPersistedChannelLen))
