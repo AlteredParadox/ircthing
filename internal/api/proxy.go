@@ -18,6 +18,7 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -91,9 +92,11 @@ func acquireSlot(ctx context.Context, sem chan struct{}) bool {
 }
 
 var (
-	errBadURL   = errors.New("proxy: url must be an absolute http(s) URL")
-	errTooLarge = errors.New("proxy: response exceeds size cap")
-	errBlocked  = errors.New("proxy: refusing to connect to a non-public address")
+	errBadURL         = errors.New("proxy: url must be an absolute http(s) URL")
+	errTooLarge       = errors.New("proxy: response exceeds size cap")
+	errBlocked        = errors.New("proxy: refusing to connect to a non-public address")
+	errRedirectLoop   = errors.New("proxy: too many redirects")
+	errRedirectScheme = errors.New("proxy: disallowed redirect scheme")
 )
 
 // upstreamStatusError is get's error for a non-200 upstream response. It carries
@@ -112,14 +115,27 @@ func (e *upstreamStatusError) Error() string {
 //   - errTooLarge: the body already exceeds the cap; a retry re-downloads it (up
 //     to ~10 MiB per attempt for an oversized image) to the same end.
 //   - errBadURL / errBlocked: our own validation rejected it; deterministic.
+//   - errRedirectLoop / errRedirectScheme: the target's redirect behavior is
+//     deterministic too, and each retry of a five-hop loop re-walks all five
+//     hops — an untyped classification here turned one client retry cycle into
+//     ~twenty upstream requests.
+//   - certificate verification failure: the peer's certificate won't become
+//     valid between immediate retries.
 //   - permanent upstream status (4xx except 408/429): the origin answered "no".
-// Everything else — dial/TLS/timeout errors (a WireGuard tunnel still warming up),
-// truncated reads, and 5xx/408/429 upstream — is transient.
+//
+// Everything else — dial/timeout errors (a WireGuard tunnel still warming up),
+// TLS handshake I/O errors, truncated reads, and 5xx/408/429 upstream — is
+// transient.
 func fetchErrorRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, errTooLarge) || errors.Is(err, errBadURL) || errors.Is(err, errBlocked) {
+	if errors.Is(err, errTooLarge) || errors.Is(err, errBadURL) || errors.Is(err, errBlocked) ||
+		errors.Is(err, errRedirectLoop) || errors.Is(err, errRedirectScheme) {
+		return false
+	}
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
 		return false
 	}
 	var se *upstreamStatusError
@@ -234,12 +250,17 @@ func (f *fetcher) dialContext(proxy *url.URL) func(context.Context, string, stri
 	return d.DialContext
 }
 
+// checkRedirect vets each redirect hop. Its errors are TYPED (and survive
+// the *url.Error wrapping client.Do applies) so fetchErrorRetryable can
+// classify a redirect loop or a forbidden scheme as permanent — both are
+// deterministic properties of the target, and retrying a loop re-walks
+// every hop.
 func (f *fetcher) checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 5 {
-		return errors.New("proxy: too many redirects")
+		return errRedirectLoop
 	}
 	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
-		return errors.New("proxy: disallowed redirect scheme")
+		return errRedirectScheme
 	}
 	// The proxied path has no connect-time IP check, so re-apply the literal
 	// non-public-IP block on each redirect target.

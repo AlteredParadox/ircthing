@@ -19,6 +19,7 @@ package api
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -277,6 +278,19 @@ func TestFetchErrorRetryable(t *testing.T) {
 		{"upstream 500", &upstreamStatusError{500}, true},
 		{"upstream 503", &upstreamStatusError{503}, true},
 		{"dial/timeout", errors.New("dial tcp: i/o timeout"), true},
+		// Redirect misbehavior is a deterministic property of the target: a
+		// retry of a five-hop loop re-walks every hop, so it must be permanent.
+		// client.Do wraps CheckRedirect errors in *url.Error, so test the
+		// wrapped form too.
+		{"redirect loop", errRedirectLoop, false},
+		{"wrapped redirect loop", &url.Error{Op: "Get", URL: "http://x", Err: errRedirectLoop}, false},
+		{"redirect scheme", errRedirectScheme, false},
+		{"wrapped redirect scheme", &url.Error{Op: "Get", URL: "http://x", Err: errRedirectScheme}, false},
+		// A certificate verification failure won't heal between retries.
+		{"cert verification", &url.Error{Op: "Get", URL: "https://x",
+			Err: &tls.CertificateVerificationError{Err: errors.New("x509: bad")}}, false},
+		// A generic TLS I/O failure (handshake cut short) stays transient.
+		{"tls io error", &url.Error{Op: "Get", URL: "https://x", Err: errors.New("EOF during handshake")}, true},
 	}
 	for _, tc := range cases {
 		if got := fetchErrorRetryable(tc.err); got != tc.want {
