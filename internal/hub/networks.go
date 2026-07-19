@@ -398,7 +398,7 @@ func (s *Session) handleJoinChannel(ctx context.Context, env Envelope, join bool
 		s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
 		return
 	}
-	if err := s.hub.updateAutojoin(ctx, d.Network, d.Channel, join, c.Fold); err != nil {
+	if err := s.hub.updateAutojoin(ctx, d.Network, []string{d.Channel}, join, c.Fold); err != nil {
 		log.Printf("network %q: updating autojoin for %s: %v", d.Network, d.Channel, err)
 	}
 	s.push(envelope("ok", env.Seq, nil))
@@ -458,18 +458,21 @@ func (h *Hub) knownNetwork(ctx context.Context, name string) (bool, error) {
 // channels can't grow the config JSON without limit.
 const maxPersistedChannels = 4096
 
-// updateAutojoin adds or removes a channel in a stored definition's channels
+// updateAutojoin adds or removes channels in a stored definition's channels
 // list (case-insensitive dedup). Holds netOps — use ONLY from a goroutine that
 // StopNetwork does not wait on (a session handler, not the Hub event loop; see
 // persistAutojoin, which uses TryLock to avoid that deadlock).
-func (h *Hub) updateAutojoin(ctx context.Context, network, channel string, add bool, fold func(string) string) error {
+func (h *Hub) updateAutojoin(ctx context.Context, network string, channels []string, add bool, fold func(string) string) error {
 	h.netOps.Lock()
 	defer h.netOps.Unlock()
-	return h.updateAutojoinLocked(ctx, network, channel, add, fold)
+	return h.updateAutojoinLocked(ctx, network, channels, add, fold)
 }
 
 // updateAutojoinLocked is the read-modify-write body; the caller holds netOps.
-func (h *Hub) updateAutojoinLocked(ctx context.Context, network, channel string, add bool, fold func(string) string) error {
+// It applies the WHOLE channels slice in one read+write (one store round-trip
+// regardless of comma-list length), so a hostile JOIN/PART flood cannot drive
+// one full-table read-modify-write per token.
+func (h *Hub) updateAutojoinLocked(ctx context.Context, network string, channels []string, add bool, fold func(string) string) error {
 	configs, err := h.store.NetworkConfigs(ctx)
 	if err != nil {
 		return err
@@ -488,10 +491,7 @@ func (h *Hub) updateAutojoinLocked(ctx context.Context, network, channel string,
 	if err != nil {
 		return err
 	}
-	if add && len(nc.Channels) >= maxPersistedChannels {
-		return nil // list already at the cap; don't grow it further
-	}
-	out, changed := editChannelList(nc.Channels, channel, add, fold)
+	out, changed := editChannelList(nc.Channels, channels, add, fold)
 	if !changed {
 		return nil
 	}
@@ -503,27 +503,53 @@ func (h *Hub) updateAutojoinLocked(ctx context.Context, network, channel string,
 	return h.store.PutNetworkConfig(ctx, network, string(canonical))
 }
 
-// editChannelList adds or removes a channel (deduplicated under the
-// network's casemapping), reporting whether the list changed.
-func editChannelList(chans []string, channel string, add bool, fold func(string) string) ([]string, bool) {
-	out := make([]string, 0, len(chans)+1)
-	found := false
-	for _, ch := range chans {
-		if fold(ch) == fold(channel) {
-			found = true
-			if !add {
+// editChannelList adds or removes a set of channels (deduplicated under the
+// network's casemapping), reporting whether the list changed. It folds each
+// stored name and each wanted name exactly ONCE (into a set), so cost is
+// O(stored + wanted) rather than O(stored × wanted) — a hostile comma-list of
+// thousands of tokens can't turn one line into a fold storm.
+func editChannelList(chans []string, wanted []string, add bool, fold func(string) string) ([]string, bool) {
+	// Fold each wanted channel once; keep the first spelling seen for the add
+	// path, and preserve wanted order for a deterministic stored config.
+	wantFold := make(map[string]string, len(wanted))
+	order := make([]string, 0, len(wanted))
+	for _, w := range wanted {
+		fw := fold(w)
+		if _, ok := wantFold[fw]; !ok {
+			wantFold[fw] = w
+			order = append(order, fw)
+		}
+	}
+	if !add {
+		// Remove: keep stored channels whose fold is not in the wanted set.
+		out := make([]string, 0, len(chans))
+		changed := false
+		for _, ch := range chans {
+			if _, drop := wantFold[fold(ch)]; drop {
+				changed = true
 				continue
 			}
+			out = append(out, ch)
 		}
-		out = append(out, ch)
+		return out, changed
 	}
-	if add {
-		if found {
-			return chans, false
+	// Add: keep every stored channel, then append wanted names not already
+	// present, in wanted order, up to the persisted-count cap.
+	have := make(map[string]bool, len(chans))
+	for _, ch := range chans {
+		have[fold(ch)] = true
+	}
+	out := chans
+	changed := false
+	for _, fw := range order {
+		if have[fw] || len(out) >= maxPersistedChannels {
+			continue // already stored, or the list is at the cap; don't grow it
 		}
-		return append(out, channel), true
+		have[fw] = true
+		out = append(out, wantFold[fw])
+		changed = true
 	}
-	return out, found
+	return out, changed
 }
 
 // SeedRows converts config-file networks into store rows for

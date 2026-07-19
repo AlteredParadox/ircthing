@@ -1,10 +1,11 @@
 package hub
 
 import (
-	"strconv"
-	"strings"
 	"context"
 	"encoding/json"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +15,66 @@ import (
 	"ircthing/internal/irc"
 	"ircthing/internal/store"
 )
+
+// editChannelList is the autojoin read-modify-write core. It applies the WHOLE
+// wanted slice in one pass (each name folded once), so a hostile comma-list
+// can't turn one JOIN/PART line into a per-token fold/store storm (F1/F2).
+func TestEditChannelList(t *testing.T) {
+	fold := strings.ToLower
+	tests := []struct {
+		name    string
+		chans   []string
+		wanted  []string
+		add     bool
+		want    []string
+		changed bool
+	}{
+		{"add new", []string{"#a"}, []string{"#b"}, true, []string{"#a", "#b"}, true},
+		{"add dedups against stored fold", []string{"#Chan"}, []string{"#chan"}, true, []string{"#Chan"}, false},
+		{"add batch keeps order, skips existing", []string{"#a"}, []string{"#a", "#b", "#c"}, true, []string{"#a", "#b", "#c"}, true},
+		{"add batch dedups within wanted", nil, []string{"#x", "#X", "#y"}, true, []string{"#x", "#y"}, true},
+		{"remove one", []string{"#a", "#b"}, []string{"#a"}, false, []string{"#b"}, true},
+		{"remove folds", []string{"#Chan", "#b"}, []string{"#chan"}, false, []string{"#b"}, true},
+		{"remove batch (combined PART)", []string{"#a", "#b", "#c"}, []string{"#a", "#c"}, false, []string{"#b"}, true},
+		{"remove absent is a no-op", []string{"#a"}, []string{"#zzz"}, false, []string{"#a"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, changed := editChannelList(tt.chans, tt.wanted, tt.add, fold)
+			if changed != tt.changed {
+				t.Fatalf("changed = %v, want %v", changed, tt.changed)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	// The count cap holds: a full list rejects further additions without change.
+	full := make([]string, maxPersistedChannels)
+	for i := range full {
+		full[i] = "#c" + strconv.Itoa(i)
+	}
+	if got, changed := editChannelList(full, []string{"#new"}, true, fold); changed || len(got) != maxPersistedChannels {
+		t.Fatalf("count cap not enforced: changed=%v len=%d", changed, len(got))
+	}
+}
+
+// The hub keys histBatches by a 512-byte RAW cut that must match internal/irc's
+// clampBatchRef byte-for-byte (F5): if the two layers clamped differently, a ref
+// in the gap would classify as replay to one and live to the other. This locks
+// the hub side of that contract (the constant and the raw, non-rune cut).
+func TestClampBatchRef(t *testing.T) {
+	if maxBatchRefBytes != 512 {
+		t.Fatalf("maxBatchRefBytes = %d, must stay 512 to match internal/irc", maxBatchRefBytes)
+	}
+	if got := clampBatchRef(strings.Repeat("a", 100)); got != strings.Repeat("a", 100) {
+		t.Fatalf("short ref altered: %q", got)
+	}
+	if got := clampBatchRef(strings.Repeat("a", 600)); len(got) != 512 {
+		t.Fatalf("long ref not cut to 512: len=%d", len(got))
+	}
+}
 
 // Network CRUD over the session protocol. StartNetwork dials for real,
 // so definitions point at a closed local port — the manager just cycles

@@ -267,7 +267,7 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 	// here and misclassify the batch's replayed messages as live traffic —
 	// notifications, unread counts, and duplicate own messages from
 	// history.
-	batchRef := clampServerInfo(ev.Msg.Tags["batch"])
+	batchRef := clampBatchRef(ev.Msg.Tags["batch"])
 	replay := batchRef != "" && histBatches[batchRef] != nil
 	batch := histBatches[batchRef]
 	if replay {
@@ -390,24 +390,34 @@ func (h *Hub) persistAutojoin(ctx context.Context, c Conn, ev irc.Event) {
 		return
 	}
 	defer h.netOps.Unlock()
-	// JOIN/PART carry a comma-list of channels (RFC 2812); update each, or a
-	// combined self-PART ("PART #a,#b") would leave the stored list with #a,#b
-	// still present and rejoin them after a restart against the user's intent.
+	// JOIN/PART carry a comma-list of channels (RFC 2812); collect the whole list
+	// and apply it in ONE read-modify-write, or a combined self-PART
+	// ("PART #a,#b") would leave the stored list with #a,#b still present and
+	// rejoin them after a restart. Batching also caps a hostile comma-list flood:
+	// a "PART #x,#y,…" with thousands of tokens is one store round-trip, not one
+	// per token (F2), and each token is length-clamped BEFORE it reaches c.Fold —
+	// a token longer than maxPersistedChannelLen can neither be validly persisted
+	// (add) nor fold-match any stored ≤200-byte name (remove), so oversized junk
+	// is dropped before the fold, defusing the self-PART fold amplifier (F1).
+	var chans []string
 	for _, ch := range strings.Split(ev.Msg.Param(0), ",") {
-		if ch == "" || !c.IsChannel(ch) {
+		if ch == "" || !c.IsChannel(ch) || len(ch) > maxPersistedChannelLen {
 			continue
 		}
-		// Never persist a channel we could not validly rejoin: a spoofed
-		// self-JOIN for an over-long name or one carrying framing bytes would
-		// make netconf.Validate fail on every restart (bricking the network). A
-		// PART (remove) is always allowed, so an already-stored bad entry can be
-		// cleared.
-		if add && (len(ch) > maxPersistedChannelLen || strings.ContainsAny(ch, " \r\n\x00")) {
+		// A spoofed self-JOIN for a name carrying framing bytes would make
+		// netconf.Validate fail on every restart (bricking the network); never
+		// persist one. A PART (remove) is always allowed, so an already-stored
+		// bad entry can still be cleared.
+		if add && strings.ContainsAny(ch, " \r\n\x00") {
 			continue
 		}
-		if err := h.updateAutojoinLocked(ctx, ev.Network, ch, add, c.Fold); err != nil {
-			log.Printf("irc[%s]: persist autojoin %s %q: %v", ev.Network, ev.Msg.Command, ch, err)
-		}
+		chans = append(chans, ch)
+	}
+	if len(chans) == 0 {
+		return
+	}
+	if err := h.updateAutojoinLocked(ctx, ev.Network, chans, add, c.Fold); err != nil {
+		log.Printf("irc[%s]: persist autojoin %s %d chans: %v", ev.Network, ev.Msg.Command, len(chans), err)
 	}
 }
 
@@ -815,6 +825,25 @@ func clampServerInfo(s string) string {
 	return s
 }
 
+// maxBatchRefBytes bounds a BATCH reference used as a histBatches key. It MUST
+// stay equal to internal/irc's clampBatchRef limit (also 512) AND clamp the SAME
+// way (a raw byte cut, not clampServerInfo's rune-boundary trim): the manager
+// keys its own replay-suppression map by that clamp, and any disagreement lets a
+// ref in the gap be replay to one layer but live to the other — splitting hub vs
+// manager state (roster/autojoin recorded on one side only). Real refs are short.
+const maxBatchRefBytes = 512
+
+// clampBatchRef truncates a batch reference to maxBatchRefBytes with a raw byte
+// cut, matching internal/irc.clampBatchRef byte-for-byte. The result is only a
+// map key (never displayed), so a split mid-rune is harmless as long as BOTH
+// layers split identically.
+func clampBatchRef(s string) string {
+	if len(s) > maxBatchRefBytes {
+		return s[:maxBatchRefBytes]
+	}
+	return s
+}
+
 // accumulateWhois collects the WHOIS reply numerics into one card, keyed
 // by the CONNECTION-FOLDED queried nick (param 1), and flushes it as a
 // "whois" push on 318 (end of /WHOIS). The fold matters: real servers
@@ -847,8 +876,7 @@ func (h *Hub) accumulateWhois(c Conn, ev irc.Event, whois map[string]*WhoisData)
 			w = &WhoisData{Nick: nick}
 			whois[key] = w
 		}
-		applyWhois(w, m)
-		clampWhois(w) // bound+detach fields now — the server may never send 318
+		applyWhois(w, m) // detaches each field it sets — see the note there
 		return true
 	case "301": // away — part of a whois only if one is open
 		if w := whois[c.Fold(clampServerInfo(m.Param(1)))]; w != nil {
@@ -879,9 +907,9 @@ func clampDetach(s string) string {
 }
 
 // clampWhois bounds AND detaches every server-controlled field of a whois card.
-// It runs at accumulation (each numeric), not just at flush, because a hostile
-// server can withhold the 318 terminator and leave the card resident — so the
-// raw ~64 KiB fields must not stay pinned while it's held.
+// applyWhois already clamps+detaches each field as it sets it (so a resident,
+// never-flushed card pins nothing), making this a cheap once-per-WHOIS safety
+// net at flush that also re-bounds the appended 319 channel list.
 func clampWhois(w *WhoisData) {
 	w.Nick = clampDetach(w.Nick)
 	w.User = clampDetach(w.User)
@@ -894,32 +922,38 @@ func clampWhois(w *WhoisData) {
 	w.Away = clampDetach(w.Away)
 }
 
-// applyWhois sets the field one WHOIS numeric carries.
+// applyWhois sets the field(s) one WHOIS numeric carries, bounding AND detaching
+// each server-controlled string as it stores it (clampDetach) so a resident card
+// pins no ~64 KiB parsed line even if the server never sends the 318 terminator.
+// Integers and bools need no detach.
 func applyWhois(w *WhoisData, m *ircv4.Message) {
 	switch m.Command {
 	case "311": // <me> <nick> <user> <host> * :<realname>
-		w.User, w.Host, w.Realname = m.Param(2), m.Param(3), m.Trailing()
+		w.User, w.Host, w.Realname = clampDetach(m.Param(2)), clampDetach(m.Param(3)), clampDetach(m.Trailing())
 	case "312": // <me> <nick> <server> :<info>
-		w.Server = m.Param(2)
+		w.Server = clampDetach(m.Param(2))
 	case "313": // is an IRC operator
 		w.Operator = true
 	case "317": // <me> <nick> <idle> [<signon>] :seconds idle, signon time
 		w.Idle = atoiOr0(m.Param(2))
 		w.Signon = atoiOr0(m.Param(3))
-	case "319": // :<prefixed channels>
-		w.Channels = m.Trailing()
+	case "319": // :<prefixed channels> — a heavily-joined user's list spans
+		// MULTIPLE 319 replies; APPEND (bounded) rather than overwrite, or only
+		// the last chunk survives. The concat is a fresh allocation (detached);
+		// clampServerInfo bounds the running total to maxServerInfoBytes.
+		w.Channels = clampServerInfo(strings.TrimSpace(w.Channels + " " + m.Trailing()))
 	case "330": // <me> <nick> <account> :is logged in as
-		w.Account = m.Param(2)
+		w.Account = clampDetach(m.Param(2))
 	case "335": // is a bot
 		w.Bot = true
 	case "338": // <me> <nick> <host/ip> [...] :actually using host
 		// The IP/host is in the middle params; the trailing is a label.
 		if mid := strings.Join(midParams(m, 2), " "); mid != "" && w.Actual == "" {
-			w.Actual = mid
+			w.Actual = clampDetach(mid)
 		}
 	case "378": // <me> <nick> :is connecting from <user@host> <ip>
 		if w.Actual == "" {
-			w.Actual = strings.TrimPrefix(m.Trailing(), "is connecting from ")
+			w.Actual = clampDetach(strings.TrimPrefix(m.Trailing(), "is connecting from "))
 		}
 	case "671": // is using a secure connection
 		w.Secure = true
@@ -975,18 +1009,19 @@ func (h *Hub) trackHistoryBatch(ctx context.Context, ev irc.Event, c Conn, batch
 	}
 	ref := ev.Msg.Params[0]
 	switch {
-	case strings.HasPrefix(ref, "+") && strings.Contains(ev.Msg.Param(1), "chathistory"):
+	case strings.HasPrefix(ref, "+") && ev.Msg.Param(1) == "chathistory":
 		openHistoryBatch(ev, ref[1:], batches)
 	case strings.HasPrefix(ref, "-"):
-		h.closeHistoryBatch(ctx, ev, c, clampServerInfo(ref[1:]), batches, pages)
+		h.closeHistoryBatch(ctx, ev, c, clampBatchRef(ref[1:]), batches, pages)
 	}
 }
 
 // openHistoryBatch records an opened chathistory BATCH so its replayed lines
-// are classified as history, not live. The ref key and target are clamped+
-// detached (both server-controlled, would otherwise pin the ~64 KiB BATCH line;
-// the target also seeds the folded backfillPages key, bounded by count not
-// length), and the open map is bounded.
+// are classified as history, not live. The ref KEY is clamped with clampBatchRef
+// (512, matching the manager's replay-suppression key so both layers agree) and
+// cloned to detach it from the ~64 KiB BATCH line; the target is clamped+detached
+// separately (2048 — it seeds the folded backfillPages key, bounded by count not
+// length). The open map is bounded.
 func openHistoryBatch(ev irc.Event, ref string, batches map[string]*histBatch) {
 	if ref == "" {
 		return // empty reference: ignore, or it becomes batches[""]
@@ -994,7 +1029,7 @@ func openHistoryBatch(ev irc.Event, ref string, batches map[string]*histBatch) {
 	if len(batches) >= maxOpenHistBatches {
 		return // bound the map at maxOpenHistBatches
 	}
-	batches[clampDetach(ref)] = &histBatch{target: clampDetach(ev.Msg.Param(2))}
+	batches[strings.Clone(clampBatchRef(ref))] = &histBatch{target: clampDetach(ev.Msg.Param(2))}
 }
 
 // closeHistoryBatch finishes a chathistory replay: it announces the affected

@@ -158,7 +158,20 @@ func (s *Store) pruneOnce(ctx context.Context, now time.Time) (int64, error) {
 
 	if days > 0 {
 		cutoff := now.Add(-time.Duration(days) * 24 * time.Hour).UnixMilli()
-		n, err := s.deleteChunked(ctx,
+		// Bail if retention is disabled or its window is widened mid-prune: our
+		// fixed cutoff must never delete a row the live (possibly larger) window
+		// would keep. A tightened window (live cutoff newer) is fine — we simply
+		// delete less than it wants and the next prune catches up.
+		ageGuard := func() bool {
+			s.mu.Lock()
+			liveDays := s.retention.days
+			s.mu.Unlock()
+			if liveDays == 0 {
+				return false
+			}
+			return cutoff <= now.Add(-time.Duration(liveDays)*24*time.Hour).UnixMilli()
+		}
+		n, err := s.deleteChunked(ctx, ageGuard,
 			`DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE ts < ? LIMIT ?)`,
 			cutoff)
 		total += n
@@ -194,11 +207,17 @@ func (s *Store) pruneOnce(ctx context.Context, now time.Time) (int64, error) {
 // deleteChunked runs a `DELETE ... id IN (SELECT ... LIMIT ?)` statement
 // repeatedly — re-acquiring s.mu for each chunk — until a short batch signals
 // the last rows are gone. args are the query parameters BEFORE the trailing
-// LIMIT. Returns the total rows deleted.
-func (s *Store) deleteChunked(ctx context.Context, query string, args ...any) (int64, error) {
+// LIMIT. Returns the total rows deleted. guard (if non-nil) is checked before
+// each chunk against the LIVE retention policy: if the operator loosens or
+// disables retention mid-prune, it returns false and the loop stops cleanly
+// rather than continuing to delete rows the new policy wants to keep.
+func (s *Store) deleteChunked(ctx context.Context, guard func() bool, query string, args ...any) (int64, error) {
 	var total int64
 	chunkArgs := append(append(make([]any, 0, len(args)+1), args...), pruneChunk)
 	for {
+		if guard != nil && !guard() {
+			return total, nil // retention loosened mid-prune; stop deleting
+		}
 		s.mu.Lock()
 		res, err := s.db.ExecContext(ctx, query, chunkArgs...)
 		if err != nil {
@@ -250,8 +269,19 @@ func (s *Store) pruneByCount(ctx context.Context, maxPer int) (int64, error) {
 		return 0, err
 	}
 
+	// Stop enforcing this maxPer if the operator raises or disables the per-buffer
+	// cap mid-prune — otherwise we keep deleting down to the old, smaller cap.
+	countGuard := func() bool {
+		s.mu.Lock()
+		liveMax := s.retention.maxPerBuffer
+		s.mu.Unlock()
+		return liveMax > 0 && liveMax <= maxPer
+	}
 	var total int64
 	for _, bufID := range ids {
+		if !countGuard() {
+			return total, nil
+		}
 		// The last row to keep: the maxPer-th newest (OFFSET maxPer-1). No row
 		// means the buffer has <= maxPer rows — nothing to prune.
 		s.mu.Lock()
@@ -267,7 +297,7 @@ func (s *Store) pruneByCount(ctx context.Context, maxPer int) (int64, error) {
 			return total, err
 		}
 		// Delete everything strictly older than the last-kept cursor.
-		n, err := s.deleteChunked(ctx,
+		n, err := s.deleteChunked(ctx, countGuard,
 			`DELETE FROM messages WHERE id IN (
 				SELECT id FROM messages
 				WHERE buffer_id = ? AND (ts < ? OR (ts = ? AND id < ?)) LIMIT ?)`,

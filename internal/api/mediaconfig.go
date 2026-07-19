@@ -26,9 +26,17 @@ import (
 const previewsKey = "previews_enabled"
 
 // loadPreviews resolves the effective previews switch: the stored value if
-// present, else the config-file default.
+// present, the config-file default when the key is unset. A genuine store READ
+// ERROR fails CLOSED (previews off) rather than falling through to a config
+// default that may be on — a persisted "off" must not be silently re-enabled.
+// (Setting returns "" with nil err for an absent key, so err != nil is a real
+// error, not "unset".)
 func loadPreviews(ctx context.Context, st *store.Store, cfg Config) bool {
-	if v, err := st.Setting(ctx, previewsKey); err == nil && v != "" {
+	v, err := st.Setting(ctx, previewsKey)
+	if err != nil {
+		return false // fail closed on a read error
+	}
+	if v != "" {
 		return v == "1"
 	}
 	return cfg.PreviewsDefault

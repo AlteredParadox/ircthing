@@ -113,8 +113,11 @@ type Manager struct {
 	// namesMu guards namesReq: channels for which we have already sent an
 	// explicit NAMES this connection (draft/no-implicit-names). Touched by
 	// EnsureNames (hub goroutine) and reset on reconnect (run goroutine).
+	// namesGen bumps on every resetNames so a NAMES send that straddles a
+	// reconnect cannot stamp its request into the fresh connection's map.
 	namesMu  sync.Mutex
 	namesReq map[string]bool
+	namesGen uint64
 
 	// whoxDone tracks channels already WHOX-queried this connection (see
 	// maybeWHOX). Only the read loop touches it.
@@ -309,6 +312,7 @@ func (m *Manager) EnsureNames(channel string) {
 		m.namesMu.Unlock()
 		return
 	}
+	gen := m.namesGen // the connection generation this request belongs to
 	m.namesMu.Unlock()
 	if already {
 		return
@@ -320,13 +324,22 @@ func (m *Manager) EnsureNames(channel string) {
 		return
 	}
 	m.namesMu.Lock()
-	m.namesReq[key] = true
+	// Only stamp if we are still on the same connection generation. If a
+	// reconnect ran resetNames between the Send above and here, the NAMES we
+	// enqueued was discarded with the old send queue; stamping the fresh map
+	// would suppress the re-fetch and leave this channel's roster empty for the
+	// life of the new connection (the JOIN-echo delete is racy — it may land
+	// before this stamp).
+	if m.namesGen == gen {
+		m.namesReq[key] = true
+	}
 	m.namesMu.Unlock()
 }
 
 func (m *Manager) resetNames() {
 	m.namesMu.Lock()
 	m.namesReq = make(map[string]bool)
+	m.namesGen++
 	m.namesMu.Unlock()
 }
 
@@ -1204,7 +1217,7 @@ func trackChathistoryBatch(in *ircv4.Message, histBatch map[string]bool) error {
 	}
 	ref := in.Params[0]
 	switch {
-	case strings.HasPrefix(ref, "+") && strings.Contains(in.Param(1), "chathistory"):
+	case strings.HasPrefix(ref, "+") && in.Param(1) == "chathistory":
 		if len(histBatch) >= maxOpenHistBatches {
 			return fmt.Errorf("irc: too many open chathistory batches (>%d)", maxOpenHistBatches)
 		}

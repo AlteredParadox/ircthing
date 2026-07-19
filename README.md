@@ -8,9 +8,9 @@ you run one process, it stays on IRC, and every browser you log in from
 picks up exactly where you left off.
 
 No CGO, no runtime dependencies beyond the config file and the SQLite
-database it creates. The binary is ~12 MB; the web bundle inside it is
-~26 KB gzipped; a working setup with 5 networks and 10k messages of hot
-scrollback runs in ~25 MB of RSS.
+database it creates. The binary is ~15 MB; the web bundle inside it is
+~42 KB gzipped; a working setup with 5 networks and 10k messages of hot
+scrollback runs in ~32 MB of RSS.
 
 ## Features
 
@@ -86,7 +86,7 @@ loudly. See `config.example.json` for a complete example.
 | `user.username`, `user.password_hash` | Web login. Generate the bcrypt hash with `ircd-web -hash-password`. |
 | `session_ttl_days` | Login cookie lifetime. Default 30. |
 | `ring_size` | Hot scrollback kept in memory per buffer. Default 200; older history is read from SQLite. |
-| `retention_days` | Prune stored messages older than this many days. Default 0 (keep forever). Pruning runs hourly and keeps the search index in step. A hot buffer's in-memory ring may briefly still show just-pruned messages until they evict. |
+| `retention_days` | Prune stored messages older than this many days. Default 0 (keep forever). Pruning runs hourly and keeps the search index in step; each hot buffer's in-memory ring is reconciled in the same pass, so pruned messages stop showing immediately. |
 | `retention_max_messages` | Keep at most this many messages per buffer; older ones are pruned. Default 0 (unlimited). Retention is **per buffer**, not an aggregate disk cap: a server that opens many buffers can still grow the database. For production, put the database on a volume with a filesystem quota (or a dedicated volume) and monitor disk — the systemd unit bounds memory, not disk. Editable live in **Settings → History retention** (the stored value then wins over this seed). |
 | `behind_proxy` | Set `true` when a **trusted single-hop** reverse proxy fronts the binary. The login rate-limit then keys on the **last `X-Forwarded-For` entry** (the hop the proxy appends) instead of the shared proxy address, so one attacker can't lock out everyone. The proxy **must** append the real client to `X-Forwarded-For` — Caddy's `reverse_proxy` does this by default; for nginx set `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`. `X-Real-IP` is deliberately **ignored** (Caddy forwards a client-set `X-Real-IP` unchanged by default, so trusting it would let an attacker spoof the backoff key). Leave `false` for direct/loopback deployments — otherwise a client could spoof `X-Forwarded-For` to evade the backoff. It also lets the WebSocket origin check verify the request scheme via `X-Forwarded-Proto` (Caddy sends it by default; for nginx add `proxy_set_header X-Forwarded-Proto $scheme;`) rather than falling back to a host-only check; with it off behind a TLS-terminating proxy the check still permits the connection, just without the scheme assertion. |
 | `disable_previews` | **Initial default** for the previews switch (tri-state). **Omit it and previews start OFF** — the privacy-first default, since an auto-fetched preview is a tracking beacon (a poster learns when a buffer is viewed) and the server makes **zero** outbound fetches. Set it to `false` to start with previews **on**, or `true` to be explicit about off. Toggle it live in **Settings → Link previews** (the saved value wins over this). Previews are fetched through **each link's own network proxy** — see [Preview fetches & the proxy SSRF caveat](#preview-fetches--the-proxy-ssrf-caveat). |
@@ -207,7 +207,8 @@ sudo systemctl enable --now ircthing
 
 The unit sets `GOMEMLIMIT=64MiB`, which keeps the Go heap comfortably
 inside the project's 72 MB RSS target (`make memcheck` verifies the
-5-networks / 50-channels / 10k-messages scenario at ~25 MB).
+5-networks / 50-channels / 10k-messages scenario: ~32 MB steady, and an
+adversarial 16 KiB-message flood peaks transiently around 72 MB).
 
 These RSS figures are for proxy/direct networks. Each **WireGuard** network
 runs its own in-process gVisor netstack; one tunnel measured ~35 MB idle /

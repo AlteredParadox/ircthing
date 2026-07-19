@@ -943,20 +943,32 @@ func (s *Store) bufferAndRing(ctx context.Context, network, target string, creat
 		s.touchRing(r)
 		return bufID, r, nil
 	}
-	// Warm with the newest ringSize+1 rows: getting fewer proves the ring
-	// now holds the buffer's entire history.
+	// Warm with the newest ringSize+1 rows: getting fewer than requested proves
+	// the ring now holds the buffer's entire history. Cap the fetch at what the
+	// byte budget could ever retain (maxRingBytes/msgOverhead rows, at the
+	// 128-byte per-message floor) so a very large configured ring_size can't
+	// materialize millions of rows here only for evictRings/trimToBytes to drop
+	// them a moment later.
+	warmLimit := s.ringSize + 1
+	if byteCap := s.maxRingBytes/msgOverhead + 1; byteCap < warmLimit {
+		warmLimit = byteCap
+	}
 	msgs, err := s.queryPage(ctx, network, target,
 		`SELECT id, ts, msgid, sender, command, raw, redacted, COALESCE(redact_reason,'') FROM messages
 		 WHERE buffer_id = ? ORDER BY ts DESC, id DESC LIMIT ?`,
-		bufID, s.ringSize+1)
+		bufID, warmLimit)
 	if err != nil {
 		return 0, nil, err
 	}
 	reverse(msgs)
 	r := newRing(s.ringSize)
-	if len(msgs) <= s.ringSize {
+	switch {
+	case len(msgs) < warmLimit:
+		// Disk returned fewer than requested: the ring holds all history.
 		r.complete = true
-	} else {
+	case len(msgs) > s.ringSize:
+		// Over-fetched the +1 sentinel (only when the byte cap didn't bind);
+		// drop the oldest so the ring holds exactly the newest ringSize.
 		msgs = msgs[1:]
 	}
 	for _, m := range msgs {

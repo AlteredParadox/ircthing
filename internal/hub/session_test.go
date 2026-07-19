@@ -1789,6 +1789,33 @@ func TestWhoisAccumulation(t *testing.T) {
 	expectSilence(t, s)
 }
 
+// A heavily-joined user's channel list spans several RPL_WHOISCHANNELS (319)
+// replies; the accumulator must APPEND them, not let each overwrite the last
+// (which would leave the card showing only the final chunk's channels).
+func TestWhoisChannelsMultiChunk(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 16), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+	conn.ch <- ev(":srv 311 AlteredParadox alice ~auser example.org * :Alice A.")
+	conn.ch <- ev(":srv 319 AlteredParadox alice :@#go +#rust")
+	conn.ch <- ev(":srv 319 AlteredParadox alice :#zig #odin")
+	conn.ch <- ev(":srv 318 AlteredParadox alice :End of /WHOIS list")
+
+	w := decode[WhoisData](t, recv(t, s, "whois"))
+	if w.Channels != "@#go +#rust #zig #odin" {
+		t.Fatalf("multi-chunk 319 channels = %q, want %q", w.Channels, "@#go +#rust #zig #odin")
+	}
+}
+
 // Real servers (Ergo among them) send the WHOIS detail numerics with the
 // target's CANONICAL spelling but echo the CLIENT'S requested spelling in
 // the 318 terminator. The accumulator must correlate the two under the

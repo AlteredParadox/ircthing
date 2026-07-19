@@ -55,6 +55,12 @@ func bytesPerPixel(m color.Model) int64 {
 	switch m {
 	case color.RGBA64Model, color.NRGBA64Model, color.Gray16Model:
 		return 8
+	case color.CMYKModel:
+		// Go's JPEG decoder holds the YCbCr planes (3 B/px) + blackPix (1 B/px)
+		// AND a separate CMYK result (4 B/px) live simultaneously during
+		// applyBlack — an ~8 B/px peak, double the output bitmap. Modeling it as
+		// 4 let a max-dimension CMYK JPEG pass the check yet decode near 72 MiB.
+		return 8
 	default:
 		return 4
 	}
@@ -133,7 +139,13 @@ func decodableFormat(body []byte) (format string, ok bool) {
 	// a small progressive JPEG blow past maxDecodeBytes at image.Decode time.
 	perPixel := bytesPerPixel(cfg.ColorModel)
 	if format == "jpeg" && isProgressiveJPEG(body) {
-		perPixel += 12
+		// ~4 B/px of full-res coefficient storage PER COMPONENT (256 B per 8x8
+		// block / 64 px). 3 components for YCbCr, 4 for CMYK/YCCK.
+		comps := int64(3)
+		if cfg.ColorModel == color.CMYKModel {
+			comps = 4
+		}
+		perPixel += 4 * comps
 	}
 	if int64(cfg.Width)*int64(cfg.Height)*perPixel > maxDecodeBytes {
 		return "", false

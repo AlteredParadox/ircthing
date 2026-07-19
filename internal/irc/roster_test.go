@@ -131,12 +131,14 @@ func TestRosterByteBudget(t *testing.T) {
 		}
 	}
 
-	// Accounting stays exact through the mutation paths.
-	checkExact := func(step string) {
+	// Accounting stays exact through the mutation paths. Takes the roster
+	// under test explicitly — it must inspect the SAME roster being mutated
+	// (r2 below), not the earlier small-budget r.
+	checkExact := func(rr *roster, step string) {
 		t.Helper()
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		for _, st := range r.chans {
+		rr.mu.Lock()
+		defer rr.mu.Unlock()
+		for _, st := range rr.chans {
 			want := len(st.topic)
 			for k, m := range st.members {
 				want += memberBytes(k, m)
@@ -154,19 +156,19 @@ func TestRosterByteBudget(t *testing.T) {
 	feed(t, r2, ":AlteredParadox!u@h JOIN #x",
 		":irc 353 AlteredParadox = #x :@op +voice plain AlteredParadox",
 		":irc 366 AlteredParadox #x :End of /NAMES list")
-	checkExact("after NAMES")
+	checkExact(r2, "after NAMES")
 	feed(t, r2, ":plain!u@h ACCOUNT services-acct")
-	checkExact("after ACCOUNT")
+	checkExact(r2, "after ACCOUNT")
 	feed(t, r2, ":op!u@h NICK operator")
-	checkExact("after NICK")
+	checkExact(r2, "after NICK")
 	feed(t, r2, ":irc TOPIC #x :a channel topic")
-	checkExact("after TOPIC")
+	checkExact(r2, "after TOPIC")
 	feed(t, r2, ":voice!u@h QUIT :bye")
-	checkExact("after QUIT")
+	checkExact(r2, "after QUIT")
 	feed(t, r2, ":plain!u@h PART #x")
-	checkExact("after PART")
+	checkExact(r2, "after PART")
 	feed(t, r2, ":irc MODE #x +o operator")
-	checkExact("after MODE")
+	checkExact(r2, "after MODE")
 }
 
 func TestRoster(t *testing.T) {

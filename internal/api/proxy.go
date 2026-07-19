@@ -97,12 +97,13 @@ func newFetcher(maxBytes int64, proxy *url.URL) *fetcher {
 	f.client = &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
-			Proxy:                 nil, // never honor $HTTP_PROXY implicitly
-			DialContext:           f.dialContext(proxy),
-			TLSHandshakeTimeout:   8 * time.Second,
-			ResponseHeaderTimeout: 8 * time.Second,
-			DisableKeepAlives:     true,
-			MaxIdleConns:          0,
+			Proxy:                  nil, // never honor $HTTP_PROXY implicitly
+			DialContext:            f.dialContext(proxy),
+			TLSHandshakeTimeout:    8 * time.Second,
+			ResponseHeaderTimeout:  8 * time.Second,
+			MaxResponseHeaderBytes: 64 << 10, // hostile targets can otherwise stream ~10 MiB of headers (Go default) outside the body budget
+			DisableKeepAlives:      true,
+			MaxIdleConns:           0,
 		},
 		CheckRedirect: f.checkRedirect,
 	}
@@ -126,10 +127,11 @@ func newTunnelFetcher(maxBytes int64, dial func(ctx context.Context, addr string
 			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
 				return dial(ctx, addr)
 			},
-			TLSHandshakeTimeout:   8 * time.Second,
-			ResponseHeaderTimeout: 8 * time.Second,
-			DisableKeepAlives:     true,
-			MaxIdleConns:          0,
+			TLSHandshakeTimeout:    8 * time.Second,
+			ResponseHeaderTimeout:  8 * time.Second,
+			MaxResponseHeaderBytes: 64 << 10, // hostile targets can otherwise stream ~10 MiB of headers (Go default) outside the body budget
+			DisableKeepAlives:      true,
+			MaxIdleConns:           0,
 		},
 		CheckRedirect: f.checkRedirect,
 	}

@@ -193,13 +193,28 @@ func (r *roster) channel(name string) (topic string, members []Member, ok bool) 
 	if st == nil {
 		return "", nil, false
 	}
-	members = make([]Member, 0, len(st.members))
+	// Decorate-sort-undecorate: fold each nick ONCE (n folds), not twice per
+	// comparison (~2·n·log n folds). On a 25k-member channel that is ~50k folds
+	// instead of ~730k — each Fold copies the string twice and takes isup.mu, and
+	// this whole block runs under r.mu, so the naive comparator would block the
+	// read loop's roster updates for far longer.
+	keyed := make([]struct {
+		m    Member
+		fold string
+	}, 0, len(st.members))
 	for _, m := range st.members {
-		members = append(members, m)
+		keyed = append(keyed, struct {
+			m    Member
+			fold string
+		}{m, r.isup.Fold(m.Nick)})
 	}
-	sort.Slice(members, func(i, j int) bool {
-		return r.isup.Fold(members[i].Nick) < r.isup.Fold(members[j].Nick)
+	sort.Slice(keyed, func(i, j int) bool {
+		return keyed[i].fold < keyed[j].fold
 	})
+	members = make([]Member, len(keyed))
+	for i := range keyed {
+		members[i] = keyed[i].m
+	}
 	return st.topic, members, true
 }
 
