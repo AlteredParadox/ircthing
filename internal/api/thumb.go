@@ -35,13 +35,15 @@ import (
 const (
 	maxImageBytes = 10 * 1024 * 1024
 	thumbMaxDim   = 400
-	// maxDecodeBytes caps the decoded bitmap size to defuse decompression
-	// bombs (a small file can declare enormous dimensions) AND deep bit
-	// depths (16-bit images are 8 bytes/pixel). ~36 MB covers 9 MP at
-	// 4 bytes/pixel, or ~4.5 MP at 8 — most shared content; full-res
-	// photos usually exceed the byte cap on the wire anyway. With
-	// mediaSlots request-wide slots the media path's worst case stays
-	// bounded transiently and the steady-state RSS target is unaffected.
+	// maxDecodeBytes caps the modeled decode memory to defuse decompression
+	// bombs (a small file can declare enormous dimensions) AND deep bit depths
+	// (16-bit images are 8 bytes/pixel). The per-pixel model (bytesPerPixel plus
+	// the progressive-JPEG, RGB/Adobe-JPEG, and Adam7-PNG surcharges in
+	// decodableFormat) charges every buffer the std-lib decoder holds LIVE AT
+	// ONCE, so this genuinely bounds the peak decode allocation — ~36 MB is
+	// 9 MP for a plain YCbCr JPEG / non-interlaced PNG (4 B/px), ~4.5 MP for the
+	// coexisting-copy cases (8 B/px). Serialized by mediaSlots (=1), so the
+	// process-wide media peak is one decode (<=36 MB) + the <=10 MB body.
 	maxDecodeBytes = 36 * 1024 * 1024
 	// maxImageDim caps each declared dimension. Defense in depth: it keeps
 	// the decoded-size multiplication below (per-dimension <= 65535, x8 bpp
@@ -133,6 +135,64 @@ func skipSegment(b []byte, i int) int {
 	return i + segLen
 }
 
+// jpegAdobeRGB reports whether b is a 3-component JPEG that Go decodes to RGBA
+// rather than YCbCr: one carrying an Adobe APP14 marker with transform==0 (RGB).
+// For those, image/jpeg holds the decoded component planes AND a separate RGBA
+// result live SIMULTANEOUSLY (reader.go's RGB conversion), so the decode costs
+// an extra ~4 B/px over the YCbCr planes — which a plain 4 B/px model misses,
+// letting a max-dimension RGB JPEG decode to ~63 MiB while passing the gate.
+// Normal JFIF/YCbCr JPEGs (no Adobe marker, or transform 1/2) decode straight
+// to *image.YCbCr with no such copy. Walks the marker segments like
+// isProgressiveJPEG, stopping at SOS.
+func jpegAdobeRGB(b []byte) bool {
+	if len(b) < 2 || b[0] != 0xFF || b[1] != 0xD8 { // SOI
+		return false
+	}
+	for i := 2; i+1 < len(b); {
+		if b[i] != 0xFF {
+			i++
+			continue
+		}
+		marker := b[i+1]
+		if marker == 0xFF { // fill byte
+			i++
+			continue
+		}
+		i += 2
+		switch {
+		case marker == 0xDA: // SOS: header done, no APP14 past here
+			return false
+		case marker == 0x01 || (marker >= 0xD0 && marker <= 0xD9):
+			continue // standalone markers, no payload
+		case marker == 0xEE: // APP14: Adobe "Adobe"(5) ver(2) flags0(2) flags1(2) transform(1)
+			if i+2+12 <= len(b) && string(b[i+2:i+2+5]) == "Adobe" {
+				return b[i+2+11] == 0 // transform 0 == RGB (adobeTransformUnknown)
+			}
+			next := skipSegment(b, i)
+			if next < 0 {
+				return false
+			}
+			i = next
+		default:
+			next := skipSegment(b, i)
+			if next < 0 {
+				return false
+			}
+			i = next
+		}
+	}
+	return false
+}
+
+// isAdam7PNG reports whether a PNG body is Adam7-interlaced (IHDR interlace
+// byte == 1). Go's PNG decoder holds the full destination image AND the current
+// pass image at once, so an interlaced PNG needs an extra copy charged. The
+// interlace byte sits at a fixed offset: 8 (signature) + 4 (IHDR length) +
+// 4 ("IHDR") + 12 (width/height/depth/colortype/compression/filter) = 28.
+func isAdam7PNG(b []byte) bool {
+	return len(b) >= 29 && b[28] == 1
+}
+
 // decodableFormat validates that body is an image we are willing to fully
 // decode within maxDecodeBytes, returning its format. ok is false when the
 // header is unreadable, the dimensions are out of range, or the modeled
@@ -154,14 +214,28 @@ func decodableFormat(body []byte) (format string, ok bool) {
 	// entirely separate from the result. Modeling only the output bitmap lets
 	// a small progressive JPEG blow past maxDecodeBytes at image.Decode time.
 	perPixel := bytesPerPixel(cfg.ColorModel)
-	if format == "jpeg" && isProgressiveJPEG(body) {
-		// ~4 B/px of full-res coefficient storage PER COMPONENT (256 B per 8x8
-		// block / 64 px). 3 components for YCbCr, 4 for CMYK/YCCK.
-		comps := int64(3)
-		if cfg.ColorModel == color.CMYKModel {
-			comps = 4
+	switch {
+	case format == "jpeg":
+		if isProgressiveJPEG(body) {
+			// ~4 B/px of full-res coefficient storage PER COMPONENT (256 B per 8x8
+			// block / 64 px). 3 components for YCbCr, 4 for CMYK/YCCK.
+			comps := int64(3)
+			if cfg.ColorModel == color.CMYKModel {
+				comps = 4
+			}
+			perPixel += 4 * comps
 		}
-		perPixel += 4 * comps
+		// A 3-component RGB/Adobe JPEG (YCbCrModel from DecodeConfig, but decoded
+		// to RGBA) holds the component planes AND the RGBA result at once — charge
+		// the extra copy so the gate bounds the REAL peak, not just the planes.
+		if cfg.ColorModel == color.YCbCrModel && jpegAdobeRGB(body) {
+			perPixel += 4
+		}
+	case format == "png" && isAdam7PNG(body):
+		// Interlaced PNG: the full destination image plus the current pass image
+		// coexist. Charge a full extra copy (conservative — the largest pass is
+		// ~half) so a max-dimension Adam7 PNG can't decode past the cap.
+		perPixel += bytesPerPixel(cfg.ColorModel)
 	}
 	if int64(cfg.Width)*int64(cfg.Height)*perPixel > maxDecodeBytes {
 		return "", false

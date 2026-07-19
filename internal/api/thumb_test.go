@@ -184,6 +184,63 @@ func TestIsProgressiveJPEG(t *testing.T) {
 	}
 }
 
+// jpegAdobeRGB and isAdam7PNG drive the decode surcharges that keep a crafted
+// RGB/Adobe JPEG or Adam7 PNG from decoding past maxDecodeBytes (F3). The stdlib
+// encoders never emit these, so the headers are crafted.
+func TestCoexistingBufferDetectors(t *testing.T) {
+	// APP14 "Adobe" segment: FF EE, len=0x0010(16), "Adobe", ver(2) flags0(2)
+	// flags1(2), transform(1). len covers the 2 length bytes + 12 payload + 2.
+	adobe := func(transform byte) []byte {
+		seg := append([]byte{0xFF, 0xEE, 0x00, 0x0E}, []byte("Adobe")...)
+		seg = append(seg, 0, 0, 0, 0, 0, 0, transform) // ver, flags0, flags1, transform
+		return append([]byte{0xFF, 0xD8}, append(seg, 0xFF, 0xDA, 0x00, 0x02)...)
+	}
+	jpegCases := []struct {
+		name string
+		b    []byte
+		want bool
+	}{
+		{"adobe transform 0 (RGB)", adobe(0), true},
+		{"adobe transform 1 (YCbCr)", adobe(1), false},
+		{"adobe transform 2 (YCCK)", adobe(2), false},
+		{"no adobe marker", []byte{0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02}, false},
+		{"not a jpeg", []byte{0x89, 0x50}, false},
+	}
+	for _, tc := range jpegCases {
+		if got := jpegAdobeRGB(tc.b); got != tc.want {
+			t.Errorf("jpegAdobeRGB(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// PNG: interlace byte at offset 28.
+	png := func(interlace byte) []byte {
+		b := make([]byte, 29)
+		copy(b, []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A})
+		b[28] = interlace
+		return b
+	}
+	if !isAdam7PNG(png(1)) {
+		t.Error("interlace=1 not detected as Adam7")
+	}
+	if isAdam7PNG(png(0)) {
+		t.Error("interlace=0 wrongly detected as Adam7")
+	}
+	if isAdam7PNG([]byte{0x89, 'P'}) {
+		t.Error("short buffer detected as Adam7")
+	}
+
+	// The surcharges bite: an 8 MP RGB JPEG (8 B/px) and an 8 MP Adam7 RGBA PNG
+	// (8 B/px) both exceed the cap, where the same pixels as plain YCbCr/non-
+	// interlaced (4 B/px) pass.
+	const px = 8_000_000
+	if int64(px)*(bytesPerPixel(color.YCbCrModel)+4) <= maxDecodeBytes {
+		t.Fatal("RGB-JPEG surcharge too low to bound the RGBA copy")
+	}
+	if int64(px)*bytesPerPixel(color.YCbCrModel) > maxDecodeBytes {
+		t.Fatal("8MP plain YCbCr should pass; test premise wrong")
+	}
+}
+
 // The media budget is request-wide: with every slot held, a thumbnail
 // request is refused (bounded wait honors context cancellation) instead
 // of fetching and queueing unbounded work.

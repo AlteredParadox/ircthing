@@ -253,15 +253,29 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 const sourceBaseURL = "https://github.com/AlteredParadox/ircthing"
 
 // sourceURL returns the Corresponding Source location, pinned to the built
-// commit when the build embedded one (go build stamps vcs.revision unless
-// -buildvcs=false), else the repository root.
+// commit ONLY for a clean, VCS-stamped build. A dirty build (vcs.modified=true)
+// runs code that no commit reflects, and a build with no stamp (-buildvcs=false)
+// has no commit to point at — in both cases pinning would MISLEAD, so fall back
+// to the repository root. Release builds should be clean and VCS-stamped so
+// users get the exact revision; the fallback keeps §13 honest otherwise.
 func sourceURL() string {
-	if bi, ok := debug.ReadBuildInfo(); ok {
-		for _, s := range bi.Settings {
-			if s.Key == "vcs.revision" && s.Value != "" {
-				return sourceBaseURL + "/tree/" + s.Value
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return sourceBaseURL
+	}
+	var revision string
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				return sourceBaseURL // dirty tree: no commit reflects what's running
 			}
 		}
+	}
+	if revision != "" {
+		return sourceBaseURL + "/tree/" + revision
 	}
 	return sourceBaseURL
 }
