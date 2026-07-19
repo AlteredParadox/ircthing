@@ -414,7 +414,7 @@ export function highlightNicks(text, nickMap) {
 	const out = [];
 	const pushPlain = (t) => {
 		const last = out.at(-1);
-		if (last && last.nick === null) last.text += t;
+		if (last?.nick === null) last.text += t;
 		else out.push({ nick: null, text: t });
 	};
 	for (let i = 0; i < parts.length; i++) {

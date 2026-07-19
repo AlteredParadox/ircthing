@@ -1187,7 +1187,13 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 	// the correspondent's notice in "*" and the REDACT's batch target is the
 	// query buffer.
 	retryStar := addressedToUs || (replay && !c.IsChannel(target))
-	ok, buffer := h.scrubRedaction(ctx, ev, buffer, msgid, reason, retryStar, replay, batch)
+	// starBatch is the batch to flag when a REPLAYED scrub lands in "*" (nil on
+	// the live path — a live scrub never touches batch state).
+	var starBatch *histBatch
+	if replay {
+		starBatch = batch
+	}
+	ok, buffer := h.scrubRedaction(ctx, ev, buffer, msgid, reason, retryStar, starBatch)
 	if !ok || replay {
 		return
 	}
@@ -1208,8 +1214,9 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 // scrubRedaction marks the message deleted in the store, retrying the server
 // buffer "*" when the first attempt misses and retryStar is set (a private
 // NOTICE's redaction). Returns whether a row was scrubbed and the buffer it
-// landed in; flags the batch's starTouched when a replayed scrub hits "*".
-func (h *Hub) scrubRedaction(ctx context.Context, ev irc.Event, buffer, msgid, reason string, retryStar, replay bool, batch *histBatch) (bool, string) {
+// landed in; when starBatch is non-nil (a replay), flags its starTouched if
+// the scrub landed in "*".
+func (h *Hub) scrubRedaction(ctx context.Context, ev irc.Event, buffer, msgid, reason string, retryStar bool, starBatch *histBatch) (bool, string) {
 	ok, err := h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason)
 	if err != nil {
 		log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)
@@ -1226,8 +1233,8 @@ func (h *Hub) scrubRedaction(ctx context.Context, ev irc.Event, buffer, msgid, r
 	}
 	// A replayed scrub that landed in "*": flag it so the batch close
 	// invalidates the client's cached "*" list (see histBatch.starTouched).
-	if ok && replay && batch != nil {
-		batch.starTouched = true
+	if ok && starBatch != nil {
+		starBatch.starTouched = true
 	}
 	return ok, buffer
 }
