@@ -145,43 +145,45 @@ func skipSegment(b []byte, i int) int {
 // to *image.YCbCr with no such copy. Walks the marker segments like
 // isProgressiveJPEG, stopping at SOS.
 func jpegAdobeRGB(b []byte) bool {
-	if len(b) < 2 || b[0] != 0xFF || b[1] != 0xD8 { // SOI
+	if !bytes.HasPrefix(b, []byte{0xFF, 0xD8}) { // SOI
 		return false
 	}
 	for i := 2; i+1 < len(b); {
-		if b[i] != 0xFF {
+		if b[i] != 0xFF || b[i+1] == 0xFF { // not a marker start, or a fill byte
 			i++
 			continue
 		}
 		marker := b[i+1]
-		if marker == 0xFF { // fill byte
-			i++
+		i += 2
+		if marker == 0xDA { // SOS: header done, no APP14 past here
+			return false
+		}
+		if isStandaloneJPEGMarker(marker) { // no length-prefixed payload
 			continue
 		}
-		i += 2
-		switch {
-		case marker == 0xDA: // SOS: header done, no APP14 past here
+		next := skipSegment(b, i)
+		if next < 0 {
 			return false
-		case marker == 0x01 || (marker >= 0xD0 && marker <= 0xD9):
-			continue // standalone markers, no payload
-		case marker == 0xEE: // APP14: Adobe "Adobe"(5) ver(2) flags0(2) flags1(2) transform(1)
-			if i+2+12 <= len(b) && string(b[i+2:i+2+5]) == "Adobe" {
-				return b[i+2+11] == 0 // transform 0 == RGB (adobeTransformUnknown)
-			}
-			next := skipSegment(b, i)
-			if next < 0 {
-				return false
-			}
-			i = next
-		default:
-			next := skipSegment(b, i)
-			if next < 0 {
-				return false
-			}
-			i = next
 		}
+		if marker == 0xEE && isAdobeRGB(b[i+2:min(next, len(b))]) { // APP14
+			return true
+		}
+		i = next
 	}
 	return false
+}
+
+// isStandaloneJPEGMarker reports a marker that carries no length-prefixed
+// payload (TEM, RST0-7, SOI, EOI) — the walk skips past it by marker byte alone.
+func isStandaloneJPEGMarker(m byte) bool {
+	return m == 0x01 || (m >= 0xD0 && m <= 0xD9)
+}
+
+// isAdobeRGB reports whether an APP14 segment payload is an Adobe marker
+// declaring RGB (transform 0). Layout: "Adobe"(5) version(2) flags0(2)
+// flags1(2) transform(1).
+func isAdobeRGB(payload []byte) bool {
+	return len(payload) >= 12 && string(payload[:5]) == "Adobe" && payload[11] == 0
 }
 
 // isAdam7PNG reports whether a PNG body is Adam7-interlaced (IHDR interlace
