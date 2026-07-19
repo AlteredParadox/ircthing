@@ -32,7 +32,12 @@ import (
 // preview that fails just isn't shown.
 
 const (
-	maxHTMLBytes    = 512 * 1024
+	// maxHTMLBytes caps the HTML body fetched for a link preview. It must clear
+	// the head of real-world pages that front-load large inline JSON before their
+	// og/title tags — YouTube's watch page, for one, puts og:title ~660 KiB in.
+	// The HTML fetcher truncates (not rejects) at this cap, and extractMeta only
+	// scans to </head>, so oversizing costs at most one prefix per preview slot.
+	maxHTMLBytes    = 1024 * 1024
 	previewMaxTitle = 300
 	previewMaxDesc  = 500
 	// maxImageURL matches the /api/thumb URL limit; a longer og:image is
@@ -251,10 +256,15 @@ func clip(s string, max int) string {
 	return strings.TrimSpace(s[:max]) + "…"
 }
 
+// isImageType reports whether contentType is an image format the thumbnailer can
+// actually DECODE (see thumb.go's registered decoders). It must not claim formats
+// we can't decode — a claimed-but-undecodable type routes the client to /api/thumb,
+// which 415s, leaving a blank card instead of a link preview. avif and x-icon have
+// no pure-Go decoder in our dependency set, so they are deliberately absent.
 func isImageType(contentType string) bool {
 	ct, _, _ := strings.Cut(contentType, ";")
 	switch strings.TrimSpace(strings.ToLower(ct)) {
-	case "image/jpeg", "image/png", "image/gif", "image/webp", "image/avif", "image/x-icon":
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
 		return true
 	}
 	return false

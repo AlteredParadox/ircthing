@@ -24,13 +24,17 @@ import (
 	"image/jpeg"
 	"image/png"
 	"net/http"
+
+	_ "golang.org/x/image/webp" // register the WebP decoder (lossy VP8 / lossless VP8L)
 )
 
 // Image thumbnails: fetch an image through the proxy, downscale it
 // server-side, and serve a small re-encoded version so the browser never
-// pulls full-size remote images and memory stays bounded. Only formats
-// the standard library can decode (JPEG/PNG/GIF) are supported; anything
-// else returns 415 and the client shows no thumbnail.
+// pulls full-size remote images and memory stays bounded. Supported
+// formats are JPEG/PNG/GIF (standard library) and WebP (golang.org/x/image,
+// pure-Go, CGO-free); anything else returns 415 and the client shows no
+// thumbnail. WebP decodes to YCbCr (lossy) or NRGBA (lossless), both <=4 B/px,
+// so it needs no decode-cost surcharge beyond the default per-pixel model.
 
 const (
 	maxImageBytes = 10 * 1024 * 1024

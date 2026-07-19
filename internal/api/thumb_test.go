@@ -143,6 +143,41 @@ func TestDecodeByteGate(t *testing.T) {
 	}
 }
 
+// minimalWebP is a valid 1x1 lossless (VP8L) WebP. Go has no WebP encoder, so
+// the fixture is raw bytes; it exercises that the golang.org/x/image/webp
+// decoder is registered and drives the format/decode path.
+var minimalWebP = []byte{
+	0x52, 0x49, 0x46, 0x46, 0x1a, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x4c,
+	0x0d, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x10, 0x07, 0x10, 0x11, 0x11, 0x88, 0x88, 0xfe,
+	0x07, 0x00,
+}
+
+func TestWebPDecodes(t *testing.T) {
+	// The decoder must be registered: decodableFormat classifies it as "webp"
+	// (a claimed-but-undecodable image type would 415 and blank the card).
+	format, ok := decodableFormat(minimalWebP)
+	if !ok || format != "webp" {
+		t.Fatalf("decodableFormat = (%q, %v), want (webp, true)", format, ok)
+	}
+	// isImageType must agree the content type is decodable, and reject the
+	// formats we have no decoder for (avif, x-icon) so they don't route to a
+	// thumbnail that fails.
+	if !isImageType("image/webp") {
+		t.Fatal("isImageType(image/webp) = false")
+	}
+	if isImageType("image/avif") || isImageType("image/x-icon") {
+		t.Fatal("isImageType claims a format with no registered decoder")
+	}
+	// End to end: decode → downscale → re-encode, as handleThumb does.
+	src, _, err := image.Decode(bytes.NewReader(minimalWebP))
+	if err != nil {
+		t.Fatalf("image.Decode(webp): %v", err)
+	}
+	if _, err := encodeThumb(thumbnail(src, thumbMaxDim), format); err != nil {
+		t.Fatalf("encodeThumb(webp): %v", err)
+	}
+}
+
 func TestIsProgressiveJPEG(t *testing.T) {
 	// A stdlib-encoded JPEG is baseline (SOF0), never progressive.
 	img := image.NewRGBA(image.Rect(0, 0, 8, 8))

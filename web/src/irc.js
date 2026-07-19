@@ -760,7 +760,9 @@ export function firstURL(text) {
 export function looksLikeImageURL(u) {
 	try {
 		const path = new URL(u).pathname.toLowerCase();
-		return /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/.test(path);
+		// Only extensions the server can decode (see api isImageType / thumb.go):
+		// an undecodable one would route here to a thumbnail that 415s (blank).
+		return /\.(png|jpe?g|gif|webp)$/.test(path);
 	} catch {
 		return false;
 	}

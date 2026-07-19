@@ -61,9 +61,9 @@ const proxyUserAgent = "ircthing-media-proxy/1.0 (+https://github.com/ircthing)"
 const mediaSlots = 1
 
 // previewSlots is the LINK-PREVIEW (HTML fetch + parse) concurrency. A preview
-// only holds a <=512 KiB HTML body and no decoded bitmap (see maxHTMLBytes), so
-// several run at once cheaply (~4 x 512 KiB) without the decode memory bound —
-// they no longer wait behind image thumbnails.
+// only holds a <=maxHTMLBytes HTML body and no decoded bitmap, so several run at
+// once cheaply (~4 x 1 MiB) without the decode memory bound — they no longer
+// wait behind image thumbnails.
 const previewSlots = 4
 
 // mediaAcquireWait bounds how long a request waits for a slot (var for
@@ -107,7 +107,7 @@ type fetcher struct {
 	// truncate reads at most maxBytes and USES that prefix instead of failing
 	// when the body is larger. Set for HTML link-preview fetches: the og/title
 	// metadata lives in <head> at the top of the document, so a large page
-	// (Next.js/GitBook sites routinely exceed 512 KiB) yields a good preview
+	// (Next.js/GitBook/YouTube routinely exceed the cap) yields a good preview
 	// from its head. Left false for image fetches, where a truncated body is a
 	// corrupt image and must be rejected (errTooLarge).
 	truncate bool
