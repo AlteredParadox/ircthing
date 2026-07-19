@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strings"
 	"syscall"
 	"time"
 
@@ -119,6 +120,8 @@ func (e *upstreamStatusError) Error() string {
 //     deterministic too, and each retry of a five-hop loop re-walks all five
 //     hops — an untyped classification here turned one client retry cycle into
 //     ~twenty upstream requests.
+//   - a malformed Location header (rejected by net/http before CheckRedirect
+//     runs): equally deterministic; recognized by message text, see below.
 //   - certificate verification failure: the peer's certificate won't become
 //     valid between immediate retries.
 //   - permanent upstream status (4xx except 408/429): the origin answered "no".
@@ -136,6 +139,17 @@ func fetchErrorRetryable(err error) bool {
 	}
 	var certErr *tls.CertificateVerificationError
 	if errors.As(err, &certErr) {
+		return false
+	}
+	// A syntactically invalid Location header is rejected inside net/http
+	// BEFORE CheckRedirect runs, so it cannot be typed there; the client
+	// returns it as an untyped fmt error inside *url.Error (go1.25
+	// net/http/client.go, redirectBehavior). Match its stable message text —
+	// a malformed redirect is a deterministic property of the target, and an
+	// untyped classification gave it the full transient-retry treatment.
+	var uerr *url.Error
+	if errors.As(err, &uerr) && uerr.Err != nil &&
+		strings.Contains(uerr.Err.Error(), "failed to parse Location header") {
 		return false
 	}
 	var se *upstreamStatusError

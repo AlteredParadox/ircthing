@@ -291,6 +291,11 @@ func TestFetchErrorRetryable(t *testing.T) {
 			Err: &tls.CertificateVerificationError{Err: errors.New("x509: bad")}}, false},
 		// A generic TLS I/O failure (handshake cut short) stays transient.
 		{"tls io error", &url.Error{Op: "Get", URL: "https://x", Err: errors.New("EOF during handshake")}, true},
+		// A malformed Location header is rejected inside net/http before
+		// CheckRedirect runs and surfaces as an untyped error in *url.Error
+		// (matched by message text) — deterministic, so permanent.
+		{"malformed location", &url.Error{Op: "Get", URL: "http://x",
+			Err: fmt.Errorf("failed to parse Location header %q: %v", "http://[bad", errors.New("parse error"))}, false},
 	}
 	for _, tc := range cases {
 		if got := fetchErrorRetryable(tc.err); got != tc.want {
