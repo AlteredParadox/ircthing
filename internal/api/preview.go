@@ -85,11 +85,11 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, pv)
 		return
 	}
-	if !s.acquireMedia(r.Context()) {
+	if !s.acquirePreview(r.Context()) {
 		http.Error(w, "busy, retry later", http.StatusServiceUnavailable)
 		return
 	}
-	defer s.releaseMedia()
+	defer s.releasePreview()
 	// Re-check after the (up to 5s) slot wait: previews may have been disabled
 	// while this request was parked, and it must not fetch after that.
 	if !s.previewsEnabled() {

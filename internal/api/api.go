@@ -126,7 +126,8 @@ type Server struct {
 	tunnelImageByNet map[string]*fetcher
 	previewCache     *ttlCache[PreviewData]
 	thumbCache       *ttlCache[thumbResult]
-	mediaSem         chan struct{}
+	mediaSem         chan struct{} // image-decode concurrency (thumbnails)
+	previewSem       chan struct{} // link-preview (HTML) concurrency, decoupled from decodes
 
 	login *loginLimiter
 
@@ -205,6 +206,7 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		// to refetch; the previous 24 h only saved re-decode work.
 		thumbCache: newTTLCache[thumbResult](30*time.Minute, maxThumbCache),
 		mediaSem:   make(chan struct{}, mediaSlots),
+		previewSem: make(chan struct{}, previewSlots),
 		login:      newLoginLimiter(),
 		tokens:     make(map[string]time.Time),
 	}

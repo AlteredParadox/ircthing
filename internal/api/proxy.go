@@ -50,36 +50,44 @@ import (
 
 const proxyUserAgent = "ircthing-media-proxy/1.0 (+https://github.com/ircthing)"
 
-// mediaSlots is the media-path concurrency: each slot admits one whole
-// preview or thumbnail request (fetch through decode/parse and encode),
-// bounding in-flight bodies and decoded bitmaps together. One slot: a single
-// worst-case decode (10 MiB body + ~36 MiB bitmap) fits comfortably under
-// the unit's MemoryMax with room for the rest of the process; two could
-// approach it and OOM-restart the whole bouncer. Previews are best-effort,
-// so serializing them is an acceptable trade for a hard memory bound.
+// mediaSlots is the IMAGE-DECODE concurrency: each slot admits one whole
+// thumbnail request (fetch through decode + encode), bounding in-flight bodies
+// and decoded bitmaps together. One slot: a single worst-case decode (10 MiB
+// body + ~36 MiB bitmap) fits comfortably under the unit's MemoryMax; two could
+// approach it and OOM-restart the bouncer. Link previews are NOT decode-bound,
+// so they use previewSlots instead — serializing them behind a slow thumbnail
+// decode made previews trickle in one-at-a-time over slow (WireGuard/Tor)
+// egress, some 503-ing out entirely.
 const mediaSlots = 1
+
+// previewSlots is the LINK-PREVIEW (HTML fetch + parse) concurrency. A preview
+// only holds a <=512 KiB HTML body and no decoded bitmap (see maxHTMLBytes), so
+// several run at once cheaply (~4 x 512 KiB) without the decode memory bound —
+// they no longer wait behind image thumbnails.
+const previewSlots = 4
 
 // mediaAcquireWait bounds how long a request waits for a slot (var for
 // tests).
 var mediaAcquireWait = 5 * time.Second
 
-// acquireMedia takes a media slot, giving up after a short bounded wait
-// (or when the request dies) so waiters cannot pile up.
-func (s *Server) acquireMedia(ctx context.Context) bool {
+func (s *Server) acquireMedia(ctx context.Context) bool   { return acquireSlot(ctx, s.mediaSem) }
+func (s *Server) releaseMedia()                           { <-s.mediaSem }
+func (s *Server) acquirePreview(ctx context.Context) bool { return acquireSlot(ctx, s.previewSem) }
+func (s *Server) releasePreview()                         { <-s.previewSem }
+
+// acquireSlot takes a slot on sem, giving up after a short bounded wait (or when
+// the request dies) so waiters cannot pile up.
+func acquireSlot(ctx context.Context, sem chan struct{}) bool {
 	t := time.NewTimer(mediaAcquireWait)
 	defer t.Stop()
 	select {
-	case s.mediaSem <- struct{}{}:
+	case sem <- struct{}{}:
 		return true
 	case <-ctx.Done():
 		return false
 	case <-t.C:
 		return false
 	}
-}
-
-func (s *Server) releaseMedia() {
-	<-s.mediaSem
 }
 
 var (

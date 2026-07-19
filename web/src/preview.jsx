@@ -27,7 +27,8 @@ import { LRU } from "./lru.js";
 // retries soon.
 
 const cache = new LRU(300, 60 * 60 * 1000); // url -> PreviewData | null
-const FAIL_TTL = 5 * 60 * 1000;
+const FAIL_TTL = 5 * 60 * 1000; // a real failure (dead link, undecodable image)
+const RETRY_TTL = 12 * 1000; // a TRANSIENT failure (server slot busy / network) — retry soon
 const inflight = new Map(); // key -> { promise, controller, refs }
 
 // Thumbnails are fetched as blobs and cached as object URLs (revoked on
@@ -59,6 +60,20 @@ function mediaFetch(path, url, net, signal) {
 		body: JSON.stringify({ url, net: net || "" }),
 		signal,
 	});
+}
+
+// mediaFetch503 wraps mediaFetch with a bounded retry on 503 (the server's media
+// slot was briefly busy — common over slow WireGuard/Tor egress). Without it a
+// transient 503 blanks the preview for FAIL_TTL, and a message row (keyed by id)
+// never re-mounts to retry. Aborts (row scrolled away) stop it immediately.
+async function mediaFetch503(path, url, net, signal) {
+	let r = await mediaFetch(path, url, net, signal);
+	for (let attempt = 0; r.status === 503 && attempt < 3 && !signal.aborted; attempt++) {
+		await new Promise((res) => setTimeout(res, 1200 * (attempt + 1))); // 1.2s, 2.4s, 3.6s
+		if (signal.aborted) break;
+		r = await mediaFetch(path, url, net, signal);
+	}
+	return r;
 }
 
 // shared runs `run(signal)` deduped by key: concurrent callers share one request
@@ -96,14 +111,17 @@ function fetchPreview(url, net) {
 	const key = ck(url, net);
 	if (cache.has(key)) return { promise: Promise.resolve(cache.get(key)), release() {} };
 	return shared(inflight, key, (signal) =>
-		mediaFetch("/api/preview", url, net, signal)
-			.then((r) => (r.ok ? r.json() : null))
-			.catch(() => null)
-			.then((data) => {
-				// Never cache an aborted fetch's null: it would pin a 5-min failure
-				// TTL on a URL we merely cancelled, blocking a legitimate retry.
-				if (!signal.aborted) cache.set(key, data, data === null ? FAIL_TTL : undefined);
-				return data;
+		mediaFetch503("/api/preview", url, net, signal)
+			.then((r) => (r.ok ? r.json() : { __fail: r.status === 503 ? RETRY_TTL : FAIL_TTL }))
+			.catch(() => ({ __fail: RETRY_TTL })) // network error: transient, retry soon
+			.then((res) => {
+				if (signal.aborted) return null; // don't cache a cancelled fetch
+				if (res && res.__fail !== undefined) {
+					cache.set(key, null, res.__fail); // transient → RETRY_TTL, real → FAIL_TTL
+					return null;
+				}
+				cache.set(key, res);
+				return res;
 			}));
 }
 
@@ -113,17 +131,22 @@ function fetchThumb(url, net) {
 	const cached = thumbCache.get(key);
 	if (cached !== undefined) return { promise: Promise.resolve(cached), release() {} }; // objURL or cached null
 	return shared(thumbInflight, key, (signal) =>
-		mediaFetch("/api/thumb", url, net, signal)
-			.then((r) => (r.ok ? r.blob() : null))
-			.catch(() => null)
-			.then((blob) => {
-				const obj = blob ? URL.createObjectURL(blob) : null;
-				if (signal.aborted) {
-					if (obj) URL.revokeObjectURL(obj); // don't leak an object URL we won't cache
-					return null;
+		mediaFetch503("/api/thumb", url, net, signal)
+			.then((r) => (r.ok ? r.blob().then((b) => ({ blob: b })) : { __fail: r.status === 503 ? RETRY_TTL : FAIL_TTL }))
+			.catch(() => ({ __fail: RETRY_TTL })) // network error: transient
+			.then((res) => {
+				if (res.blob) {
+					const obj = URL.createObjectURL(res.blob);
+					if (signal.aborted) {
+						URL.revokeObjectURL(obj); // don't leak an object URL we won't cache
+						return null;
+					}
+					thumbCache.set(key, obj);
+					return obj;
 				}
-				thumbCache.set(key, obj, obj === null ? FAIL_TTL : undefined);
-				return obj;
+				if (signal.aborted) return null; // cancelled: don't cache the failure
+				thumbCache.set(key, null, res.__fail); // transient → RETRY_TTL, real → FAIL_TTL
+				return null;
 			}));
 }
 
