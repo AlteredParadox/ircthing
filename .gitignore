@@ -33,3 +33,8 @@ web/node_modules/
 # Python bytecode (irctest controller)
 __pycache__/
 *.py[cod]
+
+# Editor swap/backup files
+*.swp
+*.swo
+*~
