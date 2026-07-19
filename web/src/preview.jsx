@@ -66,9 +66,15 @@ function mediaFetch(path, url, net, signal) {
 // slot was briefly busy — common over slow WireGuard/Tor egress). Without it a
 // transient 503 blanks the preview for FAIL_TTL, and a message row (keyed by id)
 // never re-mounts to retry. Aborts (row scrolled away) stop it immediately.
-async function mediaFetch503(path, url, net, signal) {
+// Every completed 503 spends the key's network-attempt budget (the final
+// failure is counted by the caller), so the in-loop retries and the outer
+// auto-retry/remount cycles draw on ONE shared bound — without this, each
+// outer cycle multiplied into up to four requests of its own.
+async function mediaFetch503(path, url, net, signal, key) {
 	let r = await mediaFetch(path, url, net, signal);
 	for (let attempt = 0; r.status === 503 && attempt < 3 && !signal.aborted; attempt++) {
+		noteFailure(key);
+		if (spent(key)) break;
 		// Abort-aware backoff: a row scrolled away mid-wait resolves immediately
 		// (and its abort tears the fetch down) instead of holding the inflight
 		// entry for the full delay.
@@ -112,14 +118,28 @@ function shared(map, key, run) {
 	};
 }
 
-// retryCounts tracks COMPLETED failed fetch attempts per (network, URL) key,
-// outside any component: it is what bounds auto-retry. The old bound was a
-// per-mount counter that reset whenever the row transiently stopped being
-// blank — which happens on every refetch — so a mounted hostile URL could
-// retry indefinitely, a persistent tracking beacon. This count increments
-// only when an attempt actually completes and fails (never on abort), and
-// resets only on success or when the entry ages out.
+// retryCounts tracks COMPLETED failed HTTP attempts per (network, URL) key,
+// outside any component: it is the ONE budget every fetch path draws on —
+// the in-flight 503 retries inside mediaFetch503, the mounted-row auto-retry
+// (useAutoRetry), and fresh fetches from remounts (fetchPreview/fetchThumb
+// refuse to fetch once it is spent). Component-local bounds are not enough:
+// a per-mount counter reset on every remount, so repeated messages, buffer
+// revisits, or virtual-list remounts restarted a full request cycle against
+// a hostile origin forever — an unbounded tracking beacon. The count
+// increments only when an attempt actually completes and fails (never on
+// abort), and resets only on success or when the entry ages out (1h) —
+// bounding a permanently failing key to MAX_NET_ATTEMPTS requests per hour.
 const retryCounts = new LRU(300, 60 * 60 * 1000); // key -> failed attempts
+
+// MAX_NET_ATTEMPTS is that budget: completed failed HTTP requests per key
+// (per retryCounts TTL window) across ALL mounts, remounts, and in-flight
+// 503 retries combined.
+const MAX_NET_ATTEMPTS = 4;
+
+// spent reports whether a key's network-attempt budget is exhausted.
+function spent(key) {
+	return (retryCounts.get(key) || 0) >= MAX_NET_ATTEMPTS;
+}
 
 function noteFailure(key) {
 	retryCounts.set(key, (retryCounts.get(key) || 0) + 1);
@@ -136,8 +156,13 @@ function noteSuccess(key) {
 function fetchPreview(url, net) {
 	const key = ck(url, net);
 	if (cache.has(key)) return { promise: Promise.resolve(cache.get(key)), release() {} };
+	// The budget gate must sit on the FETCH, not only on the retry timer: a
+	// fresh mount (repeated message, buffer revisit, virtual-list remount)
+	// fetches unconditionally once the short failure-cache TTL lapses, which
+	// used to hand an exhausted key a whole new request cycle per remount.
+	if (spent(key)) return { promise: Promise.resolve(null), release() {} };
 	return shared(inflight, key, (signal) =>
-		mediaFetch503("/api/preview", url, net, signal)
+		mediaFetch503("/api/preview", url, net, signal, key)
 			.then((r) => (r.ok ? r.json() : { __fail: r.status === 503 ? RETRY_TTL : FAIL_TTL }))
 			.catch(() => ({ __fail: RETRY_TTL })) // network error: transient, retry soon
 			.then((res) => {
@@ -158,8 +183,9 @@ function fetchThumb(url, net) {
 	const key = ck(url, net);
 	const cached = thumbCache.get(key);
 	if (cached !== undefined) return { promise: Promise.resolve(cached), release() {} }; // objURL or cached null
+	if (spent(key)) return { promise: Promise.resolve(null), release() {} }; // budget gate (see fetchPreview)
 	return shared(thumbInflight, key, (signal) =>
-		mediaFetch503("/api/thumb", url, net, signal)
+		mediaFetch503("/api/thumb", url, net, signal, key)
 			.then((r) => (r.ok ? r.blob().then((b) => ({ blob: b })) : { __fail: r.status === 503 ? RETRY_TTL : FAIL_TTL }))
 			.catch(() => ({ __fail: RETRY_TTL })) // network error: transient
 			.then((res) => {
@@ -188,10 +214,10 @@ function fetchThumb(url, net) {
 // it scrolls out and back, because its effect deps never change.
 //
 // The bound is enforced on TWO axes, both required: retryCounts caps completed
-// failed NETWORK attempts per (network, URL), shared across every row and mount
-// (the fix for the unbounded-beacon bug — a per-mount counter reset every time
-// blank flickered false during a refetch); the local tick additionally caps how
-// often one mounted row re-runs its effect against a cached failure.
+// failed NETWORK attempts per (network, URL) at MAX_NET_ATTEMPTS, shared across
+// every row, mount, and in-flight 503 retry — and enforced at the fetch itself,
+// so remounts cannot bypass it; the local tick additionally caps how often one
+// mounted row re-runs its effect against a cached failure.
 const MAX_AUTO_RETRIES = 3;
 
 // useAutoRetry returns a counter that increments up to MAX_AUTO_RETRIES, once
@@ -207,7 +233,7 @@ function useAutoRetry(blank, key) {
 	const tick = last.key === key ? last.tick : 0;
 	useEffect(() => {
 		if (!blank || tick >= MAX_AUTO_RETRIES) return undefined;
-		if ((retryCounts.get(key) || 0) >= MAX_AUTO_RETRIES) return undefined;
+		if (spent(key)) return undefined; // network budget gone: don't even tick
 		const t = setTimeout(() => setLast({ key, tick: tick + 1 }), RETRY_TTL + 500);
 		return () => clearTimeout(t);
 	}, [blank, key, tick]);
