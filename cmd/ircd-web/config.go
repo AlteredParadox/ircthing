@@ -190,8 +190,13 @@ func (c *config) cookieConfigWarning() string {
 	if loopback && !c.BehindProxy && c.SecureCookies {
 		return "secure_cookies is true but listen is plain-HTTP loopback with no proxy — a Secure cookie is never sent over http://, so login will appear to succeed then bounce. Set secure_cookies=false for local plain-HTTP testing."
 	}
-	if !loopback && !c.BehindProxy && !c.SecureCookies {
-		return "listen is a PUBLIC address (" + c.Listen + ") with no proxy and secure_cookies=false — login credentials and the session cookie would travel over plain HTTP. Put a TLS-terminating proxy in front (behind_proxy=true, secure_cookies=true) or bind to loopback."
+	// A public listen with no fronting proxy is served over plain HTTP — this
+	// binary never terminates TLS itself (main.go uses ListenAndServe). The login
+	// POST and the session cookie both travel unencrypted REGARDLESS of
+	// secure_cookies: false exposes the cookie, and true additionally breaks login
+	// (a Secure cookie never returns over http://). Warn on every such listen.
+	if !loopback && !c.BehindProxy {
+		return "listen is a PUBLIC address (" + c.Listen + ") with no proxy — this binary serves plain HTTP, so login credentials and the session cookie travel unencrypted. Put a TLS-terminating proxy in front (behind_proxy=true, secure_cookies=true) or bind to loopback."
 	}
 	return ""
 }

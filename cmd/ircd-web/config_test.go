@@ -209,6 +209,10 @@ func TestCookieConfigWarning(t *testing.T) {
 		{"plain-http loopback, secure cookie bounces", "127.0.0.1:8067", false, true, true},
 		{"plain-http loopback, insecure cookie ok", "127.0.0.1:8067", false, false, false},
 		{"public direct plaintext warns (credentials over HTTP)", "0.0.0.0:8067", false, false, true},
+		// A public direct listen is plaintext regardless of secure_cookies —
+		// secure=true doesn't encrypt the login POST and additionally breaks the
+		// cookie. It must still warn.
+		{"public direct plaintext, secure cookie still warns", "0.0.0.0:8067", false, true, true},
 		{"public behind TLS proxy, secure", "0.0.0.0:8067", true, true, false},
 	}
 	for _, tc := range cases {
