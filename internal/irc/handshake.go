@@ -37,6 +37,10 @@ var wantedCaps = []string{
 	"multi-prefix",
 	"no-implicit-names",
 	"server-time",
+	// setname is negotiated for completeness of the ratified IRCv3 set
+	// (CLAUDE.md protocol scope). Incoming SETNAME is accepted and dropped:
+	// the roster tracks no per-user realname to update, and realname is
+	// surfaced on demand via WHOIS (311/354), not from live state.
 	"setname",
 	"standard-replies",
 	"userhost-in-names",
@@ -73,8 +77,7 @@ type hsPhase int
 const (
 	hsCapLS         hsPhase = iota // waiting for the (possibly multiline) CAP LS reply
 	hsCapAck                       // sent CAP REQ :sasl, waiting for ACK/NAK
-	hsAuthChallenge                // sent AUTHENTICATE PLAIN, waiting for the "+" challenge
-	hsAuthResult                   // sent credentials, waiting for 903/904/...
+	hsAuthChallenge                // AUTHENTICATE exchange: "+" challenge, then 903/904 (no separate result phase)
 	hsAwaitWelcome                 // sent CAP END, waiting for 001
 	hsDone
 )
