@@ -213,34 +213,52 @@ func decodableFormat(body []byte) (format string, ok bool) {
 	// holds ~256 bytes per 8x8 block per component (~12 bytes/pixel at 4:4:4),
 	// entirely separate from the result. Modeling only the output bitmap lets
 	// a small progressive JPEG blow past maxDecodeBytes at image.Decode time.
-	perPixel := bytesPerPixel(cfg.ColorModel)
-	switch {
-	case format == "jpeg":
-		if isProgressiveJPEG(body) {
-			// ~4 B/px of full-res coefficient storage PER COMPONENT (256 B per 8x8
-			// block / 64 px). 3 components for YCbCr, 4 for CMYK/YCCK.
-			comps := int64(3)
-			if cfg.ColorModel == color.CMYKModel {
-				comps = 4
-			}
-			perPixel += 4 * comps
-		}
-		// A 3-component RGB/Adobe JPEG (YCbCrModel from DecodeConfig, but decoded
-		// to RGBA) holds the component planes AND the RGBA result at once — charge
-		// the extra copy so the gate bounds the REAL peak, not just the planes.
-		if cfg.ColorModel == color.YCbCrModel && jpegAdobeRGB(body) {
-			perPixel += 4
-		}
-	case format == "png" && isAdam7PNG(body):
-		// Interlaced PNG: the full destination image plus the current pass image
-		// coexist. Charge a full extra copy (conservative — the largest pass is
-		// ~half) so a max-dimension Adam7 PNG can't decode past the cap.
-		perPixel += bytesPerPixel(cfg.ColorModel)
-	}
+	perPixel := decodePerPixel(format, cfg.ColorModel, body)
 	if int64(cfg.Width)*int64(cfg.Height)*perPixel > maxDecodeBytes {
 		return "", false
 	}
 	return format, true
+}
+
+// decodePerPixel estimates the per-pixel cost of decoding, charging EVERY buffer
+// the std-lib decoder holds live at once so maxDecodeBytes bounds the real peak:
+// the output bitmap (bytesPerPixel) plus the format-specific surcharges below.
+func decodePerPixel(format string, model color.Model, body []byte) int64 {
+	perPixel := bytesPerPixel(model)
+	switch format {
+	case "jpeg":
+		perPixel += jpegDecodeSurcharge(model, body)
+	case "png":
+		// Interlaced PNG: the full destination image plus the current pass image
+		// coexist. Charge a full extra copy (conservative — the largest pass is
+		// ~half) so a max-dimension Adam7 PNG can't decode past the cap.
+		if isAdam7PNG(body) {
+			perPixel += bytesPerPixel(model)
+		}
+	}
+	return perPixel
+}
+
+// jpegDecodeSurcharge is the extra per-pixel memory a JPEG decode holds beyond
+// the output planes: progressive coefficients, and the RGBA copy an RGB/Adobe
+// JPEG builds while the component planes are still live.
+func jpegDecodeSurcharge(model color.Model, body []byte) int64 {
+	var extra int64
+	if isProgressiveJPEG(body) {
+		// ~4 B/px of full-res coefficient storage PER COMPONENT (256 B per 8x8
+		// block / 64 px). 3 components for YCbCr, 4 for CMYK/YCCK.
+		comps := int64(3)
+		if model == color.CMYKModel {
+			comps = 4
+		}
+		extra += 4 * comps
+	}
+	// A 3-component RGB/Adobe JPEG (YCbCrModel from DecodeConfig, but decoded to
+	// RGBA) holds the component planes AND the RGBA result at once.
+	if model == color.YCbCrModel && jpegAdobeRGB(body) {
+		extra += 4
+	}
+	return extra
 }
 
 func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
