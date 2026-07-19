@@ -175,9 +175,17 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 		case ev := <-c.Events():
 			switch ev.Kind {
 			case irc.EventState:
-				if ev.State == irc.StateRegistered {
-					// Fresh connection: stale batch refs are gone and
-					// every target gets a full pagination budget again.
+				if ev.State == irc.StateConnecting || ev.State == irc.StateRegistered {
+					// Reset connection-scoped state on a NEW connection. Doing it on
+					// StateConnecting (not only StateRegistered) is what closes the
+					// pre-registration window: the manager emits StateConnecting
+					// before it starts the read loop, and events arrive over one
+					// ordered channel, so stale batch refs and pagination budgets are
+					// cleared BEFORE any message — even a pre-registration BATCH —
+					// from the new connection is processed against them. StateRegistered
+					// keeps resetting too: it is the long-standing budget-restore point
+					// (a fresh registration always precedes with StateConnecting, so
+					// this is a harmless backstop and keeps the semantics obvious).
 					histBatches = make(map[string]*histBatch)
 					backfillPages = make(map[string]int)
 					whois = make(map[string]*WhoisData)

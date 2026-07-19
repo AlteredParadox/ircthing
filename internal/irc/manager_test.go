@@ -683,6 +683,41 @@ func TestManagerRequestsChatHistory(t *testing.T) {
 	}
 }
 
+// A server that omits MSGREFTYPES entirely must still get the msgid selector: the
+// chathistory spec says a missing token means both timestamp and msgid are
+// supported. Only an explicit list without "msgid" forces the timestamp fallback.
+func TestManagerChatHistoryMsgidWithoutMsgRefTypes(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+
+	s := accept(t, conns)
+	s.registerCaps("AlteredParadox", "batch server-time message-tags draft/chathistory")
+	waitState(t, m, StateRegistered)
+	// CHATHISTORY advertised, but NO MSGREFTYPES token.
+	s.send(":irc.test 005 AlteredParadox CHATHISTORY=50 :are supported by this server")
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if v, ok := m.isup.Raw("CHATHISTORY"); ok && v == "50" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("005 never applied")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	m.RequestChatHistory("#go", int64(1752570000000), "abc123")
+	got := s.readCmd("CHATHISTORY")
+	if got.Param(2) != "msgid=abc123" {
+		t.Fatalf("absent MSGREFTYPES should still use msgid selector; wire = %q", got.String())
+	}
+}
+
 func TestManagerChatHistoryWithoutCapIsNoop(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

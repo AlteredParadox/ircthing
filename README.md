@@ -15,8 +15,11 @@ scrollback runs in ~32 MB of RSS.
 ## Features
 
 - **Bouncer core**: persistent connections with reconnect
-  (exponential backoff + jitter), gap-free scrollback catch-up via
-  `chathistory` with paginated backfill, and replay to every device.
+  (exponential backoff + jitter), scrollback catch-up via `chathistory`
+  with paginated backfill, and replay to every device. (Backfill is
+  best-effort under load: on a reconnect with very many channels the
+  send queue can briefly saturate and drop a backfill round — logged,
+  and re-attempted on the next reconnect.)
 - **Protocol**: the full ratified IRCv3 set (SASL PLAIN /
   SCRAM-SHA-256 / EXTERNAL, `server-time`, `batch`, `echo-message`,
   `monitor`, STS with persisted policies, WHOX account discovery, bot

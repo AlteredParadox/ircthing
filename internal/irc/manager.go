@@ -466,7 +466,12 @@ func (m *Manager) RequestChatHistory(target string, sinceMs int64, msgid string)
 	limit := m.HistoryPageSize()
 	sel := "timestamp=" + time.UnixMilli(sinceMs).UTC().Format("2006-01-02T15:04:05.000Z")
 	if msgid != "" {
-		if refs, ok := m.isup.Raw("MSGREFTYPES"); ok && mechListed(refs, "msgid") {
+		// Per the chathistory spec, a MISSING MSGREFTYPES means the server supports
+		// both timestamp and msgid; only an explicit list that omits msgid rules it
+		// out. Treat absent-token as msgid-allowed so we still get the exact-cursor
+		// (same-millisecond-safe) selector against servers that don't advertise it.
+		refs, hasRefs := m.isup.Raw("MSGREFTYPES")
+		if !hasRefs || mechListed(refs, "msgid") {
 			// Prefer the msgid selector ONLY if the line fits: a stored msgid can
 			// be up to 512 bytes, which would push CHATHISTORY past LINELEN and be
 			// rejected by Send — losing the backfill entirely. Fall back to the
@@ -477,8 +482,14 @@ func (m *Manager) RequestChatHistory(target string, sinceMs int64, msgid string)
 			}
 		}
 	}
-	// Best-effort: a full queue just means no backfill this round.
-	_ = m.Send(newMsg("CHATHISTORY", "AFTER", target, sel, strconv.Itoa(limit)))
+	// Best-effort: a full send queue drops this backfill round. Log it rather than
+	// discard silently — during a heavy reconnect the writer can favor the paced
+	// rejoin JOINs long enough to fill `out` (see its sizing note), leaving a
+	// history gap for this target until the next backfill/reconnect. Surfacing the
+	// drop is what keeps the README's replay guarantee honest.
+	if err := m.Send(newMsg("CHATHISTORY", "AFTER", target, sel, strconv.Itoa(limit))); errors.Is(err, ErrSendQueueFull) {
+		log.Printf("irc[%s]: send queue full, dropped CHATHISTORY backfill for %s (history gap until next reconnect)", m.cfg.Name, target)
+	}
 }
 
 // HistoryPageSize is the per-request chathistory message limit: 100,
