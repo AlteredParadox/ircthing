@@ -401,8 +401,13 @@ test("firstURL", () => {
 test("looksLikeImageURL", () => {
 	is(looksLikeImageURL("https://x.com/cat.png"), true);
 	is(looksLikeImageURL("https://x.com/a/b.JPG?q=1"), true);
+	is(looksLikeImageURL("https://x.com/pic.webp"), true); // decodable via x/image
 	is(looksLikeImageURL("https://x.com/page.html"), false);
 	is(looksLikeImageURL("https://x.com/noext"), false);
+	// Formats with no server-side decoder must NOT route to a thumbnail (they'd
+	// 415 and blank); they fall through to /api/preview classification instead.
+	is(looksLikeImageURL("https://x.com/pic.avif"), false);
+	is(looksLikeImageURL("https://x.com/pic.svg"), false);
 	is(looksLikeImageURL("not a url"), false);
 });
 

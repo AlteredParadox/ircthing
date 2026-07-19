@@ -156,27 +156,59 @@ function fetchThumb(url, net) {
 			}));
 }
 
+// MAX_AUTO_RETRIES bounds how many times a still-mounted, still-blank preview
+// re-attempts on its own. A transient failure caches null for only RETRY_TTL, so
+// after that the cache lookup misses and the retry refetches; a permanent failure
+// stays cached (FAIL_TTL) so the retry is a cheap cache hit, no network. Without
+// this a row that failed transiently (e.g. WireGuard warming up) stays blank until
+// it scrolls out and back, because its effect deps never change.
+const MAX_AUTO_RETRIES = 3;
+
+// useAutoRetry returns a counter that increments up to MAX_AUTO_RETRIES, once per
+// RETRY_TTL, while `blank` is true — a deps-changing tick that re-runs a fetch
+// effect. It resets when the row stops being blank (a later attempt succeeded).
+function useAutoRetry(blank) {
+	const [tick, setTick] = useState(0);
+	useEffect(() => {
+		if (!blank) {
+			if (tick !== 0) setTick(0);
+			return undefined;
+		}
+		if (tick >= MAX_AUTO_RETRIES) return undefined;
+		const t = setTimeout(() => setTick((n) => n + 1), RETRY_TTL + 500);
+		return () => clearTimeout(t);
+	}, [blank, tick]);
+	return tick;
+}
+
 // useThumb fetches a thumbnail's object URL, null while loading or on failure.
 function useThumb(url, net) {
 	const [src, setSrc] = useState(() => {
 		const c = thumbCache.get(ck(url, net));
 		return c === undefined ? null : c;
 	});
+	const [blank, setBlank] = useState(false);
+	const tick = useAutoRetry(blank);
 	useEffect(() => {
 		let alive = true;
+		const settle = (u) => {
+			if (!alive) return;
+			setSrc(u);
+			setBlank(u === null); // null => failed/loading; drives the bounded retry
+		};
 		const c = thumbCache.get(ck(url, net));
 		if (c !== undefined) {
-			setSrc(c);
+			settle(c);
 			return undefined;
 		}
 		setSrc(null);
 		const { promise, release } = fetchThumb(url, net);
-		promise.then((u) => alive && setSrc(u));
+		promise.then(settle);
 		return () => {
 			alive = false;
 			release(); // aborts the proxy fetch if no other row still needs it
 		};
-	}, [url, net]);
+	}, [url, net, tick]);
 	return src;
 }
 
@@ -196,16 +228,26 @@ export function LinkPreview({ url, net }) {
 // nothing at all on failure.
 function LinkCard({ url, net }) {
 	const [data, setData] = useState(() => (cache.has(ck(url, net)) ? cache.get(ck(url, net)) : undefined));
+	// blank => the fetch resolved to null (failure). A resolved PreviewData with no
+	// renderable fields is a SUCCESS (cached as a value), so it does not retry.
+	const [blank, setBlank] = useState(false);
+	const tick = useAutoRetry(blank);
 
 	// Re-resolve whenever url or net changes: a reused component must not keep
 	// rendering the previous url's preview, and the network selects the proxy.
+	// tick drives the bounded auto-retry for a transiently failed row.
 	useEffect(() => {
 		let alive = true;
 		const cached = cache.has(ck(url, net)) ? cache.get(ck(url, net)) : undefined;
 		setData(cached);
+		setBlank(cached === null);
 		if (cached === undefined) {
 			const { promise, release } = fetchPreview(url, net);
-			promise.then((d) => alive && setData(d));
+			promise.then((d) => {
+				if (!alive) return;
+				setData(d);
+				setBlank(d === null);
+			});
 			return () => {
 				alive = false;
 				release(); // aborts the proxy fetch if no other row still needs it
@@ -214,7 +256,7 @@ function LinkCard({ url, net }) {
 		return () => {
 			alive = false;
 		};
-	}, [url, net]);
+	}, [url, net, tick]);
 
 	if (!data) return null; // loading or failed: no card (not an obvious image)
 	if (data.kind === "image") return <ImageThumb url={data.image || url} net={net} />;
