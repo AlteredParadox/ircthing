@@ -46,6 +46,17 @@ const (
 	// maxMetaTags bounds how many <meta> tags parseHeadMeta scans — real pages
 	// carry a few dozen; a hostile one could carry tens of thousands.
 	maxMetaTags = 256
+	// maxMetaTagBytes bounds ONE matched <meta …> tag. Without it, a tag
+	// missing its closing '>' matches up to the whole 1 MiB body, and a
+	// 1 MiB tag stuffed with ~250k tiny attributes made FindAllStringSubmatch
+	// materialize six strings plus a slice per attribute — ~30 MiB for one
+	// request, ×previewSlots against MemoryMax. Real head metadata is well
+	// under this; an over-limit tag is skipped, not truncated.
+	maxMetaTagBytes = 8 * 1024
+	// maxMetaAttrs bounds the attributes parsed per tag. A real <meta> tag
+	// carries 2–4 (property/name, content, maybe charset); this cap only
+	// bites hostile attribute stuffing.
+	maxMetaAttrs = 32
 )
 
 // wantedMeta is the exact set of head-metadata keys extractMeta consumes;
@@ -112,9 +123,12 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	// This dedups requests that arrived while an earlier one held a slot, but NOT
 	// a simultaneous burst: with previewSlots>1, N identical first-time requests
 	// (e.g. the same link open in N browser tabs) can all take a free slot, all
-	// miss here, and all fetch. Accepted residual — it is bounded by the slot count
-	// (<=previewSlots duplicate fetches, once, then the cache serves the rest) and
-	// only bites concurrent first views of the same URL. A single-slot design (like
+	// miss here, and all fetch. Accepted residual — for a SUCCESSFUL fetch it is
+	// bounded by the slot count (<=previewSlots duplicate fetches, once, then the
+	// cache serves the rest). FAILURES are not server-cached, so every waiting tab
+	// can still fetch and retry after its slot wait; that stays acceptable for a
+	// single-user deployment because the client bounds its own retries per
+	// (network, URL) — see web/src/preview.jsx. A single-slot design (like
 	// thumbnails) would serialize it but at the cost of the per-tab responsiveness
 	// the extra slots buy; full singleflight isn't worth the request-path locking.
 	if pv, ok := s.previewCache.get(ck); ok {
@@ -201,23 +215,21 @@ func extractMeta(doc, pageURL string, pv *PreviewData) {
 
 // parseHeadMeta collects <meta property|name=… content=…> pairs (first
 // value wins), unescaped. Only the handful of keys extractMeta reads are
-// retained (wantedMeta), and at most maxMetaTags tags are scanned — a hostile
-// page could otherwise carry tens of thousands of distinct meta keys and blow
-// the map (and the materialized match slice) up, overlapping the image decoder
-// against MemoryMax.
-//
-// The remaining bound is coarse, not tight: reMeta caps the tag COUNT at 256,
-// but one <meta …> with no closing '>' can match up to the whole document, so
-// the scan and reAttr's submatches are bounded by the HTML body size
-// (maxHTMLBytes, currently 1 MiB) rather than by a small per-tag limit. That is
-// acceptable — it is one transient allocation on the order of the body we already
-// hold, serialized by previewSlots, not the unbounded (key-count × body) blowup
-// the wantedMeta/maxMetaTags caps removed.
+// retained (wantedMeta), and the work is bounded on every axis a hostile
+// page controls: tag count (maxMetaTags), bytes per tag (maxMetaTagBytes —
+// an unterminated <meta can otherwise match up to the whole 1 MiB body),
+// and attributes parsed per tag (maxMetaAttrs — each submatch materializes
+// six strings plus a slice, so unbounded attribute stuffing was tens of MiB
+// per request). Worst case is now maxMetaTags × maxMetaAttrs tiny strings
+// over ≤8 KiB tags — a few MB transient, far under the decoder budget.
 func parseHeadMeta(doc string) map[string]string {
 	meta := map[string]string{}
 	for _, tag := range reMeta.FindAllString(doc, maxMetaTags) {
+		if len(tag) > maxMetaTagBytes {
+			continue // hostile or degenerate tag; no real metadata is this big
+		}
 		var key, content string
-		for _, a := range reAttr.FindAllStringSubmatch(tag, -1) {
+		for _, a := range reAttr.FindAllStringSubmatch(tag, maxMetaAttrs) {
 			name := strings.ToLower(a[1])
 			val := firstNonEmpty(a[3], a[4], a[5])
 			switch name {
@@ -284,6 +296,9 @@ func clip(s string, max int) string {
 // we can't decode — a claimed-but-undecodable type routes the client to /api/thumb,
 // which 415s, leaving a blank card instead of a link preview. avif and x-icon have
 // no pure-Go decoder in our dependency set, so they are deliberately absent.
+// image/webp is claimed even though LOSSLESS (VP8L) bodies are refused at the
+// decode gate (see webpUsesVP8L): the content type doesn't distinguish them, and
+// a blank card for lossless WebP is the accepted cost of that restriction.
 func isImageType(contentType string) bool {
 	ct, _, _ := strings.Cut(contentType, ";")
 	switch strings.TrimSpace(strings.ToLower(ct)) {

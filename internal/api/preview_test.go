@@ -16,7 +16,43 @@
 
 package api
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+// parseHeadMeta must bound the work a hostile page controls: an oversized
+// tag (an unterminated <meta can match up to the whole body) is skipped, and
+// attributes past maxMetaAttrs are ignored — unbounded attribute stuffing
+// used to materialize six strings per attribute (~30 MiB for one 1 MiB tag).
+// Normal-sized tags keep working around both caps.
+func TestParseHeadMetaCaps(t *testing.T) {
+	// An over-limit tag is skipped entirely, without disturbing later tags.
+	big := `<meta name="description" content="evil ` + strings.Repeat("x", maxMetaTagBytes) + `">`
+	doc := big + `<meta property="og:title" content="Kept">`
+	meta := parseHeadMeta(doc)
+	if meta["description"] != "" {
+		t.Fatalf("oversized tag was parsed: %.60q", meta["description"])
+	}
+	if meta["og:title"] != "Kept" {
+		t.Fatalf("tag after an oversized one lost: %+v", meta)
+	}
+
+	// Attribute stuffing: keys buried past maxMetaAttrs are never parsed.
+	var b strings.Builder
+	b.WriteString(`<meta `)
+	for i := 0; i < maxMetaAttrs+8; i++ {
+		b.WriteString(`a="b" `)
+	}
+	b.WriteString(`property="og:title" content="Buried">`)
+	if meta := parseHeadMeta(b.String()); meta["og:title"] != "" {
+		t.Fatalf("attribute cap not applied: %+v", meta)
+	}
+	// A real-world tag (a handful of attributes) is far under the cap.
+	if meta := parseHeadMeta(`<meta charset="utf-8" property="og:title" content="Fine">`); meta["og:title"] != "Fine" {
+		t.Fatalf("normal tag broken by the caps: %+v", meta)
+	}
+}
 
 func TestExtractMeta(t *testing.T) {
 	cases := []struct {
