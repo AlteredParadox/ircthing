@@ -150,6 +150,12 @@ type Manager struct {
 
 	batchSeq atomic.Uint64 // outgoing multiline batch reference counter
 
+	// dropMu guards the aggregated CHATHISTORY-drop warning state (see
+	// noteHistoryDrop); RequestChatHistory is called from the hub goroutine.
+	dropMu    sync.Mutex
+	dropCount int
+	dropLogAt time.Time
+
 	// wgMu guards wgTun, the lazily-built WireGuard egress tunnel. Built on
 	// first dial when cfg.WireGuard != nil, reused across reconnects, torn
 	// down when Run returns.
@@ -450,15 +456,17 @@ func chunkTargets(targets []string, n int) [][]string {
 }
 
 // RequestChatHistory asks the server for messages in target newer than
-// the given resume point — gap-free scrollback after reconnects
+// the given resume point — scrollback resume after reconnects
 // (draft/chathistory AFTER; https://ircv3.net/specs/extensions/
 // chathistory, fetched 2026-07-15). No-op unless the server offers the
 // cap. The msgid selector is preferred when the newest stored message
-// has one and MSGREFTYPES allows it: AFTER excludes equal timestamps, so
-// two messages in the same millisecond would lose the second one under a
-// timestamp selector. One page per call, clamped to the CHATHISTORY
-// ISUPPORT limit; the hub keeps paging while replay batches come back
-// full (paginated backfill).
+// has one and MSGREFTYPES allows it: it is an exact cursor. The timestamp
+// fallback is NOT gap-free — AFTER excludes equal timestamps, so a later
+// message sharing the newest stored millisecond is skipped. Accepted
+// residual: it needs two messages in one millisecond straddling exactly
+// the resume point, on a server that also withholds msgids. One page per
+// call, clamped to the CHATHISTORY ISUPPORT limit; the hub keeps paging
+// while replay batches come back full (paginated backfill).
 func (m *Manager) RequestChatHistory(target string, sinceMs int64, msgid string) {
 	if !m.CapEnabled("draft/chathistory") {
 		return
@@ -488,8 +496,32 @@ func (m *Manager) RequestChatHistory(target string, sinceMs int64, msgid string)
 	// history gap for this target until the next backfill/reconnect. Surfacing the
 	// drop is what keeps the README's replay guarantee honest.
 	if err := m.Send(newMsg("CHATHISTORY", "AFTER", target, sel, strconv.Itoa(limit))); errors.Is(err, ErrSendQueueFull) {
-		log.Printf("irc[%s]: send queue full, dropped CHATHISTORY backfill for %s (history gap until next reconnect)", m.cfg.Name, target)
+		m.noteHistoryDrop(target)
 	}
+}
+
+// historyDropLogWindow rate-limits the CHATHISTORY-drop warning: at most one
+// log line per window, carrying the count of drops it covers. A reconnect
+// against thousands of stored query buffers (server-creatable state) could
+// otherwise emit one synchronous log record per dropped target.
+const historyDropLogWindow = 10 * time.Second
+
+// noteHistoryDrop records one dropped CHATHISTORY backfill and emits the
+// aggregated, rate-limited warning. The sample target is length-clamped and
+// %q-quoted: it is server-derived, and raw %s would let control characters
+// manipulate journal/terminal presentation.
+func (m *Manager) noteHistoryDrop(target string) {
+	m.dropMu.Lock()
+	defer m.dropMu.Unlock()
+	m.dropCount++
+	now := time.Now()
+	if !m.dropLogAt.IsZero() && now.Sub(m.dropLogAt) < historyDropLogWindow {
+		return
+	}
+	log.Printf("irc[%s]: send queue full, dropped CHATHISTORY backfill for %d target(s), e.g. %.100q (history gap until next reconnect)",
+		m.cfg.Name, m.dropCount, target)
+	m.dropCount = 0
+	m.dropLogAt = now
 }
 
 // HistoryPageSize is the per-request chathistory message limit: 100,
@@ -956,29 +988,24 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	readDone := make(chan error, 1)
 	go func() { readDone <- m.serveLoop(ctx, lc) }()
 
-	// Queue the JOINs on the priority `internal` path and expose
-	// send-readiness as soon as the first one is queued: the writer drains
-	// `internal` ahead of `m.out`, and this loop keeps `internal` fed, so
-	// every JOIN still precedes any user message or the hub's backfill/
-	// monitor traffic (enqueued to m.out on StateRegistered) — without
-	// waiting the full throttled drain to become send-ready.
+	// Expose send-readiness BEFORE the first JOIN is queued, then feed the
+	// JOINs on the priority `internal` path: the writer drains `internal`
+	// ahead of `m.out`, and this loop keeps `internal` fed, so the JOINs
+	// still effectively precede user/hub traffic without waiting for the
+	// full throttled drain. Registered-before-JOIN also closes a race the
+	// old queue-then-mark order left open: the server's JOIN echo triggers
+	// a one-shot channel history request in the hub, and an unusually fast
+	// echo could reach it before the flag flipped, failing that request
+	// with ErrNotConnected — a silent history gap until the next reconnect.
 	defer m.setRegistered(false)
-	markRegistered := func() {
-		m.setRegistered(true)
-		bo.reset()
-		m.emit(ctx, Event{Kind: EventState, State: StateRegistered})
-	}
-	for i, ch := range rejoins {
+	m.setRegistered(true)
+	bo.reset()
+	m.emit(ctx, Event{Kind: EventState, State: StateRegistered})
+	for _, ch := range rejoins {
 		if err := send([]*ircv4.Message{newMsg("JOIN", ch)}); err != nil {
 			cancel(err) // writer gone; serveLoop's read fails too
 			return <-readDone
 		}
-		if i == 0 {
-			markRegistered()
-		}
-	}
-	if len(rejoins) == 0 {
-		markRegistered()
 	}
 	return <-readDone
 }
