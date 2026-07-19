@@ -987,9 +987,10 @@ func (s *Store) bufferAndRing(ctx context.Context, network, target string, creat
 		// drop the oldest so the ring holds exactly the newest ringSize.
 		msgs = msgs[1:]
 	}
-	for _, m := range msgs {
-		r.insert(m)
-	}
+	// msgs is already ascending (ORDER BY ts DESC + reverse) and len <= ringSize,
+	// which is exactly the ring's backing invariant — adopt it directly rather
+	// than re-inserting into a second slice (avoids the transient double copy).
+	r.adopt(msgs)
 	s.rings[bufID] = r
 	s.ringBytes += int64(r.bytes)
 	s.touchRing(r)

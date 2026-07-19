@@ -156,7 +156,10 @@ func (c *config) proxyConfigWarning() string {
 		return ""
 	}
 	ip := net.ParseIP(host)
-	loopback := ip != nil && ip.IsLoopback()
+	// net.ParseIP returns nil for the hostname "localhost", so classify it (and
+	// *.localhost) as loopback explicitly — otherwise a loopback listen using
+	// the name is misread as public (wrong warning direction).
+	loopback := (ip != nil && ip.IsLoopback()) || host == "localhost" || strings.HasSuffix(host, ".localhost")
 	switch {
 	case loopback && !c.BehindProxy:
 		return "behind_proxy is false but listen is loopback (" + c.Listen + "): if a reverse proxy fronts this, all clients share the proxy's IP for login rate-limiting — one attacker can lock everyone out. Set behind_proxy=true when behind a trusted proxy."

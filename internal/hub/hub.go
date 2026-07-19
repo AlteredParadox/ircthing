@@ -198,8 +198,11 @@ func (h *Hub) onState(ctx context.Context, c Conn, ev irc.Event) {
 	h.mu.Unlock()
 	errStr := ""
 	if ev.Err != nil {
-		errStr = ev.Err.Error()
-		log.Printf("irc[%s]: %s: %v", ev.Network, ev.State, ev.Err)
+		// A registration error embeds the server's raw ERROR line (handshake.go),
+		// so clamp+quote it like FAIL/MONITOR — otherwise a hostile server drives
+		// control bytes and ~64 KiB lines into the log and the client broadcast.
+		errStr = clampServerInfo(ev.Err.Error())
+		log.Printf("irc[%s]: %s: %q", ev.Network, ev.State, errStr)
 	} else {
 		log.Printf("irc[%s]: %s", ev.Network, ev.State)
 	}
@@ -852,20 +855,20 @@ func clampServerInfo(s string) string {
 }
 
 // maxBatchRefBytes bounds a BATCH reference used as a histBatches key. It MUST
-// stay equal to internal/irc's clampBatchRef limit (also 512) AND clamp the SAME
-// way (a raw byte cut, not clampServerInfo's rune-boundary trim): the manager
-// keys its own replay-suppression map by that clamp, and any disagreement lets a
-// ref in the gap be replay to one layer but live to the other — splitting hub vs
-// manager state (roster/autojoin recorded on one side only). Real refs are short.
+// stay equal to internal/irc's clampBatchRef limit (also 512) AND reject the
+// SAME way: the manager keys its own replay-suppression map by that rule, and
+// any disagreement lets a ref be replay to one layer but live to the other —
+// splitting hub vs manager state. Real refs are short.
 const maxBatchRefBytes = 512
 
-// clampBatchRef truncates a batch reference to maxBatchRefBytes with a raw byte
-// cut, matching internal/irc.clampBatchRef byte-for-byte. The result is only a
-// map key (never displayed), so a split mid-rune is harmless as long as BOTH
-// layers split identically.
+// clampBatchRef returns the batch reference to use as a key, or "" if it is
+// unusable (over maxBatchRefBytes). It REJECTS over-limit refs rather than
+// truncating — see internal/irc.clampBatchRef for why (truncation aliases
+// distinct opaque refs). Callers never store or match "" (over-limit ⇒ no
+// batch ⇒ live). Must match internal/irc byte-for-byte. Normal refs pass through.
 func clampBatchRef(s string) string {
 	if len(s) > maxBatchRefBytes {
-		return s[:maxBatchRefBytes]
+		return ""
 	}
 	return s
 }
@@ -1051,13 +1054,14 @@ func (h *Hub) trackHistoryBatch(ctx context.Context, ev irc.Event, c Conn, batch
 // separately (2048 — it seeds the folded backfillPages key, bounded by count not
 // length). The open map is bounded.
 func openHistoryBatch(ev irc.Event, ref string, batches map[string]*histBatch) {
-	if ref == "" {
-		return // empty reference: ignore, or it becomes batches[""]
+	key := clampBatchRef(ref)
+	if key == "" {
+		return // empty OR over-limit reference: ignore (never store "" as a key)
 	}
 	if len(batches) >= maxOpenHistBatches {
 		return // bound the map at maxOpenHistBatches
 	}
-	batches[strings.Clone(clampBatchRef(ref))] = &histBatch{target: clampDetach(ev.Msg.Param(2))}
+	batches[strings.Clone(key)] = &histBatch{target: clampDetach(ev.Msg.Param(2))}
 }
 
 // closeHistoryBatch finishes a chathistory replay: it announces the affected
@@ -1364,12 +1368,13 @@ func (h *Hub) persistMembership(ctx context.Context, c Conn, ev irc.Event, repla
 // maxMembershipFanout caps how many buffers one QUIT/NICK line is persisted
 // and broadcast into. The roster tolerates up to 4096 channels per nick, so a
 // hostile server that first stuffs our roster can otherwise turn every 20-byte
-// NICK line into 4096 serialized DB inserts + 4096 client pushes, repeatably
-// (alternating NICK a<->b preserves membership). 512 is far beyond any real
-// shared-channel count; past it, the roster still updates every channel —
-// only the scrollback system lines in the excess channels are skipped
-// (logged, never silent).
-const maxMembershipFanout = 512
+// NICK line into that many serialized DB inserts + client pushes, repeatably
+// (alternating NICK a<->b preserves membership). The manager already truncates
+// Event.Affected to maxAffectedChannels (== this) at capture, so this is a
+// belt-and-braces bound; past it the roster still updates every channel — only
+// the scrollback system lines in the excess channels are skipped (logged, never
+// silent). 128 is far beyond any real shared-channel count.
+const maxMembershipFanout = 128
 
 // membershipTargets collects the buffers a QUIT/NICK line lands in: the
 // replay batch's channel, or — live — the shared channels the manager

@@ -347,6 +347,13 @@ func (r *roster) channelMode(m *ircv4.Message) {
 func (r *roster) setTopic(channel, topic string) {
 	if st := r.chans[r.foldKey(channel)]; st != nil {
 		t := clampRoster(topic) // bound + detach from the parsed line
+		// Refuse a GROWING topic when already over the roster byte budget, so a
+		// hostile server can't push totalBytes past the ceiling one topic at a
+		// time (mirrors the rename/updateEverywhere guards). Shrinking is always
+		// allowed — it frees bytes.
+		if len(t) > len(st.topic) && r.totalBytes() >= maxRosterBytes {
+			return
+		}
 		st.bytes += len(t) - len(st.topic)
 		st.topic = t
 	}

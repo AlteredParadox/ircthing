@@ -253,7 +253,10 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 
 func writeThumb(w http.ResponseWriter, t thumbResult) {
 	w.Header().Set("Content-Type", t.contentType)
-	w.Header().Set("Cache-Control", "private, max-age=86400")
+	// 30 min, matching the server-side thumbCache TTL. A longer browser cache
+	// (was 1 day) would keep a redacted image's thumbnail reachable in the
+	// browser long after the server purged it. private: never proxy-cacheable.
+	w.Header().Set("Cache-Control", "private, max-age=1800")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	_, _ = w.Write(t.data)
 }

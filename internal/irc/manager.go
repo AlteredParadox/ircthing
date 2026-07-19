@@ -1205,16 +1205,21 @@ func (m *Manager) serviceLine(ctx context.Context, lc *liveConn, in *ircv4.Messa
 const maxOpenHistBatches = 256
 
 // maxBatchRefBytes bounds a batch reference used as a map key. Real refs are
-// short opaque tokens; near-line-limit refs would otherwise pin whole parsed
-// lines in the count-capped map. The clamp MUST be applied identically at
-// store, delete, and lookup: clamping only at store would make oversized-ref
-// batches miss at lookup and misclassify their replayed messages as live
-// traffic (notifications, unread counts, roster churn from history).
+// short opaque [A-Za-z0-9] tokens (IRCv3 batch spec); near-line-limit refs
+// would otherwise pin whole parsed lines in the count-capped map.
 const maxBatchRefBytes = 512
 
+// clampBatchRef returns the reference to use as a map key, or "" if it is
+// unusable. An over-limit ref is REJECTED (→ ""), not truncated: truncation
+// would alias two distinct over-limit refs to one key (refs are opaque and
+// case-sensitive), so a colliding close could end the wrong batch and its
+// remaining replayed messages would classify as live. Callers never store or
+// match "" (an over-limit ref thus behaves as "no batch" → live, the benign
+// default). Must reject IDENTICALLY here and in internal/hub or the two layers'
+// state splits. Normal refs (≤512) pass through unchanged.
 func clampBatchRef(ref string) string {
 	if len(ref) > maxBatchRefBytes {
-		return ref[:maxBatchRefBytes]
+		return ""
 	}
 	return ref
 }
@@ -1238,7 +1243,10 @@ func trackChathistoryBatch(in *ircv4.Message, histBatch map[string]bool) error {
 			return fmt.Errorf("irc: too many open chathistory batches (>%d)", maxOpenHistBatches)
 		}
 		// Clone: the ref is a substring of the parsed line and would pin it.
-		histBatch[strings.Clone(clampBatchRef(ref[1:]))] = true
+		// Skip an unusable (over-limit) ref rather than storing "" as a key.
+		if k := clampBatchRef(ref[1:]); k != "" {
+			histBatch[strings.Clone(k)] = true
+		}
 	case strings.HasPrefix(ref, "-"):
 		delete(histBatch, clampBatchRef(ref[1:]))
 	}
@@ -1282,6 +1290,14 @@ func (m *Manager) onLiveLine(in *ircv4.Message, send func([]*ircv4.Message) erro
 	// hub can persist a line per buffer.
 	if (in.Command == "QUIT" || in.Command == "NICK") && in.Prefix != nil {
 		affected = m.roster.channelsWith(in.Prefix.Name)
+		// Cap at capture: one QUIT/NICK for a nick sharing thousands of channels
+		// (hostile forced-joins) would otherwise queue a ~4096-entry slice across
+		// the event channel and drive that many per-buffer store writes. The hub
+		// caps its fan-out to the same bound; capping here also bounds the queued
+		// memory. Far above the real shared-channel count at any sane scale.
+		if len(affected) > maxAffectedChannels {
+			affected = affected[:maxAffectedChannels:maxAffectedChannels]
+		}
 	}
 	if err := m.autoReply(in, send); err != nil {
 		return nil, err
@@ -1453,6 +1469,12 @@ func (m *Manager) forgetJoinIntent(list string) {
 
 // maxJoinedChannels bounds the rejoin-intent set (see trackJoinIntent).
 const maxJoinedChannels = 4096
+
+// maxAffectedChannels caps how many shared channels one QUIT/NICK fans out to
+// (system-line persistence + broadcast). Kept equal to the hub's
+// maxMembershipFanout; comfortably above the real shared-channel count at the
+// documented 5-networks/50-channels scale, while bounding a hostile amplifier.
+const maxAffectedChannels = 128
 
 // maxChannelNameBytes is a hard cap on a channel name used as a map key
 // (whoxDone, namesReq). Real names are bounded by ISUPPORT CHANNELLEN (tens of

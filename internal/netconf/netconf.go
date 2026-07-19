@@ -105,6 +105,11 @@ func (n *Network) EffectiveName() string {
 // characters (CR, LF, NUL) in every value that reaches the wire during
 // registration — these go out via PASS/NICK/USER/JOIN and would
 // otherwise inject extra protocol lines on every (re)connect.
+// maxChannels caps a network definition's channel list, matching the
+// incremental autojoin cap (internal/hub.maxPersistedChannels) so the bulk
+// (config/PutNetworkConfig) and incremental paths agree.
+const maxChannels = 4096
+
 func (n *Network) Validate() error {
 	if err := n.validateIdentity(); err != nil {
 		return err
@@ -184,6 +189,13 @@ func (n *Network) validateFraming() error {
 	}
 	if strings.IndexByte(n.Username, ' ') != -1 {
 		return errors.New("username must not contain spaces")
+	}
+	// Bound the LIST length, not just each name: the incremental autojoin path
+	// caps growth at maxPersistedChannels, but a bulk definition (config seed or
+	// PutNetworkConfig) bypassed that, so a 100k-channel definition was accepted
+	// and drove a 100k-entry rejoin map + JOIN storm on connect. Same cap here.
+	if len(n.Channels) > maxChannels {
+		return fmt.Errorf("too many channels (%d, max %d)", len(n.Channels), maxChannels)
 	}
 	for i, ch := range n.Channels {
 		if strings.ContainsAny(ch, " \r\n\x00") { // space too: one JOIN target

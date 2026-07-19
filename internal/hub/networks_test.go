@@ -76,10 +76,11 @@ func TestEditChannelList(t *testing.T) {
 	}
 }
 
-// The hub keys histBatches by a 512-byte RAW cut that must match internal/irc's
-// clampBatchRef byte-for-byte (F5): if the two layers clamped differently, a ref
-// in the gap would classify as replay to one and live to the other. This locks
-// the hub side of that contract (the constant and the raw, non-rune cut).
+// The hub keys histBatches by a rule that must match internal/irc's
+// clampBatchRef exactly: a normal ref passes through, an over-512 ref is
+// REJECTED (→ ""), never truncated (truncation would alias distinct opaque
+// refs). If the two layers disagreed, a ref would classify as replay to one and
+// live to the other. This locks the hub side of that contract.
 func TestClampBatchRef(t *testing.T) {
 	if maxBatchRefBytes != 512 {
 		t.Fatalf("maxBatchRefBytes = %d, must stay 512 to match internal/irc", maxBatchRefBytes)
@@ -87,8 +88,11 @@ func TestClampBatchRef(t *testing.T) {
 	if got := clampBatchRef(strings.Repeat("a", 100)); got != strings.Repeat("a", 100) {
 		t.Fatalf("short ref altered: %q", got)
 	}
-	if got := clampBatchRef(strings.Repeat("a", 600)); len(got) != 512 {
-		t.Fatalf("long ref not cut to 512: len=%d", len(got))
+	if got := clampBatchRef(strings.Repeat("a", 512)); len(got) != 512 {
+		t.Fatalf("at-limit ref must pass through: len=%d", len(got))
+	}
+	if got := clampBatchRef(strings.Repeat("a", 513)); got != "" {
+		t.Fatalf("over-limit ref must be rejected (empty), got len=%d", len(got))
 	}
 }
 

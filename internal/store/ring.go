@@ -49,10 +49,26 @@ func newRing(max int) *ring {
 	return &ring{max: max}
 }
 
+// adopt takes ownership of a pre-sorted (ascending by ts,id), already-capped
+// (len <= max) slice as the ring's backing and computes its byte total in one
+// pass. Warm-up uses this instead of inserting row-by-row into a second slice,
+// which would transiently retain BOTH the scanned slice and a growing copy
+// (~2× the scanned bytes) — the finding-4 warm-up spike.
+func (r *ring) adopt(msgs []Message) {
+	r.msgs = msgs
+	r.bytes = 0
+	for i := range msgs {
+		r.bytes += msgBytes(msgs[i])
+	}
+}
+
 // msgOverhead approximates a Message's fixed retained cost beyond its string
-// CONTENT: the string headers, Time/ID/bool fields, and per-element slice slack.
-// The budget only needs to be roughly right — it bounds memory, not bills it.
-const msgOverhead = 128
+// CONTENT. unsafe.Sizeof(Message{}) is 168 bytes on amd64 (int64 + 8 string
+// headers + time.Time + bool/pad); 192 covers that plus per-element slice
+// growth slack, so the byte budget counts real retained memory rather than
+// under-charging by ~40 B/row (which let warm-up scan ~1.5× more rows than the
+// 16 MiB budget implies). The budget bounds memory, it doesn't bill it exactly.
+const msgOverhead = 192
 
 // msgBytes estimates the bytes a Message keeps resident in a ring: all its
 // (server-controlled, already-clamped) string content plus the fixed overhead.
