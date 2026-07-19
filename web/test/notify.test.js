@@ -28,6 +28,14 @@ test("highlightText: empty and blank patterns ignored", () => {
 	is(highlightText("hi", "", [], "libera"), false, "no nick, no rules");
 });
 
+test("highlightText: a corrupt non-string rule pattern does not throw", () => {
+	// This runs in the message hot path (event handler + row render); a corrupt
+	// localStorage rule must be skipped, not blank the chat with a TypeError.
+	const rules = [{ pattern: 123 }, { pattern: ["deploy"] }, { pattern: "ok" }];
+	is(highlightText("say ok please", "AlteredParadox", rules, "libera"), true);
+	is(highlightText("nothing here", "AlteredParadox", rules, "libera"), false);
+});
+
 test("highlightText: mIRC formatting inside a keyword cannot defeat the rule", () => {
 	const rules = [{ pattern: "deploy", network: "" }];
 	is(highlightText("de\x02ploy now", "AlteredParadox", rules, "libera"), true, "bold mid-word");

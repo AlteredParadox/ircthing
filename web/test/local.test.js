@@ -38,6 +38,15 @@ test("ignores: empty/garbage nick is never ignored", () => {
 	is(isIgnored(ig, "libera", undefined), false);
 });
 
+test("ignores: a corrupt non-array network value does not throw the hot path", () => {
+	// A hand-edited / partially-written store could map a network to a non-array.
+	const corrupt = { libera: 5, oftc: "x" };
+	is(isIgnored(corrupt, "libera", "bob"), false);
+	is(isIgnored(corrupt, "oftc", "bob"), false);
+	eq(ignoredFor(corrupt, "libera"), []);
+	eq(ignoredFor(corrupt, "missing"), []);
+});
+
 test("mutes: toggle and persist by buffer key", () => {
 	let m = loadMutes();
 	eq(m, []);

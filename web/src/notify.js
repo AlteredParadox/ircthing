@@ -18,7 +18,10 @@ export function highlightText(text, nick, rules, network) {
 	if (!rules) return false;
 	const lower = clean.toLowerCase();
 	for (const r of rules) {
-		if (!r.pattern) continue;
+		// Guard the type: this runs in the message hot path (event handler AND
+		// row render), so a corrupt non-string pattern must not throw and blank
+		// the chat. loadRules also sanitizes; this is defense in depth.
+		if (typeof r.pattern !== "string" || !r.pattern) continue;
 		if (r.network && r.network !== network) continue;
 		if (lower.includes(r.pattern.toLowerCase())) return true;
 	}
@@ -31,8 +34,12 @@ export function loadRules() {
 	try {
 		const v = JSON.parse(localStorage.getItem("highlightRules"));
 		if (!Array.isArray(v)) return [];
-		// Stable ids key the settings rows (rules are edited in place).
-		return v.map((r) => ({ ...r, id: r.id || uuid() }));
+		// Drop corrupt entries (a hand-edited or partially-written store): a
+		// non-string pattern would throw in highlightText. Stable ids key the
+		// settings rows (rules are edited in place); coerce network to a string.
+		return v
+			.filter((r) => r && typeof r.pattern === "string")
+			.map((r) => ({ ...r, network: typeof r.network === "string" ? r.network : "", id: r.id || uuid() }));
 	} catch {
 		return [];
 	}

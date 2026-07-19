@@ -20,7 +20,10 @@ export function loadIgnores() {
 }
 
 export function isIgnored(ignores, network, nick) {
-	return !!nick && (ignores[network] || []).includes(nick.toLowerCase());
+	// Array.isArray guard: a corrupt store where a network maps to a non-array
+	// (e.g. {"libera": 5}) would otherwise throw in this message hot path.
+	const list = ignores[network];
+	return !!nick && Array.isArray(list) && list.includes(nick.toLowerCase());
 }
 
 // toggleIgnore returns the updated map (persisted); empty network lists
@@ -37,9 +40,10 @@ export function toggleIgnore(ignores, network, nick) {
 	return next;
 }
 
-// ignoredFor returns the ignore list for one network (never undefined).
+// ignoredFor returns the ignore list for one network (never undefined, always
+// an array even if the stored value for the network is corrupt).
 export function ignoredFor(ignores, network) {
-	return ignores[network] || [];
+	return Array.isArray(ignores[network]) ? ignores[network] : [];
 }
 
 // mutes: [bufKey, ...]. A muted buffer still counts unread (dimmed in the

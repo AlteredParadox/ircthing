@@ -221,12 +221,17 @@ function setTypingState(t, key, d) {
 // state for a live event (creating the buffer on first traffic).
 function bumpBufferActivity(b, key, ev, countUnread, highlight) {
 	const cur = b[key] || makeBuffer(ev.network, ev.buffer);
+	// Only count messages NEWER than the read marker, mirroring the server's
+	// strict `ts > marker` — a message with a server-time at or below the
+	// marker (same-ms on a busy channel, or a backdated relay/bridge line) is
+	// already-read and must not badge, or the client over-counts vs the server.
+	const fresh = countUnread && ev.time > cur.marker;
 	return {
 		...b,
 		[key]: {
 			...cur,
 			lastTime: ev.time,
-			unread: countUnread ? cur.unread + 1 : cur.unread,
+			unread: fresh ? cur.unread + 1 : cur.unread,
 			mention: cur.mention || highlight,
 		},
 	};
@@ -785,8 +790,21 @@ export function App() {
 			}
 		});
 
-		s.on("read_marker", (d) =>
-			setBuffers((b) => applyMarkerState(b, bufKey(d.network, d.buffer), d.time)));
+		s.on("read_marker", (d) => {
+			const key = bufKey(d.network, d.buffer);
+			const cur = buffersRef.current[key];
+			setBuffers((b) => applyMarkerState(b, key, d.time));
+			// A marker pushed by ANOTHER device (our own reads take the direct
+			// path below) that moves forward but not to the tail leaves our
+			// running unread higher than the server's ts>marker count — resync
+			// (debounced) so the badge matches. Our web reads always send the
+			// full tail ts (applyMarkerState clears), so this only fires for an
+			// external client that read partway via draft/read-marker.
+			if (cur && d.time > cur.marker && d.time < cur.lastTime) {
+				clearTimeout(bufRefresh);
+				bufRefresh = setTimeout(refreshBuffers, 300);
+			}
+		});
 
 		s.connect();
 		return () => s.close();
@@ -1359,7 +1377,13 @@ export function App() {
 				return sock.current
 					.request("command", { network: buf.network, command: p.command, params: p.params })
 					.then(() => {
-						if (p.switchTo) select(buf.network, p.switchTo);
+						// switchTo is set only by /join. Select once our actual
+						// JOIN arrives (via pendingJoin), not the requested name —
+						// the server may forward the join (MODE +f, numeric 470),
+						// and selecting the requested name now would leave a
+						// persistent phantom buffer (mergeServerBuffers keeps
+						// ephemeral buffers). Mirrors the UI joinChannel path.
+						if (p.switchTo) pendingJoin.current = { network: buf.network, ts: Date.now() };
 					})
 					.catch(oops);
 			default:
