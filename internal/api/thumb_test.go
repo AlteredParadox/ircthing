@@ -101,19 +101,30 @@ func TestThumbnailAveragesColor(t *testing.T) {
 }
 
 func TestEncodeThumb(t *testing.T) {
-	img := image.NewRGBA(image.Rect(0, 0, 10, 10))
-	png, err := encodeThumb(img, "png")
+	opaque := image.NewRGBA(image.Rect(0, 0, 10, 10))
+	for y := 0; y < 10; y++ {
+		for x := 0; x < 10; x++ {
+			opaque.Set(x, y, color.RGBA{100, 150, 200, 255})
+		}
+	}
+	png, err := encodeThumb(opaque, "png")
 	if err != nil || png.contentType != "image/png" {
 		t.Fatalf("png: %+v %v", png.contentType, err)
 	}
-	jpg, err := encodeThumb(img, "jpeg")
+	jpg, err := encodeThumb(opaque, "jpeg")
 	if err != nil || jpg.contentType != "image/jpeg" {
 		t.Fatalf("jpeg: %+v %v", jpg.contentType, err)
 	}
 	// GIF sources re-encode as PNG (may carry transparency).
-	g, _ := encodeThumb(img, "gif")
+	g, _ := encodeThumb(opaque, "gif")
 	if g.contentType != "image/png" {
 		t.Fatalf("gif re-encode = %q", g.contentType)
+	}
+	// A NON-OPAQUE image forces PNG regardless of source format, or the
+	// transparency would render dark/black through JPEG.
+	clear := image.NewRGBA(image.Rect(0, 0, 10, 10)) // zero-valued: alpha 0
+	if tr, _ := encodeThumb(clear, "webp"); tr.contentType != "image/png" {
+		t.Fatalf("transparent re-encode = %q, want image/png", tr.contentType)
 	}
 }
 
@@ -144,19 +155,71 @@ func TestDecodeByteGate(t *testing.T) {
 	}
 }
 
-// minimalWebP is a valid 1x1 lossless (VP8L) WebP. Go has no WebP encoder, so
-// the fixture is raw bytes; it exercises that the golang.org/x/image/webp
-// decoder is registered and drives the format/decode path.
-var minimalWebP = []byte{
+// minimalVP8LWebP is a valid 1x1 lossless (VP8L) WebP. Go has no WebP encoder,
+// so the fixture is raw bytes. Since the VP8L restriction (its decoder's peak
+// memory is metadata-driven, see webpUsesVP8L) it must be REJECTED by the
+// decode gate.
+var minimalVP8LWebP = []byte{
 	0x52, 0x49, 0x46, 0x46, 0x1a, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x4c,
 	0x0d, 0x00, 0x00, 0x00, 0x2f, 0x00, 0x00, 0x00, 0x10, 0x07, 0x10, 0x11, 0x11, 0x88, 0x88, 0xfe,
 	0x07, 0x00,
 }
 
-func TestWebPDecodes(t *testing.T) {
-	// The decoder must be registered: decodableFormat classifies it as "webp"
-	// (a claimed-but-undecodable image type would 415 and blank the card).
-	format, ok := decodableFormat(minimalWebP)
+// lossyWebP is a 16x16 lossy VP8 WebP (no alpha) — the form the thumbnailer
+// still accepts. Generated once with Pillow/libwebp (quality=75).
+var lossyWebP = []byte{
+	0x52, 0x49, 0x46, 0x46, 0x4e, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x20,
+	0x42, 0x00, 0x00, 0x00, 0xf0, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00, 0x10, 0x00, 0x02, 0x00,
+	0x34, 0x25, 0xb0, 0x02, 0x74, 0x01, 0x0f, 0x0c, 0x12, 0xf2, 0xca, 0x80, 0x00, 0xfe, 0xfc, 0xc9,
+	0x5e, 0xd9, 0x36, 0xe6, 0x26, 0xa6, 0xef, 0x73, 0x5a, 0x6b, 0xdf, 0xe4, 0xb7, 0xe3, 0xd0, 0x94,
+	0x56, 0x77, 0xcb, 0x40, 0xf6, 0xb5, 0x27, 0x57, 0xe4, 0x6a, 0x7f, 0xf5, 0x12, 0x0a, 0xbf, 0xfe,
+	0xfb, 0x04, 0x89, 0x16, 0x40, 0x00,
+}
+
+// lossyAlphaWebP is the same 16x16 lossy VP8 frame with a VP8L-COMPRESSED
+// ALPH chunk (VP8X + ALPH whose first payload byte has compression=1) — the
+// alpha path that routes through the unbounded VP8L decoder, so it must be
+// rejected. Generated with Pillow/libwebp from an RGBA source.
+var lossyAlphaWebP = []byte{
+	0x52, 0x49, 0x46, 0x46, 0x7c, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x58,
+	0x0a, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x41, 0x4c,
+	0x50, 0x48, 0x13, 0x00, 0x00, 0x00, 0x01, 0x0f, 0xf0, 0xc0, 0xff, 0x88, 0x88, 0x20, 0x16, 0x4c,
+	0xe6, 0x2f, 0xdd, 0x9d, 0x41, 0x44, 0xff, 0x23, 0x17, 0x00, 0x56, 0x50, 0x38, 0x20, 0x42, 0x00,
+	0x00, 0x00, 0xf0, 0x01, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00, 0x10, 0x00, 0x02, 0x00, 0x34, 0x25,
+	0xb0, 0x02, 0x74, 0x01, 0x0f, 0x0c, 0x12, 0xf2, 0xca, 0x80, 0x00, 0xfe, 0xfc, 0xc9, 0x5e, 0xd9,
+	0x36, 0xe6, 0x26, 0xa6, 0xef, 0x73, 0x5a, 0x6b, 0xdf, 0xe4, 0xb7, 0xe3, 0xd0, 0x94, 0x56, 0x77,
+	0xcb, 0x40, 0xf6, 0xb5, 0x27, 0x57, 0xe4, 0x6a, 0x7f, 0xf5, 0x12, 0x0a, 0xbf, 0xfe, 0xfb, 0x04,
+	0x89, 0x16, 0x40, 0x00,
+}
+
+// uncompressedAlphaWebP is lossyAlphaWebP with its ALPH payload rewritten to
+// compression method 0 (raw 16x16 alpha bytes, half-transparent left side):
+// no VP8L bitstream anywhere, so it stays accepted — and its thumbnail must
+// re-encode as PNG, not JPEG, to keep the transparency.
+var uncompressedAlphaWebP = func() []byte {
+	b := []byte{
+		0x52, 0x49, 0x46, 0x46, 0x6a, 0x01, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38, 0x58,
+		0x0a, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x00, 0x0f, 0x00, 0x00,
+	}
+	// ALPH chunk: fourCC, LE32 length (1 header byte + 256 alpha bytes = 257),
+	// header byte 0 (uncompressed), then row-major alpha.
+	b = append(b, 'A', 'L', 'P', 'H', 0x01, 0x01, 0x00, 0x00, 0x00)
+	for range 16 {
+		for x := range 16 {
+			a := byte(0xff)
+			if x < 8 {
+				a = 0x80
+			}
+			b = append(b, a)
+		}
+	}
+	b = append(b, 0x00) // pad: 257-byte payload rounds to even
+	// The same lossy VP8 frame as lossyWebP.
+	return append(b, lossyWebP[12:]...)
+}()
+
+func TestWebPLossyDecodes(t *testing.T) {
+	format, ok := decodableFormat(lossyWebP)
 	if !ok || format != "webp" {
 		t.Fatalf("decodableFormat = (%q, %v), want (webp, true)", format, ok)
 	}
@@ -169,13 +232,71 @@ func TestWebPDecodes(t *testing.T) {
 	if isImageType("image/avif") || isImageType("image/x-icon") {
 		t.Fatal("isImageType claims a format with no registered decoder")
 	}
-	// End to end: decode → downscale → re-encode, as handleThumb does.
-	src, _, err := image.Decode(bytes.NewReader(minimalWebP))
+	// End to end: decode → downscale → re-encode, as handleThumb does. An
+	// opaque lossy frame re-encodes as JPEG.
+	src, _, err := image.Decode(bytes.NewReader(lossyWebP))
 	if err != nil {
 		t.Fatalf("image.Decode(webp): %v", err)
 	}
-	if _, err := encodeThumb(thumbnail(src, thumbMaxDim), format); err != nil {
+	res, err := encodeThumb(thumbnail(src, thumbMaxDim), format)
+	if err != nil {
 		t.Fatalf("encodeThumb(webp): %v", err)
+	}
+	if res.contentType != "image/jpeg" {
+		t.Fatalf("opaque webp re-encode = %q, want image/jpeg", res.contentType)
+	}
+}
+
+// The VP8L decoder's peak allocation is chosen by encoded metadata (up to
+// ~167 MiB of Huffman groups regardless of declared dimensions), so lossless
+// bodies and VP8L-compressed alpha must be refused before any decode.
+func TestWebPVP8LRejected(t *testing.T) {
+	if !webpUsesVP8L(minimalVP8LWebP) {
+		t.Fatal("webpUsesVP8L missed a VP8L image chunk")
+	}
+	if !webpUsesVP8L(lossyAlphaWebP) {
+		t.Fatal("webpUsesVP8L missed a VP8L-compressed ALPH chunk")
+	}
+	if webpUsesVP8L(lossyWebP) || webpUsesVP8L(uncompressedAlphaWebP) {
+		t.Fatal("webpUsesVP8L false positive on plain-VP8 / uncompressed-alpha bodies")
+	}
+	if webpUsesVP8L([]byte("not a webp at all")) {
+		t.Fatal("webpUsesVP8L false positive on a non-RIFF body")
+	}
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{"lossless VP8L", minimalVP8LWebP},
+		{"compressed ALPH", lossyAlphaWebP},
+	} {
+		if format, ok := decodableFormat(tc.body); ok {
+			t.Errorf("%s: decodableFormat = (%q, true), want rejected", tc.name, format)
+		}
+	}
+}
+
+// A WebP whose alpha survives the VP8L restriction (uncompressed ALPH) decodes
+// to a non-opaque NYCbCrA; the thumbnail must select PNG or the transparency
+// renders dark/black through JPEG.
+func TestWebPAlphaKeepsPNG(t *testing.T) {
+	format, ok := decodableFormat(uncompressedAlphaWebP)
+	if !ok || format != "webp" {
+		t.Fatalf("decodableFormat = (%q, %v), want (webp, true)", format, ok)
+	}
+	src, _, err := image.Decode(bytes.NewReader(uncompressedAlphaWebP))
+	if err != nil {
+		t.Fatalf("image.Decode(alpha webp): %v", err)
+	}
+	if imageOpaque(src) {
+		t.Fatal("fixture decoded opaque; premise wrong")
+	}
+	res, err := encodeThumb(thumbnail(src, thumbMaxDim), format)
+	if err != nil {
+		t.Fatalf("encodeThumb: %v", err)
+	}
+	if res.contentType != "image/png" {
+		t.Fatalf("alpha webp re-encode = %q, want image/png", res.contentType)
 	}
 }
 

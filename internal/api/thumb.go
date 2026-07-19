@@ -18,6 +18,7 @@ package api
 
 import (
 	"bytes"
+	"encoding/binary"
 	"image"
 	"image/color"
 	_ "image/gif" // register the GIF decoder (first frame only)
@@ -25,7 +26,7 @@ import (
 	"image/png"
 	"net/http"
 
-	_ "golang.org/x/image/webp" // register the WebP decoder (lossy VP8 / lossless VP8L)
+	_ "golang.org/x/image/webp" // register the WebP decoder (see the VP8L restriction below)
 )
 
 // Image thumbnails: fetch an image through the proxy, downscale it
@@ -33,8 +34,17 @@ import (
 // pulls full-size remote images and memory stays bounded. Supported
 // formats are JPEG/PNG/GIF (standard library) and WebP (golang.org/x/image,
 // pure-Go, CGO-free); anything else returns 415 and the client shows no
-// thumbnail. WebP decodes to YCbCr (lossy) or NRGBA (lossless), both <=4 B/px,
-// so it needs no decode-cost surcharge beyond the default per-pixel model.
+// thumbnail.
+//
+// WebP is restricted to LOSSY VP8: the x/image VP8L (lossless) decoder's
+// peak memory is driven by encoded METADATA, not pixel area — see
+// webpUsesVP8L — so VP8L bodies (and VP8L-compressed ALPH alpha chunks)
+// are rejected outright rather than admitted under the per-pixel model.
+// What remains — lossy VP8, optionally with an UNCOMPRESSED ALPH chunk —
+// decodes to YCbCr/NYCbCrA, well under 4 B/px, so it needs no decode-cost
+// surcharge. Animated WebP (ANIM/ANMF) is not decoded by x/image/webp at
+// all; only a static frame layout parses, so animations 415 like any other
+// undecodable body.
 
 const (
 	maxImageBytes = 10 * 1024 * 1024
@@ -172,6 +182,43 @@ func jpegDecodesToRGBA(b []byte) bool {
 	}
 }
 
+// webpUsesVP8L reports whether a WebP body carries a VP8L (lossless)
+// bitstream — as its image chunk or as a VP8L-COMPRESSED ALPH alpha chunk.
+// Both are rejected: the x/image VP8L decoder's peak allocation is chosen
+// by encoded metadata, not by the declared pixel area the per-pixel model
+// charges. A 16-bit Huffman-group index in the bitstream makes
+// vp8l.decodeHuffmanGroups allocate up to 65,536 groups × 5 trees
+// (~536 B/tree) ≈ 167 MiB up front (x/image v0.44.0 vp8l/decode.go:296,
+// huffman.go:46) — independent of DecodeConfig's dimensions and far past
+// the deploy unit's MemoryMax. VP8L color transforms and compressed alpha
+// exceed the model too, less dramatically. Until the decoder bounds its
+// Huffman groups upstream, lossless WebP is refused (415, blank card);
+// plain lossy VP8 — the dominant CDN form — still thumbnails.
+//
+// RIFF layout (the caller already validated the header via DecodeConfig):
+// "RIFF" len "WEBP", then chunks of fourCC + LE32 length + payload + pad.
+// An ALPH payload's first byte holds the compression method in its low two
+// bits; 1 means VP8L-compressed (x/image webp/decode.go readAlpha).
+func webpUsesVP8L(body []byte) bool {
+	if len(body) < 12 || string(body[0:4]) != "RIFF" || string(body[8:12]) != "WEBP" {
+		return false // not RIFF/WebP; the decoder rejects it on its own
+	}
+	for off := int64(12); off+8 <= int64(len(body)); {
+		id := string(body[off : off+4])
+		n := int64(binary.LittleEndian.Uint32(body[off+4 : off+8]))
+		switch id {
+		case "VP8L":
+			return true
+		case "ALPH":
+			if off+8 < int64(len(body)) && body[off+8]&0x03 == 1 {
+				return true
+			}
+		}
+		off += 8 + n + (n & 1) // chunks are padded to even lengths
+	}
+	return false
+}
+
 // decodableFormat validates that body is an image we are willing to fully
 // decode within maxDecodeBytes, returning its format. ok is false when the
 // header is unreadable, the dimensions are out of range, or the modeled
@@ -185,6 +232,11 @@ func decodableFormat(body []byte) (format string, ok bool) {
 	// product below can never overflow int64.
 	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 ||
 		cfg.Width > maxImageDim || cfg.Height > maxImageDim {
+		return "", false
+	}
+	// Lossless (VP8L) WebP escapes the per-pixel decode model entirely —
+	// see webpUsesVP8L — so it is refused before any decode.
+	if format == "webp" && webpUsesVP8L(body) {
 		return "", false
 	}
 	// Per-pixel decode cost is the output bitmap PLUS, for a progressive
@@ -366,10 +418,13 @@ func writeThumb(w http.ResponseWriter, t thumbResult) {
 }
 
 // encodeThumb re-encodes a thumbnail: PNG for formats that may carry
-// transparency (png/gif), JPEG otherwise.
+// transparency (png/gif) AND for any decoded image that actually holds
+// non-opaque pixels — a WebP with an (uncompressed) ALPH chunk decodes to
+// NYCbCrA, and routing it through JPEG rendered its transparency as
+// dark/black. JPEG only for images verified fully opaque.
 func encodeThumb(img image.Image, srcFormat string) (thumbResult, error) {
 	var buf bytes.Buffer
-	if srcFormat == "png" || srcFormat == "gif" {
+	if srcFormat == "png" || srcFormat == "gif" || !imageOpaque(img) {
 		if err := png.Encode(&buf, img); err != nil {
 			return thumbResult{}, err
 		}
@@ -379,6 +434,16 @@ func encodeThumb(img image.Image, srcFormat string) (thumbResult, error) {
 		return thumbResult{}, err
 	}
 	return thumbResult{contentType: "image/jpeg", data: buf.Bytes()}, nil
+}
+
+// imageOpaque reports whether img is fully opaque. Every image type our
+// decoders produce implements Opaque(); an unknown type conservatively
+// counts as transparent (PNG is always correct, just larger).
+func imageOpaque(img image.Image) bool {
+	if o, ok := img.(interface{ Opaque() bool }); ok {
+		return o.Opaque()
+	}
+	return false
 }
 
 // thumbnail downscales src so its longest side is at most maxDim,
