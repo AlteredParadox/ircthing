@@ -190,6 +190,9 @@ func (c *config) cookieConfigWarning() string {
 	if loopback && !c.BehindProxy && c.SecureCookies {
 		return "secure_cookies is true but listen is plain-HTTP loopback with no proxy — a Secure cookie is never sent over http://, so login will appear to succeed then bounce. Set secure_cookies=false for local plain-HTTP testing."
 	}
+	if !loopback && !c.BehindProxy && !c.SecureCookies {
+		return "listen is a PUBLIC address (" + c.Listen + ") with no proxy and secure_cookies=false — login credentials and the session cookie would travel over plain HTTP. Put a TLS-terminating proxy in front (behind_proxy=true, secure_cookies=true) or bind to loopback."
+	}
 	return ""
 }
 

@@ -203,6 +203,9 @@ func (n *Network) validateFraming() error {
 		return fmt.Errorf("too many channels (%d, max %d)", len(n.Channels), maxChannels)
 	}
 	for i, ch := range n.Channels {
+		if ch == "" { // an empty entry would send a bare `JOIN :` on reconnect
+			return fmt.Errorf("channels[%d] is empty", i)
+		}
 		if strings.ContainsAny(ch, " \r\n\x00") { // space too: one JOIN target
 			return fmt.Errorf("channels[%d] must not contain spaces, CR, LF, or NUL", i)
 		}

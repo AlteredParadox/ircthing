@@ -11,7 +11,7 @@ edit by hand.
 
 ---
 
-## Go standard library and runtime (golang.org/x — BSD-3-Clause)
+## Go standard library and runtime (BSD-3-Clause)
 
 ### LICENSE
 

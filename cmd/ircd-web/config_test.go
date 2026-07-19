@@ -208,7 +208,8 @@ func TestCookieConfigWarning(t *testing.T) {
 		{"proxy-fronted but insecure cookie", "127.0.0.1:8067", true, false, true},
 		{"plain-http loopback, secure cookie bounces", "127.0.0.1:8067", false, true, true},
 		{"plain-http loopback, insecure cookie ok", "127.0.0.1:8067", false, false, false},
-		{"public direct, insecure", "0.0.0.0:8067", false, false, false},
+		{"public direct plaintext warns (credentials over HTTP)", "0.0.0.0:8067", false, false, true},
+		{"public behind TLS proxy, secure", "0.0.0.0:8067", true, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
