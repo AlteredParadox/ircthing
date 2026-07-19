@@ -742,7 +742,14 @@ func TestMonitorReestablishedOnRegistration(t *testing.T) {
 	defer cancel()
 	go h.Run(ctx, conn)
 
+	// Registration alone must NOT re-establish MONITOR: the ISUPPORT burst
+	// (which carries the MONITOR limit) is only known once the welcome burst
+	// ends (376/422).
 	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered}
+	conn.ch <- irc.Event{
+		Network: "libera", Kind: irc.EventMessage,
+		Msg: ircv4.MustParseMessage(":srv 376 AlteredParadox :End of /MOTD"), Time: time.Now(),
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if got := conn.monitoredNicks(); len(got) == 1 && got[0] == "alice" {
@@ -1065,9 +1072,18 @@ func TestChatHistoryBackfillFlow(t *testing.T) {
 	s := h.NewSession()
 	defer s.Close()
 
-	// Registration backfills the query buffer only.
+	// Registration + end of the welcome burst backfills the query buffer
+	// only. StateRegistered alone must not: the CHATHISTORY/MSGREFTYPES
+	// ISUPPORT tokens are only known once 376/422 lands.
 	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered}
 	recv(t, s, "state")
+	if got := conn.histReqs(); len(got) != 0 {
+		t.Fatalf("backfill before the welcome burst ended: %v", got)
+	}
+	conn.ch <- irc.Event{
+		Network: "libera", Kind: irc.EventMessage,
+		Msg: ircv4.MustParseMessage(":srv 376 AlteredParadox :End of /MOTD"), Time: time.Now(),
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for len(conn.histReqs()) == 0 {
 		if time.Now().After(deadline) {
@@ -1355,6 +1371,10 @@ func TestReadMarkerFetchedForQueriesOnRegistration(t *testing.T) {
 	go h.Run(ctx, conn)
 
 	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered}
+	conn.ch <- irc.Event{
+		Network: "libera", Kind: irc.EventMessage,
+		Msg: ircv4.MustParseMessage(":srv 376 AlteredParadox :End of /MOTD"), Time: time.Now(),
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		var get bool
@@ -1548,10 +1568,88 @@ func TestPaginatedBackfill(t *testing.T) {
 	}
 	waitReqs(maxBackfillPages, "at the page cap")
 
-	// A new registration restores the pagination budget.
+	// A new connection restores the pagination budget. The reset rides on
+	// StateConnecting — NOT StateRegistered, which the read loop can race
+	// (a batch opened between the two events must not be erased).
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateConnecting, Time: time.Now()}
 	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered, Time: time.Now()}
 	fullBatch("fresh", 50)
 	waitReqs(maxBackfillPages+1, "after re-registration")
+}
+
+// The welcome-burst end can legitimately arrive BEFORE StateRegistered on the
+// event channel — the manager's read loop starts before that event is emitted
+// — so post-registration sync must fire on either order, exactly once.
+func TestSyncOrderIndependent(t *testing.T) {
+	h := newTestHub(t)
+	if err := h.store.AddMonitor(context.Background(), "libera", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateConnecting}
+	conn.ch <- irc.Event{
+		Network: "libera", Kind: irc.EventMessage,
+		Msg: ircv4.MustParseMessage(":srv 422 AlteredParadox :No MOTD"), Time: time.Now(),
+	}
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(conn.monitoredNicks()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("sync never started with 422 preceding StateRegistered")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// A second 376 on the same connection (a user /motd) must not re-sync.
+	conn.ch <- irc.Event{
+		Network: "libera", Kind: irc.EventMessage,
+		Msg: ircv4.MustParseMessage(":srv 376 AlteredParadox :End of /MOTD"), Time: time.Now(),
+	}
+	waitForNetwork(t, h, "libera") // flush: any re-sync would have queued by now
+	time.Sleep(20 * time.Millisecond)
+	if got := conn.monitoredNicks(); len(got) != 1 {
+		t.Fatalf("monitor re-established more than once: %v", got)
+	}
+}
+
+// A chathistory batch opened between StateConnecting and StateRegistered (the
+// read loop starts first, so this is a real ordering) must survive
+// StateRegistered: the old second reset erased it, reclassifying its replayed
+// lines as live traffic.
+func TestRegisteredDoesNotEraseOpenBatch(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	s := h.NewSession()
+	defer s.Close()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateConnecting}
+	conn.ch <- ev(":srv BATCH +early chathistory #go")
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered}
+	conn.ch <- ev("@batch=early;msgid=e1;time=2026-07-15T00:00:01.000Z :bob!u@h PRIVMSG #go :replayed")
+	conn.ch <- ev(":srv BATCH -early")
+
+	// Replay semantics: no live "event" push, but a history_changed hint on
+	// close. Seeing "event" here means the batch was erased at StateRegistered.
+	env := recv(t, s, "history_changed", "state")
+	data := decode[HistoryChangedData](t, env)
+	if data.Buffer != "#go" {
+		t.Fatalf("history_changed buffer = %q", data.Buffer)
+	}
+	msgs, err := h.store.Latest(context.Background(), "libera", "#go", 10)
+	if err != nil || len(msgs) != 1 || msgs[0].MsgID != "e1" {
+		t.Fatalf("replayed message not persisted: %v %v", msgs, err)
+	}
 }
 
 func TestServerInfoFlow(t *testing.T) {

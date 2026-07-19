@@ -167,6 +167,9 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 	// whois accumulates WHOIS reply numerics into a card, keyed by the
 	// queried nick, until 318 flushes it (see accumulateWhois).
 	whois := make(map[string]*WhoisData)
+	// reg gates the post-registration synchronization for the current
+	// connection (see regSync).
+	reg := &regSync{}
 
 	for {
 		select {
@@ -175,23 +178,32 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 		case ev := <-c.Events():
 			switch ev.Kind {
 			case irc.EventState:
-				if ev.State == irc.StateConnecting || ev.State == irc.StateRegistered {
+				if ev.State == irc.StateConnecting {
 					// Reset connection-scoped state on a NEW connection. Doing it on
-					// StateConnecting (not only StateRegistered) is what closes the
+					// StateConnecting — and ONLY there — is what closes the
 					// pre-registration window: the manager emits StateConnecting
 					// before it starts the read loop, and events arrive over one
 					// ordered channel, so stale batch refs and pagination budgets are
 					// cleared BEFORE any message — even a pre-registration BATCH —
-					// from the new connection is processed against them. StateRegistered
-					// keeps resetting too: it is the long-standing budget-restore point
-					// (a fresh registration always precedes with StateConnecting, so
-					// this is a harmless backstop and keeps the semantics obvious).
+					// from the new connection is processed against them. There is
+					// deliberately NO second reset at StateRegistered: the read loop
+					// runs before that event is emitted, so a batch legitimately
+					// opened between the two events would be erased by it.
 					histBatches = make(map[string]*histBatch)
 					backfillPages = make(map[string]int)
 					whois = make(map[string]*WhoisData)
+					*reg = regSync{}
 				}
-				h.onState(ctx, c, ev)
+				h.onState(ctx, c, ev, reg)
 			case irc.EventMessage:
+				// End of the welcome burst (RPL_ENDOFMOTD/ERR_NOMOTD): the
+				// second of the two signals post-registration synchronization
+				// waits for. Checked here — not inside onMessage — because it
+				// must fire regardless of how the numeric is otherwise routed.
+				if !reg.burstEnded && (ev.Msg.Command == "376" || ev.Msg.Command == "422") {
+					reg.burstEnded = true
+					h.maybeStartSync(ctx, c, reg)
+				}
 				if err := h.onMessage(ctx, c, ev, histBatches, backfillPages, whois); err != nil {
 					return err
 				}
@@ -200,9 +212,42 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 	}
 }
 
-// onState records and broadcasts a connection state change, kicking off
-// backfill and MONITOR re-establishment on registration.
-func (h *Hub) onState(ctx context.Context, c Conn, ev irc.Event) {
+// regSync tracks when one connection's post-registration synchronization
+// (query-buffer backfill, MONITOR re-establishment) may start: only after
+// BOTH StateRegistered (sends are accepted) AND the end of the welcome
+// burst (376/422, which standard registration ordering — see
+// https://modern.ircdocs.horse — places after the 005 ISUPPORT burst).
+// Keying off StateRegistered alone raced the asynchronously-applied 005:
+// the hub could send msgid= selectors before MSGREFTYPES arrived, request
+// 100 messages before a smaller CHATHISTORY limit was known, send an
+// oversized MONITOR list, and classify buffers with default CHANTYPES.
+// The two flags accept either arrival order — the read loop starts before
+// StateRegistered is emitted, so a fast server's 376 can precede it on the
+// event channel. A server that never ends its MOTD (an RFC violation; 376
+// or 422 is mandatory) simply gets no query backfill/MONITOR on that
+// connection — accepted, since such a server controls the history anyway.
+type regSync struct {
+	registered bool
+	burstEnded bool
+	synced     bool
+}
+
+// maybeStartSync runs the one-shot post-registration synchronization once
+// both regSync signals are in.
+func (h *Hub) maybeStartSync(ctx context.Context, c Conn, reg *regSync) {
+	if reg.synced || !reg.registered || !reg.burstEnded {
+		return
+	}
+	reg.synced = true
+	h.backfill(ctx, c)
+	h.startMonitor(ctx, c)
+}
+
+// onState records and broadcasts a connection state change. Registration
+// arms the first of regSync's two gates; backfill and MONITOR
+// re-establishment start only once the welcome burst has also ended (see
+// regSync/maybeStartSync).
+func (h *Hub) onState(ctx context.Context, c Conn, ev irc.Event, reg *regSync) {
 	h.mu.Lock()
 	h.states[ev.Network] = ev.State.String()
 	h.mu.Unlock()
@@ -222,8 +267,8 @@ func (h *Hub) onState(ctx context.Context, c Conn, ev irc.Event) {
 		Error:   errStr,
 	}))
 	if ev.State == irc.StateRegistered {
-		h.backfill(ctx, c)
-		h.startMonitor(ctx, c)
+		reg.registered = true
+		h.maybeStartSync(ctx, c, reg)
 	}
 	if ev.State == irc.StateDisconnected {
 		h.clearPresence(ev.Network)
