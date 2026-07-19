@@ -291,6 +291,12 @@ func (s *Session) persistOwn(ctx context.Context, conn Conn, network, target, te
 	if err != nil {
 		return
 	}
+	// AppendFolded returns a zero-value Message (ID 0) when the target buffer is
+	// at the per-network cap and was dropped rather than created; broadcasting it
+	// would push a blank event to the UI. Nothing was stored, so nothing to emit.
+	if stored.ID == 0 {
+		return
+	}
 	s.hub.broadcast(envelope("event", 0, eventData(stored)))
 }
 

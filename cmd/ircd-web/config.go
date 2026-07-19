@@ -169,6 +169,30 @@ func (c *config) proxyConfigWarning() string {
 	return ""
 }
 
+// cookieConfigWarning flags a secure_cookies setting that disagrees with the
+// deployment, "" when sensible. Paired with proxyConfigWarning so the pair of
+// warnings the README promises actually fires.
+//
+//   - behind_proxy + secure_cookies=false: the fronting proxy serves HTTPS, so
+//     the session cookie should be Secure; false lets it ride plain HTTP.
+//   - plain-HTTP loopback (no proxy) + secure_cookies=true: a Secure cookie is
+//     never sent over http://, so login appears to succeed then bounces.
+func (c *config) cookieConfigWarning() string {
+	if c.BehindProxy && !c.SecureCookies {
+		return "behind_proxy is set (a TLS-terminating proxy) but secure_cookies is false — the session cookie is not marked Secure and could be sent over plain HTTP. Set secure_cookies=true."
+	}
+	host, _, err := net.SplitHostPort(c.Listen)
+	if err != nil {
+		return ""
+	}
+	ip := net.ParseIP(host)
+	loopback := (ip != nil && ip.IsLoopback()) || host == "localhost" || strings.HasSuffix(host, ".localhost")
+	if loopback && !c.BehindProxy && c.SecureCookies {
+		return "secure_cookies is true but listen is plain-HTTP loopback with no proxy — a Secure cookie is never sent over http://, so login will appear to succeed then bounce. Set secure_cookies=false for local plain-HTTP testing."
+	}
+	return ""
+}
+
 // Conservative upper bounds on numeric knobs. These sit far below the points
 // where the downstream arithmetic misbehaves — a retention_days that overflows
 // the time.Duration cutoff (~106752) flips it into the FUTURE and deletes all

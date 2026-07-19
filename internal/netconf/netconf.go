@@ -107,8 +107,13 @@ func (n *Network) EffectiveName() string {
 // otherwise inject extra protocol lines on every (re)connect.
 // maxChannels caps a network definition's channel list, matching the
 // incremental autojoin cap (internal/hub.maxPersistedChannels) so the bulk
-// (config/PutNetworkConfig) and incremental paths agree.
-const maxChannels = 4096
+// (config/PutNetworkConfig) and incremental paths agree. maxChannelLen caps
+// each name to internal/hub.maxPersistedChannelLen for the same reason: a name
+// the persist path would skip must not be storable in the first place.
+const (
+	maxChannels   = 4096
+	maxChannelLen = 200
+)
 
 func (n *Network) Validate() error {
 	if err := n.validateIdentity(); err != nil {
@@ -200,6 +205,13 @@ func (n *Network) validateFraming() error {
 	for i, ch := range n.Channels {
 		if strings.ContainsAny(ch, " \r\n\x00") { // space too: one JOIN target
 			return fmt.Errorf("channels[%d] must not contain spaces, CR, LF, or NUL", i)
+		}
+		// Cap each name to the persisted-channel length: a longer name can be
+		// JOINed but the autojoin persist path (maxPersistedChannelLen) silently
+		// skips it, so it could never be durably removed. Real names are tens of
+		// bytes.
+		if len(ch) > maxChannelLen {
+			return fmt.Errorf("channels[%d] too long (%d bytes, max %d)", i, len(ch), maxChannelLen)
 		}
 	}
 	return nil

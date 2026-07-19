@@ -189,7 +189,34 @@ func TestExampleConfigParses(t *testing.T) {
 		t.Fatal(err)
 	}
 	if w := cfg.proxyConfigWarning(); w != "" {
-		t.Fatalf("example config warns: %q", w)
+		t.Fatalf("example config proxy-warns: %q", w)
+	}
+	if w := cfg.cookieConfigWarning(); w != "" {
+		t.Fatalf("example config cookie-warns: %q", w)
+	}
+}
+
+func TestCookieConfigWarning(t *testing.T) {
+	cases := []struct {
+		name   string
+		listen string
+		behind bool
+		secure bool
+		warn   bool
+	}{
+		{"proxy-fronted, secure (example)", "127.0.0.1:8067", true, true, false},
+		{"proxy-fronted but insecure cookie", "127.0.0.1:8067", true, false, true},
+		{"plain-http loopback, secure cookie bounces", "127.0.0.1:8067", false, true, true},
+		{"plain-http loopback, insecure cookie ok", "127.0.0.1:8067", false, false, false},
+		{"public direct, insecure", "0.0.0.0:8067", false, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &config{Listen: tc.listen, BehindProxy: tc.behind, SecureCookies: tc.secure}
+			if got := c.cookieConfigWarning() != ""; got != tc.warn {
+				t.Fatalf("warn = %v, want %v (msg: %q)", got, tc.warn, c.cookieConfigWarning())
+			}
+		})
 	}
 }
 

@@ -93,6 +93,11 @@ emit_module() {
 	echo "dependency change (\`make notices-check\` fails if this is stale); do not"
 	echo "edit by hand."
 
+	# The Go standard library and runtime are statically linked into the binary;
+	# go version -m lists third-party modules but not them, so emit their license
+	# (and PATENTS grant) explicitly from GOROOT.
+	emit_module "Go standard library and runtime (golang.org/x — BSD-3-Clause)" "$(go env GOROOT)"
+
 	go version -m "$PROBE" | awk '$1=="dep"{print $2"@"$3}' | sort | while IFS= read -r mod; do
 		emit_module "$mod" "$MODCACHE/$mod"
 	done

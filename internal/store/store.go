@@ -515,6 +515,12 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 	if msgid == "" {
 		return false, nil
 	}
+	// Match the msgid the SAME way append clamped it before storing (512 bytes),
+	// or a REDACT for a >512-byte msgid would search the full value and never
+	// find the truncated-stored row. Real msgids are short opaque tokens; the
+	// residual (two msgids sharing a 512-byte prefix redact together) needs a
+	// hostile server minting such collisions.
+	msgid = clampUTF8(msgid, maxStoredFieldBytes)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

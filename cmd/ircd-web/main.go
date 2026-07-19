@@ -120,6 +120,9 @@ func run(cfg *config) error {
 	if w := cfg.proxyConfigWarning(); w != "" {
 		log.Print("config: " + w)
 	}
+	if w := cfg.cookieConfigWarning(); w != "" {
+		log.Print("config: " + w)
+	}
 
 	h := hub.New(st)
 
