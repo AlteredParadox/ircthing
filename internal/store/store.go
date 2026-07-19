@@ -90,9 +90,12 @@ func clampUTF8(s string, max int) string {
 // A >512-byte msgid is not impossible, only abnormal: ordinary servers use short
 // ids, but message-tag framing can represent longer ones, so a HOSTILE server
 // could send them. Accepted residual: two distinct msgids sharing their first 512
-// bytes clamp to the same key, so redacting one would also blank the other's
-// display. That requires a server crafting such ids for its own users — no
-// cross-user or gap risk — so we accept it rather than store unbounded ids.
+// bytes clamp to the same key, so (a) the per-buffer msgid dedup (INSERT OR
+// IGNORE) drops the LATER colliding message — a real history/display gap for
+// that line — and (b) a redaction addressed to either id tombstones the one
+// surviving row. Both require a server deliberately crafting near-identical
+// oversized ids, and a server can already fabricate or withhold history
+// outright, so we accept this rather than store unbounded ids.
 func ClampMsgID(s string) string { return clampUTF8(s, maxStoredFieldBytes) }
 
 // Message is one stored IRC message. ID and Network/Target are assigned
