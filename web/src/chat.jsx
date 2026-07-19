@@ -1,4 +1,3 @@
-import { Fragment } from "preact";
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Completer } from "./complete.js";
 import { isEditable, modalScrimOpen } from "./dom.js";
@@ -53,24 +52,24 @@ function fmtWrap(run, inner, key) {
 }
 
 function Body({ text, nicks, theme, onNick }) {
-	// draft/multiline messages carry embedded newlines; render each line on its
-	// own row. Within a line, mIRC formatting is parsed into styled runs first,
-	// then links and nick mentions are resolved WITHIN each run (on its clean,
-	// code-free text).
-	const lines = text.split("\n");
-	return lines.map((line, li) => (
-		<Fragment key={li}>
-			{li > 0 && <br />}
-			{parseFormatting(line).map((run, ri) => {
-				const inner = linkify(run.text).map((seg, si) =>
-					seg.link
-						? <a key={si} href={seg.text} target="_blank" rel="noopener noreferrer">{seg.text}</a>
-						: bodyText(seg.text, nicks, theme, onNick, li + "-" + ri + "-" + si + "-"),
-				);
-				return fmtWrap(run, inner, ri);
-			})}
-		</Fragment>
-	));
+	// Parse mIRC formatting ONCE across the WHOLE message so the styled-run cap
+	// (MAX_FMT_RUNS) bounds the entire body — splitting per line first would let a
+	// hostile many-line body multiply the cap by the line count. draft/multiline
+	// newlines survive as plain text inside runs and become <br/> at render;
+	// links and nick mentions resolve within each \n-delimited run segment.
+	return parseFormatting(text).map((run, ri) => {
+		const inner = [];
+		run.text.split("\n").forEach((line, pi) => {
+			if (pi > 0) inner.push(<br key={ri + "-br-" + pi} />);
+			for (const [si, seg] of linkify(line).entries()) {
+				const kp = ri + "-" + pi + "-" + si;
+				inner.push(seg.link
+					? <a key={kp} href={seg.text} target="_blank" rel="noopener noreferrer">{seg.text}</a>
+					: bodyText(seg.text, nicks, theme, onNick, kp + "-"));
+			}
+		});
+		return fmtWrap(run, inner, ri);
+	});
 }
 
 function SysRow({ ev, r, focused, timeFmt }) {
@@ -198,6 +197,12 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 	const completer = useMemo(() => new Completer(), [buf?.key]);
 	const list = msgs?.list || [];
 	const last = list[list.length - 1];
+	// The read marker must track the NEWEST message by server-time, not the
+	// last-ARRIVED one: live events append in arrival order (app.jsx), so a
+	// backdated relay/bridge line lands at the tail with an older time. Marking
+	// list[last].time there would rewind the marker and re-badge genuinely-newer
+	// messages as unread. Max time is monotonic (budget trims drop the oldest).
+	const readTS = useMemo(() => list.reduce((mx, m) => (m.time > mx ? m.time : mx), 0), [list]);
 	// Hide ignored senders from view (they are still stored, so
 	// un-ignoring reveals them live). Zero cost when nobody is ignored.
 	const ignoreKey = (ignoredNicks || []).join("\n");
@@ -279,7 +284,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 	}
 
 	const markRead = () => {
-		if (last && pinned.current && document.hasFocus()) onRead(last.time);
+		if (readTS && pinned.current && document.hasFocus()) onRead(readTS);
 	};
 	useEffect(() => {
 		markRead();

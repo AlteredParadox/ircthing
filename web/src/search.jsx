@@ -64,6 +64,10 @@ export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep, redacte
 	useEffect(() => {
 		const q = query.trim();
 		if (!q) {
+			// Invalidate any in-flight response too: without bumping seq, a
+			// pending request from the previous non-empty query would still pass
+			// its `mine === seq.current` guard and repopulate the cleared panel.
+			++seq.current;
 			setResults([]);
 			setState("idle");
 			return;

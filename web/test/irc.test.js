@@ -79,7 +79,7 @@ test("bare \\x04 strips like it renders: no invisible mention-splitting", () => 
 test("parseFormatting caps runs; the remainder renders plainly, codes stripped", () => {
 	const bomb = "\x02a".repeat(5000); // would be 5000 one-char bold toggle runs
 	const runs = parseFormatting(bomb);
-	is(runs.length <= 1025, true); // MAX_FMT_RUNS + the merged remainder
+	is(runs.length <= 1024, true); // exactly MAX_FMT_RUNS, remainder merged into the last run
 	// No content is lost and no control bytes leak into the rendered text.
 	const joined = runs.map((r) => r.text).join("");
 	is(joined, "a".repeat(5000));

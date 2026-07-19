@@ -12,13 +12,18 @@ import { LRU } from "./lru.js";
 
 const cache = new LRU(300, 60 * 60 * 1000); // url -> PreviewData | null
 const FAIL_TTL = 5 * 60 * 1000;
-const inflight = new Map(); // url -> Promise
+const inflight = new Map(); // key -> { promise, controller, refs }
 
 // Thumbnails are fetched as blobs and cached as object URLs (revoked on
 // eviction) so the target URL travels in a POST body, not a query string an
 // <img src> would put in reverse-proxy access logs.
 const thumbCache = new LRU(200, 60 * 60 * 1000, (u) => u && URL.revokeObjectURL(u));
 const thumbInflight = new Map();
+
+// Above this many concurrent distinct requests, extra fetches still run and
+// cache but are not tracked for dedup/abort — a hard ceiling so a pathological
+// burst of distinct URLs cannot grow the maps without bound.
+const MAX_INFLIGHT = 64;
 
 // Cache/fetch key by (network, url): the network selects the server-side
 // proxy, so the same URL in two networks is fetched independently.
@@ -27,48 +32,79 @@ function ck(url, net) {
 }
 
 // mediaFetch POSTs {url, net} to a media endpoint — the target URL in the body,
-// never a logged query string.
-function mediaFetch(path, url, net) {
+// never a logged query string. signal lets a caller abort the request.
+function mediaFetch(path, url, net, signal) {
 	return fetch(path, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ url, net: net || "" }),
+		signal,
 	});
 }
 
-function fetchPreview(url, net) {
-	const key = ck(url, net);
-	if (cache.has(key)) return Promise.resolve(cache.get(key));
-	if (inflight.has(key)) return inflight.get(key);
-	const p = mediaFetch("/api/preview", url, net)
-		.then((r) => (r.ok ? r.json() : null))
-		.catch(() => null)
-		.then((data) => {
-			cache.set(key, data, data === null ? FAIL_TTL : undefined);
-			inflight.delete(key);
-			return data;
+// shared runs `run(signal)` deduped by key: concurrent callers share one request
+// (and one server-side proxy fetch). It returns { promise, release }; the caller
+// MUST release() when it no longer needs the result (component unmount). When the
+// LAST waiter releases a still-pending request it is ABORTED — so a preview
+// scrolled out of the virtualized list stops the server doing remote work —
+// without cancelling a fetch another visible row still needs. The map self-empties
+// as requests settle; entries above MAX_INFLIGHT run untracked.
+function shared(map, key, run) {
+	let e = map.get(key);
+	if (!e || e.controller.signal.aborted) {
+		const controller = new AbortController();
+		e = { controller, refs: 0, promise: null };
+		e.promise = run(controller.signal).finally(() => {
+			if (map.get(key) === e) map.delete(key);
 		});
-	inflight.set(key, p);
-	return p;
+		if (map.size < MAX_INFLIGHT) map.set(key, e);
+	}
+	e.refs++;
+	let released = false;
+	return {
+		promise: e.promise,
+		release() {
+			if (released) return;
+			released = true;
+			if (--e.refs <= 0 && map.get(key) === e) e.controller.abort();
+		},
+	};
 }
 
-// fetchThumb resolves to an object URL for the thumbnail, or null on failure.
+// fetchPreview returns { promise, release }; promise resolves to PreviewData|null.
+function fetchPreview(url, net) {
+	const key = ck(url, net);
+	if (cache.has(key)) return { promise: Promise.resolve(cache.get(key)), release() {} };
+	return shared(inflight, key, (signal) =>
+		mediaFetch("/api/preview", url, net, signal)
+			.then((r) => (r.ok ? r.json() : null))
+			.catch(() => null)
+			.then((data) => {
+				// Never cache an aborted fetch's null: it would pin a 5-min failure
+				// TTL on a URL we merely cancelled, blocking a legitimate retry.
+				if (!signal.aborted) cache.set(key, data, data === null ? FAIL_TTL : undefined);
+				return data;
+			}));
+}
+
+// fetchThumb returns { promise, release }; promise resolves to an object URL or null.
 function fetchThumb(url, net) {
 	const key = ck(url, net);
 	const cached = thumbCache.get(key);
-	if (cached !== undefined) return Promise.resolve(cached); // objURL or cached null
-	if (thumbInflight.has(key)) return thumbInflight.get(key);
-	const p = mediaFetch("/api/thumb", url, net)
-		.then((r) => (r.ok ? r.blob() : null))
-		.catch(() => null)
-		.then((blob) => {
-			const obj = blob ? URL.createObjectURL(blob) : null;
-			thumbCache.set(key, obj, obj === null ? FAIL_TTL : undefined);
-			thumbInflight.delete(key);
-			return obj;
-		});
-	thumbInflight.set(key, p);
-	return p;
+	if (cached !== undefined) return { promise: Promise.resolve(cached), release() {} }; // objURL or cached null
+	return shared(thumbInflight, key, (signal) =>
+		mediaFetch("/api/thumb", url, net, signal)
+			.then((r) => (r.ok ? r.blob() : null))
+			.catch(() => null)
+			.then((blob) => {
+				const obj = blob ? URL.createObjectURL(blob) : null;
+				if (signal.aborted) {
+					if (obj) URL.revokeObjectURL(obj); // don't leak an object URL we won't cache
+					return null;
+				}
+				thumbCache.set(key, obj, obj === null ? FAIL_TTL : undefined);
+				return obj;
+			}));
 }
 
 // useThumb fetches a thumbnail's object URL, null while loading or on failure.
@@ -85,9 +121,11 @@ function useThumb(url, net) {
 			return undefined;
 		}
 		setSrc(null);
-		fetchThumb(url, net).then((u) => alive && setSrc(u));
+		const { promise, release } = fetchThumb(url, net);
+		promise.then((u) => alive && setSrc(u));
 		return () => {
 			alive = false;
+			release(); // aborts the proxy fetch if no other row still needs it
 		};
 	}, [url, net]);
 	return src;
@@ -107,7 +145,12 @@ export function LinkPreview({ url, net }) {
 		const cached = cache.has(ck(url, net)) ? cache.get(ck(url, net)) : undefined;
 		setData(cached);
 		if (cached === undefined) {
-			fetchPreview(url, net).then((d) => alive && setData(d));
+			const { promise, release } = fetchPreview(url, net);
+			promise.then((d) => alive && setData(d));
+			return () => {
+				alive = false;
+				release(); // aborts the proxy fetch if no other row still needs it
+			};
 		}
 		return () => {
 			alive = false;

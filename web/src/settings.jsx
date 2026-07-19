@@ -134,6 +134,12 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	const [sessionDays, setSessionDays] = useState(null); // login cookie lifetime
 	const retentionGen = useRef(0); // latest-save guards (see saveRetention)
 	const sessionGen = useRef(0);
+	// The last values the SERVER confirmed. A failed save rolls the display back
+	// to these, NOT to the pre-edit in-memory value — which may itself be an
+	// unpersisted edit from an earlier failed save, so rolling back to it would
+	// leave the UI showing a value the server never accepted.
+	const retentionSaved = useRef(null);
+	const sessionSaved = useRef(null);
 
 	useEffect(() => {
 		const onKey = (e) => e.key === "Escape" && onClose();
@@ -150,8 +156,12 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 				// the display and making every later retention save a 400.
 				const num = (v) => Math.max(0, Math.floor(Number(v) || 0));
 				setPreviewsOn(!!d.previews);
-				setRetention({ days: num(d.retention_days), max: num(d.retention_max_messages) });
-				setSessionDays(num(d.session_ttl_days));
+				const ret = { days: num(d.retention_days), max: num(d.retention_max_messages) };
+				const sess = num(d.session_ttl_days);
+				setRetention(ret);
+				setSessionDays(sess);
+				retentionSaved.current = ret; // seed the confirmed-value baselines
+				sessionSaved.current = sess;
 			})
 			.catch(() => {});
 	}, []);
@@ -164,24 +174,24 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	// that already succeeded.
 	const saveQueue = useRef(Promise.resolve());
 	function saveRetention(patch) {
-		const prev = retention;
 		const next = { ...retention, ...patch };
 		setRetention(next);
 		const gen = ++retentionGen.current;
 		saveQueue.current = saveQueue.current
 			.then(() => saveConfig({ retention_days: next.days, retention_max_messages: next.max }))
 			.then((ok) => {
-				if (!ok && gen === retentionGen.current) setRetention(prev);
+				if (ok) retentionSaved.current = next; // the server now holds this
+				else if (gen === retentionGen.current && retentionSaved.current) setRetention(retentionSaved.current);
 			});
 	}
 	function saveSessionDays(days) {
-		const prev = sessionDays;
 		setSessionDays(days);
 		const gen = ++sessionGen.current;
 		saveQueue.current = saveQueue.current
 			.then(() => saveConfig({ session_ttl_days: days }))
 			.then((ok) => {
-				if (!ok && gen === sessionGen.current) setSessionDays(prev);
+				if (ok) sessionSaved.current = days;
+				else if (gen === sessionGen.current && sessionSaved.current != null) setSessionDays(sessionSaved.current);
 			});
 	}
 	const retNum = (v) => Math.max(0, Number.parseInt(v, 10) || 0);

@@ -337,7 +337,9 @@ export function parseFormatting(text) {
 	const reset = () => Object.assign(st, { bold: false, italic: false, underline: false, strike: false, mono: false, reverse: false, fg: null, bg: null });
 	let i = 0;
 	while (i < text.length) {
-		if (runs.length >= MAX_FMT_RUNS) {
+		// Reserve one slot for the merged-remainder run the trailing flush pushes,
+		// so the hard ceiling is exactly MAX_FMT_RUNS (not MAX_FMT_RUNS+1).
+		if (runs.length >= MAX_FMT_RUNS - 1) {
 			buf += stripFormatting(text.slice(i));
 			break;
 		}
@@ -780,7 +782,10 @@ export function mergeServerBuffers(dataBuffers, prev, nets) {
 		bufs[key] = {
 			key, network: b.network, buffer: b.buffer,
 			lastTime: b.last_time, marker: b.marker, unread: b.unread,
-			mention: prev[key]?.mention || false,
+			// Only carry the client mention flag while the AUTHORITATIVE unread is
+			// still positive: unread==0 means the buffer was read (here or on
+			// another device), so a leftover mention badge would be stale.
+			mention: b.unread > 0 ? (prev[key]?.mention || false) : false,
 		};
 	}
 	for (const key of Object.keys(prev)) {

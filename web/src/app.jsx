@@ -221,18 +221,19 @@ function setTypingState(t, key, d) {
 // state for a live event (creating the buffer on first traffic).
 function bumpBufferActivity(b, key, ev, countUnread, highlight) {
 	const cur = b[key] || makeBuffer(ev.network, ev.buffer);
-	// Only count messages NEWER than the read marker, mirroring the server's
-	// strict `ts > marker` — a message with a server-time at or below the
-	// marker (same-ms on a busy channel, or a backdated relay/bridge line) is
-	// already-read and must not badge, or the client over-counts vs the server.
-	const fresh = countUnread && ev.time > cur.marker;
+	// Only count/alert on messages NEWER than the read marker, mirroring the
+	// server's strict `ts > marker`: an event at/below the marker (same-ms on a
+	// busy channel, or a backdated relay/bridge line) is already-read. Gate BOTH
+	// unread and mention on it, and never regress lastTime — a backdated event
+	// must not lower it (which would let markRead clear genuinely-newer unread).
+	const newer = ev.time > cur.marker;
 	return {
 		...b,
 		[key]: {
 			...cur,
-			lastTime: ev.time,
-			unread: fresh ? cur.unread + 1 : cur.unread,
-			mention: cur.mention || highlight,
+			lastTime: Math.max(cur.lastTime, ev.time),
+			unread: countUnread && newer ? cur.unread + 1 : cur.unread,
+			mention: cur.mention || (highlight && newer),
 		},
 	};
 }
@@ -276,7 +277,10 @@ function applyRedaction(m, key, d) {
 		// would leave the deleted text in this client's memory.
 		return { ...ev, redacted: true, redact_reason: d.reason, raw: "" };
 	});
-	return hit ? { ...m, [key]: { ...cur, list } } : m;
+	// Recompute the byte total: dropping raw shrinks the event, and a stale
+	// cur.bytes would over-count and trim the buffer earlier than the budget
+	// warrants. Redaction is rare, so the O(n) recompute is cheap.
+	return hit ? { ...m, [key]: { ...cur, list, bytes: listBytes(list) } } : m;
 }
 
 // mergeHistoryPage installs a fetched page, keeping events that streamed
@@ -317,6 +321,7 @@ export function App() {
 	// request (which would put the full target URL in the reverse-proxy access
 	// log even while previews are disabled). The render gate requires === true.
 	const [previews, setPreviews] = useState(false); // link/media previews enabled (server switch)
+	const previewsPinned = useRef(false); // user toggled it: the initial GET must not clobber that
 	const [connected, setConnected] = useState(false);
 	const [networks, setNetworks] = useState({});
 	const [buffers, setBuffers] = useState({});
@@ -445,11 +450,19 @@ export function App() {
 	// Server switches (whether link/media previews are enabled). Fetched
 	// once authed so the UI never requests previews the server disabled.
 	useEffect(() => {
-		if (phase !== "app") return;
+		if (phase !== "app") return undefined;
+		let ignore = false;
 		fetch("/api/config")
 			.then((r) => (r.ok ? r.json() : null))
-			.then((c) => c && typeof c.previews === "boolean" && setPreviews(c.previews))
+			.then((c) => {
+				// Drop the response if this effect was torn down, or the user
+				// already toggled previews while the GET was in flight — the
+				// user's value (and its PUT) is newer than this stale read.
+				if (ignore || previewsPinned.current) return;
+				if (c && typeof c.previews === "boolean") setPreviews(c.previews);
+			})
 			.catch(() => {});
+		return () => { ignore = true; };
 	}, [phase]);
 
 	useEffect(() => {
@@ -534,10 +547,14 @@ export function App() {
 	function adoptPrefs(d) {
 		// A change made while disconnected never reached the server, so
 		// its get_prefs is stale — re-push the local prefs instead of
-		// reverting to it.
+		// reverting to it. Only clear dirty if no newer edit landed while the
+		// re-push was in flight (same guard as updatePrefs); otherwise a queued
+		// newer edit would look synced and the next reconnect would adopt the
+		// server's now-stale copy over it.
 		if (prefsDirty.current) {
-			sock.current?.request("set_prefs", { prefs: prefsRef.current })
-				.then(() => { prefsDirty.current = false; })
+			const pushed = prefsRef.current;
+			sock.current?.request("set_prefs", { prefs: pushed })
+				.then(() => { if (prefsRef.current === pushed) prefsDirty.current = false; })
 				.catch(() => {});
 			return;
 		}
@@ -1513,7 +1530,7 @@ export function App() {
 			{settingsOpen && (
 				<Settings
 					networks={networks} rules={rules} onRules={updateRules}
-					prefs={prefs} onPrefs={updatePrefs} onPreviews={setPreviews}
+					prefs={prefs} onPrefs={updatePrefs} onPreviews={(v) => { previewsPinned.current = true; setPreviews(v); }}
 					notifier={notifier.current} onClose={() => setSettingsOpen(false)}
 				/>
 			)}
