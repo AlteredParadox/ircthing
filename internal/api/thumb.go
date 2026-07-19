@@ -240,13 +240,19 @@ func jpegDecodeSurcharge(model color.Model, body []byte) int64 {
 		}
 		extra += 4 * comps
 	}
-	// A 3-component JPEG (YCbCrModel or RGBAModel per DecodeConfig) that Go decodes
-	// to RGBA holds the component planes AND the RGBA result at once — charge the
-	// coexisting planes (~4 B/px on top of the RGBA output). DecodeConfig's model
-	// is NOT authoritative (a late Adobe APP14 is invisible to it), so detect RGB
-	// by scanning the whole file. Normal YCbCr JPEGs (no Adobe marker) get no
-	// surcharge, keeping their 9 MP budget.
-	if (model == color.YCbCrModel || model == color.RGBAModel) && jpegDecodesToRGBA(body) {
+	// A 3-component JPEG Go decodes to RGBA holds the component planes AND the
+	// RGBA result live at once — charge the coexisting planes (~4 B/px on top of
+	// the RGBA output). Go decodes to RGBA in two cases, distinguished by what
+	// DecodeConfig can see:
+	//   - It already reports RGBAModel — either the SOF component IDs are 'R','G','B'
+	//     (no Adobe marker needed) or an Adobe APP14 sits before the first scan.
+	//     Charge unconditionally; DecodeConfig is authoritative here.
+	//   - It reports YCbCrModel but a *late* Adobe APP14 (after the first SOS, which
+	//     DecodeConfig stops at) still flips the full decode to RGBA. DecodeConfig
+	//     misses it, so scan the whole file for the marker.
+	// Empirically verified against image/jpeg (all four cases). A plain YCbCr JPEG
+	// (no marker, IDs 1/2/3) gets no surcharge, keeping its 9 MP budget.
+	if model == color.RGBAModel || (model == color.YCbCrModel && jpegDecodesToRGBA(body)) {
 		extra += 4
 	}
 	return extra
@@ -296,13 +302,18 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
 		return
 	}
-	// A fetch/dial error is often TRANSIENT — a WireGuard tunnel still coming up
-	// dials-fail here — so 503 (retryable), not 502, so the client retries a few
-	// times instead of caching a 5-minute failure. Still fail closed: no direct
-	// fetch, just a retry hint.
+	// Classify the fetch error: TRANSIENT (WireGuard tunnel still warming up,
+	// upstream 5xx) → 503 so the client retries; PERMANENT (bad/blocked URL, body
+	// over the 10 MiB cap, upstream 4xx) → 502 so it caches the failure instead of
+	// re-downloading up to ~10 MiB per retry to the same end. Fail closed either
+	// way: no direct fetch.
 	ct, _, body, err := f.get(r.Context(), target)
 	if err != nil {
-		http.Error(w, "thumbnail fetch failed", http.StatusServiceUnavailable)
+		if fetchErrorRetryable(err) {
+			http.Error(w, "thumbnail fetch failed", http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
+		}
 		return
 	}
 	if !isImageType(ct) && !isImageType(http.DetectContentType(body)) {

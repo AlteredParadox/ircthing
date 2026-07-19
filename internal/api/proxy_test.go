@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -251,6 +252,37 @@ func TestFetcherRejects(t *testing.T) {
 			t.Fatal("expected error on 403")
 		}
 	})
+}
+
+// TestFetchErrorRetryable: only transient failures may be reported to the client
+// as retryable (503). Permanent ones (bad/blocked URL, over-size body, upstream
+// 4xx) must be non-retryable so the browser caches the failure instead of
+// hammering four requests — a dead link is four tracking hits, an over-size image
+// is ~40 MiB re-downloaded, to the same end.
+func TestFetchErrorRetryable(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"too large", errTooLarge, false},
+		{"bad url", errBadURL, false},
+		{"blocked", errBlocked, false},
+		{"wrapped too large", fmt.Errorf("get: %w", errTooLarge), false},
+		{"upstream 403", &upstreamStatusError{403}, false},
+		{"upstream 404", &upstreamStatusError{404}, false},
+		{"upstream 410", &upstreamStatusError{410}, false},
+		{"upstream 429", &upstreamStatusError{429}, true},
+		{"upstream 500", &upstreamStatusError{500}, true},
+		{"upstream 503", &upstreamStatusError{503}, true},
+		{"dial/timeout", errors.New("dial tcp: i/o timeout"), true},
+	}
+	for _, tc := range cases {
+		if got := fetchErrorRetryable(tc.err); got != tc.want {
+			t.Errorf("%s: fetchErrorRetryable = %v, want %v", tc.name, got, tc.want)
+		}
+	}
 }
 
 // TestFetcherTruncatesHTML: an HTML fetcher (truncate=true) must keep the

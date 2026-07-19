@@ -19,6 +19,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -219,49 +220,138 @@ func TestIsProgressiveJPEG(t *testing.T) {
 	}
 }
 
-// The decode surcharge keeps an RGB/Adobe JPEG (Go decodes it to RGBA while the
-// component planes are live) from decoding past maxDecodeBytes. Crucially it must
-// catch an Adobe APP14 placed AFTER the first scan — DecodeConfig stops there and
-// reports YCbCr, so the gate must scan the whole file, not trust the model (F3).
-func TestCoexistingBufferSurcharges(t *testing.T) {
-	// An Adobe APP14 segment: FF EE, len=0x000E (2 len + 12 payload), "Adobe",
-	// version(2) flags0(2) flags1(2) transform(1).
-	adobeSeg := func(transform byte) []byte {
-		seg := append([]byte{0xFF, 0xEE, 0x00, 0x0E}, []byte("Adobe")...)
-		return append(seg, 0, 0, 0, 0, 0, 0, transform)
+// adobeAPP14 builds an Adobe APP14 segment: FF EE, len=0x000E (2 len + 12
+// payload), "Adobe", version(2) flags0(2) flags1(2) transform(1). transform 0
+// means RGB (3-component). Both jpegDecodesToRGBA and image/jpeg key on this.
+func adobeAPP14(transform byte) []byte {
+	seg := append([]byte{0xFF, 0xEE, 0x00, 0x0E}, []byte("Adobe")...)
+	return append(seg, 0, 0, 0, 0, 0, 0, transform)
+}
+
+// patchJPEGToRGBIDs rewrites the 3 SOF0 component IDs *and* the 3 SOS component
+// selectors of a baseline JPEG to 'R','G','B'. Go's image/jpeg then decodes it to
+// *image.RGBA with NO Adobe marker present — the case DecodeConfig reports as
+// RGBAModel that a whole-file APP14 scan cannot see.
+func patchJPEGToRGBIDs(t *testing.T, b []byte) []byte {
+	t.Helper()
+	out := append([]byte(nil), b...)
+	for i := 2; i+1 < len(out); {
+		if out[i] != 0xFF {
+			i++
+			continue
+		}
+		m := out[i+1]
+		if m == 0xFF {
+			i++
+			continue
+		}
+		if m == 0xD8 || (m >= 0xD0 && m <= 0xD9) || m == 0x01 {
+			i += 2
+			continue
+		}
+		seglen := int(out[i+2])<<8 | int(out[i+3])
+		switch m {
+		case 0xC0: // SOF0: len,precision,height,width,ncomp, then comp{id,samp,q}
+			base := i + 2 + 2 + 1 + 2 + 2 + 1
+			out[base+0], out[base+3], out[base+6] = 'R', 'G', 'B'
+		case 0xDA: // SOS: len,ns, then scan-comp{selector,tables}
+			base := i + 2 + 2 + 1
+			out[base+0], out[base+2], out[base+4] = 'R', 'G', 'B'
+			return out
+		}
+		i += 2 + seglen
 	}
-	if !jpegDecodesToRGBA(adobeSeg(0)) {
+	t.Fatal("no SOS marker found to patch")
+	return nil
+}
+
+// insertAPP14BeforeEOI splices an Adobe APP14 in right before EOI (0xFFD9), i.e.
+// AFTER the entropy-coded scan. DecodeConfig stops at the first SOS and never sees
+// it (reports YCbCrModel), but the full decode honors it and produces *image.RGBA.
+func insertAPP14BeforeEOI(t *testing.T, b []byte) []byte {
+	t.Helper()
+	idx := bytes.LastIndex(b, []byte{0xFF, 0xD9})
+	if idx < 0 {
+		t.Fatal("no EOI marker")
+	}
+	out := append([]byte(nil), b[:idx]...)
+	out = append(out, adobeAPP14(0)...)
+	return append(out, b[idx:]...)
+}
+
+// The decode surcharge keeps a JPEG that Go decodes to RGBA (component planes AND
+// the RGBA result live at once) from decoding past maxDecodeBytes. Go reaches RGBA
+// three ways; the gate must charge all of them and only them. Fixtures are patched
+// real JPEGs whose FULL decode is asserted to actually be *image.RGBA (F3/Medium-1).
+func TestCoexistingBufferSurcharges(t *testing.T) {
+	// jpegDecodesToRGBA marker detection (used for the late-APP14 branch only).
+	if !jpegDecodesToRGBA(adobeAPP14(0)) {
 		t.Error("Adobe transform 0 (RGB) not detected")
 	}
-	if jpegDecodesToRGBA(adobeSeg(1)) || jpegDecodesToRGBA(adobeSeg(2)) {
+	if jpegDecodesToRGBA(adobeAPP14(1)) || jpegDecodesToRGBA(adobeAPP14(2)) {
 		t.Error("Adobe transform 1/2 (YCbCr/YCCK) wrongly detected as RGB")
 	}
 
-	// A stdlib JPEG is plain YCbCr (JFIF, no Adobe marker) → YCbCrModel, NO
-	// surcharge; the common case keeps the full 4 B/px budget.
-	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
+	for y := 0; y < 16; y++ {
+		for x := 0; x < 16; x++ {
+			img.Set(x, y, color.RGBA{uint8(x * 16), uint8(y * 16), 100, 255})
+		}
+	}
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, img, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := jpegDecodeSurcharge(color.YCbCrModel, buf.Bytes()); got != 0 {
-		t.Fatalf("plain YCbCr JPEG surcharge = %d, want 0", got)
+	baseline := buf.Bytes()
+
+	// assertDecode returns the DecodeConfig model and the concrete decoded type so
+	// each case validates its own premise (GPT's objection: the old test never
+	// decoded, so it couldn't prove the body actually became RGBA).
+	decodeInfo := func(b []byte) (color.Model, string) {
+		cfg, _, err := image.DecodeConfig(bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("DecodeConfig: %v", err)
+		}
+		di, _, err := image.Decode(bytes.NewReader(b))
+		if err != nil {
+			t.Fatalf("Decode: %v", err)
+		}
+		return cfg.ColorModel, fmt.Sprintf("%T", di)
 	}
 
-	// THE MEDIUM-1 CASE: append the Adobe RGB marker after the encoded stream (a
-	// late APP14). DecodeConfig still reports YCbCr (it stopped at the first
-	// scan), but the surcharge must STILL fire because the full decode produces
-	// RGBA — the gate can't trust DecodeConfig's model.
-	late := append(append([]byte{}, buf.Bytes()...), adobeSeg(0)...)
-	lcfg, _, err := image.DecodeConfig(bytes.NewReader(late))
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name        string
+		body        []byte
+		wantCfg     color.Model
+		wantDecoded string // concrete type the FULL decode must produce
+		wantScan    bool   // jpegDecodesToRGBA (APP14 whole-file scan) result
+		wantExtra   int64
+	}{
+		// Plain YCbCr (JFIF, IDs 1/2/3): no surcharge, keeps the 9 MP budget.
+		{"baseline YCbCr", baseline, color.YCbCrModel, "*image.YCbCr", false, 0},
+		// Component-ID RGB: DecodeConfig already reports RGBA, NO Adobe marker — the
+		// case the old code missed (scan returns false, yet it decodes to RGBA).
+		{"component-ID RGB", patchJPEGToRGBIDs(t, baseline), color.RGBAModel, "*image.RGBA", false, 4},
+		// Late APP14: DecodeConfig reports YCbCr but the full decode is RGBA; only
+		// the whole-file scan catches it.
+		{"late APP14", insertAPP14BeforeEOI(t, baseline), color.YCbCrModel, "*image.RGBA", true, 4},
 	}
-	if lcfg.ColorModel != color.YCbCrModel {
-		t.Fatalf("late-APP14 DecodeConfig model = %T, want YCbCrModel (proves it misses the marker)", lcfg.ColorModel)
-	}
-	if got := jpegDecodeSurcharge(lcfg.ColorModel, late); got != 4 {
-		t.Fatalf("late-APP14 RGB JPEG surcharge = %d, want 4 (whole-file scan must catch it)", got)
+	for _, tc := range cases {
+		gotCfg, gotDecoded := decodeInfo(tc.body)
+		if gotCfg != tc.wantCfg {
+			t.Errorf("%s: DecodeConfig model = %T, want %T", tc.name, gotCfg, tc.wantCfg)
+		}
+		if gotDecoded != tc.wantDecoded {
+			t.Errorf("%s: full decode = %s, want %s", tc.name, gotDecoded, tc.wantDecoded)
+		}
+		if got := jpegDecodesToRGBA(tc.body); got != tc.wantScan {
+			t.Errorf("%s: jpegDecodesToRGBA = %v, want %v", tc.name, got, tc.wantScan)
+		}
+		// The surcharge is keyed on DecodeConfig's model (what the gate actually
+		// sees at decode time), exactly as decodableFormat calls it.
+		if got := jpegDecodeSurcharge(gotCfg, tc.body); got != tc.wantExtra {
+			t.Errorf("%s: surcharge = %d, want %d", tc.name, got, tc.wantExtra)
+		}
 	}
 
 	// PNG interlace byte at offset 28 drives the Adam7 surcharge.
@@ -275,13 +365,13 @@ func TestCoexistingBufferSurcharges(t *testing.T) {
 		t.Error("isAdam7PNG detection wrong")
 	}
 
-	// The surcharge bites: an 8 MP RGB JPEG (late marker, 4+4=8 B/px) exceeds the
-	// cap where the same pixels as plain YCbCr (4 B/px) pass.
+	// The surcharge bites: an 8 MP RGB JPEG (4+4=8 B/px) exceeds the cap where the
+	// same pixels as plain YCbCr (4 B/px) pass.
 	const px = 8_000_000
-	if int64(px)*decodePerPixel("jpeg", color.YCbCrModel, late) <= maxDecodeBytes {
+	if int64(px)*decodePerPixel("jpeg", color.RGBAModel, baseline) <= maxDecodeBytes {
 		t.Fatal("RGB-JPEG per-pixel too low to bound the coexisting RGBA copy")
 	}
-	if int64(px)*decodePerPixel("jpeg", color.YCbCrModel, buf.Bytes()) > maxDecodeBytes {
+	if int64(px)*decodePerPixel("jpeg", color.YCbCrModel, baseline) > maxDecodeBytes {
 		t.Fatal("8MP plain YCbCr should pass; test premise wrong")
 	}
 }

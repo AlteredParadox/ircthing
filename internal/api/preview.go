@@ -109,6 +109,14 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.releasePreview()
 	// Re-check the cache: another request may have populated it during the wait.
+	// This dedups requests that arrived while an earlier one held a slot, but NOT
+	// a simultaneous burst: with previewSlots>1, N identical first-time requests
+	// (e.g. the same link open in N browser tabs) can all take a free slot, all
+	// miss here, and all fetch. Accepted residual — it is bounded by the slot count
+	// (<=previewSlots duplicate fetches, once, then the cache serves the rest) and
+	// only bites concurrent first views of the same URL. A single-slot design (like
+	// thumbnails) would serialize it but at the cost of the per-tab responsiveness
+	// the extra slots buy; full singleflight isn't worth the request-path locking.
 	if pv, ok := s.previewCache.get(ck); ok {
 		writeJSON(w, pv)
 		return
@@ -128,12 +136,19 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "preview unavailable", http.StatusBadGateway)
 		return
 	}
-	// A fetch/dial error is often TRANSIENT (a WireGuard tunnel still coming up
-	// dials-fail here) — 503 (retryable) so the client retries a few times rather
-	// than caching a 5-minute failure. Still fail closed: no direct fetch.
+	// Classify the fetch error: a TRANSIENT failure (WireGuard tunnel still coming
+	// up, upstream 5xx) → 503 so the client retries a few times; a PERMANENT one
+	// (bad/blocked URL, over-size body, upstream 4xx) → 502 so it caches the
+	// failure and does NOT retry — retrying a dead link is four tracking hits and,
+	// for an over-size image, ~40 MiB re-downloaded to the same end. Fail closed
+	// either way: no direct fetch.
 	ct, finalURL, body, err := f.get(r.Context(), target)
 	if err != nil {
-		http.Error(w, "preview fetch failed", http.StatusServiceUnavailable)
+		if fetchErrorRetryable(err) {
+			http.Error(w, "preview fetch failed", http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, "preview unavailable", http.StatusBadGateway)
+		}
 		return
 	}
 
@@ -188,8 +203,16 @@ func extractMeta(doc, pageURL string, pv *PreviewData) {
 // value wins), unescaped. Only the handful of keys extractMeta reads are
 // retained (wantedMeta), and at most maxMetaTags tags are scanned — a hostile
 // page could otherwise carry tens of thousands of distinct meta keys and blow
-// the map (and the materialized match slice) to tens of MiB, overlapping the
-// image decoder against MemoryMax.
+// the map (and the materialized match slice) up, overlapping the image decoder
+// against MemoryMax.
+//
+// The remaining bound is coarse, not tight: reMeta caps the tag COUNT at 256,
+// but one <meta …> with no closing '>' can match up to the whole document, so
+// the scan and reAttr's submatches are bounded by the HTML body size
+// (maxHTMLBytes, currently 1 MiB) rather than by a small per-tag limit. That is
+// acceptable — it is one transient allocation on the order of the body we already
+// hold, serialized by previewSlots, not the unbounded (key-count × body) blowup
+// the wantedMeta/maxMetaTags caps removed.
 func parseHeadMeta(doc string) map[string]string {
 	meta := map[string]string{}
 	for _, tag := range reMeta.FindAllString(doc, maxMetaTags) {

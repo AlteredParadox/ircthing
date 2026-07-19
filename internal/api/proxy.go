@@ -96,6 +96,46 @@ var (
 	errBlocked  = errors.New("proxy: refusing to connect to a non-public address")
 )
 
+// upstreamStatusError is get's error for a non-200 upstream response. It carries
+// the status so the caller can tell a transient upstream hiccup (5xx/429/408 —
+// worth a client retry) from a permanent one (403/404/410 — retrying just repeats
+// a tracking hit and holds a media slot).
+type upstreamStatusError struct{ code int }
+
+func (e *upstreamStatusError) Error() string {
+	return fmt.Sprintf("proxy: upstream status %d", e.code)
+}
+
+// fetchErrorRetryable reports whether a get() failure is transient and worth the
+// client retrying (mapped to 503). Permanent failures map to 502 so the browser
+// caches the failure for FAIL_TTL instead of hammering four requests at it:
+//   - errTooLarge: the body already exceeds the cap; a retry re-downloads it (up
+//     to ~10 MiB per attempt for an oversized image) to the same end.
+//   - errBadURL / errBlocked: our own validation rejected it; deterministic.
+//   - permanent upstream status (4xx except 408/429): the origin answered "no".
+// Everything else — dial/TLS/timeout errors (a WireGuard tunnel still warming up),
+// truncated reads, and 5xx/408/429 upstream — is transient.
+func fetchErrorRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errTooLarge) || errors.Is(err, errBadURL) || errors.Is(err, errBlocked) {
+		return false
+	}
+	var se *upstreamStatusError
+	if errors.As(err, &se) {
+		switch se.code {
+		case http.StatusRequestTimeout, http.StatusTooManyRequests, // 408, 429
+			http.StatusInternalServerError, http.StatusBadGateway, // 500, 502
+			http.StatusServiceUnavailable, http.StatusGatewayTimeout: // 503, 504
+			return true
+		default:
+			return false // 4xx and other permanent statuses
+		}
+	}
+	return true // dial/TLS/timeout/network — transient
+}
+
 type fetcher struct {
 	client   *http.Client
 	maxBytes int64
@@ -249,7 +289,7 @@ func (f *fetcher) get(ctx context.Context, rawURL string) (contentType, finalURL
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", "", nil, fmt.Errorf("proxy: upstream status %d", resp.StatusCode)
+		return "", "", nil, &upstreamStatusError{resp.StatusCode}
 	}
 	body, err = io.ReadAll(io.LimitReader(resp.Body, f.maxBytes+1))
 	if err != nil {
