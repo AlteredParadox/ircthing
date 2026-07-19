@@ -112,6 +112,26 @@ function shared(map, key, run) {
 	};
 }
 
+// retryCounts tracks COMPLETED failed fetch attempts per (network, URL) key,
+// outside any component: it is what bounds auto-retry. The old bound was a
+// per-mount counter that reset whenever the row transiently stopped being
+// blank — which happens on every refetch — so a mounted hostile URL could
+// retry indefinitely, a persistent tracking beacon. This count increments
+// only when an attempt actually completes and fails (never on abort), and
+// resets only on success or when the entry ages out.
+const retryCounts = new LRU(300, 60 * 60 * 1000); // key -> failed attempts
+
+function noteFailure(key) {
+	retryCounts.set(key, (retryCounts.get(key) || 0) + 1);
+}
+
+function noteSuccess(key) {
+	// Clear only an EXISTING count: inserting a key per success would let a
+	// stream of healthy fetches evict failing keys from the bounded LRU and
+	// hand a hostile URL its retry budget back.
+	if (retryCounts.get(key)) retryCounts.set(key, 0);
+}
+
 // fetchPreview returns { promise, release }; promise resolves to PreviewData|null.
 function fetchPreview(url, net) {
 	const key = ck(url, net);
@@ -124,9 +144,11 @@ function fetchPreview(url, net) {
 				if (signal.aborted) return null; // don't cache a cancelled fetch
 				if (res && res.__fail !== undefined) {
 					cache.set(key, null, res.__fail); // transient → RETRY_TTL, real → FAIL_TTL
+					noteFailure(key); // a completed failed attempt: counts against auto-retry
 					return null;
 				}
 				cache.set(key, res);
+				noteSuccess(key);
 				return res;
 			}));
 }
@@ -148,10 +170,12 @@ function fetchThumb(url, net) {
 						return null;
 					}
 					thumbCache.set(key, obj);
+					noteSuccess(key);
 					return obj;
 				}
 				if (signal.aborted) return null; // cancelled: don't cache the failure
 				thumbCache.set(key, null, res.__fail); // transient → RETRY_TTL, real → FAIL_TTL
+				noteFailure(key); // a completed failed attempt: counts against auto-retry
 				return null;
 			}));
 }
@@ -162,22 +186,31 @@ function fetchThumb(url, net) {
 // stays cached (FAIL_TTL) so the retry is a cheap cache hit, no network. Without
 // this a row that failed transiently (e.g. WireGuard warming up) stays blank until
 // it scrolls out and back, because its effect deps never change.
+//
+// The bound is enforced on TWO axes, both required: retryCounts caps completed
+// failed NETWORK attempts per (network, URL), shared across every row and mount
+// (the fix for the unbounded-beacon bug — a per-mount counter reset every time
+// blank flickered false during a refetch); the local tick additionally caps how
+// often one mounted row re-runs its effect against a cached failure.
 const MAX_AUTO_RETRIES = 3;
 
-// useAutoRetry returns a counter that increments up to MAX_AUTO_RETRIES, once per
-// RETRY_TTL, while `blank` is true — a deps-changing tick that re-runs a fetch
-// effect. It resets when the row stops being blank (a later attempt succeeded).
-function useAutoRetry(blank) {
-	const [tick, setTick] = useState(0);
+// useAutoRetry returns a counter that increments up to MAX_AUTO_RETRIES, once
+// per RETRY_TTL, while `blank` is true. It is a deps-changing tick that re-runs
+// a fetch effect. blank must mean "a COMPLETED attempt failed" — never "still
+// loading" — so no timer runs while a request is in flight (a live timer used
+// to abort a healthy request that was merely slower than the retry interval).
+// The tick is keyed to (network, URL): a reused component with a new key starts
+// from 0 instead of inheriting an exhausted counter, and never resets merely
+// because blank flickered false during a refetch.
+function useAutoRetry(blank, key) {
+	const [last, setLast] = useState({ key, tick: 0 });
+	const tick = last.key === key ? last.tick : 0;
 	useEffect(() => {
-		if (!blank) {
-			if (tick !== 0) setTick(0);
-			return undefined;
-		}
-		if (tick >= MAX_AUTO_RETRIES) return undefined;
-		const t = setTimeout(() => setTick((n) => n + 1), RETRY_TTL + 500);
+		if (!blank || tick >= MAX_AUTO_RETRIES) return undefined;
+		if ((retryCounts.get(key) || 0) >= MAX_AUTO_RETRIES) return undefined;
+		const t = setTimeout(() => setLast({ key, tick: tick + 1 }), RETRY_TTL + 500);
 		return () => clearTimeout(t);
-	}, [blank, tick]);
+	}, [blank, key, tick]);
 	return tick;
 }
 
@@ -188,13 +221,13 @@ function useThumb(url, net) {
 		return c === undefined ? null : c;
 	});
 	const [blank, setBlank] = useState(false);
-	const tick = useAutoRetry(blank);
+	const tick = useAutoRetry(blank, ck(url, net));
 	useEffect(() => {
 		let alive = true;
 		const settle = (u) => {
 			if (!alive) return;
 			setSrc(u);
-			setBlank(u === null); // null => failed/loading; drives the bounded retry
+			setBlank(u === null); // a COMPLETED failure; arms the bounded retry
 		};
 		const c = thumbCache.get(ck(url, net));
 		if (c !== undefined) {
@@ -202,6 +235,11 @@ function useThumb(url, net) {
 			return undefined;
 		}
 		setSrc(null);
+		// Loading is not blank: clearing it disarms the retry timer while the
+		// request is in flight, so a slow-but-healthy fetch (backend allows
+		// 15s; the retry interval is shorter) is never aborted and restarted
+		// by its own retry.
+		setBlank(false);
 		const { promise, release } = fetchThumb(url, net);
 		promise.then(settle);
 		return () => {
@@ -228,10 +266,12 @@ export function LinkPreview({ url, net }) {
 // nothing at all on failure.
 function LinkCard({ url, net }) {
 	const [data, setData] = useState(() => (cache.has(ck(url, net)) ? cache.get(ck(url, net)) : undefined));
-	// blank => the fetch resolved to null (failure). A resolved PreviewData with no
-	// renderable fields is a SUCCESS (cached as a value), so it does not retry.
+	// blank => a COMPLETED fetch resolved to null (failure); while a fetch is in
+	// flight blank stays false, so no retry timer runs against it. A resolved
+	// PreviewData with no renderable fields is a SUCCESS (cached as a value), so
+	// it does not retry.
 	const [blank, setBlank] = useState(false);
-	const tick = useAutoRetry(blank);
+	const tick = useAutoRetry(blank, ck(url, net));
 
 	// Re-resolve whenever url or net changes: a reused component must not keep
 	// rendering the previous url's preview, and the network selects the proxy.
