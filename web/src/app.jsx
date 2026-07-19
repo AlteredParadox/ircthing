@@ -1555,6 +1555,7 @@ export function App() {
 					networks={networks} rules={rules} onRules={updateRules}
 					prefs={prefs} onPrefs={updatePrefs} onPreviews={(v) => { previewsPinned.current = true; setPreviews(v); }}
 					notifier={notifier.current} onClose={() => setSettingsOpen(false)}
+					onLogout={() => { setSettingsOpen(false); setPhase("login"); }}
 				/>
 			)}
 			{netForm && (

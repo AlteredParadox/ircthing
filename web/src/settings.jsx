@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
 import { ACCENT_RGB, ACCENTS, CLOCKS, MAX_NICK_SEP } from "./prefs.js";
 import { uuid } from "./irc.js";
 
@@ -136,28 +136,42 @@ async function saveConfig(patch) {
 	}
 }
 
+// Mutation-ordering state for the server-side settings, at MODULE level
+// deliberately: these used to be per-modal-instance refs, so closing and
+// reopening Settings created an independent save queue while the old
+// instance's requests were still in flight — a delayed older "previews on"
+// PUT could land after a newer "previews off" PUT and its stale callback
+// could still flip onPreviews, silently reversing the user's privacy choice.
+// One page-wide queue and one generation counter per setting serialize and
+// version every save regardless of how many times the modal remounts.
+// saveQueue: the next PUT is not sent until the previous settles, so an older
+// request can never land after (and overwrite) a newer one server-side.
+// *Gen: a callback only applies its result if it is still the LATEST save of
+// that setting. *Saved: the last value the server CONFIRMED — failed saves
+// roll the display back to it, never to an unpersisted in-memory edit.
+const saveQueue = { current: Promise.resolve() };
+const retentionGen = { current: 0 };
+const sessionGen = { current: 0 };
+const previewsGen = { current: 0 };
+const retentionSaved = { current: null };
+const sessionSaved = { current: null };
+const previewsSaved = { current: null };
+
 // Settings modal: appearance preferences, desktop-notification
 // permission, and per-network highlight rules. Everything is edited live
 // and persisted by the parent.
-export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, onPreviews, onClose }) {
+export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, onPreviews, onClose, onLogout }) {
 	const [perm, setPerm] = useState(notifier.permission());
 	const [enabled, setEnabled] = useState(notifier.enabled);
+	const [logoutErr, setLogoutErr] = useState(false);
 	const netNames = Object.keys(networks).sort((a, b) => a.localeCompare(b));
 
-	// Server-side settings, loaded on open and applied on change.
+	// Server-side settings, loaded on open and applied on change. The save
+	// queue, generation guards, and confirmed-value baselines live at module
+	// level (see above) so they survive the modal closing and reopening.
 	const [previewsOn, setPreviewsOn] = useState(null); // null while loading
 	const [retention, setRetention] = useState(null); // { days, max } | null
 	const [sessionDays, setSessionDays] = useState(null); // login cookie lifetime
-	const retentionGen = useRef(0); // latest-save guards (see saveRetention)
-	const sessionGen = useRef(0);
-	const previewsGen = useRef(0);
-	// The last values the SERVER confirmed. A failed save rolls the display back
-	// to these, NOT to the pre-edit in-memory value — which may itself be an
-	// unpersisted edit from an earlier failed save, so rolling back to it would
-	// leave the UI showing a value the server never accepted.
-	const retentionSaved = useRef(null);
-	const sessionSaved = useRef(null);
-	const previewsSaved = useRef(null);
 
 	useEffect(() => {
 		const onKey = (e) => e.key === "Escape" && onClose();
@@ -185,13 +199,8 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 			.catch(() => {});
 	}, []);
 
-	// Saves are serialized per-setting (saveQueue): the next PUT is not sent
-	// until the previous settles, so an older request can never land after —
-	// and silently overwrite — a newer one server-side. The generation guard
-	// additionally reverts only if THIS is still the latest in-flight save:
-	// otherwise an older request that fails could clobber a newer request
-	// that already succeeded.
-	const saveQueue = useRef(Promise.resolve());
+	// Saves are serialized through the module-level saveQueue and versioned by
+	// the module-level generation guards — see the block above saveConfig.
 	function saveRetention(patch) {
 		const next = { ...retention, ...patch };
 		setRetention(next);
@@ -240,6 +249,21 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 					onPreviews?.(previewsSaved.current);
 				}
 			});
+	}
+
+	// Sign out deliberately invalidates the CURRENT session server-side —
+	// the only in-app way to revoke this cookie (password rotation keeps it).
+	// Only leave the app once the server confirms the revocation; a network
+	// failure must not show the login screen over a still-valid session.
+	async function logout() {
+		setLogoutErr(false);
+		try {
+			const r = await fetch("/api/logout", { method: "POST" });
+			if (!r.ok) throw new Error();
+			onLogout?.();
+		} catch {
+			setLogoutErr(true);
+		}
 	}
 
 	async function enableNotif() {
@@ -483,6 +507,12 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 								/>
 							</div>
 						)}
+						<div class="settings-note">
+							Signing out invalidates this device’s login immediately (other
+							devices stay signed in).
+						</div>
+						{logoutErr && <div class="cmd-error">Sign out failed — try again.</div>}
+						<button class="btn-accent" onClick={logout}>Sign out</button>
 					</section>
 
 					<ChangePassword />
