@@ -150,6 +150,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	const [sessionDays, setSessionDays] = useState(null); // login cookie lifetime
 	const retentionGen = useRef(0); // latest-save guards (see saveRetention)
 	const sessionGen = useRef(0);
+	const previewsGen = useRef(0);
 	// The last values the SERVER confirmed. A failed save rolls the display back
 	// to these, NOT to the pre-edit in-memory value — which may itself be an
 	// unpersisted edit from an earlier failed save, so rolling back to it would
@@ -212,23 +213,22 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	}
 	const retNum = (v) => Math.max(0, Number.parseInt(v, 10) || 0);
 
-	async function togglePreviews(on) {
-		// Only reflect the new state once the server confirms the write.
-		// A failed/non-2xx save must leave the toggle where it was, so
-		// this session and other devices do not diverge (and previews are
-		// not silently left enabled).
-		try {
-			const r = await fetch("/api/config", {
-				method: "PUT",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ previews: on }),
+	function togglePreviews(on) {
+		// Only reflect the new state once the server confirms the write — a
+		// failed save leaves the toggle where it was, so this session and other
+		// devices do not diverge. Serialized through saveQueue with a generation
+		// guard (same as saveRetention): two rapid toggles would otherwise race
+		// their PUTs, and the response completing LAST — not the one carrying the
+		// user's final choice — would set the visible state.
+		const gen = ++previewsGen.current;
+		saveQueue.current = saveQueue.current
+			.then(() => saveConfig({ previews: on }))
+			.then((ok) => {
+				if (ok && gen === previewsGen.current) {
+					setPreviewsOn(on);
+					onPreviews?.(on);
+				}
 			});
-			if (!r.ok) return;
-		} catch {
-			return;
-		}
-		setPreviewsOn(on);
-		onPreviews?.(on);
 	}
 
 	async function enableNotif() {
@@ -518,11 +518,14 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 						<div class="settings-label">About</div>
 						<div class="settings-note">
 							ircthing is free software, licensed under the{" "}
-							<a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noopener noreferrer">
+							<a href="/license" target="_blank" rel="noopener noreferrer">
 								GNU AGPL v3 or later
 							</a>. Get the{" "}
 							<a href="https://github.com/AlteredParadox/ircthing" target="_blank" rel="noopener noreferrer">
 								source code
+							</a>. Bundled{" "}
+							<a href="/third-party-licenses" target="_blank" rel="noopener noreferrer">
+								third-party licenses
 							</a>.
 						</div>
 					</section>

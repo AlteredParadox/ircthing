@@ -25,13 +25,34 @@ import { WhoisCard } from "./whois.jsx";
 import { estimateMsgHeight } from "./vmath.js";
 
 
-// bodyText renders one non-link text segment: plain text unless nick
-// highlighting is on (nicks map present), in which case known nicks mentioned
-// in the text become colored, clickable spans with the user menu.
-function bodyText(text, nicks, theme, onNick, keyBase) {
-	if (!nicks) return text;
-	return highlightNicks(text, nicks).map((p, i) =>
-		p.nick
+// MAX_BODY_NODES caps the DOM nodes ONE message may render across all passes
+// (formatting runs, <br>, links, nick spans). The formatting-run cap alone
+// doesn't bound this: nick highlighting can split a single run into thousands
+// of spans, and a visible message is re-diffed on every composer keystroke. A
+// message's text is already clamped to 16 KiB by the store, so the true ceiling
+// is ~16-25k nodes; 4000 is far above any real message yet caps the adversarial
+// case. Past it, the remainder renders as one plain text node.
+const MAX_BODY_NODES = 4000;
+
+// pushBodyText appends one non-link text segment to `out`: plain text unless
+// nick highlighting is on (nicks map present), in which case known nicks
+// mentioned in the text become colored, clickable spans with the user menu.
+// It decrements the shared node budget; when the budget runs out mid-segment
+// the untouched tail is appended as one plain string (never dropped).
+function pushBodyText(out, budget, text, nicks, theme, onNick, keyBase) {
+	if (!nicks) {
+		out.push(text);
+		budget.n--;
+		return;
+	}
+	const parts = highlightNicks(text, nicks);
+	for (let i = 0; i < parts.length; i++) {
+		if (budget.n <= 0) {
+			out.push(parts.slice(i).map((p) => p.text).join(""));
+			return;
+		}
+		const p = parts[i];
+		out.push(p.nick
 			? (
 				<span
 					key={keyBase + "n" + i}
@@ -40,8 +61,9 @@ function bodyText(text, nicks, theme, onNick, keyBase) {
 					{...menuTrigger((x, y) => onNick(p.nick, x, y))}
 				>{p.text}</span>
 			)
-			: p.text,
-	);
+			: p.text);
+		budget.n--;
+	}
 }
 
 // fmtWrap wraps a run's rendered inner content in a span carrying its mIRC
@@ -73,19 +95,39 @@ function Body({ text, nicks, theme, onNick }) {
 	// hostile many-line body multiply the cap by the line count. draft/multiline
 	// newlines survive as plain text inside runs and become <br/> at render;
 	// links and nick mentions resolve within each \n-delimited run segment.
-	return parseFormatting(text).map((run, ri) => {
+	const runs = parseFormatting(text);
+	const budget = { n: MAX_BODY_NODES }; // shared across every run/line/segment
+	const out = [];
+	let ri = 0;
+	for (; ri < runs.length && budget.n > 0; ri++) {
+		const run = runs[ri];
 		const inner = [];
-		run.text.split("\n").forEach((line, pi) => {
-			if (pi > 0) inner.push(<br key={ri + "-br-" + pi} />);
-			for (const [si, seg] of linkify(line).entries()) {
-				const kp = ri + "-" + pi + "-" + si;
-				inner.push(seg.link
-					? <a key={kp} href={seg.text} target="_blank" rel="noopener noreferrer">{seg.text}</a>
-					: bodyText(seg.text, nicks, theme, onNick, kp + "-"));
+		const lines = run.text.split("\n");
+		for (let pi = 0; pi < lines.length && budget.n > 0; pi++) {
+			if (pi > 0) {
+				inner.push(<br key={ri + "-br-" + pi} />);
+				budget.n--;
+				if (budget.n <= 0) break;
 			}
-		});
-		return fmtWrap(run, inner, ri);
-	});
+			for (const [si, seg] of linkify(lines[pi]).entries()) {
+				if (budget.n <= 0) break;
+				const kp = ri + "-" + pi + "-" + si;
+				if (seg.link) {
+					inner.push(<a key={kp} href={seg.text} target="_blank" rel="noopener noreferrer">{seg.text}</a>);
+					budget.n--;
+				} else {
+					pushBodyText(inner, budget, seg.text, nicks, theme, onNick, kp + "-");
+				}
+			}
+		}
+		out.push(fmtWrap(run, inner, ri));
+	}
+	if (ri < runs.length) {
+		// Node budget spent by an adversarial body: everything still unprocessed
+		// renders as ONE plain, unstyled text node (no <br>/link/highlight).
+		out.push(runs.slice(ri).map((r) => r.text).join(""));
+	}
+	return out;
 }
 
 function SysRow({ ev, r, focused, timeFmt }) {

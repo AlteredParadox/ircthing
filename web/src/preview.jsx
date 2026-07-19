@@ -36,9 +36,12 @@ const inflight = new Map(); // key -> { promise, controller, refs }
 const thumbCache = new LRU(200, 60 * 60 * 1000, (u) => u && URL.revokeObjectURL(u));
 const thumbInflight = new Map();
 
-// Above this many concurrent distinct requests, extra fetches still run and
-// cache but are not tracked for dedup/abort — a hard ceiling so a pathological
-// burst of distinct URLs cannot grow the maps without bound.
+// Above this many concurrent distinct requests, new fetches are REJECTED
+// (resolve null, nothing cached) rather than started untracked — an untracked
+// request can be neither deduped nor aborted, so a burst of distinct URLs
+// would keep the server's single media slot busy on rows already scrolled
+// away. Previews are cosmetic: a rejected row renders nothing now and retries
+// on the next mount once below the cap.
 const MAX_INFLIGHT = 64;
 
 // Cache/fetch key by (network, url): the network selects the server-side
@@ -64,16 +67,17 @@ function mediaFetch(path, url, net, signal) {
 // LAST waiter releases a still-pending request it is ABORTED — so a preview
 // scrolled out of the virtualized list stops the server doing remote work —
 // without cancelling a fetch another visible row still needs. The map self-empties
-// as requests settle; entries above MAX_INFLIGHT run untracked.
+// as requests settle; at MAX_INFLIGHT, new keys are rejected (see the constant).
 function shared(map, key, run) {
 	let e = map.get(key);
 	if (!e || e.controller.signal.aborted) {
+		if (map.size >= MAX_INFLIGHT) return { promise: Promise.resolve(null), release() {} };
 		const controller = new AbortController();
 		e = { controller, refs: 0, promise: null };
 		e.promise = run(controller.signal).finally(() => {
 			if (map.get(key) === e) map.delete(key);
 		});
-		if (map.size < MAX_INFLIGHT) map.set(key, e);
+		map.set(key, e);
 	}
 	e.refs++;
 	let released = false;

@@ -630,7 +630,14 @@ export function App() {
 		s.on("history_changed", (d) => {
 			const key = bufKey(d.network, d.buffer);
 			historyGen.current[key] = (historyGen.current[key] || 0) + 1;
+			// This buffer is being told to refetch — a failed-load marker from
+			// before must not veto it, or an active buffer whose initial load
+			// errored stays blank until revisited/reconnected. The loadTick bump
+			// re-runs the load effect even when dropBufferMsgs was a no-op
+			// (nothing cached => no state change => no re-render).
+			failedHistory.current.delete(key);
 			setMsgs((m) => dropBufferMsgs(m, key));
+			setLoadTick((t) => t + 1);
 			clearTimeout(bufRefresh);
 			bufRefresh = setTimeout(refreshBuffers, 300);
 		});
