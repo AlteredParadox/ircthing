@@ -16,10 +16,14 @@ scrollback runs in ~32 MB of RSS.
 
 - **Bouncer core**: persistent connections with reconnect
   (exponential backoff + jitter), scrollback catch-up via `chathistory`
-  with paginated backfill, and replay to every device. (Backfill is
-  best-effort under load: on a reconnect with very many channels the
-  send queue can briefly saturate and drop a backfill round — logged,
-  and re-attempted on the next reconnect.)
+  with paginated backfill, and replay to every device. (Reconnect
+  synchronization is best-effort under load: on a reconnect with very
+  many channels the send queue can briefly saturate and silently drop a
+  backfill round — logged, re-attempted on the next reconnect — and can
+  likewise drop the `MARKREAD` read-marker fetches and the `MONITOR`
+  buddy-list restoration issued at the same moment; read positions
+  re-sync on the next reconnect or the next marker update, presence on
+  the next reconnect.)
 - **Protocol**: the full ratified IRCv3 set (SASL PLAIN /
   SCRAM-SHA-256 / EXTERNAL, `server-time`, `batch`, `echo-message`,
   `monitor`, STS with persisted policies, WHOX account discovery, bot
