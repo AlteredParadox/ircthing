@@ -1,6 +1,7 @@
 {
   "name": "ircthing-web",
   "private": true,
+  "license": "AGPL-3.0-or-later",
   "type": "module",
   "dependencies": {
     "preact": "^10.26.9"
