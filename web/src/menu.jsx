@@ -88,16 +88,22 @@ export function menuTrigger(open) {
 // hold, for touch parity with right-click. It cancels on move or early
 // release and marks the gesture so the element's onClick can ignore the
 // tap that follows the press.
-export function longPress(open, firedRef) {
-	let timer = null;
+//
+// The pending timer MUST live in a caller-owned ref (timerRef), not a
+// per-call local: longPress is spread inline in JSX, so a re-render during
+// the hold (e.g. an incoming message bumping an unread count) rebuilds the
+// handlers, and Preact routes the release to the NEW closure — whose local
+// timer is null, orphaning the old one so it fires a spurious menu. One ref
+// suffices since only one press is ever active at a time.
+export function longPress(open, firedRef, timerRef) {
 	const cancel = () => {
-		clearTimeout(timer);
-		timer = null;
+		clearTimeout(timerRef.current);
+		timerRef.current = null;
 	};
 	return {
 		onTouchStart: (e) => {
 			const t = e.touches[0];
-			timer = setTimeout(() => {
+			timerRef.current = setTimeout(() => {
 				if (firedRef) firedRef.current = true;
 				open(t.clientX, t.clientY);
 			}, 500);

@@ -12,8 +12,10 @@ function stateDot(state) {
 
 export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSet, onSelect, onSettings, onBufferMenu, onNetworkMenu, onAddNetwork, onAddMonitor, onRemoveMonitor }) {
 	// One shared flag: a long-press that opened a menu suppresses the tap
-	// that follows it.
+	// that follows it. pressTimer holds the pending hold timer across
+	// re-renders (see longPress) so a mid-hold re-render can't orphan it.
 	const pressFired = useRef(false);
+	const pressTimer = useRef(null);
 	// Group buffers under their network; networks without buffers still
 	// get a section so a fresh install isn't a blank panel.
 	const names = new Set(Object.keys(networks));
@@ -65,7 +67,7 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSe
 										e.preventDefault();
 										openMenu(e.clientX, e.clientY);
 									}}
-									{...longPress(openMenu, pressFired)}
+									{...longPress(openMenu, pressFired, pressTimer)}
 								>
 									<span class={"dot " + stateDot(sec.state)} />
 									<span class="net-name">{sec.name}</span>
@@ -100,7 +102,7 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSe
 										e.preventDefault();
 										openMenu(e.clientX, e.clientY);
 									}}
-									{...longPress(openMenu, pressFired)}
+									{...longPress(openMenu, pressFired, pressTimer)}
 								>
 									<BufIcon chan={isChan} />
 									<span class="chan-name">{b.buffer}</span>
