@@ -218,7 +218,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 	// backdated relay/bridge line lands at the tail with an older time. Marking
 	// list[last].time there would rewind the marker and re-badge genuinely-newer
 	// messages as unread. Max time is monotonic (budget trims drop the oldest).
-	const readTS = useMemo(() => list.reduce((mx, m) => (m.time > mx ? m.time : mx), 0), [list]);
+	const readTS = useMemo(() => list.reduce((mx, m) => Math.max(mx, m.time), 0), [list]);
 	// Hide ignored senders from view (they are still stored, so
 	// un-ignoring reveals them live). Zero cost when nobody is ignored.
 	const ignoreKey = (ignoredNicks || []).join("\n");

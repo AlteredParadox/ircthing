@@ -173,30 +173,9 @@ func (s *Store) pruneOnce(ctx context.Context, now time.Time) (int64, error) {
 	}()
 
 	if days > 0 {
-		cutoff := now.Add(-time.Duration(days) * 24 * time.Hour).UnixMilli()
-		// Bail if retention is disabled or its window is widened mid-prune: our
-		// fixed cutoff must never delete a row the live (possibly larger) window
-		// would keep. A tightened window (live cutoff newer) is fine — we simply
-		// delete less than it wants and the next prune catches up.
-		ageGuard := func() bool {
-			s.mu.Lock()
-			liveDays := s.retention.days
-			s.mu.Unlock()
-			if liveDays == 0 {
-				return false
-			}
-			return cutoff <= now.Add(-time.Duration(liveDays)*24*time.Hour).UnixMilli()
-		}
-		n, err := s.deleteChunked(ctx, ageGuard,
-			`DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE ts < ? LIMIT ?)`,
-			cutoff)
+		n, cut, err := s.pruneByAge(ctx, now, days)
 		total += n
-		// Trim the rings to the cutoff whenever any pre-cutoff row was (or is
-		// being) deleted: an untrimmed complete ring would keep serving them.
-		// Safe on partial failure — a ring miss just falls back to disk.
-		if n > 0 || err == nil {
-			appliedCutoff = cutoff
-		}
+		appliedCutoff = cut
 		if err != nil {
 			return total, err
 		}
@@ -218,6 +197,34 @@ func (s *Store) pruneOnce(ctx context.Context, now time.Time) (int64, error) {
 		s.vacuumChunked(ctx)
 	}
 	return total, nil
+}
+
+// pruneByAge chunk-deletes rows older than the days cutoff. appliedCutoff is
+// set (nonzero) once any pre-cutoff row was — or is being — deleted, so the
+// caller trims the hot rings to exactly what reached disk; safe on partial
+// failure, since a ring miss just falls back to disk.
+func (s *Store) pruneByAge(ctx context.Context, now time.Time, days int) (n int64, appliedCutoff int64, err error) {
+	cutoff := now.Add(-time.Duration(days) * 24 * time.Hour).UnixMilli()
+	// Bail if retention is disabled or its window is widened mid-prune: our
+	// fixed cutoff must never delete a row the live (possibly larger) window
+	// would keep. A tightened window (live cutoff newer) is fine — we simply
+	// delete less than it wants and the next prune catches up.
+	ageGuard := func() bool {
+		s.mu.Lock()
+		liveDays := s.retention.days
+		s.mu.Unlock()
+		if liveDays == 0 {
+			return false
+		}
+		return cutoff <= now.Add(-time.Duration(liveDays)*24*time.Hour).UnixMilli()
+	}
+	n, err = s.deleteChunked(ctx, ageGuard,
+		`DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE ts < ? LIMIT ?)`,
+		cutoff)
+	if n > 0 || err == nil {
+		appliedCutoff = cutoff
+	}
+	return n, appliedCutoff, err
 }
 
 // deleteChunked runs a `DELETE ... id IN (SELECT ... LIMIT ?)` statement
