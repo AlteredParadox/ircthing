@@ -397,21 +397,45 @@ func (m *Manager) SendMultiline(target string, lines []string) error {
 	return m.sendAll(batch)
 }
 
+// maxMonitorNickLen bounds a MONITOR target. Real NICKLEN tops out around
+// 32; 48 additionally guarantees a full ten-nick chunk ("MONITOR + " + ten
+// 48-byte nicks + nine commas + CRLF = 501 bytes) fits the default 512
+// LINELEN, so no valid chunk can ever fail the send-time length check.
+const maxMonitorNickLen = 48
+
+// ValidMonitorTarget reports whether nick is safe to persist and to place
+// in a comma-separated MONITOR list: non-empty, no separator or framing
+// bytes (space, comma, CR, LF, NUL), and within maxMonitorNickLen. The hub
+// enforces this before persisting; SetMonitored re-applies it to already-
+// persisted entries, since one bad stored value would otherwise fail its
+// whole ten-nick chunk on every reconnect, silently suppressing up to nine
+// valid buddies.
+func ValidMonitorTarget(nick string) bool {
+	return nick != "" && len(nick) <= maxMonitorNickLen && !strings.ContainsAny(nick, " ,\r\n\x00")
+}
+
 // SetMonitored replaces the MONITOR list with nicks (MONITOR extension,
 // https://ircv3.net/specs/extensions/monitor, fetched 2026-07-15). The
 // hub drives this on every registration from the persisted buddy list, so
-// the list is re-established after reconnects. Requests are clamped to the
+// the list is re-established after reconnects. Invalid persisted entries
+// are dropped (see ValidMonitorTarget); requests are clamped to the
 // ISUPPORT MONITOR limit and chunked to stay within the line length; the
 // server replies 730/731 with each target's current presence.
 func (m *Manager) SetMonitored(nicks []string) {
 	if !m.registered.Load() {
 		return
 	}
-	if limit := m.monitorLimit(); limit > 0 && len(nicks) > limit {
-		nicks = nicks[:limit]
+	valid := make([]string, 0, len(nicks))
+	for _, n := range nicks {
+		if ValidMonitorTarget(n) {
+			valid = append(valid, n)
+		}
+	}
+	if limit := m.monitorLimit(); limit > 0 && len(valid) > limit {
+		valid = valid[:limit]
 	}
 	_ = m.Send(newMsg("MONITOR", "C")) // clear any stale list on this connection
-	for _, chunk := range chunkTargets(nicks, 10) {
+	for _, chunk := range chunkTargets(valid, 10) {
 		_ = m.Send(newMsg("MONITOR", "+", strings.Join(chunk, ",")))
 	}
 }

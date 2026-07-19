@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"ircthing/internal/irc"
 	"ircthing/internal/store"
 
 	ircv4 "gopkg.in/irc.v4"
@@ -354,7 +355,10 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		s.push(errEnvelope(env.Seq, "bad_request", "malformed monitor data"))
 		return
 	}
-	if d.Network == "" || d.Nick == "" || strings.ContainsAny(d.Nick, " ,\r\n") {
+	// ValidMonitorTarget also rejects NUL and excessive length — an invalid
+	// value must not be PERSISTED, or it would poison its ten-nick MONITOR
+	// chunk on every reconnect (the live send would reject it anyway).
+	if d.Network == "" || !irc.ValidMonitorTarget(d.Nick) {
 		s.push(errEnvelope(env.Seq, "bad_request", "monitor needs a network and a valid nick"))
 		return
 	}
