@@ -175,9 +175,19 @@ func NewManager(cfg Config) (*Manager, error) {
 	cfg.applyDefaults()
 	isup := newISupport()
 	m := &Manager{
-		cfg:            cfg,
-		events:         make(chan Event, 256),
-		out:            make(chan *ircv4.Message, 64),
+		cfg:    cfg,
+		events: make(chan Event, 256),
+		// out buffers the normal-priority send queue. It must hold a whole
+		// reconnect's registration fan-out (per-query CHATHISTORY + MARKREAD,
+		// MONITOR, per-channel backfills) because the writer serves the higher-
+		// priority `internal` rejoin-JOIN queue first, starving `out` for the
+		// ~tens of seconds the paced JOINs take — so the fan-out cannot drain
+		// until then and must be buffered. 512 covers the documented 5-network/
+		// 50-channel scale with headroom (was 64, which a heavy account could
+		// overrun, silently dropping the tail — see the discard note in the hub's
+		// backfill/MONITOR path; the complete fix is a bounded off-goroutine
+		// retry, tracked as a follow-up).
+		out:            make(chan *ircv4.Message, 512),
 		isup:           isup,
 		roster:         newRoster(isup),
 		joined:         make(map[string]string),
@@ -457,7 +467,14 @@ func (m *Manager) RequestChatHistory(target string, sinceMs int64, msgid string)
 	sel := "timestamp=" + time.UnixMilli(sinceMs).UTC().Format("2006-01-02T15:04:05.000Z")
 	if msgid != "" {
 		if refs, ok := m.isup.Raw("MSGREFTYPES"); ok && mechListed(refs, "msgid") {
-			sel = "msgid=" + msgid
+			// Prefer the msgid selector ONLY if the line fits: a stored msgid can
+			// be up to 512 bytes, which would push CHATHISTORY past LINELEN and be
+			// rejected by Send — losing the backfill entirely. Fall back to the
+			// already-computed timestamp selector rather than send nothing.
+			cand := newMsg("CHATHISTORY", "AFTER", target, "msgid="+msgid, strconv.Itoa(limit))
+			if checkLineLen(cand, m.lineLen()) == nil {
+				sel = "msgid=" + msgid
+			}
 		}
 	}
 	// Best-effort: a full queue just means no backfill this round.

@@ -1276,7 +1276,10 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 	// verbatim, which the client retains as a tombstone. Match the replay path,
 	// which serves the already-clamped stored reason.
 	h.broadcast(envelope("redact", 0, RedactData{
-		Network: ev.Network, Buffer: buffer, MsgID: msgid,
+		// Clamp the msgid to the stored form (store.ClampMsgID): the message was
+		// indexed under the truncated id, so an unclamped >512-byte id here would
+		// never match its tombstone on the client.
+		Network: ev.Network, Buffer: buffer, MsgID: store.ClampMsgID(msgid),
 		By: clampServerInfo(by), Reason: clampServerInfo(reason),
 	}))
 }

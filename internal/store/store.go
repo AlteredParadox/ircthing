@@ -82,6 +82,12 @@ func clampUTF8(s string, max int) string {
 	return s
 }
 
+// ClampMsgID bounds a msgid to the same field limit append stores it under, so a
+// LIVE redact event carries the exact id the stored (and client-displayed)
+// message was indexed by — a >512-byte msgid would otherwise be broadcast in
+// full and never match its truncated tombstone.
+func ClampMsgID(s string) string { return clampUTF8(s, maxStoredFieldBytes) }
+
 // Message is one stored IRC message. ID and Network/Target are assigned
 // by the store on append.
 type Message struct {

@@ -698,6 +698,11 @@ func (r *roster) applyChannelMode(st *channelState, params []string) {
 // Caller holds r.mu.
 func (r *roster) applyStatusMode(st *channelState, nick, sym string, adding bool) {
 	fk := r.foldKey(nick)
+	// A hostile server can advertise a ~254-symbol PREFIX and MODE-grant them all
+	// across 100k members (~25 MiB), past the 8 MiB ceiling — so refuse a GROWING
+	// prefix when already over budget, mirroring the join/rename/topic guards.
+	// Revocation only shrinks and is always allowed.
+	over := r.totalBytes() >= maxRosterBytes
 	// Apply to whichever map holds the member: during a NAMES burst the
 	// member is in st.pending (not yet swapped into st.members), so a
 	// MODE between 353 and 366 must land in pending to survive the swap.
@@ -707,11 +712,15 @@ func (r *roster) applyStatusMode(st *channelState, nick, sym string, adding bool
 			return
 		}
 		if adding {
-			mem.Prefix = addPrefix(r.isup.PrefixSymbols(), mem.Prefix, sym)
+			np := addPrefix(r.isup.PrefixSymbols(), mem.Prefix, sym)
+			if over && len(np) > len(mem.Prefix) {
+				return // don't grow the roster past the byte ceiling
+			}
+			mem.Prefix = np
 		} else {
 			mem.Prefix = strings.ReplaceAll(mem.Prefix, sym, "")
 		}
-		st.put(mp, fk, mem) // prefix growth is bounded by the PREFIX symbol set
+		st.put(mp, fk, mem)
 	}
 	apply(st.members)
 	if st.pending != nil {
