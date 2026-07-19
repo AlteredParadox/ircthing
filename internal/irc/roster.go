@@ -209,7 +209,6 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	fold := r.isup.Fold
 	sender := ""
 	if m.Prefix != nil {
 		sender = m.Prefix.Name
@@ -230,32 +229,11 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 	case "JOIN":
 		r.memberJoin(m, sender, us(sender))
 	case "PART":
-		// PART takes a comma-list of channels (RFC 2812 §3.2.2). Mainstream
-		// servers split these before relaying, but handle the multi form so a
-		// server that doesn't leaves no ghost members.
-		for _, ch := range strings.Split(m.Param(0), ",") {
-			r.memberLeft(ch, sender, us(sender))
-		}
-	case "KICK": // <channel>{,<channel>} <user>{,<user>} (RFC 2812 §3.2.8)
-		chans := strings.Split(m.Param(0), ",")
-		victims := strings.Split(m.Param(1), ",")
-		for i, victim := range victims {
-			ch := chans[0] // 1 channel, N victims: all from that channel
-			if len(chans) == len(victims) {
-				ch = chans[i] // parallel channel[i]/victim[i] form
-			}
-			r.memberLeft(ch, victim, us(victim))
-		}
+		r.membersPart(m.Param(0), sender, us(sender))
+	case "KICK":
+		r.membersKick(m, ourNick)
 	case "QUIT":
-		// Clamp+fold ONCE, outside the loop: Fold allocates twice per call,
-		// so folding a raw (up to ~64 KiB) spoofed sender per channel across
-		// 4096 channels would be ~0.5 GiB of transient allocation for one
-		// line. Clamping also matches how member keys were stored.
-		qk := fold(clampRoster(sender))
-		for _, st := range r.chans {
-			st.del(st.members, qk)
-			st.del(st.pending, qk)
-		}
+		r.memberQuit(sender)
 	case "NICK":
 		r.rename(sender, m.Param(0))
 	case "CHGHOST": // chghost: ":nick!user@host CHGHOST <newuser> <newhost>"
@@ -283,9 +261,54 @@ func (r *roster) handle(ourNick string, m *ircv4.Message) {
 	case "354": // RPL_WHOSPCRPL: our WHOX reply
 		r.whoxReply(m)
 	case "MODE":
-		if st := r.chans[r.foldKey(m.Param(0))]; st != nil {
-			r.applyChannelMode(st, m.Params)
+		r.channelMode(m)
+	}
+}
+
+// membersPart removes the sender from each comma-listed channel. PART takes a
+// comma-list of channels (RFC 2812 §3.2.2); mainstream servers split these
+// before relaying, but handle the multi form so one that doesn't leaves no
+// ghost members. Caller holds r.mu.
+func (r *roster) membersPart(channels, nick string, ours bool) {
+	for _, ch := range strings.Split(channels, ",") {
+		r.memberLeft(ch, nick, ours)
+	}
+}
+
+// membersKick removes each kicked victim from its channel: KICK is
+// <channel>{,<channel>} <user>{,<user>} (RFC 2812 §3.2.8) — one channel with N
+// victims, or parallel channel[i]/victim[i] lists. Caller holds r.mu.
+func (r *roster) membersKick(m *ircv4.Message, ourNick string) {
+	chans := strings.Split(m.Param(0), ",")
+	victims := strings.Split(m.Param(1), ",")
+	for i, victim := range victims {
+		ch := chans[0] // 1 channel, N victims: all from that channel
+		if len(chans) == len(victims) {
+			ch = chans[i] // parallel channel[i]/victim[i] form
 		}
+		r.memberLeft(ch, victim, ourNick != "" && r.isup.FoldEqual(victim, ourNick))
+	}
+}
+
+// memberQuit removes the sender from every channel (QUIT spans channels the
+// roster doesn't index by). Caller holds r.mu.
+func (r *roster) memberQuit(sender string) {
+	// Clamp+fold ONCE, outside the loop: Fold allocates twice per call, so
+	// folding a raw (up to ~64 KiB) spoofed sender per channel across 4096
+	// channels would be ~0.5 GiB of transient allocation for one line.
+	// Clamping also matches how member keys were stored.
+	qk := r.isup.Fold(clampRoster(sender))
+	for _, st := range r.chans {
+		st.del(st.members, qk)
+		st.del(st.pending, qk)
+	}
+}
+
+// channelMode applies a channel MODE change to member status prefixes, if the
+// channel is tracked. Caller holds r.mu.
+func (r *roster) channelMode(m *ircv4.Message) {
+	if st := r.chans[r.foldKey(m.Param(0))]; st != nil {
+		r.applyChannelMode(st, m.Params)
 	}
 }
 

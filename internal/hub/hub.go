@@ -976,49 +976,61 @@ func (h *Hub) trackHistoryBatch(ctx context.Context, ev irc.Event, c Conn, batch
 	ref := ev.Msg.Params[0]
 	switch {
 	case strings.HasPrefix(ref, "+") && strings.Contains(ev.Msg.Param(1), "chathistory"):
-		if ref[1:] == "" {
-			return // empty reference: ignore, or it becomes histBatches[""]
-		}
-		if len(batches) >= maxOpenHistBatches {
-			return // bound the map at maxOpenHistBatches
-		}
-		// Clamp+detach the retained ref key and target: both are server-controlled
-		// and otherwise pin the ~64 KiB BATCH line, and the target further seeds
-		// the folded backfillPages key below (bounded by count, not length).
-		batches[clampDetach(ref[1:])] = &histBatch{target: clampDetach(ev.Msg.Param(2))}
+		openHistoryBatch(ev, ref[1:], batches)
 	case strings.HasPrefix(ref, "-"):
-		id := clampServerInfo(ref[1:]) // same value as the stored (clamped) key
-		b := batches[id]
-		if b == nil {
-			return
-		}
-		delete(batches, id)
-		key := c.Fold(b.target)
-		// Cap the number of distinct targets tracked, not just the pages per
-		// target: a hostile server can close a chathistory batch for an
-		// endlessly varying target and grow this map for the life of the
-		// connection otherwise (mirrors the presence/whois key caps above).
-		_, known := pages[key]
-		if !known && len(pages) >= maxBackfillTargets {
-			// Drop the follow-up rather than track a new target.
-		} else if b.count >= c.HistoryPageSize() && b.lastTS > 0 && pages[key] < maxBackfillPages {
-			pages[key]++
-			c.RequestChatHistory(b.target, b.lastTS, b.lastID)
-		}
-		// Announce the CANONICAL stored spelling: clients key buffers by it,
-		// so a wire-spelling hint whose casing differs would miss the client's
-		// page-invalidation and leave stale scrollback.
+		h.closeHistoryBatch(ctx, ev, c, clampServerInfo(ref[1:]), batches, pages)
+	}
+}
+
+// openHistoryBatch records an opened chathistory BATCH so its replayed lines
+// are classified as history, not live. The ref key and target are clamped+
+// detached (both server-controlled, would otherwise pin the ~64 KiB BATCH line;
+// the target also seeds the folded backfillPages key, bounded by count not
+// length), and the open map is bounded.
+func openHistoryBatch(ev irc.Event, ref string, batches map[string]*histBatch) {
+	if ref == "" {
+		return // empty reference: ignore, or it becomes batches[""]
+	}
+	if len(batches) >= maxOpenHistBatches {
+		return // bound the map at maxOpenHistBatches
+	}
+	batches[clampDetach(ref)] = &histBatch{target: clampDetach(ev.Msg.Param(2))}
+}
+
+// closeHistoryBatch finishes a chathistory replay: it announces the affected
+// buffer (so clients drop stale pages and refetch) and requests the next page
+// when the batch filled a whole page (the gap may extend past it).
+func (h *Hub) closeHistoryBatch(ctx context.Context, ev irc.Event, c Conn, id string, batches map[string]*histBatch, pages map[string]int) {
+	b := batches[id]
+	if b == nil {
+		return
+	}
+	delete(batches, id)
+	key := c.Fold(b.target)
+	// Cap the number of distinct targets tracked, not just the pages per
+	// target: a hostile server can close a chathistory batch for an
+	// endlessly varying target and grow this map for the life of the
+	// connection otherwise (mirrors the presence/whois key caps above).
+	_, known := pages[key]
+	if !known && len(pages) >= maxBackfillTargets {
+		// Drop the follow-up rather than track a new target.
+	} else if b.count >= c.HistoryPageSize() && b.lastTS > 0 && pages[key] < maxBackfillPages {
+		pages[key]++
+		c.RequestChatHistory(b.target, b.lastTS, b.lastID)
+	}
+	// Announce the CANONICAL stored spelling: clients key buffers by it, so a
+	// wire-spelling hint whose casing differs would miss the client's page-
+	// invalidation and leave stale scrollback.
+	h.broadcast(envelope("history_changed", 0, HistoryChangedData{
+		Network: ev.Network, Buffer: h.store.CanonicalBuffer(ctx, ev.Network, b.target, c.Fold),
+	}))
+	// If a replayed event in this batch was rerouted to the server buffer (a
+	// correspondent's private NOTICE or its redaction), "*" changed too but the
+	// hint above named only b.target — invalidate "*" as well.
+	if b.starTouched {
 		h.broadcast(envelope("history_changed", 0, HistoryChangedData{
-			Network: ev.Network, Buffer: h.store.CanonicalBuffer(ctx, ev.Network, b.target, c.Fold),
+			Network: ev.Network, Buffer: serverBufferTarget,
 		}))
-		// If a replayed event in this batch was rerouted to the server buffer
-		// (a correspondent's private NOTICE or its redaction), "*" changed too
-		// but the hint above named only b.target — invalidate "*" as well.
-		if b.starTouched {
-			h.broadcast(envelope("history_changed", 0, HistoryChangedData{
-				Network: ev.Network, Buffer: serverBufferTarget,
-			}))
-		}
 	}
 }
 
@@ -1168,29 +1180,14 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 	}
 	buffer, addressedToUs := redactionBuffer(ev, c, target, replay, batch)
 	buffer = h.store.CanonicalBuffer(ctx, ev.Network, buffer, c.Fold)
-	ok, err := h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason)
-	if err != nil {
-		log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)
-		return
-	}
 	// A private NOTICE addressed to us is filed in the server buffer (see
-	// noticeTarget / replayTarget), not the sender's query — retry there so a
-	// redaction of a stored private NOTICE actually scrubs it. Live: only when
-	// the redaction was addressed to us. Replay: whenever a non-channel (query)
-	// target missed, since replayTarget files the correspondent's notice in "*"
-	// too and the REDACT's batch target is the query buffer.
-	if !ok && (addressedToUs || (replay && !c.IsChannel(target))) {
-		buffer = serverBufferTarget
-		if ok, err = h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason); err != nil {
-			log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)
-			return
-		}
-		// A replayed scrub that landed in "*": flag it so the batch close
-		// invalidates the client's cached "*" list (see histBatch.starTouched).
-		if ok && replay && batch != nil {
-			batch.starTouched = true
-		}
-	}
+	// noticeTarget / replayTarget), not the sender's query — so a redaction
+	// that misses should retry "*". Live: only when addressed to us. Replay:
+	// whenever a non-channel (query) target missed, since replayTarget files
+	// the correspondent's notice in "*" and the REDACT's batch target is the
+	// query buffer.
+	retryStar := addressedToUs || (replay && !c.IsChannel(target))
+	ok, buffer := h.scrubRedaction(ctx, ev, buffer, msgid, reason, retryStar, replay, batch)
 	if !ok || replay {
 		return
 	}
@@ -1206,6 +1203,33 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 		Network: ev.Network, Buffer: buffer, MsgID: msgid,
 		By: clampServerInfo(by), Reason: clampServerInfo(reason),
 	}))
+}
+
+// scrubRedaction marks the message deleted in the store, retrying the server
+// buffer "*" when the first attempt misses and retryStar is set (a private
+// NOTICE's redaction). Returns whether a row was scrubbed and the buffer it
+// landed in; flags the batch's starTouched when a replayed scrub hits "*".
+func (h *Hub) scrubRedaction(ctx context.Context, ev irc.Event, buffer, msgid, reason string, retryStar, replay bool, batch *histBatch) (bool, string) {
+	ok, err := h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason)
+	if err != nil {
+		log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)
+		return false, buffer
+	}
+	if ok || !retryStar {
+		return ok, buffer
+	}
+	buffer = serverBufferTarget
+	ok, err = h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason)
+	if err != nil {
+		log.Printf("irc[%s]: redact %s in %q: %v", ev.Network, msgid, buffer, err)
+		return false, buffer
+	}
+	// A replayed scrub that landed in "*": flag it so the batch close
+	// invalidates the client's cached "*" list (see histBatch.starTouched).
+	if ok && replay && batch != nil {
+		batch.starTouched = true
+	}
+	return ok, buffer
 }
 
 func eventData(m store.Message) EventData {

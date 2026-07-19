@@ -32,6 +32,25 @@ function computeWindow(geo, items, { viewTop, viewH, overscan, pinned, focusing,
 	return { start, end };
 }
 
+// centerRow scrolls so row `idx` sits centered in the viewport (used for a
+// search-jump focus).
+function centerRow(sc, geo, headerH, idx) {
+	const rowH = geo.offsetOf(idx + 1) - geo.offsetOf(idx);
+	sc.scrollTop = headerH + geo.offsetOf(idx) - (sc.clientHeight - rowH) / 2;
+}
+
+// anchorPrepended measures the k just-prepended rows (in the DOM, pre-paint)
+// and compensates scrollTop by their real height, so the previously-visible
+// content stays put with no jump instead of using the density/font-blind
+// estimate.
+function anchorPrepended(sc, geo, items, rowEls, k) {
+	for (let i = 0; i < k; i++) {
+		const node = rowEls.get(items[i].id);
+		if (node) geo.measure(items[i].id, node.offsetHeight);
+	}
+	sc.scrollTop += geo.offsetOf(k);
+}
+
 // VirtualList: windowed rendering for the message list. Only the rows
 // intersecting the viewport (plus `overscan` px each side) exist in the
 // DOM; spacer divs stand in for everything else, so 50k+ loaded messages
@@ -190,30 +209,16 @@ export function VirtualList({
 		const sc = scroller.current;
 		if (!sc) return;
 		if (pendingFocus.current && focusIdx !== -1) {
-			// Center the target row in the viewport. A focus jump replaces the
-			// window wholesale, so discard any prepend detected in the same
-			// commit — otherwise it fires on the next commit and scrolls the
-			// view off the focused row.
+			// A focus jump replaces the window wholesale, so discard any prepend
+			// detected in the same commit — otherwise it fires on the next commit
+			// and scrolls the view off the focused row.
 			pendingPrepend.current = 0;
-			const hh = headerEl.current?.offsetHeight || 0;
-			const rowH = geo.offsetOf(focusIdx + 1) - geo.offsetOf(focusIdx);
-			sc.scrollTop = hh + geo.offsetOf(focusIdx) - (sc.clientHeight - rowH) / 2;
+			centerRow(sc, geo, headerEl.current?.offsetHeight || 0, focusIdx);
 			pendingFocus.current = false;
 			return;
 		}
 		if (pendingPrepend.current > 0) {
-			// Measure the just-prepended rows NOW (they're in the DOM, before
-			// paint — the render above forced the whole page into the window)
-			// so the anchor compensation uses real heights instead of the
-			// density/font-blind estimate. This keeps offsetOf(k) exact, so
-			// the previously-visible content stays put with no visible jump;
-			// the ResizeObserver later re-measures to the same value (a no-op).
-			const kk = pendingPrepend.current;
-			for (let i = 0; i < kk; i++) {
-				const node = rowEls.current.get(items[i].id);
-				if (node) geo.measure(items[i].id, node.offsetHeight);
-			}
-			sc.scrollTop += geo.offsetOf(kk);
+			anchorPrepended(sc, geo, items, rowEls.current, pendingPrepend.current);
 			pendingPrepend.current = 0;
 		}
 		if (pinned.current && appended) {

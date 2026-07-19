@@ -218,7 +218,7 @@ export function mentionsMe(text, nick) {
 // carrying a control byte fails the preview endpoint's url.Parse (silently no
 // preview) and the image fast-path; inside Body, linkify sees per-run text that
 // parseFormatting already stripped, so it is unaffected either way.
-const URL_RE = /https?:\/\/[^\s<>"'`\x00-\x1f]+/g;
+const URL_RE = /https?:\/\/[^\s<>"'`\x00-\x08\x0e-\x1f]+/g;
 export function linkify(text) {
 	const out = [];
 	let last = 0;
@@ -378,8 +378,13 @@ export function stripFormatting(text) {
 	// it, mirroring parseIndexedColor: a bare "\x03,5" is a colour reset plus
 	// the literal ",5", so strip must leave ",5" or mention detection diverges
 	// from what the body renders.
+	// Three disjoint-by-lead-byte passes (indexed colour, hex colour, then the
+	// bare attribute bytes). Splitting the two colour forms keeps each regex
+	// simple; the passes can't interact since removing one lead byte's code
+	// never forms another's.
 	return text
-		.replace(/\x03(?:\d{1,2}(?:,\d{1,2})?)?|\x04(?:[0-9a-fA-F]{6}(?:,[0-9a-fA-F]{6})?)?/g, "")
+		.replace(/\x03(?:\d{1,2}(?:,\d{1,2})?)?/g, "")
+		.replace(/\x04(?:[0-9a-fA-F]{6}(?:,[0-9a-fA-F]{6})?)?/g, "")
 		.replace(/[\x02\x0f\x11\x16\x1d\x1e\x1f]/g, "");
 }
 
@@ -404,7 +409,7 @@ const NICK_SPLIT_RE = /([\w\-[\]\\{}|^`~]+)/;
 // nick ("bob" inside "bobby" stays plain). Returns [{nick, text}] where nick
 // is the canonical nick (null for plain text) and text is the text as typed.
 export function highlightNicks(text, nickMap) {
-	if (!nickMap || nickMap.size === 0) return [{ nick: null, text }];
+	if (!nickMap?.size) return [{ nick: null, text }];
 	const parts = text.split(NICK_SPLIT_RE);
 	const out = [];
 	const pushPlain = (t) => {

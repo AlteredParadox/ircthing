@@ -1363,55 +1363,57 @@ func (m *Manager) trackJoinIntent(in *ircv4.Message) error {
 	}
 	switch in.Command {
 	case "JOIN":
-		// Clone: Param substrings alias the whole parsed line's backing
-		// array, so storing even a 2-byte name in the persistent rejoin map
-		// would pin the full (up to 64 KiB) line — 4096 padded self-JOINs
-		// could pin ~256 MiB. rejoinable bounds the name itself; the clone
-		// detaches it from the line.
-		ch := strings.Clone(in.Param(0))
-		// Only store a channel we could actually rejoin: a spoofed
-		// self-JOIN with framing bytes or an over-length name would
-		// otherwise poison the never-reset rejoin set, and since the
-		// rejoin JOIN bypasses sendAll and hits the writer's FATAL
-		// length/framing guard, it would brick the network on every
-		// reconnect. Validate against the registration-time line limit
-		// (isup is reset before rejoin, so lineLen is the default there).
-		if ch == "" || !m.isup.IsChannel(ch) || !m.rejoinable(ch) {
-			return nil
-		}
-		if _, known := m.joined[ch]; !known && len(m.joined) >= maxJoinedChannels {
-			return fmt.Errorf("irc: joined-channel set exceeded %d", maxJoinedChannels)
-		}
-		m.joined[ch] = ch
-		// A fresh self-JOIN invalidates any prior NAMES fetch: under
-		// no-implicit-names the server sends no membership on JOIN, so
-		// after a part/rejoin (or a forward/cycle) EnsureNames must
-		// re-request when the channel is next viewed — otherwise the
-		// roster is stuck with only ourselves.
-		m.namesMu.Lock()
-		delete(m.namesReq, m.isup.Fold(ch))
-		m.namesMu.Unlock()
+		return m.rememberJoinIntent(strings.Clone(in.Param(0)))
 	case "PART":
-		// Remove by the network's casemapping so a PART in any equivalent
-		// casing clears the rejoin intent. PART carries a comma-list of
-		// channels (RFC 2812 §3.2.2); clear every one, or a multi-channel
-		// self-PART would leave the un-cleared channels to rejoin on the
-		// next reconnect against the user's intent. Fold each part ONCE into a
-		// set, then fold each joined key once — O(parts+joined), not the
-		// O(parts×joined) double-fold a nested loop would do (a spoofed
-		// self-PART with thousands of comma channels is otherwise a fold bomb,
-		// the same class the QUIT handler guards).
-		parted := make(map[string]bool)
-		for _, part := range strings.Split(in.Param(0), ",") {
-			parted[m.isup.Fold(part)] = true
-		}
-		for key := range m.joined {
-			if parted[m.isup.Fold(key)] {
-				delete(m.joined, key)
-			}
-		}
+		m.forgetJoinIntent(in.Param(0))
 	}
 	return nil
+}
+
+// rememberJoinIntent records our own self-JOIN so the channel is rejoined
+// after a reconnect. ch is already detached from the parsed line (clone: Param
+// substrings alias the whole ~64 KiB line's backing array, so 4096 padded
+// self-JOINs could pin ~256 MiB). Only a channel we could actually rejoin is
+// stored: a spoofed self-JOIN with framing bytes or an over-length name would
+// otherwise poison the never-reset rejoin set and, since the rejoin JOIN
+// bypasses sendAll and hits the writer's FATAL length/framing guard, brick the
+// network on every reconnect (validated against the default line limit, since
+// isup is reset before rejoin). The set is bounded against a self-JOIN flood.
+func (m *Manager) rememberJoinIntent(ch string) error {
+	if ch == "" || !m.isup.IsChannel(ch) || !m.rejoinable(ch) {
+		return nil
+	}
+	if _, known := m.joined[ch]; !known && len(m.joined) >= maxJoinedChannels {
+		return fmt.Errorf("irc: joined-channel set exceeded %d", maxJoinedChannels)
+	}
+	m.joined[ch] = ch
+	// A fresh self-JOIN invalidates any prior NAMES fetch: under
+	// no-implicit-names the server sends no membership on JOIN, so after a
+	// part/rejoin (or a forward/cycle) EnsureNames must re-request when the
+	// channel is next viewed — otherwise the roster is stuck with only us.
+	m.namesMu.Lock()
+	delete(m.namesReq, m.isup.Fold(ch))
+	m.namesMu.Unlock()
+	return nil
+}
+
+// forgetJoinIntent clears the rejoin intent for our own PART. PART carries a
+// comma-list of channels (RFC 2812 §3.2.2); clear every one, or a multi-channel
+// self-PART leaves the un-cleared channels to rejoin on the next reconnect
+// against the user's intent. Fold each part ONCE into a set, then fold each
+// joined key once — O(parts+joined), not the O(parts×joined) double-fold a
+// nested loop would do (a spoofed self-PART with thousands of comma channels is
+// otherwise a fold bomb, the class the QUIT handler guards).
+func (m *Manager) forgetJoinIntent(list string) {
+	parted := make(map[string]bool)
+	for _, part := range strings.Split(list, ",") {
+		parted[m.isup.Fold(part)] = true
+	}
+	for key := range m.joined {
+		if parted[m.isup.Fold(key)] {
+			delete(m.joined, key)
+		}
+	}
 }
 
 // maxJoinedChannels bounds the rejoin-intent set (see trackJoinIntent).
