@@ -33,7 +33,3 @@ web/node_modules/
 # Python bytecode (irctest controller)
 __pycache__/
 *.py[cod]
-
-# Design-tool generated runtime (external, unlicensed) — mockup reference only,
-# never built or shipped. Kept locally so design/*.dc.html renders; not published.
-design/support.js
