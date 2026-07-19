@@ -228,7 +228,11 @@ func (h *Hub) handleControlNumeric(ctx context.Context, c Conn, ev irc.Event) bo
 	switch ev.Msg.Command {
 	case "FAIL", "WARN", "NOTE":
 		if ev.Msg.Command == "FAIL" {
-			log.Printf("irc[%s]: server failure: %s", ev.Network, ev.Msg.String())
+			// %q + clamp: the line is server-controlled — raw %s would let a
+			// hostile server drive terminal escape sequences and ~64 KiB lines
+			// into the log (the client-facing broadcast below is already
+			// clamped; the log must be too).
+			log.Printf("irc[%s]: server failure: %q", ev.Network, clampServerInfo(ev.Msg.String()))
 		}
 		if txt := strings.TrimSpace(strings.Join(ev.Msg.Params, " ")); txt != "" {
 			h.broadcast(envelope("server_info", 0, ServerInfoData{
@@ -244,7 +248,7 @@ func (h *Hub) handleControlNumeric(ctx context.Context, c Conn, ev irc.Event) bo
 		h.updatePresence(ctx, c, ev.Network, ev.Msg, false)
 		return true
 	case "734": // ERR_MONLISTFULL
-		log.Printf("irc[%s]: MONITOR list full: %s", ev.Network, ev.Msg.Trailing())
+		log.Printf("irc[%s]: MONITOR list full: %q", ev.Network, clampServerInfo(ev.Msg.Trailing()))
 		return true
 	case "732", "733": // RPL_MONLIST / end — the store is our source of truth
 		return true
@@ -422,9 +426,15 @@ func (h *Hub) persistAutojoin(ctx context.Context, c Conn, ev irc.Event) {
 		}
 		// A spoofed self-JOIN for a name carrying framing bytes would make
 		// netconf.Validate fail on every restart (bricking the network); never
-		// persist one. A PART (remove) is always allowed, so an already-stored
-		// bad entry can still be cleared.
-		if add && strings.ContainsAny(ch, " \r\n\x00") {
+		// persist one. Invalid UTF-8 is just as poisonous, differently:
+		// json.Marshal coerces it to U+FFFD (3 bytes per bad byte), so the
+		// STORED spelling silently diverges from the live one — restart joins
+		// a mojibake channel, dedup misses forever (one duplicate entry per
+		// echo), and a near-cap name can inflate past the registration-line
+		// validator, putting the network into skip-on-startup. A PART (remove)
+		// is always allowed, so an already-stored bad entry can still be
+		// cleared.
+		if add && (strings.ContainsAny(ch, " \r\n\x00") || !utf8.ValidString(ch)) {
 			continue
 		}
 		chans = append(chans, ch)
@@ -955,9 +965,11 @@ func applyWhois(w *WhoisData, m *ircv4.Message) {
 		w.Signon = atoiOr0(m.Param(3))
 	case "319": // :<prefixed channels> — a heavily-joined user's list spans
 		// MULTIPLE 319 replies; APPEND (bounded) rather than overwrite, or only
-		// the last chunk survives. The concat is a fresh allocation (detached);
-		// clampServerInfo bounds the running total to maxServerInfoBytes.
-		w.Channels = clampServerInfo(strings.TrimSpace(w.Channels + " " + m.Trailing()))
+		// the last chunk survives. clampDetach, not clampServerInfo: when the
+		// clamp truncates, a plain slice would share the oversized concat's
+		// backing array — up to ~66 KiB pinned per card (64 cards max) until
+		// the 318 flush a hostile server can simply withhold.
+		w.Channels = clampDetach(strings.TrimSpace(w.Channels + " " + m.Trailing()))
 	case "330": // <me> <nick> <account> :is logged in as
 		w.Account = clampDetach(m.Param(2))
 	case "335": // is a bot
@@ -1349,6 +1361,16 @@ func (h *Hub) persistMembership(ctx context.Context, c Conn, ev irc.Event, repla
 	}
 }
 
+// maxMembershipFanout caps how many buffers one QUIT/NICK line is persisted
+// and broadcast into. The roster tolerates up to 4096 channels per nick, so a
+// hostile server that first stuffs our roster can otherwise turn every 20-byte
+// NICK line into 4096 serialized DB inserts + 4096 client pushes, repeatably
+// (alternating NICK a<->b preserves membership). 512 is far beyond any real
+// shared-channel count; past it, the roster still updates every channel —
+// only the scrollback system lines in the excess channels are skipped
+// (logged, never silent).
+const maxMembershipFanout = 512
+
 // membershipTargets collects the buffers a QUIT/NICK line lands in: the
 // replay batch's channel, or — live — the shared channels the manager
 // captured plus any open query buffer with that nick.
@@ -1360,6 +1382,13 @@ func (h *Hub) membershipTargets(ctx context.Context, ev irc.Event, replay bool, 
 		return nil
 	}
 	targets := ev.Affected
+	if len(targets) > maxMembershipFanout {
+		log.Printf("irc[%s]: %s affects %d channels; persisting the system line to the first %d only",
+			ev.Network, ev.Msg.Command, len(targets), maxMembershipFanout)
+		// Full-slice expression: the append below must reallocate rather than
+		// write into ev.Affected's spare capacity.
+		targets = targets[:maxMembershipFanout:maxMembershipFanout]
+	}
 	if ev.Msg.Prefix != nil {
 		if name, ok, err := h.store.FindBuffer(ctx, ev.Network, ev.Msg.Prefix.Name, fold); err == nil && ok {
 			targets = append(targets, name)

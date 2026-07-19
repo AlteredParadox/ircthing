@@ -177,6 +177,55 @@ func TestHotRingByteBudgetLRU(t *testing.T) {
 	}
 }
 
+// Cold warm-up must STREAM with a byte budget: it stops scanning as soon as the
+// accumulated rows reach maxRingBytes, leaving the ring INCOMPLETE (reads fall
+// back to disk) rather than materializing a possibly-enormous history up front.
+// Without this, a large configured ring_size against a full buffer allocates the
+// whole result slice transiently — the finding-5 OOM path.
+func TestWarmRingScanStopsAtByteBudget(t *testing.T) {
+	s, _ := openTest(t, 10_000) // ring_size well above the byte-derived cap
+	const rows = 100
+	for i := 1; i <= rows; i++ {
+		if _, err := s.Append(ctx, "net", "#c", Message{
+			Time: time.UnixMilli(int64(i) * 1000), Sender: "a", Command: "PRIVMSG",
+			Raw: strings.Repeat("x", 1000), // ~1.1 KiB per row
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bufID, err := s.bufferID(ctx, "net", "#c", false)
+	if err != nil || bufID == 0 {
+		t.Fatalf("bufferID: %v", err)
+	}
+	// Evict the hot ring so the next read cold-warms from disk under a tiny budget.
+	s.mu.Lock()
+	s.ringBytes -= int64(s.rings[bufID].bytes)
+	delete(s.rings, bufID)
+	s.maxRingBytes = 8192 // only a handful of ~1.1 KiB rows fit
+	s.mu.Unlock()
+
+	if _, err := s.Latest(ctx, "net", "#c", 10); err != nil { // triggers warm-up
+		t.Fatal(err)
+	}
+
+	s.mu.Lock()
+	r := s.rings[bufID]
+	complete, held := r.complete, len(r.msgs)
+	s.mu.Unlock()
+	if complete {
+		t.Fatal("warm ring marked complete despite the byte-budget cutting the scan short")
+	}
+	if held >= rows {
+		t.Fatalf("warm ring holds %d rows; the byte budget should cap it well under %d", held, rows)
+	}
+	// And the newest message is still served correctly (from disk where the ring
+	// can't reach), proving the incomplete-ring fallback works.
+	got, err := s.Latest(ctx, "net", "#c", 5)
+	if err != nil || len(got) != 5 || got[len(got)-1].Raw != strings.Repeat("x", 1000) {
+		t.Fatalf("Latest after budgeted warm-up: n=%d err=%v", len(got), err)
+	}
+}
+
 // Redaction and retention must decrease the tracked total (they free bytes),
 // keeping s.ringBytes non-negative and in step.
 func TestHotRingBytesShrinkOnRedactAndRetention(t *testing.T) {

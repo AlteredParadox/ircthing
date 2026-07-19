@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -134,6 +135,35 @@ func loadConfig(path string) (*config, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &cfg, nil
+}
+
+// proxyConfigWarning flags a behind_proxy setting that disagrees with the
+// listen address — the two are coupled, and either mismatch is a real security
+// footgun, so we warn at startup rather than silently do the wrong thing.
+// Returns "" when the pairing is sensible.
+//
+//   - loopback listen + behind_proxy=false: a loopback bind is almost always
+//     fronted by a reverse proxy, so every request arrives from the proxy's IP
+//     and the login backoff keys on ONE shared identity — one attacker locks
+//     out every user. Set behind_proxy=true so it keys on X-Forwarded-For.
+//   - public listen + behind_proxy=true: trusting X-Forwarded-For on a directly
+//     reachable socket lets a client spoof that header to rotate identities and
+//     evade the login backoff entirely. Set behind_proxy=false, or bind to
+//     loopback behind a proxy that overwrites the header.
+func (c *config) proxyConfigWarning() string {
+	host, _, err := net.SplitHostPort(c.Listen)
+	if err != nil {
+		return ""
+	}
+	ip := net.ParseIP(host)
+	loopback := ip != nil && ip.IsLoopback()
+	switch {
+	case loopback && !c.BehindProxy:
+		return "behind_proxy is false but listen is loopback (" + c.Listen + "): if a reverse proxy fronts this, all clients share the proxy's IP for login rate-limiting — one attacker can lock everyone out. Set behind_proxy=true when behind a trusted proxy."
+	case !loopback && c.BehindProxy:
+		return "behind_proxy is true but listen is a public address (" + c.Listen + "): a client reaching this socket directly can spoof X-Forwarded-For to evade the login backoff. Set behind_proxy=false unless a proxy overwrites that header."
+	}
+	return ""
 }
 
 // Conservative upper bounds on numeric knobs. These sit far below the points

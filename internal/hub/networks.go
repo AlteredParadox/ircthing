@@ -394,7 +394,13 @@ func (s *Session) handleJoinChannel(ctx context.Context, env Envelope, join bool
 		s.push(errEnvelope(env.Seq, "bad_request", "need a network and a channel"))
 		return
 	}
-	if strings.ContainsAny(d.Channel, " ,\r\n") {
+	// Length-clamp to the same bound the persisted path enforces
+	// (maxPersistedChannelLen): Send validates only against the LIVE line
+	// limit, which a server may raise via ISUPPORT LINELEN — so without this,
+	// a >505-byte channel could be joined AND persisted here, then fail the
+	// 512-byte registration-line validator on every restart (network skipped
+	// until manually edited). Real CHANNELLEN is tens of bytes.
+	if strings.ContainsAny(d.Channel, " ,\r\n") || len(d.Channel) > maxPersistedChannelLen {
 		s.push(errEnvelope(env.Seq, "bad_request", "invalid channel name"))
 		return
 	}

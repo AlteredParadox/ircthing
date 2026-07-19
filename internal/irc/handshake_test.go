@@ -319,6 +319,17 @@ func TestHandshake(t *testing.T) {
 			},
 			wantNick: "AlteredParadoxtruncated",
 		},
+		{
+			// A hostile server assigning a huge nick fails registration (fail
+			// closed) rather than retaining it — the stored nick is folded on
+			// nearly every later line, so a ~64 KiB one is an allocation amplifier.
+			name: "001 with an over-cap nick fails registration",
+			cfg:  baseCfg,
+			steps: []step{
+				{in: "CAP * LS :example/none", want: []string{"CAP END"}},
+				{in: ":irc.test 001 " + strings.Repeat("n", 513) + " :Welcome", errSub: "cap"},
+			},
+		},
 	}
 
 	for _, tc := range cases {

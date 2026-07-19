@@ -960,30 +960,30 @@ func (s *Store) bufferAndRing(ctx context.Context, network, target string, creat
 		return bufID, r, nil
 	}
 	// Warm with the newest ringSize+1 rows: getting fewer than requested proves
-	// the ring now holds the buffer's entire history. Cap the fetch at what the
-	// byte budget could ever retain (maxRingBytes/msgOverhead rows, at the
-	// 128-byte per-message floor) so a very large configured ring_size can't
-	// materialize millions of rows here only for evictRings/trimToBytes to drop
-	// them a moment later.
+	// the ring now holds the buffer's entire history. The scan STREAMS with a
+	// byte budget (warmRingScan) — it stops as soon as the accumulated rows
+	// reach maxRingBytes — so a very large configured ring_size against a
+	// buffer full of near-clamp (16 KiB) messages cannot transiently
+	// materialize hundreds of MiB here only for evictRings/trimToBytes to
+	// drop them a moment later. The row cap (byte budget over the 128-byte
+	// per-message floor) additionally bounds the LIMIT for SQLite's sake.
 	warmLimit := s.ringSize + 1
 	if byteCap := s.maxRingBytes/msgOverhead + 1; byteCap < warmLimit {
 		warmLimit = byteCap
 	}
-	msgs, err := s.queryPage(ctx, network, target,
-		`SELECT id, ts, msgid, sender, command, raw, redacted, COALESCE(redact_reason,'') FROM messages
-		 WHERE buffer_id = ? ORDER BY ts DESC, id DESC LIMIT ?`,
-		bufID, warmLimit)
+	msgs, budgetStopped, err := s.warmRingScan(ctx, network, target, bufID, warmLimit)
 	if err != nil {
 		return 0, nil, err
 	}
 	reverse(msgs)
 	r := newRing(s.ringSize)
 	switch {
-	case len(msgs) < warmLimit:
-		// Disk returned fewer than requested: the ring holds all history.
+	case len(msgs) < warmLimit && !budgetStopped:
+		// Disk returned fewer than requested (and not because the byte budget
+		// cut the scan short): the ring holds all history.
 		r.complete = true
 	case len(msgs) > s.ringSize:
-		// Over-fetched the +1 sentinel (only when the byte cap didn't bind);
+		// Over-fetched the +1 sentinel (only when no byte bound was hit);
 		// drop the oldest so the ring holds exactly the newest ringSize.
 		msgs = msgs[1:]
 	}
@@ -995,6 +995,46 @@ func (s *Store) bufferAndRing(ctx context.Context, network, target string, creat
 	s.touchRing(r)
 	s.evictRings(bufID) // a full warm can add up to one ring's worth at once
 	return bufID, r, nil
+}
+
+// warmRingScan reads the newest rows of a buffer for ring warm-up, newest
+// first, stopping EARLY once the accumulated msgBytes reach the global ring
+// byte budget — the transient allocation is bounded by ~maxRingBytes no
+// matter how large the configured ring_size or the stored messages are.
+// budgetStopped reports an early stop, which the caller must treat as "history
+// continues past what we hold" (the ring is NOT complete).
+func (s *Store) warmRingScan(ctx context.Context, network, target string, bufID int64, limit int) (msgs []Message, budgetStopped bool, err error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, ts, msgid, sender, command, raw, redacted, COALESCE(redact_reason,'') FROM messages
+		 WHERE buffer_id = ? ORDER BY ts DESC, id DESC LIMIT ?`,
+		bufID, limit)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	var bytes int
+	for rows.Next() {
+		var (
+			m        Message
+			ts       int64
+			msgid    sql.NullString
+			redacted int
+			reason   string
+		)
+		if err := rows.Scan(&m.ID, &ts, &msgid, &m.Sender, &m.Command, &m.Raw, &redacted, &reason); err != nil {
+			return nil, false, err
+		}
+		m.Time = time.UnixMilli(ts)
+		m.MsgID = msgid.String
+		m.Redacted = redacted != 0
+		m.RedactReason = reason
+		m.Network, m.Target = network, target
+		msgs = append(msgs, m)
+		if bytes += msgBytes(m); bytes >= s.maxRingBytes {
+			return msgs, true, rows.Err()
+		}
+	}
+	return msgs, false, rows.Err()
 }
 
 func (s *Store) queryPage(ctx context.Context, network, target, query string, args ...any) ([]Message, error) {

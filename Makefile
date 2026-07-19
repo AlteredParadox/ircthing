@@ -21,9 +21,22 @@ ESBUILD_FLAGS := --bundle --minify --format=esm \
 	--jsx=automatic --jsx-import-source=preact \
 	--target=es2020
 
-.PHONY: build build-debug frontend check vet staticcheck test binary-size-gate bundle-size-gate integration irctest memcheck clean
+.PHONY: build build-debug frontend check vet staticcheck test binary-size-gate bundle-size-gate go-version-gate integration irctest memcheck clean
 
-build: frontend
+# The go.mod toolchain directive is the minimum Go patch level a release may
+# be built with (stdlib CVE fixes ship in patch releases; an older toolchain
+# reintroduces them into the binary). GOTOOLCHAIN=auto honors the directive
+# automatically — this gate catches GOTOOLCHAIN=local overrides and stale
+# system toolchains so a vulnerable build fails loudly instead of shipping.
+go-version-gate:
+	@want=$$(awk '/^toolchain /{print $$2}' go.mod); \
+	got=$$($(GO) env GOVERSION); \
+	if [ -n "$$want" ] && [ "$$(printf '%s\n' "$$want" "$$got" | sort -V | head -1)" != "$$want" ]; then \
+		echo "FAIL: building with $$got, but go.mod requires >= $$want"; \
+		exit 1; \
+	fi
+
+build: go-version-gate frontend
 	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN) ./cmd/ircd-web
 
 # Unstripped, race-enabled binary for debugging with delve. Never

@@ -40,6 +40,7 @@ import (
 	"github.com/coder/websocket"
 	"golang.org/x/crypto/bcrypt"
 
+	"ircthing"
 	"ircthing/internal/hub"
 )
 
@@ -196,10 +197,15 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		tunnelHTMLByNet:  make(map[string]*fetcher),
 		tunnelImageByNet: make(map[string]*fetcher),
 		previewCache:     newTTLCache[PreviewData](30*time.Minute, 512),
-		thumbCache:       newTTLCache[thumbResult](24*time.Hour, maxThumbCache),
-		mediaSem:         make(chan struct{}, mediaSlots),
-		login:            newLoginLimiter(),
-		tokens:           make(map[string]time.Time),
+		// 30 min, matching the preview cache: a thumbnail is the longest-lived
+		// server-side copy of a message's media, and redaction doesn't purge it
+		// (keys are (net,url), shared across messages), so a shorter TTL bounds
+		// how long a redacted image's thumbnail can linger. Thumbnails are cheap
+		// to refetch; the previous 24 h only saved re-decode work.
+		thumbCache: newTTLCache[thumbResult](30*time.Minute, maxThumbCache),
+		mediaSem:   make(chan struct{}, mediaSlots),
+		login:      newLoginLimiter(),
+		tokens:     make(map[string]time.Time),
 	}
 	s.sessionTTL.Store(int64(loadSessionTTL(context.Background(), h.Store(), cfg)))
 	initHash, err := loadPasswordHash(context.Background(), h.Store(), cfg)
@@ -223,10 +229,23 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 	// signed params). sameSiteOnly still guards them.
 	s.mux.HandleFunc("POST /api/preview", s.sameSiteOnly(s.requireAuth(s.handlePreview)))
 	s.mux.HandleFunc("POST /api/thumb", s.sameSiteOnly(s.requireAuth(s.handleThumb)))
+	// Legal texts are deliberately UNauthenticated: the AGPL §13 source offer
+	// and the bundled third-party notices must reach every network user, not
+	// just logged-in ones. Read-only, embedded at build time.
+	s.mux.HandleFunc("GET /license", serveText(ircthing.License))
+	s.mux.HandleFunc("GET /third-party-licenses", serveText(ircthing.ThirdPartyLicenses))
 	if assets != nil {
 		s.mux.Handle("/", http.FileServerFS(assets))
 	}
 	return s, nil
+}
+
+// serveText serves a static embedded text (license notices) as plain UTF-8.
+func serveText(body []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write(body)
+	}
 }
 
 // handleClientConfig returns the server-set switches the frontend needs at

@@ -277,7 +277,14 @@ func (h *handshake) handleWelcome(m *ircv4.Message) (out []*ircv4.Message, done 
 	// 001's first param is the nick the server knows us by — authoritative if
 	// it truncated or otherwise changed ours. Clone: it aliases the parsed
 	// welcome line and is retained in m.nick for the connection's life.
+	// An over-cap nick fails registration (fail closed, normal backoff): the
+	// retained nick is folded on nearly every later line, so accepting a huge
+	// one sets up an allocation amplifier — and truncating it would break
+	// own-message classification (see maxAuthoritativeNickBytes).
 	if p := m.Param(0); p != "" && p != "*" {
+		if len(p) > maxAuthoritativeNickBytes {
+			return nil, false, fmt.Errorf("server assigned a %d-byte nick (cap %d)", len(p), maxAuthoritativeNickBytes)
+		}
 		h.nick = strings.Clone(p)
 	}
 	return nil, true, nil

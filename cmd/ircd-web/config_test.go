@@ -182,6 +182,41 @@ func TestExampleConfigParses(t *testing.T) {
 	if _, err := loadConfig("../../config.example.json"); err != nil {
 		t.Fatalf("config.example.json: %v", err)
 	}
+	// And its behind_proxy must agree with its loopback listen (no warning), or
+	// a copy-paste operator inherits a rate-limit footgun.
+	cfg, err := loadConfig("../../config.example.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := cfg.proxyConfigWarning(); w != "" {
+		t.Fatalf("example config warns: %q", w)
+	}
+}
+
+func TestProxyConfigWarning(t *testing.T) {
+	cases := []struct {
+		name   string
+		listen string
+		behind bool
+		warn   bool
+	}{
+		{"loopback fronted by proxy", "127.0.0.1:8067", true, false},
+		{"loopback but not behind proxy (shared-lockout risk)", "127.0.0.1:8067", false, true},
+		{"ipv6 loopback direct", "[::1]:8067", false, true},
+		{"public direct", "0.0.0.0:8067", false, false},
+		{"public trusting XFF (spoofable)", "0.0.0.0:8067", true, true},
+		{"public host trusting XFF", "203.0.113.9:8067", true, true},
+		{"malformed listen is not flagged", "not-an-addr", true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &config{Listen: tc.listen, BehindProxy: tc.behind}
+			got := c.proxyConfigWarning() != ""
+			if got != tc.warn {
+				t.Fatalf("warn = %v, want %v (msg: %q)", got, tc.warn, c.proxyConfigWarning())
+			}
+		})
+	}
 }
 
 func TestResolveConfigPath(t *testing.T) {

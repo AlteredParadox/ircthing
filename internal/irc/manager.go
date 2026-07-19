@@ -1287,9 +1287,15 @@ func (m *Manager) onLiveLine(in *ircv4.Message, send func([]*ircv4.Message) erro
 		return nil, err
 	}
 	// Track our own nick changes, compared under the server's
-	// casemapping.
+	// casemapping. An over-cap "rename" is a protocol violation from a
+	// hostile/broken server: fail closed (tear the connection down) rather
+	// than ignore it — ignoring would leave our stored nick disagreeing with
+	// the server's, and truncating would do the same (see the constant).
 	if in.Command == "NICK" && in.Prefix != nil && m.isup.FoldEqual(in.Prefix.Name, m.Nick()) {
 		if n := in.Param(0); n != "" {
+			if len(n) > maxAuthoritativeNickBytes {
+				return affected, fmt.Errorf("irc: server set a %d-byte nick (cap %d)", len(n), maxAuthoritativeNickBytes)
+			}
 			m.nick.Store(strings.Clone(n)) // detach from the parsed line (retained)
 		}
 	}
@@ -1454,6 +1460,17 @@ const maxJoinedChannels = 4096
 // hostile server can't grow those count-capped maps with near-64 KiB keys
 // (4096 × ~64 KiB ≈ 256 MiB). Matches maxRosterField, the roster's clamp.
 const maxChannelNameBytes = maxRosterField
+
+// maxAuthoritativeNickBytes caps the server-assigned nick we RETAIN (001's
+// param, self-NICK). The stored nick is folded on nearly every incoming line
+// (own-echo checks, CTCP auto-reply, persistAutojoin), so a hostile server
+// that first raises LINELEN and then "renames" us to a ~64 KiB nick would turn
+// each small message into hundreds of KiB of fold allocations. Real nicks are
+// bounded by NICKLEN (tens of bytes); 512 is generous beyond any server.
+// Fail CLOSED on violation — never truncate: a truncated stored nick would
+// disagree with the prefixes the server keeps sending, silently breaking
+// own-message classification everywhere.
+const maxAuthoritativeNickBytes = maxRosterField
 
 // redactRaw prepares one raw IRC line for the debug log with credentials
 // removed: the PASS parameter (server password) and any non-control

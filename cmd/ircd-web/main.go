@@ -117,6 +117,9 @@ func run(cfg *config) error {
 	if days, maxPer := st.Retention(); days == 0 && maxPer == 0 {
 		log.Print("retention: disabled (retention_days and retention_max_messages both 0) — stored history grows without bound; set a limit or place the database on a quota'd filesystem")
 	}
+	if w := cfg.proxyConfigWarning(); w != "" {
+		log.Print("config: " + w)
+	}
 
 	h := hub.New(st)
 
