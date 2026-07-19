@@ -6,10 +6,18 @@ name: sonarqube
 on:
   push:
 
+# Least privilege: read-only. This job hands SONAR_TOKEN to a third-party
+# action, so pinning that action (and the others) to a full commit SHA is
+# especially advisable before trusting it — see the NOTE below.
+permissions:
+  contents: read
+
 jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
+      # NOTE: pin these to full commit SHAs (esp. sonarqube-scan-action, which
+      # receives SONAR_TOKEN) so a retagged action can't exfiltrate the secret.
       - uses: actions/checkout@v4
         with:
           # Full history: SonarQube needs blame data for new-code periods.

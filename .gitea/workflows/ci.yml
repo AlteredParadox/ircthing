@@ -14,10 +14,17 @@ on:
   push:
   pull_request:
 
+# Least privilege: this job only reads the repo (no releases, no PR writes).
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+      # NOTE: actions are on mutable major-version tags for readability. Before
+      # relying on this in an untrusted-runner setting, pin each to a full commit
+      # SHA (e.g. actions/checkout@<sha> # v4) so a retagged action can't change.
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5

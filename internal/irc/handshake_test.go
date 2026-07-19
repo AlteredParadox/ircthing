@@ -315,9 +315,9 @@ func TestHandshake(t *testing.T) {
 			cfg:  baseCfg,
 			steps: []step{
 				{in: "CAP * LS :example/none", want: []string{"CAP END"}},
-				{in: ":irc.test 001 AlteredParadoxtruncated :Welcome", done: true},
+				{in: ":irc.test 001 AlteredP :Welcome", done: true},
 			},
-			wantNick: "AlteredParadoxtruncated",
+			wantNick: "AlteredP",
 		},
 		{
 			// A hostile server assigning a huge nick fails registration (fail

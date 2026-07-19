@@ -99,18 +99,20 @@ function Body({ text, nicks, theme, onNick }) {
 	const budget = { n: MAX_BODY_NODES }; // shared across every run/line/segment
 	const out = [];
 	let ri = 0;
-	for (; ri < runs.length && budget.n > 0; ri++) {
+	for (; ri < runs.length; ri++) {
+		if (budget.n <= 0) break; // leave ri ON the unrendered run (see below)
 		const run = runs[ri];
 		const inner = [];
 		const lines = run.text.split("\n");
-		for (let pi = 0; pi < lines.length && budget.n > 0; pi++) {
+		let truncated = false;
+		for (let pi = 0; pi < lines.length && !truncated; pi++) {
 			if (pi > 0) {
+				if (budget.n <= 0) { truncated = true; break; }
 				inner.push(<br key={ri + "-br-" + pi} />);
 				budget.n--;
-				if (budget.n <= 0) break;
 			}
 			for (const [si, seg] of linkify(lines[pi]).entries()) {
-				if (budget.n <= 0) break;
+				if (budget.n <= 0) { truncated = true; break; }
 				const kp = ri + "-" + pi + "-" + si;
 				if (seg.link) {
 					inner.push(<a key={kp} href={seg.text} target="_blank" rel="noopener noreferrer">{seg.text}</a>);
@@ -120,11 +122,15 @@ function Body({ text, nicks, theme, onNick }) {
 				}
 			}
 		}
+		// If the budget ran out mid-run, DON'T push the partial styled run and
+		// DON'T advance ri: the plain-text tail below re-includes this whole run
+		// (unstyled but complete), so no text is dropped and nothing duplicates.
+		if (truncated) break;
 		out.push(fmtWrap(run, inner, ri));
 	}
 	if (ri < runs.length) {
 		// Node budget spent by an adversarial body: everything still unprocessed
-		// renders as ONE plain, unstyled text node (no <br>/link/highlight).
+		// (including the run we broke out of) renders as ONE plain text node.
 		out.push(runs.slice(ri).map((r) => r.text).join(""));
 	}
 	return out;

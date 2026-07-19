@@ -157,6 +157,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	// leave the UI showing a value the server never accepted.
 	const retentionSaved = useRef(null);
 	const sessionSaved = useRef(null);
+	const previewsSaved = useRef(null);
 
 	useEffect(() => {
 		const onKey = (e) => e.key === "Escape" && onClose();
@@ -179,6 +180,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 				setSessionDays(sess);
 				retentionSaved.current = ret; // seed the confirmed-value baselines
 				sessionSaved.current = sess;
+				previewsSaved.current = !!d.previews;
 			})
 			.catch(() => {});
 	}, []);
@@ -224,9 +226,18 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 		saveQueue.current = saveQueue.current
 			.then(() => saveConfig({ previews: on }))
 			.then((ok) => {
-				if (ok && gen === previewsGen.current) {
-					setPreviewsOn(on);
-					onPreviews?.(on);
+				if (ok) {
+					previewsSaved.current = on; // record every server-confirmed value
+					if (gen === previewsGen.current) {
+						setPreviewsOn(on);
+						onPreviews?.(on);
+					}
+				} else if (gen === previewsGen.current && previewsSaved.current != null) {
+					// Latest save failed: reconcile the UI to the last value the
+					// server actually holds (an earlier queued save may have
+					// succeeded), not to the failed toggle's target.
+					setPreviewsOn(previewsSaved.current);
+					onPreviews?.(previewsSaved.current);
 				}
 			});
 	}
@@ -521,9 +532,10 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 							<a href="/license" target="_blank" rel="noopener noreferrer">
 								GNU AGPL v3 or later
 							</a>. Get the{" "}
-							<a href="https://github.com/AlteredParadox/ircthing" target="_blank" rel="noopener noreferrer">
+							<a href="/source" target="_blank" rel="noopener noreferrer">
 								source code
-							</a>. Bundled{" "}
+							</a>{" "}
+							for this exact build. Bundled{" "}
 							<a href="/third-party-licenses" target="_blank" rel="noopener noreferrer">
 								third-party licenses
 							</a>.

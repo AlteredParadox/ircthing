@@ -11,3 +11,9 @@ runtime, or dependencies (React, etc.) into the app.
   our own generated output (created via Claude Design), included so the mockup
   renders locally. It is **not** part of the product: nothing in `design/` is
   built or embedded — the binary embeds only `web/dist/`.
+
+**Licensing:** `design/` is design-tool output kept as reference, **not** covered
+by the repository's AGPL-3.0. The application code that ships (everything outside
+`design/`) is AGPL-3.0; `design/support.js` is a Claude Design runtime and is not
+a reusable component of this project — don't treat it as AGPL-licensed or reuse
+it as a library.
