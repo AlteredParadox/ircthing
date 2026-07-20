@@ -120,8 +120,17 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	// exact token was stolen, keeping it valid would keep the thief logged in
 	// through the rotation. The requester is rotated onto a FRESH token via
 	// Set-Cookie below; their open WebSocket drops and reconnects with it.
+	// Whether the requester's own token is STILL LIVE is decided atomically
+	// with the revoke: a logout racing this rotation deletes the token first,
+	// and minting a replacement regardless would re-authenticate a browser
+	// that already signed out (whichever response lands last would win).
+	requester := ""
+	if c, err := r.Cookie(s.cookieName()); err == nil {
+		requester = c.Value
+	}
 	s.mu.Lock()
 	s.credGen.Add(1) // invalidate any login that verified the old hash
+	_, requesterLive := s.tokens[requester]
 	var cancels []context.CancelFunc
 	for tok := range s.tokens {
 		// deleteTokenLocked drops the revoked session's live sockets
@@ -131,6 +140,12 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
+	}
+	if !requesterLive {
+		// Already logged out (or expired) — rotation succeeded, but no
+		// replacement session is minted for a token that was gone.
+		w.WriteHeader(http.StatusNoContent)
+		return
 	}
 	token, err := s.issueToken(s.credGen.Load())
 	if err != nil {
