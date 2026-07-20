@@ -773,6 +773,14 @@ func TestMonitorFlow(t *testing.T) {
 	s.Handle(ctx, request(t, "monitor_add", 12, MonitorReq{Network: "libera", Nick: "bob"}))
 	recv(t, s, "ok", "monitors_changed") // restore for the assertions below
 
+	// An EXACT-duplicate add is an idempotent no-op — "ok", not an error, and no
+	// second row (even at capacity the existence check precedes the cap).
+	s.Handle(ctx, request(t, "monitor_add", 13, MonitorReq{Network: "libera", Nick: "bob"}))
+	recv(t, s, "ok")
+	if list, _ := h.store.Monitors(ctx, "libera"); len(list) != 1 {
+		t.Fatalf("exact-duplicate add changed the list: %v", list)
+	}
+
 	// An INVALID legacy row (persisted by an older, laxer version) must still
 	// be removable — validation only gates adds. The removal deletes the row;
 	// the reconcile that follows never puts the invalid nick on the wire (the
@@ -813,6 +821,50 @@ func TestMonitorReestablishedOnRegistration(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("ReconcileMonitored not called with the persisted list; got %v", conn.monitoredNicks())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// A 734 (list full) both records the rejection AND re-reconciles against the
+// persisted list — so a delayed rejection can't leave the connection out of
+// sync until the next mutation/reconnect.
+func TestMonitor734ReReconciles(t *testing.T) {
+	h := newTestHub(t)
+	for _, n := range []string{"alice", "bob"} {
+		if err := h.store.AddMonitor(context.Background(), "libera", n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered}
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(":srv 376 AlteredParadox :End"), Time: time.Now()}
+	// Wait for the registration reconcile.
+	waitFor(t, func() bool { return len(conn.monitoredNicks()) == 2 })
+
+	// The server rejects "bob" with a limit of 5.
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(":srv 734 AlteredParadox 5 bob :Monitor list is full"), Time: time.Now()}
+	waitFor(t, func() bool {
+		r := conn.rejectedNicks()
+		return len(r) == 1 && r[0] == "bob"
+	})
+	// The follow-up reconcile ran with the full desired list (bob re-added as a
+	// harmless duplicate if the server actually has it).
+	if got := conn.monitoredNicks(); len(got) != 2 {
+		t.Fatalf("post-734 reconcile list = %v, want the full desired list", got)
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met within 5s")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}

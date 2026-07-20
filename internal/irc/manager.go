@@ -409,6 +409,13 @@ func (m *Manager) SendMultiline(target string, lines []string) error {
 	return m.sendAll(batch)
 }
 
+// maxReconcileTargets is a hard ceiling on how many nicks one reconcile will
+// drive onto a connection, independent of the server's advertised limit. It
+// mirrors the hub's add-time cap (maxMonitorsPerNetwork) so a full replacement
+// stays comfortably under the send queue; a legacy over-cap persisted list is
+// bounded here rather than overflowing the queue.
+const maxReconcileTargets = 1024
+
 // maxMonitorNickLen bounds a MONITOR target. Real NICKLEN tops out around
 // 32; 48 additionally guarantees a full ten-nick chunk ("MONITOR + " + ten
 // 48-byte nicks + nine commas + CRLF = 501 bytes) fits the default 512
@@ -451,7 +458,15 @@ func (m *Manager) ReconcileMonitored(desired []string) error {
 	m.monActiveMu.Lock()
 	defer m.monActiveMu.Unlock()
 
+	// Clamp to the tighter of the server limit and a hard maximum. The hard
+	// cap defends against a server that advertises NO limit paired with a
+	// legacy oversized persisted list (predating the hub's add-time cap): it
+	// keeps even a full remove+re-add reconcile bounded, so the atomic send
+	// can never exceed the write queue and become permanently unreconcilable.
 	limit := m.effectiveMonitorLimitLocked()
+	if limit <= 0 || limit > maxReconcileTargets {
+		limit = maxReconcileTargets
+	}
 	targetSet := make(map[string]bool, len(desired))
 	var targetOrder []string // wire spellings, in desired order, clamped to limit
 	for _, n := range desired {
@@ -462,7 +477,7 @@ func (m *Manager) ReconcileMonitored(desired []string) error {
 		if targetSet[f] {
 			continue // folded duplicate
 		}
-		if limit > 0 && len(targetOrder) >= limit {
+		if len(targetOrder) >= limit {
 			break
 		}
 		targetSet[f] = true

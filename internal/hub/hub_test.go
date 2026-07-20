@@ -427,6 +427,12 @@ func (f *fakeConn) monitoredNicks() []string {
 	return append([]string(nil), f.monitored...)
 }
 
+func (f *fakeConn) rejectedNicks() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.monRejected...)
+}
+
 func TestHubPersistsEvents(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"), store.Options{})
 	if err != nil {

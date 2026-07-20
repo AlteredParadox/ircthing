@@ -334,18 +334,28 @@ func (h *Hub) handleControlNumeric(ctx context.Context, c Conn, ev irc.Event) bo
 		h.updatePresence(ctx, c, ev.Network, ev.Msg, false)
 		return true
 	case "734": // ERR_MONLISTFULL
-		// Format: <nick> <limit> <rejected,targets> :message. The server did
-		// NOT add these, so drop them from the connection's active set, and use
-		// the AUTHORITATIVE <limit> the numeric carries rather than inferring
-		// capacity from the local count. The persisted "desired" row stays
-		// (buddy shows offline; re-established on reconnect / next reconcile if
-		// room). NB: 734 identifies targets by nick with no request
-		// correlation, so a delayed rejection racing a remove/re-add of the
-		// same nick can transiently drop the newer entry — self-healed by the
-		// next reconcile, which re-syncs the active set to the desired list.
+		// Format: <nick> <limit> <rejected,targets> :message. Record the
+		// AUTHORITATIVE <limit> and drop the rejected nicks, then IMMEDIATELY
+		// re-reconcile against the persisted desired list — under monMu, same as
+		// a mutation. 734 carries no request correlation, so a delayed rejection
+		// can race a remove/re-add of the same nick; the follow-up reconcile
+		// converges both cases: a nick still desired but dropped from the active
+		// set is re-added (a duplicate MONITOR + is a server no-op), and a truly
+		// over-limit nick stays out (clamped past the now-known limit). Without
+		// the re-reconcile a delayed 734 could leave the server monitoring a nick
+		// the user removed until the next reconnect.
 		if len(ev.Msg.Params) > 2 {
 			limit, _ := strconv.Atoi(ev.Msg.Params[1])
+			h.monMu.Lock()
 			c.MonitorRejected(strings.Split(ev.Msg.Params[2], ","), limit)
+			if desired, lerr := h.store.Monitors(ctx, ev.Network); lerr == nil {
+				if rerr := c.ReconcileMonitored(desired); rerr != nil {
+					log.Printf("irc[%s]: monitor re-reconcile after 734: %v", ev.Network, rerr)
+				}
+			} else {
+				log.Printf("irc[%s]: monitor re-reconcile after 734 skipped (list read failed): %v", ev.Network, lerr)
+			}
+			h.monMu.Unlock()
 		}
 		log.Printf("irc[%s]: MONITOR list full: %q", ev.Network, clampServerInfo(ev.Msg.Trailing()))
 		return true

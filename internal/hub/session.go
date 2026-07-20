@@ -425,23 +425,34 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		// the server's mapping, and any residual pair is removable). Under
 		// monMu, two concurrent adds can't both pass and both persist.
 		existing, lerr := s.hub.store.Monitors(ctx, d.Network)
-		if lerr == nil {
-			// Cap the persisted list. A reconnect reconciles the WHOLE list as
-			// one atomic delta (up to a full remove+re-add), so an unbounded
-			// list could eventually exceed the send queue and become
-			// permanently unreconcilable on a server that advertises no limit.
-			// maxMonitorsPerNetwork keeps even a complete replacement well under
-			// the queue; it is far above any real buddy list.
-			if len(existing) >= maxMonitorsPerNetwork {
-				s.push(errEnvelope(env.Seq, "bad_request", "monitor list is full"))
+		if lerr != nil {
+			// FAIL CLOSED: without the list we can enforce neither the
+			// duplicate check nor the cap, so don't blindly persist.
+			s.push(errEnvelope(env.Seq, "internal", "monitor list unavailable"))
+			return
+		}
+		// Reject a casemapping-equivalent duplicate (Alice vs alice) — but check
+		// existence BEFORE the cap so an already-monitored nick is an idempotent
+		// no-op even at capacity, not a spurious "list full". An EXACT-spelling
+		// duplicate is likewise a no-op.
+		for _, nk := range existing {
+			if nk == d.Nick {
+				s.push(envelope("ok", env.Seq, nil)) // already monitored, idempotent
 				return
 			}
-			for _, nk := range existing {
-				if nk != d.Nick && fold(nk) == fold(d.Nick) {
-					s.push(errEnvelope(env.Seq, "bad_request", "already monitored as "+nk))
-					return
-				}
+			if fold(nk) == fold(d.Nick) {
+				s.push(errEnvelope(env.Seq, "bad_request", "already monitored as "+nk))
+				return
 			}
+		}
+		// Cap the persisted list. A reconnect reconciles the WHOLE list as one
+		// atomic delta (up to a full remove+re-add), so an unbounded list could
+		// eventually exceed the send queue and become permanently unreconcilable
+		// on a server that advertises no limit. maxMonitorsPerNetwork keeps even
+		// a complete replacement well under the queue; far above any real list.
+		if len(existing) >= maxMonitorsPerNetwork {
+			s.push(errEnvelope(env.Seq, "bad_request", "monitor list is full"))
+			return
 		}
 		err = s.hub.store.AddMonitor(ctx, d.Network, d.Nick)
 	} else {
@@ -480,6 +491,11 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 			if rerr := conn.ReconcileMonitored(desired); rerr != nil {
 				log.Printf("network %q: monitor reconcile: %v", d.Network, rerr)
 			}
+		} else {
+			// The mutation is persisted but couldn't be reconciled to the
+			// server this pass; log it (recovered on the next mutation or
+			// reconnect) rather than dropping it silently.
+			log.Printf("network %q: monitor reconcile skipped (list read failed): %v", d.Network, lerr)
 		}
 		if !add {
 			s.hub.broadcast(envelope("presence", 0, PresenceData{Network: d.Network, Nick: nick, Online: false}))
