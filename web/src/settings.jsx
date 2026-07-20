@@ -59,8 +59,9 @@ function Seg({ value, options, labels, onPick }) {
 }
 
 // ChangePassword posts to /api/password: verify current, set new (8–72 bytes,
-// confirmed). The server rotates the stored login hash and revokes other
-// sessions.
+// confirmed). The server rotates the stored login hash and revokes EVERY
+// session (including this one), returning a deletion cookie — so a successful
+// change signs the user out and onRotated routes back to login.
 function ChangePassword({ onRotated }) {
 	const [current, setCurrent] = useState("");
 	const [next, setNext] = useState("");
@@ -354,8 +355,8 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	}
 
 	// Sign out deliberately invalidates the CURRENT session server-side
-	// (password rotation also revokes it, rotating onto a fresh cookie).
-	// Only leave the app once the server confirms the revocation; a network
+	// (a password change revokes every session, this one included). Only
+	// leave the app once the server confirms the revocation; a network
 	// failure must not show the login screen over a still-valid session.
 	async function logout() {
 		setLogoutErr(false);

@@ -636,7 +636,7 @@ func (s *Server) issueToken(gen uint64) (string, error) {
 	var cancels []context.CancelFunc
 	s.mu.Lock()
 	// Close the rotation race: handleChangePassword bumps credGen and revokes
-	// other sessions under this same s.mu. If it committed after the caller's
+	// every session under this same s.mu. If it committed after the caller's
 	// snapshot, refuse — otherwise a login that verified the OLD hash could
 	// insert a token the revoke loop has already passed.
 	if s.credGen.Load() != gen {
