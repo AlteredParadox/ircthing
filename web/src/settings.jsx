@@ -147,15 +147,46 @@ async function saveConfig(patch) {
 // saveQueue: the next PUT is not sent until the previous settles, so an older
 // request can never land after (and overwrite) a newer one server-side.
 // *Gen: a callback only applies its result if it is still the LATEST save of
-// that setting. *Saved: the last value the server CONFIRMED — failed saves
-// roll the display back to it, never to an unpersisted in-memory edit.
+// that setting. Retention tracks its two dimensions (days, max) SEPARATELY:
+// with a shared counter, a later max save suppressed the rollback of an
+// earlier failed days save, leaving the UI showing a policy the server never
+// accepted. *Saved: the last value the server CONFIRMED — failed saves roll
+// the display back to it, never to an unpersisted in-memory edit.
 const saveQueue = { current: Promise.resolve() };
-const retentionGen = { current: 0 };
+const retentionGens = { days: { current: 0 }, max: { current: 0 } };
 const sessionGen = { current: 0 };
 const previewsGen = { current: 0 };
 const retentionSaved = { current: null };
 const sessionSaved = { current: null };
 const previewsSaved = { current: null };
+
+// authEpoch scopes all queued settings work to one login session. Being
+// module-global, the queue survives logout — without the epoch, a mutation
+// queued before signing out would execute against the NEXT session's cookie,
+// and a delayed previews callback could re-pin stale UI state after the
+// login-phase reset. Work enqueued under an old epoch becomes a no-op.
+const authEpoch = { current: 0 };
+
+// enqueue serializes work on the save queue, dropping it (and anything it
+// would have applied) if a logout/login boundary was crossed since it was
+// queued.
+function enqueue(work) {
+	const epoch = authEpoch.current;
+	saveQueue.current = saveQueue.current.then(() => {
+		if (epoch !== authEpoch.current) return undefined; // crossed a logout: drop
+		return work();
+	});
+}
+
+// resetSettingsSession invalidates every queued settings mutation and pending
+// callback, and clears the confirmed-value baselines. Called by the app shell
+// when the authenticated phase ends (logout, session expiry).
+export function resetSettingsSession() {
+	authEpoch.current++;
+	retentionSaved.current = null;
+	sessionSaved.current = null;
+	previewsSaved.current = null;
+}
 
 // Settings modal: appearance preferences, desktop-notification
 // permission, and per-network highlight rules. Everything is edited live
@@ -188,8 +219,9 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 		// every pending save; the per-field generation guards additionally skip
 		// applying any field the user re-edited while the GET itself was running.
 		let alive = true;
-		saveQueue.current = saveQueue.current.then(async () => {
-			const genR = retentionGen.current;
+		enqueue(async () => {
+			const genD = retentionGens.days.current;
+			const genM = retentionGens.max.current;
 			const genS = sessionGen.current;
 			const genP = previewsGen.current;
 			let d = null;
@@ -207,7 +239,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 				previewsSaved.current = !!d.previews; // seed the confirmed baseline
 				if (alive) setPreviewsOn(!!d.previews);
 			}
-			if (retentionGen.current === genR) {
+			if (retentionGens.days.current === genD && retentionGens.max.current === genM) {
 				const ret = { days: num(d.retention_days), max: num(d.retention_max_messages) };
 				retentionSaved.current = ret;
 				if (alive) setRetention(ret);
@@ -226,35 +258,38 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	// Saves are serialized through the module-level saveQueue and versioned by
 	// the module-level generation guards — see the block above saveConfig.
 	function saveRetention(patch) {
+		const dim = "days" in patch ? "days" : "max";
 		const next = { ...retention, ...patch };
 		setRetention(next);
-		const gen = ++retentionGen.current;
+		const gen = ++retentionGens[dim].current;
 		// Send ONLY the edited dimension. The API is a partial patch (pointer
 		// fields, read-modify-write under a server-side lock), so including the
 		// untouched field from this client's possibly-stale snapshot would
 		// overwrite a newer value another device (or a racing save) just wrote —
 		// premature deletion or indefinite retention, silently.
-		const body = {};
-		if ("days" in patch) body.retention_days = patch.days;
-		if ("max" in patch) body.retention_max_messages = patch.max;
-		saveQueue.current = saveQueue.current
-			.then(() => saveConfig(body))
-			.then((ok) => {
-				// Confirm only what this PUT actually carried: merge the patch into
-				// the baseline rather than adopting the whole local snapshot.
-				if (ok) retentionSaved.current = { ...(retentionSaved.current || next), ...patch };
-				else if (gen === retentionGen.current && retentionSaved.current) setRetention(retentionSaved.current);
-			});
+		const body = dim === "days" ? { retention_days: patch.days } : { retention_max_messages: patch.max };
+		enqueue(async () => {
+			const ok = await saveConfig(body);
+			// Confirm only what this PUT actually carried: merge the patch into
+			// the baseline rather than adopting the whole local snapshot.
+			if (ok) retentionSaved.current = { ...(retentionSaved.current || next), ...patch };
+			else if (gen === retentionGens[dim].current && retentionSaved.current) {
+				// Roll back ONLY the failed dimension: the generations are
+				// per-dimension, so a later (successful) save of the OTHER
+				// dimension can't suppress this rollback and leave the UI
+				// showing a policy the server never accepted.
+				setRetention((cur) => ({ ...cur, [dim]: retentionSaved.current[dim] }));
+			}
+		});
 	}
 	function saveSessionDays(days) {
 		setSessionDays(days);
 		const gen = ++sessionGen.current;
-		saveQueue.current = saveQueue.current
-			.then(() => saveConfig({ session_ttl_days: days }))
-			.then((ok) => {
-				if (ok) sessionSaved.current = days;
-				else if (gen === sessionGen.current && sessionSaved.current != null) setSessionDays(sessionSaved.current);
-			});
+		enqueue(async () => {
+			const ok = await saveConfig({ session_ttl_days: days });
+			if (ok) sessionSaved.current = days;
+			else if (gen === sessionGen.current && sessionSaved.current != null) setSessionDays(sessionSaved.current);
+		});
 	}
 	const retNum = (v) => Math.max(0, Number.parseInt(v, 10) || 0);
 
@@ -266,27 +301,26 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 		// their PUTs, and the response completing LAST — not the one carrying the
 		// user's final choice — would set the visible state.
 		const gen = ++previewsGen.current;
-		saveQueue.current = saveQueue.current
-			.then(() => saveConfig({ previews: on }))
-			.then((ok) => {
-				if (ok) {
-					previewsSaved.current = on; // record every server-confirmed value
-					if (gen === previewsGen.current) {
-						setPreviewsOn(on);
-						onPreviews?.(on);
-					}
-				} else if (gen === previewsGen.current && previewsSaved.current != null) {
-					// Latest save failed: reconcile the UI to the last value the
-					// server actually holds (an earlier queued save may have
-					// succeeded), not to the failed toggle's target.
-					setPreviewsOn(previewsSaved.current);
-					onPreviews?.(previewsSaved.current);
+		enqueue(async () => {
+			const ok = await saveConfig({ previews: on });
+			if (ok) {
+				previewsSaved.current = on; // record every server-confirmed value
+				if (gen === previewsGen.current) {
+					setPreviewsOn(on);
+					onPreviews?.(on);
 				}
-			});
+			} else if (gen === previewsGen.current && previewsSaved.current != null) {
+				// Latest save failed: reconcile the UI to the last value the
+				// server actually holds (an earlier queued save may have
+				// succeeded), not to the failed toggle's target.
+				setPreviewsOn(previewsSaved.current);
+				onPreviews?.(previewsSaved.current);
+			}
+		});
 	}
 
-	// Sign out deliberately invalidates the CURRENT session server-side —
-	// the only in-app way to revoke this cookie (password rotation keeps it).
+	// Sign out deliberately invalidates the CURRENT session server-side
+	// (password rotation also revokes it, rotating onto a fresh cookie).
 	// Only leave the app once the server confirms the revocation; a network
 	// failure must not show the login screen over a still-valid session.
 	async function logout() {

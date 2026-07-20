@@ -25,7 +25,7 @@ import { ContextMenu } from "./menu.jsx";
 import { Members } from "./members.jsx";
 import { ChannelPrompt, NetworkForm } from "./netform.jsx";
 import { SearchOverlay } from "./search.jsx";
-import { Settings } from "./settings.jsx";
+import { Settings, resetSettingsSession } from "./settings.jsx";
 import { Sidebar } from "./sidebar.jsx";
 import { Switcher } from "./switcher.jsx";
 import { BufIcon } from "./icons.jsx";
@@ -473,6 +473,11 @@ export function App() {
 		if (phase !== "login") return;
 		previewsPinned.current = false;
 		setPreviews(false);
+		// Invalidate the module-level settings save queue too: a mutation
+		// queued before signing out must not execute against the next
+		// session's cookie, and a delayed previews callback must not re-pin
+		// the state just reset above.
+		resetSettingsSession();
 	}, [phase]);
 
 	// Server switches (whether link/media previews are enabled). Fetched
