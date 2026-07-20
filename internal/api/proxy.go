@@ -342,16 +342,17 @@ func newFetcher(maxBytes int64, proxy *url.URL) *fetcher {
 			TLSHandshakeTimeout:    8 * time.Second,
 			ResponseHeaderTimeout:  8 * time.Second,
 			MaxResponseHeaderBytes: 64 << 10, // hostile targets can otherwise stream ~10 MiB of headers (Go default) outside the body budget
-			// Identity only: with transparent gzip, the LimitReader in get caps
-			// DECOMPRESSED bytes, so a hostile origin could stream unbounded wire
-			// bytes (e.g. empty gzip members) that decompress to almost nothing,
-			// burning bandwidth and CPU until the client timeout. Identity makes
-			// the cap a true network-byte cap. Cost: HTML previews arrive
-			// uncompressed — bounded by the same cap, and images (the bulk) were
-			// never compressible anyway.
-			DisableCompression: true,
-			DisableKeepAlives:  true,
-			MaxIdleConns:       0,
+			// Transparent gzip is LEFT ON. It was disabled once so the body
+			// LimitReader (which caps DECOMPRESSED bytes) couldn't be bypassed by a
+			// hostile origin streaming empty/padded gzip members — but the budgetConn
+			// now caps RAW WIRE bytes below TLS (see withWireBudget), so that bomb
+			// vector is bounded regardless: wire bytes by budgetConn, decompressed
+			// bytes by the LimitReader, CPU by both. Keeping gzip on matters for
+			// LATENCY: a large HTML page (YouTube's ~1.1 MiB) fetched uncompressed
+			// over a slow WireGuard/Tor egress can blow the 15 s timeout and blank the
+			// preview; gzipped it is ~200 KiB.
+			DisableKeepAlives: true,
+			MaxIdleConns:      0,
 		},
 		CheckRedirect: f.checkRedirect,
 	}
@@ -378,7 +379,6 @@ func newTunnelFetcher(maxBytes int64, dial func(ctx context.Context, addr string
 			TLSHandshakeTimeout:    8 * time.Second,
 			ResponseHeaderTimeout:  8 * time.Second,
 			MaxResponseHeaderBytes: 64 << 10, // hostile targets can otherwise stream ~10 MiB of headers (Go default) outside the body budget
-			DisableCompression:     true,     // identity only — see newFetcher: keep the byte cap a WIRE-byte cap
 			DisableKeepAlives:      true,
 			MaxIdleConns:           0,
 		},

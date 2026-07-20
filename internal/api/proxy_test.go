@@ -18,6 +18,7 @@ package api
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -273,15 +274,19 @@ func TestFetcherRejects(t *testing.T) {
 	})
 }
 
-// TestFetcherRequestsIdentityEncoding: the fetcher must not negotiate transparent
-// gzip. With auto-gzip, the LimitReader caps DECOMPRESSED bytes — a hostile origin
-// could stream unbounded wire bytes that decompress to almost nothing, burning
-// bandwidth/CPU until the client timeout. Identity keeps the cap a wire-byte cap.
-func TestFetcherRequestsIdentityEncoding(t *testing.T) {
+// TestFetcherAcceptsGzip: transparent gzip is LEFT ON (for latency over slow
+// egress — a 1.1 MiB HTML page is ~200 KiB gzipped). The compression-bomb vector
+// it once guarded against is bounded by the raw wire budget instead
+// (TestWireBudget), not by disabling compression. This test verifies the
+// fetcher offers gzip AND transparently decodes a gzipped body.
+func TestFetcherAcceptsGzip(t *testing.T) {
 	var acceptEncoding string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		acceptEncoding = r.Header.Get("Accept-Encoding")
-		w.Write([]byte("plain"))
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		gz.Write([]byte("hello gzipped world"))
+		gz.Close()
 	}))
 	defer srv.Close()
 
@@ -290,11 +295,11 @@ func TestFetcherRequestsIdentityEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if strings.Contains(acceptEncoding, "gzip") {
-		t.Fatalf("fetcher negotiated gzip (Accept-Encoding: %q); the byte cap would measure decompressed bytes", acceptEncoding)
+	if !strings.Contains(acceptEncoding, "gzip") {
+		t.Fatalf("fetcher did not offer gzip (Accept-Encoding: %q)", acceptEncoding)
 	}
-	if string(body) != "plain" {
-		t.Fatalf("body = %q", body)
+	if string(body) != "hello gzipped world" {
+		t.Fatalf("gzipped body not transparently decoded: %q", body)
 	}
 }
 
