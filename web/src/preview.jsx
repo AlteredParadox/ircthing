@@ -52,6 +52,17 @@ const thumbInflight = new Map();
 // on the next mount once below the cap.
 const MAX_INFLIGHT = 64;
 
+// ABORT_GRACE_MS delays aborting an in-flight fetch after its last waiter
+// releases. In a busy channel a link message scrolls out of the virtualized
+// render window (unmounting its preview) within a second or two — often BEFORE
+// a slow-egress (WireGuard/Tor) fetch has returned. Aborting instantly then
+// throws that work away and re-fetches on the next mount, so previews churn
+// (context-canceled → refetch) and feel flaky. The grace lets an in-flight
+// fetch finish and populate the cache, so scrolling back shows it instantly and
+// the server isn't asked twice. A genuinely abandoned fetch (no remount within
+// the window) still aborts, bounding runaway work.
+const ABORT_GRACE_MS = 8000;
+
 // Cache/fetch key by (network, url): the network selects the server-side
 // proxy, so the same URL in two networks is fetched independently.
 function ck(url, net) {
@@ -107,20 +118,35 @@ function shared(map, key, run) {
 	if (!e || e.controller.signal.aborted) {
 		if (map.size >= MAX_INFLIGHT) return { promise: Promise.resolve(null), release() {} };
 		const controller = new AbortController();
-		e = { controller, refs: 0, promise: null };
+		e = { controller, refs: 0, promise: null, abortTimer: null };
 		e.promise = run(controller.signal).finally(() => {
+			if (e.abortTimer) clearTimeout(e.abortTimer);
 			if (map.get(key) === e) map.delete(key);
 		});
 		map.set(key, e);
 	}
 	e.refs++;
+	// A remount within the grace window cancels a pending abort — the fetch
+	// this row shares is still wanted.
+	if (e.abortTimer) {
+		clearTimeout(e.abortTimer);
+		e.abortTimer = null;
+	}
 	let released = false;
 	return {
 		promise: e.promise,
 		release() {
 			if (released) return;
 			released = true;
-			if (--e.refs <= 0 && map.get(key) === e) e.controller.abort();
+			if (--e.refs <= 0 && map.get(key) === e && !e.abortTimer) {
+				// Grace period before aborting: a briefly-unmounted row (message
+				// scrolled out of the render window) must not kill an in-flight
+				// fetch and force a re-fetch. Abort only if still unwanted after
+				// the delay; a completed fetch clears this via the finally above.
+				e.abortTimer = setTimeout(() => {
+					if (e.refs <= 0 && map.get(key) === e) e.controller.abort();
+				}, ABORT_GRACE_MS);
+			}
 		},
 	};
 }
