@@ -374,9 +374,9 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Reject oversized decodes from the cheap header read, before
-	// committing to a full decode.
-	format, ok := decodableFormat(body)
-	if !ok {
+	// committing to a full decode. (The concrete format no longer drives the
+	// re-encode — encodeThumb keys on actual opacity — so only the gate matters.)
+	if _, ok := decodableFormat(body); !ok {
 		http.Error(w, "unsupported image", http.StatusUnsupportedMediaType)
 		return
 	}
@@ -388,7 +388,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out := thumbnail(src, thumbMaxDim)
-	res, err := encodeThumb(out, format)
+	res, err := encodeThumb(out)
 	if err != nil {
 		http.Error(w, "encode failed", http.StatusInternalServerError)
 		return
@@ -417,19 +417,28 @@ func writeThumb(w http.ResponseWriter, t thumbResult) {
 	_, _ = w.Write(t.data)
 }
 
-// encodeThumb re-encodes a thumbnail: PNG for formats that may carry
-// transparency (png/gif) AND for any decoded image that actually holds
-// non-opaque pixels — a WebP with an (uncompressed) ALPH chunk decodes to
-// NYCbCrA, and routing it through JPEG rendered its transparency as
-// dark/black. JPEG only for images verified fully opaque.
-func encodeThumb(img image.Image, srcFormat string) (thumbResult, error) {
-	var buf bytes.Buffer
-	if srcFormat == "png" || srcFormat == "gif" || !imageOpaque(img) {
+// encodeThumb re-encodes a downscaled thumbnail, choosing the format by ACTUAL
+// transparency, not source format. A non-opaque image needs PNG (a WebP ALPH
+// chunk decodes to NYCbCrA, and JPEG would render its transparency as
+// dark/black); a fully-opaque one takes JPEG, which is far more compact. This
+// matters: keying on the source format sent every gif/png through PNG, and a
+// rich opaque 400 px frame (e.g. an opaque animated GIF) re-encodes to ~250 KiB
+// of PNG — over the serving cap (maxThumbCacheEntry), which blanked the
+// thumbnail — versus ~24 KiB as JPEG. If a genuinely transparent image's PNG
+// still exceeds the cap, flatten it to JPEG anyway: a lossy preview (its
+// transparency dropped) beats serving nothing.
+func encodeThumb(img image.Image) (thumbResult, error) {
+	if !imageOpaque(img) {
+		var buf bytes.Buffer
 		if err := png.Encode(&buf, img); err != nil {
 			return thumbResult{}, err
 		}
-		return thumbResult{contentType: "image/png", data: buf.Bytes()}, nil
+		if buf.Len() <= maxThumbCacheEntry {
+			return thumbResult{contentType: "image/png", data: buf.Bytes()}, nil
+		}
+		// PNG too large even for a transparent image — fall through to JPEG.
 	}
+	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 82}); err != nil {
 		return thumbResult{}, err
 	}

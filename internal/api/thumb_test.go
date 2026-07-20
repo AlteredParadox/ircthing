@@ -107,24 +107,43 @@ func TestEncodeThumb(t *testing.T) {
 			opaque.Set(x, y, color.RGBA{100, 150, 200, 255})
 		}
 	}
-	png, err := encodeThumb(opaque, "png")
-	if err != nil || png.contentType != "image/png" {
-		t.Fatalf("png: %+v %v", png.contentType, err)
-	}
-	jpg, err := encodeThumb(opaque, "jpeg")
+	// An OPAQUE image re-encodes as JPEG regardless of source format — JPEG is
+	// far more compact, and a rich opaque PNG can blow the serving cap and blank
+	// the thumbnail. (Was: gif/png sources always took PNG.)
+	jpg, err := encodeThumb(opaque)
 	if err != nil || jpg.contentType != "image/jpeg" {
-		t.Fatalf("jpeg: %+v %v", jpg.contentType, err)
+		t.Fatalf("opaque re-encode = %q %v, want image/jpeg", jpg.contentType, err)
 	}
-	// GIF sources re-encode as PNG (may carry transparency).
-	g, _ := encodeThumb(opaque, "gif")
-	if g.contentType != "image/png" {
-		t.Fatalf("gif re-encode = %q", g.contentType)
-	}
-	// A NON-OPAQUE image forces PNG regardless of source format, or the
-	// transparency would render dark/black through JPEG.
+	// A NON-OPAQUE image takes PNG, or the transparency would render dark/black
+	// through JPEG.
 	clear := image.NewRGBA(image.Rect(0, 0, 10, 10)) // zero-valued: alpha 0
-	if tr, _ := encodeThumb(clear, "webp"); tr.contentType != "image/png" {
+	if tr, _ := encodeThumb(clear); tr.contentType != "image/png" {
 		t.Fatalf("transparent re-encode = %q, want image/png", tr.contentType)
+	}
+	// A transparent image whose PNG exceeds the serving cap FLATTENS to JPEG
+	// rather than blanking — a lossy preview beats none.
+	big := image.NewRGBA(image.Rect(0, 0, 400, 400))
+	// Incompressible fill (xorshift per byte) so the PNG genuinely exceeds the
+	// serving cap; varying alpha bytes keep it non-opaque.
+	x := uint32(0x9e3779b9)
+	for i := range big.Pix {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		big.Pix[i] = byte(x)
+	}
+	if imageOpaque(big) {
+		t.Fatal("fixture unexpectedly opaque")
+	}
+	// The over-cap PNG falls back to JPEG (whether the JPEG itself fits is
+	// content-dependent — pure noise won't, real images do; the handler's 413
+	// is the final backstop). The point is it no longer serves the huge PNG.
+	tr, err := encodeThumb(big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.contentType != "image/jpeg" {
+		t.Fatalf("oversized transparent PNG should fall back to JPEG, got %q (%d bytes)", tr.contentType, len(tr.data))
 	}
 }
 
@@ -238,7 +257,7 @@ func TestWebPLossyDecodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("image.Decode(webp): %v", err)
 	}
-	res, err := encodeThumb(thumbnail(src, thumbMaxDim), format)
+	res, err := encodeThumb(thumbnail(src, thumbMaxDim))
 	if err != nil {
 		t.Fatalf("encodeThumb(webp): %v", err)
 	}
@@ -291,7 +310,7 @@ func TestWebPAlphaKeepsPNG(t *testing.T) {
 	if imageOpaque(src) {
 		t.Fatal("fixture decoded opaque; premise wrong")
 	}
-	res, err := encodeThumb(thumbnail(src, thumbMaxDim), format)
+	res, err := encodeThumb(thumbnail(src, thumbMaxDim))
 	if err != nil {
 		t.Fatalf("encodeThumb: %v", err)
 	}

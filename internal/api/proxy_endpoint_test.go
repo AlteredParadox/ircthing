@@ -125,8 +125,11 @@ func TestThumbEndpoint(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	if ct := resp.Header.Get("Content-Type"); ct != "image/png" {
-		t.Fatalf("content-type = %q", ct)
+	// An OPAQUE source (this gradient PNG has no transparency) re-encodes to
+	// JPEG — compact, so a rich thumbnail stays under the serving cap instead
+	// of being rejected as an oversized PNG.
+	if ct := resp.Header.Get("Content-Type"); ct != "image/jpeg" {
+		t.Fatalf("content-type = %q, want image/jpeg for an opaque source", ct)
 	}
 	cfg, _, err := image.DecodeConfig(resp.Body)
 	if err != nil {
