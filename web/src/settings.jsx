@@ -310,7 +310,16 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 			else if (gen === sessionGen.current && sessionSaved.current != null) setSessionDays(sessionSaved.current);
 		});
 	}
-	const retNum = (v) => Math.max(0, Number.parseInt(v, 10) || 0);
+	// Clamp to a finite safe integer: enough digits make parseInt return
+	// Infinity, which JSON serializes as null — the server's pointer-based
+	// patch reads null as "field absent" (now a 400), while the old path
+	// 204'd and the frontend recorded Infinity as a confirmed save. The
+	// server-side caps (36500 days / 1e9 messages) then bound the value.
+	const retNum = (v) => {
+		const n = Number.parseInt(v, 10);
+		if (!Number.isFinite(n) || n <= 0) return 0;
+		return Math.min(n, Number.MAX_SAFE_INTEGER);
+	};
 
 	function togglePreviews(on) {
 		// Only reflect the new state once the server confirms the write — a
@@ -591,7 +600,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 									type="number"
 									min="1"
 									value={sessionDays}
-									onChange={(e) => saveSessionDays(Math.max(1, Number.parseInt(e.currentTarget.value, 10) || 1))}
+									onChange={(e) => saveSessionDays(Math.max(1, retNum(e.currentTarget.value)))}
 								/>
 							</div>
 						)}

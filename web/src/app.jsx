@@ -828,6 +828,9 @@ export function App() {
 		});
 
 		s.on("presence", (d) => setMonitors((all) => applyPresenceUpdate(all, d)));
+		// Another tab/device changed the buddy list: refetch the authoritative
+		// list instead of drifting on this tab's local state.
+		s.on("monitors_changed", (d) => d?.network && loadMonitors(d.network));
 
 		s.on("redact", (d) => {
 			const key = bufKey(d.network, d.buffer);
@@ -1030,18 +1033,21 @@ export function App() {
 	function addMonitor(network, nick) {
 		nick = nick.trim();
 		if (!nick) return;
-		// Optimistic: show it immediately (offline until the server replies).
+		// Optimistic: show it immediately (offline until the server replies) —
+		// but a REJECTION (duplicate under casemapping, invalid nick, store
+		// failure) must roll the display back to the authoritative list, not
+		// leave a phantom entry the server never accepted.
 		setMonitors((all) => {
 			const list = all[network] || [];
 			if (list.some((m) => m.nick === nick)) return all;
 			return { ...all, [network]: [...list, { nick, online: false }].sort((a, b) => a.nick.localeCompare(b.nick)) };
 		});
-		sock.current?.request("monitor_add", { network, nick }).catch(() => {});
+		sock.current?.request("monitor_add", { network, nick }).catch(() => loadMonitors(network));
 	}
 
 	function removeMonitor(network, nick) {
 		setMonitors((all) => ({ ...all, [network]: (all[network] || []).filter((m) => m.nick !== nick) }));
-		sock.current?.request("monitor_remove", { network, nick }).catch(() => {});
+		sock.current?.request("monitor_remove", { network, nick }).catch(() => loadMonitors(network));
 	}
 
 	// stepBuffer moves the active buffer through the sidebar order
@@ -1216,10 +1222,14 @@ export function App() {
 				? {
 					label: "Leave channel", danger: true,
 					onClick: () => {
-						// part_channel also removes the channel from autojoin.
+						// part_channel also removes the channel from autojoin. Only
+						// delete the buffer's history AFTER the server confirms both
+						// the part and the autojoin persistence — closing eagerly
+						// erased history for a channel that (disconnected network,
+						// failed persist) would rejoin on reconnect.
 						sock.current?.request("part_channel", { network, channel: buffer })
+							.then(() => closeBuffer(network, buffer))
 							.catch(() => sendCommand(network, "PART", [buffer]));
-						closeBuffer(network, buffer);
 					},
 				}
 				: { label: "Close", danger: true, onClick: () => closeBuffer(network, buffer) },
@@ -1235,7 +1245,22 @@ export function App() {
 				{ label: "Join channel…", onClick: () => { setChanPromptError(""); setChanPrompt({ network }); } },
 				{ label: "Edit network…", onClick: () => editNetwork(network) },
 				{ label: "Add network…", onClick: () => { setNetFormError(""); setNetForm({ initial: null, oldName: "" }); } },
-				{ label: "Remove network…", danger: true, onClick: () => deleteNetwork(network) },
+				{
+					// Two-step, like the edit form's guarded delete: this permanently
+					// erases the network AND its scrollback, so one misclick on a
+					// context-menu row must not be enough. (The menu's onClose fires
+					// before onClick, so reopening with the confirm item wins the
+					// state batch.)
+					label: "Remove network…", danger: true,
+					onClick: () => setMenu({
+						x, y, title: network,
+						items: [{
+							label: "Really remove? This erases its scrollback",
+							danger: true,
+							onClick: () => deleteNetwork(network),
+						}],
+					}),
+				},
 			],
 		});
 	}
