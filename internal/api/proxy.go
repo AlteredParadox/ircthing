@@ -159,7 +159,8 @@ func fetchErrorRetryable(err error) bool {
 	// than 408/429) is permanent — retrying re-runs the same rejected dial.
 	// Both surface through the dialPhaseError wrapper (transient by default),
 	// so classify them permanent explicitly, ahead of that default.
-	if errors.Is(err, proxydial.ErrProxyConfig) || errors.Is(err, proxydial.ErrProxyRejected) {
+	if errors.Is(err, proxydial.ErrProxyConfig) || errors.Is(err, proxydial.ErrProxyRejected) ||
+		errors.Is(err, proxydial.ErrProxyProtocol) {
 		return false
 	}
 	// Wire-budget exhaustion is an upstream that deliberately (or patholog-

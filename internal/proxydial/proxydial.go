@@ -50,10 +50,36 @@ var ErrProxyConfig = errors.New("proxy: invalid configuration")
 
 // ErrProxyRejected wraps a DETERMINISTIC runtime rejection by the proxy itself —
 // SOCKS auth failure / no acceptable method / policy or unsupported-command
-// rejection, or an HTTP CONNECT 4xx other than 408/429. Retrying re-runs the
-// same rejected handshake, so the media layer classifies it PERMANENT. Genuine
-// network failures, 408/429, and 5xx stay unwrapped (transient).
+// rejection, or an HTTP CONNECT 1xx/3xx/4xx (other than 408/429). Retrying
+// re-runs the same rejected handshake, so the media layer classifies it
+// PERMANENT. Genuine network failures, 408/429, and 5xx stay unwrapped
+// (transient).
 var ErrProxyRejected = errors.New("proxy: request rejected")
+
+// ErrProxyProtocol wraps a MALFORMED but complete proxy response — a wrong SOCKS
+// version or reserved byte, or an unparseable HTTP status line. The peer is not
+// speaking the protocol we expect (wrong port, not a proxy), so retrying is
+// pointless: also classified PERMANENT.
+var ErrProxyProtocol = errors.New("proxy: malformed response")
+
+// ValidHostPort is the ONE strict host:port validator shared by network config,
+// proxy URLs, and proxy targets: a structural split, a bounded host free of
+// whitespace / control / authority-delimiter bytes (an IPv6 literal's colons
+// survive net.SplitHostPort's bracket handling), and a strict decimal port. It
+// returns a neutral error (no wrapping) so each caller can phrase/classify it.
+func ValidHostPort(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host == "" {
+		return errors.New("must be host:port")
+	}
+	if len(host) > 255 || strings.ContainsAny(host, " \t\r\n/@\\?#") || hasControl(host) {
+		return errors.New("malformed host")
+	}
+	if _, ok := ParsePort(port); !ok {
+		return errors.New("port must be a decimal number in 1-65535")
+	}
+	return nil
+}
 
 // ParsePort strictly parses a decimal port: ASCII digits only (strconv.Atoi
 // otherwise accepts a leading '+'/'-' and Unicode digits, which are not valid
@@ -130,24 +156,12 @@ func validateProxyURL(u *url.URL) error {
 		return fmt.Errorf("%w: scheme must be socks5 or http", ErrProxyConfig)
 	}
 	// The RAW authority must be a bare host:port. A manually-constructed URL can
-	// smuggle userinfo into Host ("alice:secret@host:1080") or an extra colon
-	// ("alice:secret:1080", which Hostname() mis-splits to "alice:secret") —
-	// and a later dial error could echo the secret. net.SplitHostPort rejects
-	// both (an unbracketed extra colon is "too many colons"); the delimiter/
-	// control scan catches the rest. Credentials belong in u.User (validated
-	// below), never the authority.
-	if strings.ContainsAny(u.Host, "@/?# ") || hasControl(u.Host) {
-		return fmt.Errorf("%w: malformed proxy authority", ErrProxyConfig)
-	}
-	host, port, err := net.SplitHostPort(u.Host)
-	if err != nil || host == "" {
-		return fmt.Errorf("%w: host:port required", ErrProxyConfig)
-	}
-	if _, ok := ParsePort(port); !ok {
-		return fmt.Errorf("%w: port must be a decimal 1-65535", ErrProxyConfig)
-	}
-	if len(host) > 255 {
-		return fmt.Errorf("%w: proxy host too long", ErrProxyConfig)
+	// smuggle userinfo into Host ("alice:secret@host:1080", which ValidHostPort
+	// rejects for the '@') or an extra colon ("alice:secret:1080", rejected as
+	// "too many colons") — and a later dial error could echo the secret.
+	// Credentials belong in u.User (validated below), never the authority.
+	if err := ValidHostPort(u.Host); err != nil {
+		return fmt.Errorf("%w: proxy authority %v", ErrProxyConfig, err)
 	}
 	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("%w: unexpected path, query, or fragment", ErrProxyConfig)
@@ -165,15 +179,8 @@ func validateProxyURL(u *url.URL) error {
 // bytes that could inject a header line or corrupt the SOCKS framing, and no
 // over-255-byte name — and the port must be numeric and in range.
 func validateProxyTarget(target string) error {
-	host, port, err := net.SplitHostPort(target)
-	if err != nil || host == "" {
-		return fmt.Errorf("%w: malformed target address", ErrProxyConfig)
-	}
-	if len(host) > 255 || strings.ContainsAny(host, "@/?#\\ \t\r\n") || hasControl(host) {
-		return fmt.Errorf("%w: malformed target host", ErrProxyConfig)
-	}
-	if _, ok := ParsePort(port); !ok {
-		return fmt.Errorf("%w: malformed target port", ErrProxyConfig)
+	if err := ValidHostPort(target); err != nil {
+		return fmt.Errorf("%w: target %v", ErrProxyConfig, err)
 	}
 	return nil
 }
@@ -345,6 +352,9 @@ func socks5Auth(conn net.Conn, user *url.Userinfo) error {
 	if _, err := io.ReadFull(conn, st[:]); err != nil {
 		return fmt.Errorf("socks5 auth: %w", err)
 	}
+	if st[0] != 0x01 { // RFC 1929 subnegotiation version
+		return fmt.Errorf("%w: bad SOCKS5 auth version %d", ErrProxyProtocol, st[0])
+	}
 	if st[1] != 0x00 {
 		return fmt.Errorf("%w: authentication rejected", ErrProxyRejected)
 	}
@@ -383,6 +393,9 @@ func socks5ReadReply(conn net.Conn) error {
 	var head [4]byte // VER REP RSV ATYP
 	if _, err := io.ReadFull(conn, head[:]); err != nil {
 		return fmt.Errorf("socks5 reply: %w", err)
+	}
+	if head[0] != 0x05 || head[2] != 0x00 { // version must be 5, reserved must be 0
+		return fmt.Errorf("%w: bad SOCKS5 reply framing (ver=%d rsv=%d)", ErrProxyProtocol, head[0], head[2])
 	}
 	if head[1] != 0x00 {
 		// Classify by RFC 1928 §6 reply code: policy / unsupported-command /
@@ -478,17 +491,52 @@ func httpConnect(conn net.Conn, user *url.Userinfo, target string) error {
 	}
 	status, _, _ := strings.Cut(head.String(), "\r\n")
 	f := strings.Fields(status)
-	if len(f) < 2 || !strings.HasPrefix(f[0], "HTTP/") {
-		return fmt.Errorf("http proxy: malformed response %q", status)
+	// Strict status line: "HTTP/x.y NNN ...". A malformed version or a
+	// non-3-digit status is a protocol error (not an HTTP proxy) — permanent.
+	if len(f) < 2 || !validHTTPVersion(f[0]) {
+		return fmt.Errorf("%w: bad HTTP status line %q", ErrProxyProtocol, status)
 	}
-	if f[1] != "200" {
-		// A 4xx (other than 408 request-timeout / 429 too-many-requests) is a
-		// DETERMINISTIC proxy rejection — 407 proxy-auth-required, 403 forbidden,
-		// etc.: retrying repeats it. 5xx and 408/429 stay transient.
-		if code, err := strconv.Atoi(f[1]); err == nil && code >= 400 && code < 500 && code != 408 && code != 429 {
-			return fmt.Errorf("%w: CONNECT %s", ErrProxyRejected, f[1])
-		}
+	code, ok := parseHTTPStatus(f[1])
+	if !ok {
+		return fmt.Errorf("%w: bad HTTP status code %q", ErrProxyProtocol, f[1])
+	}
+	switch {
+	case code >= 200 && code < 300:
+		return nil // any 2xx establishes the tunnel
+	case code == 408 || code == 429 || (code >= 500 && code < 600):
+		// Timeout / rate-limit / server error: may clear on retry.
 		return fmt.Errorf("http proxy: CONNECT refused: %s", status)
+	default:
+		// 1xx (no final 2xx), 3xx, and 4xx other than 408/429 are DETERMINISTIC
+		// — 407 proxy-auth-required, 403 forbidden, an unexpected redirect:
+		// retrying repeats the same answer.
+		return fmt.Errorf("%w: CONNECT %d", ErrProxyRejected, code)
 	}
-	return nil
+}
+
+// validHTTPVersion reports whether tok is "HTTP/<digit>.<digit>".
+func validHTTPVersion(tok string) bool {
+	const p = "HTTP/"
+	v, ok := strings.CutPrefix(tok, p)
+	if !ok || len(v) != 3 || v[1] != '.' {
+		return false
+	}
+	return v[0] >= '0' && v[0] <= '9' && v[2] >= '0' && v[2] <= '9'
+}
+
+// parseHTTPStatus parses a strict 3-digit HTTP status in 100..599.
+func parseHTTPStatus(s string) (int, bool) {
+	if len(s) != 3 {
+		return 0, false
+	}
+	for i := 0; i < 3; i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+	}
+	n, _ := strconv.Atoi(s)
+	if n < 100 || n > 599 {
+		return 0, false
+	}
+	return n, true
 }

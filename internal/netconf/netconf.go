@@ -27,7 +27,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"strings"
 
@@ -131,15 +130,14 @@ func (n *Network) validateIdentity() error {
 	if n.Addr == "" {
 		return errors.New("addr is required")
 	}
-	// Nothing downstream supports a portless addr (dial, TLS SNI, and STS
-	// all SplitHostPort it), so a bare hostname saves fine and then wedges
-	// the network in a reconnect loop with a dial-time error. Reject the
-	// shape here, loudly, like the WireGuard endpoint check does.
-	if host, port, err := net.SplitHostPort(n.Addr); err != nil || host == "" {
-		return fmt.Errorf("addr %q must be host:port", n.Addr)
-	} else if _, ok := proxydial.ParsePort(port); !ok {
-		// Strict: ASCII digits in 1..65535 (strconv.Atoi would accept "+6667").
-		return fmt.Errorf("addr %q: port must be a decimal number in 1–65535", n.Addr)
+	// Nothing downstream supports a portless or malformed addr (dial, TLS SNI,
+	// and STS all SplitHostPort it), so a bad shape saves fine and then wedges
+	// the network in a reconnect loop with a dial-time error. Reject it here,
+	// loudly, with the SAME strict host:port validator the proxy paths use:
+	// host:port shape, bounded host free of whitespace / control / authority
+	// delimiters, and a strict decimal port (rejects "+6667").
+	if err := proxydial.ValidHostPort(n.Addr); err != nil {
+		return fmt.Errorf("addr %q: %v", n.Addr, err)
 	}
 	if n.Nick == "" {
 		return errors.New("nick is required")
