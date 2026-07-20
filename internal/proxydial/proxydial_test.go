@@ -17,8 +17,11 @@
 package proxydial
 
 import (
+	"context"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A rejected proxy URL must not leak its credentials in the error message.
@@ -108,6 +111,38 @@ func TestCredsOverCleartext(t *testing.T) {
 	for _, tc := range cases {
 		if got := CredsOverCleartext(tc.in); got != tc.warn {
 			t.Errorf("CredsOverCleartext(%q) = %v, want %v", tc.in, got, tc.warn)
+		}
+	}
+}
+
+// Dial must enforce Parse's structural invariants itself: a directly-
+// constructed or mutated URL (unknown scheme, hostless/bad-port authority, bad
+// credentials) or a malformed target must be rejected BEFORE any socket opens.
+func TestDialRejectsInvalidBeforeConnecting(t *testing.T) {
+	bad := []struct {
+		name   string
+		proxy  *url.URL
+		target string
+	}{
+		{"unknown scheme", &url.URL{Scheme: "gopher", Host: "127.0.0.1:1"}, "example.com:6667"},
+		{"empty host", &url.URL{Scheme: "socks5", Host: ":1080"}, "example.com:6667"},
+		{"bad port", &url.URL{Scheme: "socks5", Host: "h:0"}, "example.com:6667"},
+		{"socks creds missing password", &url.URL{Scheme: "socks5", Host: "h:1080", User: url.User("bob")}, "example.com:6667"},
+		{"bad target framing", &url.URL{Scheme: "socks5", Host: "h:1080"}, "no-port"},
+		{"bad target port", &url.URL{Scheme: "socks5", Host: "h:1080"}, "example.com:0"},
+	}
+	for _, tc := range bad {
+		// A zero timeout would still allow a dial attempt; we assert the error
+		// comes from validation (fast, deterministic) not a network timeout by
+		// using an unroutable-if-reached host and a short timeout, and checking
+		// the message is a proxy-validation error.
+		_, err := Dial(context.Background(), tc.proxy, tc.target, time.Second)
+		if err == nil {
+			t.Errorf("%s: Dial = nil, want a pre-dial validation error", tc.name)
+			continue
+		}
+		if !strings.HasPrefix(err.Error(), "proxy:") {
+			t.Errorf("%s: err = %v, want a proxy validation error", tc.name, err)
 		}
 	}
 }

@@ -162,18 +162,21 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 	defer s.settingsMu.Unlock()
 
 	// Re-validate the session at commit time, not just at the router: a PUT
-	// dispatched before a logout can reach here after it, and committing
-	// would overwrite a setting the NEXT session (or another device) owns.
+	// dispatched before a logout can reach here after it, and committing would
+	// overwrite a setting the NEXT session (or another device) owns.
 	//
-	// This recheck under settingsMu closes all but a microscopic window (the
-	// gap between authed() returning and the store write a few lines down). A
-	// truly gap-free guarantee would need a global read/write "auth barrier"
-	// that every token-revocation path also takes — an invasive lock across
-	// logout/rotation/expiry/eviction with real deadlock-ordering risk, for a
-	// residual whose worst case is the SAME user's own (non-security) settings
-	// write landing microseconds after their own logout on a single-user box.
-	// That is disproportionate; the commit-time recheck is the proportionate
-	// close. (Reviewed against GPT audit #5, 2026-07-19.)
+	// This recheck narrows the window to the gap between authed() returning and
+	// the store write below; a request that has passed this final admission may
+	// still complete after a concurrent logout returns. That is an ACCEPTED
+	// semantic, not a claim the settings are trivial — these are meaningful (a
+	// shorter retention prunes history; previews affect privacy; session TTL is
+	// security-relevant). Strict "nothing commits after logout returns" is
+	// achievable by holding s.mu (which every revocation path already takes)
+	// across an inlined token check and applyConfigPatch — no new lock, no
+	// reverse ordering — at the cost of serializing config commits behind that
+	// hot lock across a store write. For a single-user deployment the accepted
+	// semantic is the proportionate choice; revisit if this ever serves
+	// multiple distinct principals. (GPT audit #5, rechecked 2026-07-20.)
 	if !s.authed(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
