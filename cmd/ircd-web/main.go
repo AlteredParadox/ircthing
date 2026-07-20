@@ -126,15 +126,12 @@ func run(cfg *config) error {
 
 	h := hub.New(st)
 
-	// Networks live in the database and are managed from the web UI. The
-	// config file's networks[] seeds the table on first run only; once
-	// rows exist the file list is ignored.
-	var wg sync.WaitGroup
-	h.UseRoot(ctx, &wg)
-	if err := startNetworks(ctx, st, h, cfg.Networks); err != nil {
-		return fmt.Errorf("networks: %w", err)
-	}
-
+	// Construct (and thereby VALIDATE) the API before any network goroutine
+	// starts: api.New checks the bcrypt hash and the stored password
+	// override, and failing after networks launched meant outbound IRC
+	// connections for a process that was about to exit — with the deferred
+	// st.Close() running (LIFO) before the signal context's stop(), i.e.
+	// closing the store under goroutines still using it.
 	assets, err := fs.Sub(web.Dist, "dist")
 	if err != nil {
 		return fmt.Errorf("embedded assets: %w", err)
@@ -149,6 +146,19 @@ func run(cfg *config) error {
 	}, h, assets)
 	if err != nil {
 		return err
+	}
+
+	// Networks live in the database and are managed from the web UI. The
+	// config file's networks[] seeds the table on first run only; once
+	// rows exist the file list is ignored.
+	var wg sync.WaitGroup
+	h.UseRoot(ctx, &wg)
+	if err := startNetworks(ctx, st, h, cfg.Networks); err != nil {
+		// Some networks may already be running: cancel and WAIT for them
+		// before the deferred st.Close() pulls the store out from under them.
+		stop()
+		wg.Wait()
+		return fmt.Errorf("networks: %w", err)
 	}
 	// Full server timeouts; the WebSocket endpoint hijacks its
 	// connection at upgrade, after which the library manages deadlines,

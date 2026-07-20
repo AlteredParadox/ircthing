@@ -100,11 +100,26 @@ func Parse(s string) (*url.URL, error) {
 	default:
 		return nil, fmt.Errorf("proxy %q: scheme must be socks5 or http", redactProxy(s))
 	}
-	if u.Host == "" || u.Port() == "" {
+	// Hostname AND port must both be present and sane — url.Parse happily
+	// accepts "socks5://:1080" (empty host) and out-of-range ports, which
+	// would otherwise be persisted and only fail (confusingly) at dial time.
+	if u.Hostname() == "" || u.Port() == "" {
 		return nil, fmt.Errorf("proxy %q: host:port required", redactProxy(s))
+	}
+	if port, err := strconv.Atoi(u.Port()); err != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("proxy %q: port must be 1-65535", redactProxy(s))
 	}
 	if u.Path != "" && u.Path != "/" {
 		return nil, fmt.Errorf("proxy %q: unexpected path", redactProxy(s))
+	}
+	// SOCKS5 username/password subnegotiation (RFC 1929) carries one-byte
+	// length fields: credentials over 255 bytes cannot be represented. Reject
+	// at parse/persist time rather than after dialing the proxy.
+	if u.Scheme != "http" && u.User != nil {
+		pass, _ := u.User.Password()
+		if len(u.User.Username()) > 255 || len(pass) > 255 {
+			return nil, fmt.Errorf("proxy %q: SOCKS5 credentials must be at most 255 bytes each", redactProxy(s))
+		}
 	}
 	return u, nil
 }

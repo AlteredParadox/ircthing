@@ -72,6 +72,13 @@ func TestParse(t *testing.T) {
 		"socks5://host:1080/path", // unexpected path
 		"://bad",                  // unparseable
 		"",                        // empty
+		"socks5://:1080",          // empty hostname — impossible target
+		"socks5://host:0",         // port below range
+		"socks5://host:65536",     // port above range
+		// RFC 1929 length fields are one byte: >255-byte SOCKS creds cannot
+		// be encoded and previously failed only after dialing the proxy.
+		"socks5://" + strings.Repeat("u", 256) + ":pw@host:1080",
+		"socks5://user:" + strings.Repeat("p", 256) + "@host:1080",
 	}
 	for _, s := range bad {
 		if _, err := Parse(s); err == nil {
