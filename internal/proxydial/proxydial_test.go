@@ -22,35 +22,30 @@ import (
 )
 
 // A rejected proxy URL must not leak its credentials in the error message.
-func TestParseRedactsCredentials(t *testing.T) {
-	// Password chosen so it is unambiguous in the error text.
-	_, err := Parse("socks5://alice:sup3rSecret@host:1080/nope") // path -> rejected
-	if err == nil {
-		t.Fatal("expected an error for a proxy URL with a path")
+func TestParseNeverLeaksCredentials(t *testing.T) {
+	// Parse errors are fixed strings — no redaction heuristic to trust. Every
+	// one of these must error WITHOUT any credential substring reaching the
+	// message, including the slash-before-@ form that defeats an authority-only
+	// redactor.
+	cases := []string{
+		"socks5://alice:sup3rSecret@host:1080/nope", // path -> rejected
+		"socks5://bob:s3cr3t%zz@host:1080",          // fails url.Parse
+		"carol:hunter2@host:1080",                   // scheme-less
+		"socks5://u:first@SECRET@host:1080/path",    // multi-@
+		"socks5://alice:secret/path@proxy:1080",     // '@' after first '/' (redactor blind spot)
 	}
-	if strings.Contains(err.Error(), "sup3rSecret") || strings.Contains(err.Error(), "alice") {
-		t.Fatalf("error leaked credentials: %v", err)
-	}
-	if !strings.Contains(err.Error(), "<redacted>@host:1080") {
-		t.Fatalf("error should retain the redacted host: %v", err)
-	}
-
-	// A value that fails url.Parse must not leak the raw credential via a
-	// wrapped *url.Error (which embeds the original string).
-	if _, err := Parse("socks5://bob:s3cr3t%zz@host:1080"); err == nil || strings.Contains(err.Error(), "s3cr3t") {
-		t.Fatalf("invalid-escape URL leaked or did not error: %v", err)
-	}
-
-	// A scheme-less credential form (bypasses the scheme masker's "://" split)
-	// must still be redacted in the error.
-	if _, err := Parse("carol:hunter2@host:1080"); err == nil || strings.Contains(err.Error(), "hunter2") || strings.Contains(err.Error(), "carol") {
-		t.Fatalf("scheme-less URL leaked credentials: %v", err)
-	}
-
-	// A password containing '@' (multiple '@' in the authority): Go uses the
-	// LAST '@' as the userinfo delimiter, so masking must reach it.
-	if _, err := Parse("socks5://u:first@SECRET@host:1080/path"); err == nil || strings.Contains(err.Error(), "SECRET") {
-		t.Fatalf("multi-@ URL leaked credentials: %v", err)
+	secrets := []string{"sup3rSecret", "alice", "s3cr3t", "hunter2", "carol", "SECRET", "secret"}
+	for _, s := range cases {
+		_, err := Parse(s)
+		if err == nil {
+			t.Errorf("Parse(%q) = nil, want error", s)
+			continue
+		}
+		for _, sec := range secrets {
+			if strings.Contains(err.Error(), sec) {
+				t.Errorf("Parse(%q) leaked %q: %v", s, sec, err)
+			}
+		}
 	}
 }
 
@@ -60,6 +55,8 @@ func TestParse(t *testing.T) {
 		"socks5h://tor:9050",
 		"socks5://alice:pw@10.0.0.1:1080",
 		"http://user:pass@proxy.example:3128",
+		"http://user:@proxy.example:3128",                       // HTTP Basic allows an empty password
+		"socks5://a:" + strings.Repeat("p", 255) + "@host:1080", // 255-byte SOCKS pass is the max
 	}
 	for _, s := range ok {
 		if _, err := Parse(s); err != nil {
@@ -75,10 +72,17 @@ func TestParse(t *testing.T) {
 		"socks5://:1080",          // empty hostname — impossible target
 		"socks5://host:0",         // port below range
 		"socks5://host:65536",     // port above range
-		// RFC 1929 length fields are one byte: >255-byte SOCKS creds cannot
-		// be encoded and previously failed only after dialing the proxy.
-		"socks5://" + strings.Repeat("u", 256) + ":pw@host:1080",
-		"socks5://user:" + strings.Repeat("p", 256) + "@host:1080",
+		// RFC 1929: one-byte length fields, both 1-255 octets.
+		"socks5://" + strings.Repeat("u", 256) + ":pw@host:1080", // username too long
+		"socks5://user:" + strings.Repeat("p", 256) + "@host:1080", // password too long
+		"socks5://user@host:1080",                                  // SOCKS needs a password too
+		"socks5://user:@host:1080",                                 // empty SOCKS password
+		"socks5://:pw@host:1080",                                   // empty SOCKS username
+		// RFC 7617: HTTP Basic can't encode a control char in either field.
+		// (A ':' is legal in the PASSWORD — only the user-id forbids it — so
+		// that is not tested here as an error.)
+		"http://a\x01b:pw@host:3128",   // control char in HTTP username
+		"http://user:p\x7fw@host:3128", // DEL in HTTP password
 	}
 	for _, s := range bad {
 		if _, err := Parse(s); err == nil {

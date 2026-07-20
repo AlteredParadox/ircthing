@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -402,6 +403,25 @@ func (f *fetcher) dialContext(proxy *url.URL) func(context.Context, string, stri
 	return d.DialContext
 }
 
+// validMediaURL vets a parsed URL for both the initial fetch and every redirect
+// hop, BEFORE any dial: http(s) scheme, a non-empty hostname, and either no
+// explicit port or a decimal port in 1..65535. Checking u.Host alone is not
+// enough — "http://:80/" has a non-empty Host ("​:80") but an EMPTY Hostname(),
+// and the proxy/CONNECT/SOCKS behavior for a hostless authority or a bogus port
+// is implementation-defined. Returns false for anything that must be refused.
+func validMediaURL(u *url.URL) bool {
+	if u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return false
+	}
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return false
+		}
+	}
+	return true
+}
+
 // checkRedirect vets each redirect hop. Its errors are TYPED (and survive
 // the *url.Error wrapping client.Do applies) so fetchErrorRetryable can
 // classify a redirect loop or a forbidden scheme as permanent — both are
@@ -411,8 +431,8 @@ func (f *fetcher) checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= 5 {
 		return errRedirectLoop
 	}
-	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
-		return errRedirectScheme
+	if !validMediaURL(req.URL) {
+		return errRedirectScheme // deterministic → permanent (fetchErrorRetryable)
 	}
 	// The proxied path has no connect-time IP check, so re-apply the literal
 	// non-public-IP block on each redirect target.
@@ -440,7 +460,7 @@ func (f *fetcher) hostAllowed(host string) bool {
 // against the page they actually came from, not the pre-redirect target.
 func (f *fetcher) get(ctx context.Context, rawURL string) (contentType, finalURL string, body []byte, err error) {
 	u, err := url.Parse(rawURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+	if err != nil || !validMediaURL(u) {
 		return "", "", nil, errBadURL
 	}
 	// Proxied path: refuse a literal non-public IP up front, since the

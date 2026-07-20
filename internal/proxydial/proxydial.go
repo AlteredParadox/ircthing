@@ -42,31 +42,6 @@ import (
 	"time"
 )
 
-// redactProxy masks any userinfo (user:pass@) in a proxy URL string so
-// SOCKS5/HTTP proxy credentials never reach error messages or logs. It
-// handles both the scheme form ("socks5://user:pass@host") and a scheme-less
-// value ("user:pass@host") that bypassed the scheme check, so a malformed
-// config can't echo credentials back through a validation error.
-func redactProxy(s string) string {
-	// Mask the userinfo (user:pass@). Go/net-url treats the LAST '@' in the
-	// authority as the delimiter, so masking only through the FIRST '@' would
-	// leak a password containing a literal '@'. Restrict the search to the
-	// authority (before the first '/') so an '@' in a path isn't mistaken for
-	// userinfo. Handles the scheme and scheme-less forms alike.
-	start := 0
-	if i := strings.Index(s, "://"); i != -1 {
-		start = i + 3
-	}
-	authEnd := len(s)
-	if slash := strings.IndexByte(s[start:], '/'); slash != -1 {
-		authEnd = start + slash
-	}
-	if at := strings.LastIndexByte(s[start:authEnd], '@'); at != -1 {
-		return s[:start] + "<redacted>@" + s[start+at+1:]
-	}
-	return s
-}
-
 // CredsOverCleartext reports whether a proxy URL carries authentication to a
 // non-loopback host. SOCKS5 (RFC 1929) and HTTP Basic proxy auth are sent
 // unencrypted, so credentials to a remote proxy travel in the clear unless the
@@ -88,40 +63,85 @@ func CredsOverCleartext(proxyURL string) bool {
 }
 
 // Parse validates a proxy configuration string and returns the parsed URL.
+//
+// Parse errors are FIXED strings that never echo the input: the raw value can
+// carry credentials, and no redaction heuristic is airtight (a malformed value
+// like "socks5://alice:secret/path@proxy:1080" puts the '@' after the first
+// '/', past the authority the redactor scans). Callers that want to identify
+// the proxy in a diagnostic must build it structurally from the returned URL's
+// scheme+host, never from the raw string.
 func Parse(s string) (*url.URL, error) {
 	u, err := url.Parse(s)
 	if err != nil {
-		// Do NOT wrap the url.Parse error: *url.Error embeds the raw input,
-		// which can carry proxy credentials. Report only the redacted form.
-		return nil, fmt.Errorf("proxy %q: invalid proxy URL", redactProxy(s))
+		return nil, fmt.Errorf("proxy: invalid proxy URL")
 	}
 	switch u.Scheme {
 	case "socks5", "socks5h", "http":
 	default:
-		return nil, fmt.Errorf("proxy %q: scheme must be socks5 or http", redactProxy(s))
+		return nil, fmt.Errorf("proxy: scheme must be socks5 or http")
 	}
 	// Hostname AND port must both be present and sane — url.Parse happily
 	// accepts "socks5://:1080" (empty host) and out-of-range ports, which
 	// would otherwise be persisted and only fail (confusingly) at dial time.
 	if u.Hostname() == "" || u.Port() == "" {
-		return nil, fmt.Errorf("proxy %q: host:port required", redactProxy(s))
+		return nil, fmt.Errorf("proxy: host:port required")
 	}
 	if port, err := strconv.Atoi(u.Port()); err != nil || port < 1 || port > 65535 {
-		return nil, fmt.Errorf("proxy %q: port must be 1-65535", redactProxy(s))
+		return nil, fmt.Errorf("proxy: port must be 1-65535")
 	}
 	if u.Path != "" && u.Path != "/" {
-		return nil, fmt.Errorf("proxy %q: unexpected path", redactProxy(s))
+		return nil, fmt.Errorf("proxy: unexpected path")
 	}
-	// SOCKS5 username/password subnegotiation (RFC 1929) carries one-byte
-	// length fields: credentials over 255 bytes cannot be represented. Reject
-	// at parse/persist time rather than after dialing the proxy.
-	if u.Scheme != "http" && u.User != nil {
-		pass, _ := u.User.Password()
-		if len(u.User.Username()) > 255 || len(pass) > 255 {
-			return nil, fmt.Errorf("proxy %q: SOCKS5 credentials must be at most 255 bytes each", redactProxy(s))
+	if u.User != nil {
+		if err := validateProxyCreds(u.Scheme, u.User); err != nil {
+			return nil, err
 		}
 	}
 	return u, nil
+}
+
+// validateProxyCreds enforces the scheme-specific credential grammar so an
+// unrepresentable or malformed value is rejected at parse/persist time, not
+// after dialing the proxy. Errors are fixed strings (no credential echo).
+func validateProxyCreds(scheme string, user *url.Userinfo) error {
+	name := user.Username()
+	pass, hasPass := user.Password()
+	if scheme == "http" {
+		// HTTP Basic (RFC 7617): the field is "user-id ':' password',
+		// base64-encoded. A ':' in the user-id is unrepresentable, and
+		// control characters would corrupt the header line.
+		if strings.ContainsRune(name, ':') {
+			return fmt.Errorf("proxy: HTTP proxy username must not contain ':'")
+		}
+		if hasControl(name) || hasControl(pass) {
+			return fmt.Errorf("proxy: HTTP proxy credentials must not contain control characters")
+		}
+		if len(name) > 255 || len(pass) > 255 {
+			return fmt.Errorf("proxy: HTTP proxy credentials too long")
+		}
+		return nil
+	}
+	// SOCKS5 username/password subnegotiation (RFC 1929): BOTH fields are
+	// 1-255 octets, each length-prefixed by a single byte. Userinfo with a
+	// username but no password (socks5://user@host) is not a valid no-auth
+	// config and cannot be encoded — reject it rather than send an empty
+	// password the server may refuse.
+	if !hasPass {
+		return fmt.Errorf("proxy: SOCKS5 credentials need both a username and a password")
+	}
+	if len(name) < 1 || len(name) > 255 || len(pass) < 1 || len(pass) > 255 {
+		return fmt.Errorf("proxy: SOCKS5 username and password must each be 1-255 bytes")
+	}
+	return nil
+}
+
+func hasControl(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 // Dial connects to the proxy and tunnels to target (host:port). The whole

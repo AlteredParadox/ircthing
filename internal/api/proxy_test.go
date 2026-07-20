@@ -236,6 +236,21 @@ func TestFetcherRejects(t *testing.T) {
 			t.Fatalf("err = %v", err)
 		}
 	})
+	t.Run("hostless and bad-port authorities", func(t *testing.T) {
+		// http://:80/ has a non-empty Host (":80") but an EMPTY Hostname(): it
+		// must be refused before any dial, along with out-of-range ports. A dial
+		// counter proves none reach the dialer.
+		for _, u := range []string{"http://:80/", "http://:0/", "https://:65536/", "http://host:0/", "http://host:99999/"} {
+			f.allowIP = func(net.IP) bool {
+				t.Errorf("get(%q) reached the dialer", u)
+				return false
+			}
+			if _, _, _, err := f.get(context.Background(), u); !errors.Is(err, errBadURL) {
+				t.Fatalf("get(%q) = %v, want errBadURL", u, err)
+			}
+		}
+		f.allowIP = func(net.IP) bool { return true }
+	})
 	t.Run("size cap", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Write(make([]byte, 4096))
