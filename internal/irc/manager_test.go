@@ -627,6 +627,53 @@ func TestManagerMonitor(t *testing.T) {
 	if got := s.readCmd("MONITOR"); got.Param(0) != "+" || got.Param(1) != "e" {
 		t.Fatalf("MonitorAdd after free slot = %q", got.String())
 	}
+	// Active set now {b,c,e}. An EXACT duplicate add is a no-op (spec: not
+	// re-added) — no wire traffic, no count drift. Removing an INACTIVE nick
+	// (never added: "a" was removed, "d" clamped away) also sends nothing.
+	// A subsequent remove of an ACTIVE nick proves neither leaked ahead of it.
+	m.MonitorAdd("e")    // duplicate
+	m.MonitorRemove("a") // inactive (already removed)
+	m.MonitorRemove("d") // inactive (clamped, never added)
+	m.MonitorRemove("b") // active → this is the only thing that should hit the wire
+	if got := s.readCmd("MONITOR"); got.Param(0) != "-" || got.Param(1) != "b" {
+		t.Fatalf("MONITOR = %q; a duplicate add or inactive remove leaked", got.String())
+	}
+}
+
+// A 734 (list full) must drop the rejected nick from the connection's active
+// set, so a later add can reuse the accounting slot instead of being blocked
+// until reconnect. Uses an UNADVERTISED limit (MONITOR with no number) so the
+// client doesn't clamp and actually sends the add that the server then 734s.
+func TestManagerMonitorRejected(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+	s.send(":irc.test 005 AlteredParadox MONITOR :are supported by this server")
+	deadline := time.Now().Add(5 * time.Second)
+	for !m.monitorAdvertised() {
+		if time.Now().After(deadline) {
+			t.Fatal("005 MONITOR never applied")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	m.MonitorAdd("full1")
+	if got := s.readCmd("MONITOR"); got.Param(1) != "full1" {
+		t.Fatalf("add = %q", got.String())
+	}
+	// Server rejects it (734). The manager must forget it from the active set.
+	m.MonitorRejected([]string{"full1"})
+	// Re-adding the same nick must now go out again (not suppressed as a dup).
+	m.MonitorAdd("full1")
+	if got := s.readCmd("MONITOR"); got.Param(0) != "+" || got.Param(1) != "full1" {
+		t.Fatalf("re-add after 734 = %q; rejection did not clear the active set", got.String())
+	}
 }
 
 func TestManagerLazyNames(t *testing.T) {

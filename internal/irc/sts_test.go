@@ -149,6 +149,55 @@ func TestManagerSTSPolicyState(t *testing.T) {
 	}
 }
 
+// fakeSTSStore returns a fixed policy/error; err is the fail-closed signal.
+type fakeSTSStore struct {
+	port  int
+	until time.Time
+	ok    bool
+	err   error
+}
+
+func (f *fakeSTSStore) STSPolicy(_ context.Context, _ string) (int, time.Time, bool, error) {
+	return f.port, f.until, f.ok, f.err
+}
+func (f *fakeSTSStore) SetSTSPolicy(context.Context, string, int, time.Time) error { return nil }
+func (f *fakeSTSStore) ClearSTSPolicy(context.Context, string) error               { return nil }
+
+// loadSTS must FAIL CLOSED on an indeterminate policy state (store error or a
+// corrupt record): it returns a non-nil error, which Run turns into "do not
+// dial plaintext, retry". Once the store recovers with a real policy, loadSTS
+// applies it and effectiveAddr upgrades to the TLS port — so a plaintext
+// network never dials in cleartext across the failure window.
+func TestLoadSTSFailClosed(t *testing.T) {
+	store := &fakeSTSStore{err: errors.New("db locked")}
+	m, err := NewManager(Config{Addr: "irc.test:6667", Nick: "AlteredParadox", AllowPlaintext: true, STS: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Indeterminate state → error (Run refuses to dial plaintext on this).
+	if err := m.loadSTS(context.Background()); err == nil {
+		t.Fatal("loadSTS returned nil on a store error; a plaintext network would dial in cleartext")
+	}
+	// Nothing was applied, so effectiveAddr would still be plaintext — but Run
+	// never reaches the dial because loadSTS errored.
+	if _, secure := m.effectiveAddr(); secure {
+		t.Fatal("an errored load must not have upgraded the address")
+	}
+
+	// Store recovers with an unexpired TLS policy.
+	store.err = nil
+	store.ok = true
+	store.port = 6697
+	store.until = time.Now().Add(time.Hour)
+	if err := m.loadSTS(context.Background()); err != nil {
+		t.Fatalf("loadSTS after recovery: %v", err)
+	}
+	if addr, secure := m.effectiveAddr(); addr != "irc.test:6697" || !secure {
+		t.Fatalf("after recovery effectiveAddr = %q/%v, want the TLS port", addr, secure)
+	}
+}
+
 // A post-registration CAP NEW carrying an STS upgrade port over an
 // insecure link triggers the same secure-reconnect abort as CAP LS.
 func TestCapNotifySTSUpgrade(t *testing.T) {

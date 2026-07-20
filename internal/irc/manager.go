@@ -139,12 +139,15 @@ type Manager struct {
 	// maybeWHOX). Only the read loop touches it.
 	whoxDone map[string]bool
 
-	// monCount approximates the server-side MONITOR list size on this
-	// connection, so live MonitorAdd can respect the ISUPPORT limit instead
-	// of silently sending an add the server will 734. Set by SetMonitored at
-	// registration, adjusted by MonitorAdd/MonitorRemove (which the hub
-	// serializes under its monitor mutex).
-	monCount atomic.Int64
+	// monActive is the FOLDED set of nicks currently MONITORed on THIS
+	// connection — the server's own list, tracked so live adds respect the
+	// limit and never re-add a duplicate, and removes act only on nicks
+	// actually being watched (an overflow/inactive nick must not send a
+	// spurious MONITOR - or perturb the count). Reset per connection (the
+	// server clears its list on a new connection). Guarded by monActiveMu:
+	// mutations arrive from the hub goroutine, the reset from the run loop.
+	monActiveMu sync.Mutex
+	monActive   map[string]bool
 
 	// stsMu guards the active STS policy (sts.go): connect to stsPort
 	// with TLS until stsUntil (zero stsUntil with a port = session-only
@@ -206,6 +209,7 @@ func NewManager(cfg Config) (*Manager, error) {
 		joined:         make(map[string]string),
 		namesReq:       make(map[string]bool),
 		whoxDone:       make(map[string]bool),
+		monActive:      make(map[string]bool),
 		pendingCapVals: make(map[string]string),
 	}
 	for _, ch := range cfg.Channels {
@@ -449,25 +453,36 @@ func (m *Manager) SetMonitored(nicks []string) {
 	for _, chunk := range chunkTargets(valid, 10) {
 		_ = m.Send(newMsg("MONITOR", "+", strings.Join(chunk, ",")))
 	}
-	m.monCount.Store(int64(len(valid)))
+	m.monActiveMu.Lock()
+	m.monActive = make(map[string]bool, len(valid))
+	for _, n := range valid {
+		m.monActive[m.isup.Fold(n)] = true
+	}
+	m.monActiveMu.Unlock()
 }
 
 // MonitorAdd starts monitoring one nick; MonitorRemove stops. Both no-op
 // before registration (the hub re-sends the whole list on registration).
 // Live adds enforce the same constraints restoration does: MONITOR must be
-// advertised, and the ISUPPORT limit is respected — the server would 734 the
-// overflow anyway, but silently sending it left the persisted row appearing
-// monitored while upstream never watched it.
+// advertised, the ISUPPORT limit is respected, and a duplicate (per the spec,
+// duplicates are not re-added) is a no-op — so the active-set count stays
+// authoritative instead of drifting on exact-duplicate adds.
 func (m *Manager) MonitorAdd(nick string) {
 	if !m.registered.Load() || !m.monitorAdvertised() {
 		return
 	}
-	if limit := m.monitorLimit(); limit > 0 && m.monCount.Load() >= int64(limit) {
+	folded := m.isup.Fold(nick)
+	m.monActiveMu.Lock()
+	defer m.monActiveMu.Unlock()
+	if m.monActive[folded] {
+		return // already monitored on this connection
+	}
+	if limit := m.monitorLimit(); limit > 0 && len(m.monActive) >= limit {
 		log.Printf("irc[%s]: MONITOR list at server limit %d; %q not monitored on this connection (restored on reconnect if room)", m.cfg.Name, limit, nick)
 		return
 	}
 	if m.Send(newMsg("MONITOR", "+", nick)) == nil {
-		m.monCount.Add(1)
+		m.monActive[folded] = true
 	}
 }
 
@@ -475,10 +490,25 @@ func (m *Manager) MonitorRemove(nick string) {
 	if !m.registered.Load() || !m.monitorAdvertised() {
 		return
 	}
+	folded := m.isup.Fold(nick)
+	m.monActiveMu.Lock()
+	defer m.monActiveMu.Unlock()
+	if !m.monActive[folded] {
+		return // not actually being watched (overflow/inactive) — nothing to send
+	}
 	if m.Send(newMsg("MONITOR", "-", nick)) == nil {
-		if m.monCount.Add(-1) < 0 {
-			m.monCount.Store(0)
-		}
+		delete(m.monActive, folded)
+	}
+}
+
+// MonitorRejected drops nicks the server refused (ERR_MONLISTFULL / 734) from
+// the active set, so the count reflects the server's real list — otherwise an
+// optimistically-counted add that was rejected would wrongly block later adds.
+func (m *Manager) MonitorRejected(nicks []string) {
+	m.monActiveMu.Lock()
+	defer m.monActiveMu.Unlock()
+	for _, n := range nicks {
+		delete(m.monActive, m.isup.Fold(n))
 	}
 }
 
@@ -791,8 +821,30 @@ func (m *Manager) setRegistered(v bool) {
 // Run connects and reconnects until ctx is canceled.
 func (m *Manager) Run(ctx context.Context) error {
 	defer m.wgClose()
-	m.loadSTS(ctx)
 	bo := newBackoff(m.cfg.Backoff)
+	// Load the STS policy before the first dial. For a PLAINTEXT-configured
+	// network this is FAIL CLOSED: while the policy state is indeterminate — a
+	// store read error, or a nonempty corrupt record we cannot honor — we must
+	// not dial in cleartext, because an active policy may require TLS (STS
+	// spec: refuse rather than downgrade). Retry with backoff until the state
+	// is definitive. A TLS-configured network is already secure, so a load
+	// failure there is non-blocking (best effort — its stored port is only an
+	// optimization). NB: a persistently corrupt record keeps a plaintext
+	// network from connecting until the sts:<host> row is cleared — that is
+	// the spec-mandated cost of fail-closed, not a bug.
+	for {
+		err := m.loadSTS(ctx)
+		if err == nil || m.cfg.TLS {
+			break
+		}
+		log.Printf("irc[%s]: refusing to connect until the STS policy is readable (a plaintext downgrade is unsafe): %v", m.cfg.Name, err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(bo.next()):
+		}
+	}
+	bo.reset() // don't carry STS-load backoff into the connect loop
 	for {
 		m.emit(ctx, Event{Kind: EventState, State: StateConnecting})
 		err := m.runOnce(ctx, bo)
@@ -817,31 +869,29 @@ func (m *Manager) Run(ctx context.Context) error {
 	}
 }
 
-// loadSTS seeds the in-memory STS policy from the persistent store.
-func (m *Manager) loadSTS(ctx context.Context) {
+// loadSTS seeds the in-memory STS policy from the persistent store. It returns
+// a non-nil error ONLY when the policy state is indeterminate (store read
+// error or a corrupt record); the caller fails closed on that for a plaintext
+// network. A clean "no policy / expired" result returns nil.
+func (m *Manager) loadSTS(ctx context.Context) error {
 	if m.cfg.STS == nil {
-		return
+		return nil
 	}
 	host, _, err := net.SplitHostPort(m.cfg.Addr)
 	if err != nil {
-		return
+		return nil // a malformed addr fails at dial time; nothing to load here
 	}
 	port, until, ok, err := m.cfg.STS.STSPolicy(ctx, host)
 	if err != nil {
-		// A store READ error is ambiguous — a policy may exist that we cannot
-		// see, and silently proceeding fails OPEN: a plaintext-configured
-		// network would reconnect in cleartext despite an active STS policy.
-		// There is no port to fail closed onto (the policy is unreadable), so
-		// the strongest safe action is a loud, unambiguous log.
-		log.Printf("irc[%s]: STS POLICY LOAD FAILED (%v) — downgrade protection may be lost for %s; a plaintext config may connect in cleartext", m.cfg.Name, err, host)
-		return
+		return err
 	}
 	if !ok || !time.Now().Before(until) {
-		return
+		return nil
 	}
 	m.stsMu.Lock()
 	m.stsPort, m.stsUntil = port, until
 	m.stsMu.Unlock()
+	return nil
 }
 
 // effectiveAddr resolves where and how to connect: the configured
@@ -1007,6 +1057,11 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	defer m.roster.clear()
 	m.resetNames()
 	m.whoxDone = make(map[string]bool)
+	// New connection: the server's MONITOR list starts empty (SetMonitored
+	// re-establishes it on registration).
+	m.monActiveMu.Lock()
+	m.monActive = make(map[string]bool)
+	m.monActiveMu.Unlock()
 
 	addr, secure := m.effectiveAddr()
 	conn, err := m.dial(ctx, addr, secure)

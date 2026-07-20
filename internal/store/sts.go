@@ -19,6 +19,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -41,8 +42,12 @@ func (s *Store) STSPolicy(ctx context.Context, host string) (port int, until tim
 		return 0, time.Time{}, false, err
 	}
 	var rec stsRecord
-	if json.Unmarshal([]byte(v), &rec) != nil || rec.Port <= 0 {
-		return 0, time.Time{}, false, nil // corrupt entry: treat as unset
+	if json.Unmarshal([]byte(v), &rec) != nil || rec.Port <= 0 || rec.Port > 65535 {
+		// A NONEMPTY but unusable record is NOT "no policy": a policy was set
+		// (the host had STS) and we can't honor it. Returning an error lets the
+		// caller fail closed (refuse a plaintext downgrade) per the STS spec,
+		// rather than silently treating a corrupt record as absent.
+		return 0, time.Time{}, false, fmt.Errorf("sts: unreadable policy record for %q", host)
 	}
 	return rec.Port, time.UnixMilli(rec.Until), true, nil
 }

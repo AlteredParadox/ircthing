@@ -293,15 +293,16 @@ type fakeConn struct {
 	// pageSize is HistoryPageSize; 0 means the default 100.
 	pageSize int
 
-	mu        sync.Mutex
-	sent      []*ircv4.Message
-	sendErr   error
-	hist      []string // RequestChatHistory calls as "target@sinceMs"
-	names     []string // EnsureNames calls
-	multiline []string // SendMultiline calls
-	monitored []string // SetMonitored
-	monAdd    []string // MonitorAdd
-	monRemove []string // MonitorRemove
+	mu          sync.Mutex
+	sent        []*ircv4.Message
+	sendErr     error
+	hist        []string // RequestChatHistory calls as "target@sinceMs"
+	names       []string // EnsureNames calls
+	multiline   []string // SendMultiline calls
+	monitored   []string // SetMonitored
+	monAdd      []string // MonitorAdd
+	monRemove   []string // MonitorRemove
+	monRejected []string // MonitorRejected
 }
 
 func (f *fakeConn) Events() <-chan irc.Event     { return f.ch }
@@ -425,6 +426,12 @@ func (f *fakeConn) MonitorRemove(nick string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.monRemove = append(f.monRemove, nick)
+}
+
+func (f *fakeConn) MonitorRejected(nicks []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.monRejected = append(f.monRejected, nicks...)
 }
 
 func (f *fakeConn) monitoredNicks() []string {

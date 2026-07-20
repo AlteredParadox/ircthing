@@ -91,6 +91,9 @@ type Conn interface {
 	SetMonitored(nicks []string)
 	MonitorAdd(nick string)
 	MonitorRemove(nick string)
+	// MonitorRejected drops server-refused (734) nicks from the active set so
+	// the connection's monitor accounting stays authoritative.
+	MonitorRejected(nicks []string)
 }
 
 type Hub struct {
@@ -202,6 +205,14 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					backfillPages = make(map[string]int)
 					whois = make(map[string]*WhoisData)
 					*reg = regSync{}
+					// Presence and the MOTD gate are connection-scoped too, and an
+					// STS upgrade redials via StateConnecting WITHOUT ever emitting
+					// StateDisconnected — so clearing them only there let stale
+					// presence and an armed MOTD gate survive into the secure
+					// connection. StateConnecting is the true generation boundary;
+					// the Disconnected clears below are now a harmless backstop.
+					h.clearPresence(ev.Network)
+					h.clearMOTD(ev.Network)
 				}
 				h.onState(ctx, c, ev, reg)
 			case irc.EventMessage:
@@ -280,11 +291,11 @@ func (h *Hub) onState(ctx context.Context, c Conn, ev irc.Event, reg *regSync) {
 		h.maybeStartSync(ctx, c, reg)
 	}
 	if ev.State == irc.StateDisconnected {
+		// Backstop: the authoritative clear is on StateConnecting (the
+		// connection-generation boundary, which the STS redial also crosses).
+		// Clearing here too is harmless and covers a terminal disconnect that
+		// is never followed by a reconnect.
 		h.clearPresence(ev.Network)
-		// Drop any armed /motd gate with the connection that owned it: its
-		// reply can no longer arrive, and a gate surviving the disconnect
-		// would forward the NEXT registration's unsolicited MOTD burst as if
-		// it had been requested.
 		h.clearMOTD(ev.Network)
 	}
 }
@@ -320,6 +331,14 @@ func (h *Hub) handleControlNumeric(ctx context.Context, c Conn, ev irc.Event) bo
 		h.updatePresence(ctx, c, ev.Network, ev.Msg, false)
 		return true
 	case "734": // ERR_MONLISTFULL
+		// Format: <nick> <limit> <rejected,targets> :message. The server did
+		// NOT add these, so drop them from the connection's active set —
+		// otherwise an optimistically-counted add that was rejected would
+		// wrongly block later adds until reconnect. The persisted "desired"
+		// row stays (buddy shows offline; re-established on reconnect if room).
+		if len(ev.Msg.Params) > 2 {
+			c.MonitorRejected(strings.Split(ev.Msg.Params[2], ","))
+		}
 		log.Printf("irc[%s]: MONITOR list full: %q", ev.Network, clampServerInfo(ev.Msg.Trailing()))
 		return true
 	case "732", "733": // RPL_MONLIST / end — the store is our source of truth
