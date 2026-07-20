@@ -137,6 +137,11 @@ func fetchErrorRetryable(err error) bool {
 		errors.Is(err, errRedirectLoop) || errors.Is(err, errRedirectScheme) {
 		return false
 	}
+	// Wire-budget exhaustion is an upstream that deliberately (or patholog-
+	// ically) inflates transport bytes; retrying re-downloads the same flood.
+	if errors.Is(err, errWireBudget) {
+		return false
+	}
 	var certErr *tls.CertificateVerificationError
 	if errors.As(err, &certErr) {
 		return false
@@ -187,6 +192,55 @@ type fetcher struct {
 	allowIP func(net.IP) bool
 }
 
+// errWireBudget: the connection consumed more RAW network bytes than the fetch
+// could legitimately need. Deliberate transport-byte inflation — retrying just
+// re-downloads the flood, so it classifies as permanent.
+var errWireBudget = errors.New("proxy: connection exceeded its wire-byte budget")
+
+// wireBudgetAllowance is headroom above maxBytes for everything that is not
+// body payload: the TLS handshake (certificate chains run tens of KiB),
+// response headers (separately capped at 64 KiB), and per-record TLS framing
+// overhead on a legitimate transfer (~1–2 %).
+const wireBudgetAllowance = 512 << 10
+
+// budgetConn enforces a raw-byte read budget on a dialed connection, BELOW
+// TLS. The body LimitReader in get() caps plaintext bytes only — a hostile
+// HTTPS origin can wrap each body byte in maximally-padded TLS records
+// (~256 KiB of ciphertext per plaintext byte), streaming unbounded wire bytes
+// under any plaintext cap until the client timeout. Counting at the conn makes
+// the cap a true transport-byte cap. Reads are capped to the remaining budget,
+// then fail with a net.OpError wrapping errWireBudget — a net.Error, so
+// crypto/tls propagates it, and errors.Is still finds errWireBudget through
+// the url.Error/OpError chain for permanent classification.
+type budgetConn struct {
+	net.Conn
+	remaining int64 // raw bytes this connection may still read (single reader: the transport's read loop)
+}
+
+func (c *budgetConn) Read(p []byte) (int, error) {
+	if c.remaining <= 0 {
+		return 0, &net.OpError{Op: "read", Net: "tcp", Err: errWireBudget}
+	}
+	if int64(len(p)) > c.remaining {
+		p = p[:c.remaining]
+	}
+	n, err := c.Conn.Read(p)
+	c.remaining -= int64(n)
+	return n, err
+}
+
+// withWireBudget wraps a dial func so every connection it returns carries the
+// fetcher's raw-byte budget.
+func (f *fetcher) withWireBudget(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &budgetConn{Conn: c, remaining: f.maxBytes + wireBudgetAllowance}, nil
+	}
+}
+
 // newFetcher builds a media fetcher. When proxy is non-nil, every fetch is
 // tunneled through it (SOCKS5/HTTP), so the fetch does not reveal the
 // server's real IP — matching a network's proxy for anonymity. Direct and
@@ -199,7 +253,7 @@ func newFetcher(maxBytes int64, proxy *url.URL) *fetcher {
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
 			Proxy:                  nil, // never honor $HTTP_PROXY implicitly
-			DialContext:            f.dialContext(proxy),
+			DialContext:            f.withWireBudget(f.dialContext(proxy)),
 			TLSHandshakeTimeout:    8 * time.Second,
 			ResponseHeaderTimeout:  8 * time.Second,
 			MaxResponseHeaderBytes: 64 << 10, // hostile targets can otherwise stream ~10 MiB of headers (Go default) outside the body budget
@@ -233,9 +287,9 @@ func newTunnelFetcher(maxBytes int64, dial func(ctx context.Context, addr string
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
 			Proxy: nil,
-			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			DialContext: f.withWireBudget(func(ctx context.Context, _, addr string) (net.Conn, error) {
 				return dial(ctx, addr)
-			},
+			}),
 			TLSHandshakeTimeout:    8 * time.Second,
 			ResponseHeaderTimeout:  8 * time.Second,
 			MaxResponseHeaderBytes: 64 << 10, // hostile targets can otherwise stream ~10 MiB of headers (Go default) outside the body budget

@@ -280,6 +280,54 @@ func TestFetcherRequestsIdentityEncoding(t *testing.T) {
 	}
 }
 
+// TestWireBudget: the raw-byte budget must stop a connection that streams more
+// transport bytes than the fetch could need (TLS-padding amplification — the
+// plaintext LimitReader never sees those bytes), and the resulting error must
+// classify as PERMANENT so the client doesn't re-download the flood.
+func TestWireBudget(t *testing.T) {
+	t.Run("conn stops at budget", func(t *testing.T) {
+		src, sink := net.Pipe()
+		defer src.Close()
+		go func() { // endless writer: the "hostile origin"
+			buf := make([]byte, 4096)
+			for {
+				if _, err := src.Write(buf); err != nil {
+					return
+				}
+			}
+		}()
+		bc := &budgetConn{Conn: sink, remaining: 10_000}
+		n, err := io.Copy(io.Discard, bc)
+		sink.Close()
+		if !errors.Is(err, errWireBudget) {
+			t.Fatalf("err = %v, want errWireBudget", err)
+		}
+		if n != 10_000 {
+			t.Fatalf("read %d raw bytes, want exactly the 10000 budget", n)
+		}
+	})
+	t.Run("budget exhaustion is permanent", func(t *testing.T) {
+		wrapped := &net.OpError{Op: "read", Net: "tcp", Err: errWireBudget}
+		if fetchErrorRetryable(wrapped) {
+			t.Fatal("wire-budget exhaustion classified retryable; the client would re-download the flood")
+		}
+		if fetchErrorRetryable(&url.Error{Op: "Get", URL: "https://x", Err: wrapped}) {
+			t.Fatal("wire-budget exhaustion not found through the url.Error chain")
+		}
+	})
+	t.Run("normal fetch unaffected", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("well under budget"))
+		}))
+		defer srv.Close()
+		f := permissiveFetcher(t, 1024)
+		_, _, body, err := f.get(context.Background(), srv.URL)
+		if err != nil || string(body) != "well under budget" {
+			t.Fatalf("get = %q, %v", body, err)
+		}
+	})
+}
+
 // TestFetchErrorRetryable: only transient failures may be reported to the client
 // as retryable (503). Permanent ones (bad/blocked URL, over-size body, upstream
 // 4xx) must be non-retryable so the browser caches the failure instead of
