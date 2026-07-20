@@ -618,12 +618,20 @@ func (s *Server) effectivePasswordHash() string { return *s.passwordHash.Load() 
 // be minted.
 var errCredRotated = errors.New("api: credentials rotated during login")
 
-func (s *Server) issueToken(gen uint64) (string, error) {
+// randomToken mints a fresh 256-bit session token.
+func randomToken() (string, error) {
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
-	token := hex.EncodeToString(buf)
+	return hex.EncodeToString(buf), nil
+}
+
+func (s *Server) issueToken(gen uint64) (string, error) {
+	token, err := randomToken()
+	if err != nil {
+		return "", err
+	}
 	now := time.Now()
 	var cancels []context.CancelFunc
 	s.mu.Lock()

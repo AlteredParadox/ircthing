@@ -122,6 +122,14 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "malformed config", http.StatusBadRequest)
 		return
 	}
+	// An empty patch is a client bug, not a save: JSON null/absent fields all
+	// decode to nil pointers (e.g. a frontend serializing Infinity produces
+	// null), and 204-ing it would let the client record an unpersisted value
+	// as confirmed.
+	if body.Previews == nil && body.SessionTTLDays == nil && !body.setsRetention() {
+		http.Error(w, "empty config patch", http.StatusBadRequest)
+		return
+	}
 
 	// Serialize the whole read-validate-apply. Retention is a read-modify-write
 	// (read the current pair, overlay the changed dimension); without this two
@@ -130,6 +138,14 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 	// keeps that call's persist-then-install from interleaving with another PUT.
 	s.settingsMu.Lock()
 	defer s.settingsMu.Unlock()
+
+	// Re-validate the session at commit time, not just at the router: a PUT
+	// dispatched before a logout can reach here after it, and committing
+	// would overwrite a setting the NEXT session (or another device) owns.
+	if !s.authed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 
 	rDays, rMax, badField := s.validateConfigPatch(&body)
 	if badField != "" {

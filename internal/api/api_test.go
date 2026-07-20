@@ -686,7 +686,8 @@ type fakeConn struct {
 func (f *fakeConn) Events() <-chan irc.Event  { return f.ch }
 func (f *fakeConn) Name() string              { return f.name }
 func (f *fakeConn) Nick() string              { return f.nick }
-func (f *fakeConn) Send(*ircv4.Message) error { return nil }
+func (f *fakeConn) Send(*ircv4.Message) error      { return nil }
+func (f *fakeConn) SendAll([]*ircv4.Message) error { return nil }
 
 func (f *fakeConn) Channel(string) (string, []irc.Member, bool) {
 	return "", nil, false

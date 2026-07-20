@@ -71,16 +71,42 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The current-password check is a credential comparison, so rate-limit and
-	// bound the bcrypt work exactly like login.
+	// bound the bcrypt work exactly like login — including login's GLOBAL
+	// bucket, which this endpoint previously skipped.
 	source := s.loginSourceKey(r)
 	if wait := s.login.retryAfter(source, time.Now()); wait > 0 {
 		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
 		return
 	}
+	if wait := s.login.globalAllow(time.Now()); wait > 0 {
+		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
+		return
+	}
 	// Serialize the whole verify→store→revoke: two concurrent rotations must
 	// not both verify the (same) old password and then race their writes.
-	s.passwordMu.Lock()
+	// TryLock, not Lock: rotations are rare and human-initiated, so a burst
+	// piling up on an unbounded mutex wait is only ever an attack shape
+	// (goroutine pressure from a stolen session delaying compromise
+	// recovery) — bounce concurrent attempts instead of queueing them.
+	if !s.passwordMu.TryLock() {
+		http.Error(w, "busy, retry later", http.StatusTooManyRequests)
+		return
+	}
 	defer s.passwordMu.Unlock()
+	// RECHECK backoff after admission: a burst that arrived before the first
+	// failure installed backoff has already passed the pre-lock check, and
+	// serializing it through the lock would otherwise let every queued
+	// request burn a bcrypt verify with no further gate.
+	if wait := s.login.retryAfter(source, time.Now()); wait > 0 {
+		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
+		return
+	}
+	// Recheck auth too: a logout/rotation that landed while this request
+	// waited must invalidate it — the session it rode in on is gone.
+	if !s.authed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 
 	if !s.login.acquire(r.Context()) {
 		http.Error(w, "busy, retry later", http.StatusTooManyRequests)
@@ -128,6 +154,9 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(s.cookieName()); err == nil {
 		requester = c.Value
 	}
+	// Generate the replacement token BEFORE the lock (crypto/rand can block);
+	// whether it is actually installed is decided inside the critical section.
+	replacement, tokErr := randomToken()
 	s.mu.Lock()
 	s.credGen.Add(1) // invalidate any login that verified the old hash
 	_, requesterLive := s.tokens[requester]
@@ -137,23 +166,31 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		// immediately, same as logout — not on the 30 s ticker.
 		cancels = append(cancels, s.deleteTokenLocked(tok)...)
 	}
+	// Mint INSIDE the same critical section as the revoke. Minting after the
+	// unlock left an ordering where a concurrent logout processed the (just-
+	// revoked, hence missing) old token as a no-op between revoke and mint —
+	// and the mint then resurrected a session the user had explicitly ended.
+	// Atomically, a logout is either wholly before (requester token gone → no
+	// mint) or wholly after (it deletes the OLD token, which no longer
+	// exists; the browser's cookie jar is governed by whichever response it
+	// processes last, which no server can reorder).
+	minted := false
+	if requesterLive && tokErr == nil {
+		s.tokens[replacement] = time.Now().Add(s.sessionTTLDur())
+		minted = true
+	}
 	s.mu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
 	}
-	if !requesterLive {
-		// Already logged out (or expired) — rotation succeeded, but no
-		// replacement session is minted for a token that was gone.
+	if !minted {
+		// Already logged out/expired (no replacement for a token that was
+		// gone), or token generation failed (rotation still succeeded; the
+		// requester logs in again with the new password).
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	token, err := s.issueToken(s.credGen.Load())
-	if err != nil {
-		// The rotation itself succeeded; the requester just has to log in
-		// again with the new password (same as any other revoked session).
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
+	token := replacement
 	http.SetCookie(w, &http.Cookie{
 		Name:     s.cookieName(),
 		Value:    token,
