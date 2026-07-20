@@ -42,6 +42,12 @@ import (
 	"time"
 )
 
+// ErrProxyConfig wraps every structural proxy/target validation failure so a
+// caller can classify it as PERMANENT (a misconfiguration won't fix itself on
+// retry) rather than a transient dial error. All validation errors below are
+// %w-wrapped with it and carry no user input (credentials never reach a log).
+var ErrProxyConfig = errors.New("proxy: invalid configuration")
+
 // CredsOverCleartext reports whether a proxy URL carries authentication to a
 // non-loopback host. SOCKS5 (RFC 1929) and HTTP Basic proxy auth are sent
 // unencrypted, so credentials to a remote proxy travel in the clear unless the
@@ -73,7 +79,7 @@ func CredsOverCleartext(proxyURL string) bool {
 func Parse(s string) (*url.URL, error) {
 	u, err := url.Parse(s)
 	if err != nil {
-		return nil, fmt.Errorf("proxy: invalid proxy URL")
+		return nil, fmt.Errorf("%w: unparseable proxy URL", ErrProxyConfig)
 	}
 	if err := validateProxyURL(u); err != nil {
 		return nil, err
@@ -89,26 +95,57 @@ func Parse(s string) (*url.URL, error) {
 // raw proxy connection as a bogus "tunnel".
 func validateProxyURL(u *url.URL) error {
 	if u == nil {
-		return fmt.Errorf("proxy: nil URL")
+		return fmt.Errorf("%w: nil URL", ErrProxyConfig)
 	}
 	switch u.Scheme {
 	case "socks5", "socks5h", "http":
 	default:
-		return fmt.Errorf("proxy: scheme must be socks5 or http")
+		return fmt.Errorf("%w: scheme must be socks5 or http", ErrProxyConfig)
+	}
+	// The RAW authority must be a bare host:port. A manually-constructed URL can
+	// smuggle userinfo into Host ("alice:secret@host:1080"), which Hostname()
+	// would then mis-split — and a later error could echo the secret. Reject any
+	// authority-delimiter or control byte in the raw Host up front (a real
+	// host:port has none). Credentials belong in u.User, validated below.
+	if strings.ContainsAny(u.Host, "@/?# ") || hasControl(u.Host) {
+		return fmt.Errorf("%w: malformed proxy authority", ErrProxyConfig)
 	}
 	// url.Parse happily accepts "socks5://:1080" (empty host) and out-of-range
 	// ports; both must be present and sane.
 	if u.Hostname() == "" || u.Port() == "" {
-		return fmt.Errorf("proxy: host:port required")
+		return fmt.Errorf("%w: host:port required", ErrProxyConfig)
 	}
 	if port, err := strconv.Atoi(u.Port()); err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("proxy: port must be 1-65535")
+		return fmt.Errorf("%w: port must be 1-65535", ErrProxyConfig)
+	}
+	if len(u.Hostname()) > 255 {
+		return fmt.Errorf("%w: proxy host too long", ErrProxyConfig)
 	}
 	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("proxy: unexpected path, query, or fragment")
+		return fmt.Errorf("%w: unexpected path, query, or fragment", ErrProxyConfig)
 	}
 	if u.User != nil {
 		return validateProxyCreds(u.Scheme, u.User)
+	}
+	return nil
+}
+
+// validateProxyTarget vets the "host:port" a caller wants tunneled, BEFORE any
+// socket opens and before either handshake writes it verbatim (HTTP CONNECT
+// inserts it into a request line; SOCKS sends it as an ATYP-domain field). The
+// host must be a plausible hostname or IP — no control/whitespace/authority
+// bytes that could inject a header line or corrupt the SOCKS framing, and no
+// over-255-byte name — and the port must be numeric and in range.
+func validateProxyTarget(target string) error {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil || host == "" {
+		return fmt.Errorf("%w: malformed target address", ErrProxyConfig)
+	}
+	if len(host) > 255 || strings.ContainsAny(host, "@/?#\\ \t\r\n") || hasControl(host) {
+		return fmt.Errorf("%w: malformed target host", ErrProxyConfig)
+	}
+	if p, perr := strconv.Atoi(port); perr != nil || p < 1 || p > 65535 {
+		return fmt.Errorf("%w: malformed target port", ErrProxyConfig)
 	}
 	return nil
 }
@@ -124,13 +161,13 @@ func validateProxyCreds(scheme string, user *url.Userinfo) error {
 		// base64-encoded. A ':' in the user-id is unrepresentable, and
 		// control characters would corrupt the header line.
 		if strings.ContainsRune(name, ':') {
-			return fmt.Errorf("proxy: HTTP proxy username must not contain ':'")
+			return fmt.Errorf("%w: HTTP proxy username must not contain ':'", ErrProxyConfig)
 		}
 		if hasControl(name) || hasControl(pass) {
-			return fmt.Errorf("proxy: HTTP proxy credentials must not contain control characters")
+			return fmt.Errorf("%w: HTTP proxy credentials must not contain control characters", ErrProxyConfig)
 		}
 		if len(name) > 255 || len(pass) > 255 {
-			return fmt.Errorf("proxy: HTTP proxy credentials too long")
+			return fmt.Errorf("%w: HTTP proxy credentials too long", ErrProxyConfig)
 		}
 		return nil
 	}
@@ -140,10 +177,10 @@ func validateProxyCreds(scheme string, user *url.Userinfo) error {
 	// config and cannot be encoded — reject it rather than send an empty
 	// password the server may refuse.
 	if !hasPass {
-		return fmt.Errorf("proxy: SOCKS5 credentials need both a username and a password")
+		return fmt.Errorf("%w: SOCKS5 credentials need both a username and a password", ErrProxyConfig)
 	}
 	if len(name) < 1 || len(name) > 255 || len(pass) < 1 || len(pass) > 255 {
-		return fmt.Errorf("proxy: SOCKS5 username and password must each be 1-255 bytes")
+		return fmt.Errorf("%w: SOCKS5 username and password must each be 1-255 bytes", ErrProxyConfig)
 	}
 	return nil
 }
@@ -169,10 +206,8 @@ func Dial(ctx context.Context, proxy *url.URL, target string, timeout time.Durat
 	if err := validateProxyURL(proxy); err != nil {
 		return nil, err
 	}
-	if host, port, err := net.SplitHostPort(target); err != nil || host == "" {
-		return nil, fmt.Errorf("proxy: invalid target address")
-	} else if p, perr := strconv.Atoi(port); perr != nil || p < 1 || p > 65535 {
-		return nil, fmt.Errorf("proxy: invalid target port")
+	if err := validateProxyTarget(target); err != nil {
+		return nil, err
 	}
 	d := &net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp", proxy.Host)
@@ -193,7 +228,7 @@ func Dial(ctx context.Context, proxy *url.URL, target string, timeout time.Durat
 		// Unreachable after validateProxyURL, but never return an
 		// un-handshaked connection as a tunnel.
 		conn.Close()
-		return nil, fmt.Errorf("proxy: unsupported scheme %q", proxy.Scheme)
+		return nil, fmt.Errorf("%w: unsupported scheme", ErrProxyConfig)
 	}
 	if err != nil {
 		conn.Close()
@@ -210,6 +245,10 @@ func Dial(ctx context.Context, proxy *url.URL, target string, timeout time.Durat
 // proxy connection, one phase per helper. Reads are exact-size
 // (io.ReadFull), so no stream bytes beyond the handshake are consumed.
 func socks5Connect(conn net.Conn, user *url.Userinfo, target string) error {
+	// Defensive: Dial validated the target, but a direct caller may not have.
+	if err := validateProxyTarget(target); err != nil {
+		return err
+	}
 	if err := socks5Negotiate(conn, user); err != nil {
 		return err
 	}
@@ -362,6 +401,11 @@ func socks5Error(code byte) string {
 // consumed — the tunneled stream must start exactly where the proxy left
 // off.
 func httpConnect(conn net.Conn, user *url.Userinfo, target string) error {
+	// Defensive: the target is inserted VERBATIM into the request line below, so
+	// a control byte would inject a header — re-validate for a direct caller.
+	if err := validateProxyTarget(target); err != nil {
+		return err
+	}
 	req := "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n"
 	if user != nil {
 		// Defensive re-validation before encoding (RFC 7617: no ':' in the

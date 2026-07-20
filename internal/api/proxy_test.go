@@ -30,6 +30,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"ircthing/internal/proxydial"
 )
 
 // fakeConnectProxy runs a minimal HTTP CONNECT proxy that tunnels to the
@@ -455,6 +457,10 @@ func TestFetchErrorRetryable(t *testing.T) {
 		{"tagged dial failure", &dialPhaseError{errors.New("dial tcp: i/o timeout")}, true},
 		{"socket op error", &net.OpError{Op: "dial", Err: errors.New("connection refused")}, true},
 		{"untyped unknown error", errors.New("mystery failure"), false},
+		// A proxy MISCONFIGURATION is deterministic — permanent — even though it
+		// surfaces through the transient dialPhaseError wrapper.
+		{"proxy config error", proxydial.ErrProxyConfig, false},
+		{"proxy config via dial tag", &dialPhaseError{fmt.Errorf("%w: bad scheme", proxydial.ErrProxyConfig)}, false},
 		// Redirect misbehavior is a deterministic property of the target: a
 		// retry of a five-hop loop re-walks every hop, so it must be permanent.
 		// client.Do wraps CheckRedirect errors in *url.Error, so test the

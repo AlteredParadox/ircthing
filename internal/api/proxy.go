@@ -154,6 +154,13 @@ func fetchErrorRetryable(err error) bool {
 		errors.Is(err, errRedirectLoop) || errors.Is(err, errRedirectScheme) {
 		return false
 	}
+	// A proxy/target MISCONFIGURATION (bad scheme/host/port/creds) is
+	// deterministic — retrying re-runs the same rejected dial. It surfaces
+	// through the dialPhaseError wrapper (transient by default), so classify it
+	// permanent explicitly, ahead of that default.
+	if errors.Is(err, proxydial.ErrProxyConfig) {
+		return false
+	}
 	// Wire-budget exhaustion is an upstream that deliberately (or patholog-
 	// ically) inflates transport bytes; retrying re-downloads the same flood.
 	if errors.Is(err, errWireBudget) {
