@@ -169,10 +169,10 @@ function CollapsedRow({ ev, onToggle }) {
 }
 
 // Row dispatches by event kind; a real message renders via MsgRow.
-function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onToggle, nicks, userhosts, timeFmt, nickSep, previews }) {
+function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onToggle, nicks, userhosts, statusHost, memberPrefixes, timeFmt, nickSep, previews }) {
 	if (ev.whois) return <WhoisCard whois={ev.whois} focused={focused} />;
 	if (ev.collapse) return <CollapsedRow ev={ev} onToggle={onToggle} />;
-	const r = renderable(ev);
+	const r = renderable(ev, statusHost);
 	if (r.kind === "system" || r.kind === "redacted") {
 		return <SysRow ev={ev} r={r} focused={focused} timeFmt={timeFmt} />;
 	}
@@ -180,21 +180,23 @@ function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onTo
 		<MsgRow
 			ev={ev} r={r} selfNick={selfNick} theme={theme} focused={focused}
 			isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} nicks={nicks} userhosts={userhosts}
+			memberPrefixes={memberPrefixes}
 			timeFmt={timeFmt} nickSep={nickSep} previews={previews}
 		/>
 	);
 }
 
-// RowNick is the nick column: colored, right-click menu, optional trailing
-// separator ("AlteredParadox:").
-function RowNick({ sender, color, label, sep, onNick, userhost }) {
+// RowNick is the nick column: colored, right-click menu, optional leading
+// mode symbol ("@nick", the nickPrefixes pref) and trailing separator
+// ("AlteredParadox:").
+function RowNick({ sender, color, label, sep, onNick, userhost, prefix }) {
 	return (
 		<span
 			class={"msg-nick" + (sender ? " has-menu" : "")}
 			style={{ color }}
 			title={userhost ? `${sender} (${userhost})` : sender}
 			{...(sender ? menuTrigger((x, y) => onNick(sender, x, y)) : {})}
-		>{label}{sep}</span>
+		>{prefix && <span class="msg-nick-mode">{prefix}</span>}{label}{sep}</span>
 	);
 }
 
@@ -212,7 +214,7 @@ function RowBody({ r, color, sender, onNick, nicks, theme }) {
 	);
 }
 
-function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick, nicks, userhosts, timeFmt, nickSep, previews }) {
+function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick, nicks, userhosts, memberPrefixes, timeFmt, nickSep, previews }) {
 	const self = selfNick && ev.sender === selfNick;
 	const mention = !self && isHighlight(r.text);
 	// One preview per message (the first link), only for real messages.
@@ -225,10 +227,14 @@ function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick
 	const isAction = r.kind === "action";
 	const nickLabel = isAction ? "*" : ev.sender;
 	const sep = !isAction && ev.sender ? (nickSep || "") : "";
+	// Channel mode symbol (@, +, …) in front of the nick — only for real nicks
+	// (an action already leads with "*"), and only when memberPrefixes is
+	// supplied (the nickPrefixes pref is on and the sender is on the roster).
+	const modePrefix = !isAction && ev.sender ? memberPrefixes?.get(ev.sender.toLowerCase()) || "" : "";
 	return (
 		<div class={"msg-row" + (mention ? " mention" : "") + (focused ? " flash" : "")}>
 			<span class="msg-time">{fmtTime(ev.time, timeFmt)}</span>
-			<RowNick sender={ev.sender} color={color} label={nickLabel} sep={sep} onNick={onNick} userhost={userhosts?.get(ev.sender?.toLowerCase())} />
+			<RowNick sender={ev.sender} color={color} label={nickLabel} sep={sep} onNick={onNick} userhost={userhosts?.get(ev.sender?.toLowerCase())} prefix={modePrefix} />
 			<RowBody r={r} color={color} sender={ev.sender} onNick={onNick} nicks={nicks} theme={theme} />
 			{canRedact && (
 				<button class="msg-redact" title="Delete message" onClick={() => onRedact(ev.msgid)}>⌫</button>
@@ -250,7 +256,7 @@ function estimate(ev) {
 // Chat renders the active buffer: virtualized scrollback plus composer.
 // completionNicks feeds tab-completion (channel roster, or the query
 // counterpart).
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, timeFmt, nickSep, previews, highlightNames, userhosts, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, statusHost, timeFmt, nickSep, previews, highlightNames, userhosts, nickPrefixes, memberPrefixes, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
 	const [draft, setDraft] = useState("");
 	// Lookup for in-body nick highlighting (Settings toggle): channel roster
 	// minus our own nick. Null when off, so the row renderer skips the scan.
@@ -438,7 +444,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 					else markRead();
 				}}
 				renderItem={(ev, i) => (
-					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} nicks={nickHi} userhosts={userhosts} timeFmt={timeFmt} nickSep={nickSep} previews={previews} />
+					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} nicks={nickHi} userhosts={userhosts} statusHost={statusHost} memberPrefixes={nickPrefixes ? memberPrefixes : null} timeFmt={timeFmt} nickSep={nickSep} previews={previews} />
 				)}
 			/>
 			<div class="composer">

@@ -62,11 +62,25 @@ export const DEFAULTS = {
 	sidebarWidth: "comfortable",
 	msgFont: "sans",
 	statusMsgs: "show",
+	// Show the full ident@host on join/part/quit rows ("nick (~user@host) has
+	// quit") rather than just the nick. Off = the terse default.
+	statusHost: false,
 	clock: "24",
 	seconds: false,
 	ampm: true,
 	nickSep: "",
 	highlightNames: true,
+	// Emit our own draft/typing tags while composing. Off = never tell other
+	// clients we're typing (still receive theirs). Default on: typing is a
+	// reciprocal courtesy and was the prior behavior.
+	sendTyping: true,
+	// Tab title (see applyBadge): show the unread "(N)" count, and/or the
+	// active channel name. Count-on matches the prior behavior.
+	titleUnread: true,
+	titleChannel: false,
+	// Prefix a sender's nick with its channel mode symbol (@ op, + voice) in
+	// the message list, The Lounge style. Off = bare nicks.
+	nickPrefixes: false,
 	css: "",
 };
 
@@ -83,11 +97,16 @@ export function normalizePrefs(raw) {
 		sidebarWidth: pick(p.sidebarWidth, SIDEBAR_WIDTHS, DEFAULTS.sidebarWidth),
 		msgFont: pick(p.msgFont, MSG_FONTS, DEFAULTS.msgFont),
 		statusMsgs: pick(p.statusMsgs, STATUS_MSGS, DEFAULTS.statusMsgs),
+		statusHost: typeof p.statusHost === "boolean" ? p.statusHost : DEFAULTS.statusHost,
 		clock: pick(p.clock, CLOCKS, DEFAULTS.clock),
 		seconds: typeof p.seconds === "boolean" ? p.seconds : DEFAULTS.seconds,
 		ampm: typeof p.ampm === "boolean" ? p.ampm : DEFAULTS.ampm,
 		nickSep: typeof p.nickSep === "string" ? p.nickSep.slice(0, MAX_NICK_SEP) : DEFAULTS.nickSep,
 		highlightNames: typeof p.highlightNames === "boolean" ? p.highlightNames : DEFAULTS.highlightNames,
+		sendTyping: typeof p.sendTyping === "boolean" ? p.sendTyping : DEFAULTS.sendTyping,
+		titleUnread: typeof p.titleUnread === "boolean" ? p.titleUnread : DEFAULTS.titleUnread,
+		titleChannel: typeof p.titleChannel === "boolean" ? p.titleChannel : DEFAULTS.titleChannel,
+		nickPrefixes: typeof p.nickPrefixes === "boolean" ? p.nickPrefixes : DEFAULTS.nickPrefixes,
 		css: typeof p.css === "string" ? p.css : DEFAULTS.css,
 	};
 }

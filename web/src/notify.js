@@ -121,10 +121,17 @@ export class Notifier {
 
 // applyBadge sets the tab title and favicon to reflect unread state:
 // the total unread count, coloured red when any of it is a highlight.
-export function applyBadge(unread, mention) {
+// The title is governed by two prefs (opts): showCount adds the "(N)"
+// unread prefix, channel (a buffer name) adds the active buffer. The
+// favicon badge always shows the count regardless — it is the at-a-glance
+// signal; the prefs only tune the textual title. The Lounge order:
+// "(3) #chan — ircthing".
+export function applyBadge(unread, mention, opts = {}) {
 	if (typeof document === "undefined") return;
 	const count = unread > 99 ? "99+" : unread;
-	document.title = unread > 0 ? `(${count}) ircthing` : "ircthing";
+	const countPart = opts.showCount && unread > 0 ? `(${count}) ` : "";
+	const namePart = opts.channel ? `${opts.channel} — ` : "";
+	document.title = countPart + namePart + "ircthing";
 	const accent =
 		getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#2a6fdb";
 	setFaviconHref(renderFavicon(unread, mention, accent));

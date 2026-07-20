@@ -280,6 +280,18 @@ test("renderable", () => {
 	}
 });
 
+test("renderable: statusHost appends the ident@host to presence lines", () => {
+	const ev = (sender, command, raw) => ({ sender, command, raw, time: 0 });
+	// The "full join/part detail" pref recovers user@host from the raw prefix.
+	is(renderable(ev("alice", "JOIN", ":alice!~a@host JOIN #go"), true).text, "alice (~a@host) has joined");
+	is(renderable(ev("alice", "QUIT", ":alice!~a@host QUIT :bye"), true).text, "alice (~a@host) has quit (bye)");
+	is(renderable(ev("alice", "PART", ":alice!~a@host PART #go :later"), true).text, "alice (~a@host) has left (later)");
+	// A server/bare-nick prefix has no mask: fall back to the plain nick.
+	is(renderable(ev("alice", "JOIN", ":alice JOIN #go"), true).text, "alice has joined");
+	// PRIVMSG is unaffected by the pref.
+	is(renderable(ev("alice", "PRIVMSG", ":alice!~a@host PRIVMSG #go :hi"), true).text, "hi");
+});
+
 test("renderable: multiline body preserves the joined text", () => {
 	// The reconstructed multiline message carries embedded newlines in
 	// its trailing parameter; renderable returns them intact for the

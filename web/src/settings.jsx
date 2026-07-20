@@ -461,6 +461,19 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 								onPick={(statusMsgs) => onPrefs({ ...prefs, statusMsgs })}
 							/>
 						</div>
+						<div class="pref-row">
+							<span class="pref-name">Join/part detail</span>
+							<Seg
+								value={prefs.statusHost ? "full" : "simple"}
+								options={["simple", "full"]}
+								labels={["Simple", "Full"]}
+								onPick={(v) => onPrefs({ ...prefs, statusHost: v === "full" })}
+							/>
+						</div>
+						<div class="settings-note">
+							Full shows the ident@host on join/part/quit lines — e.g. “nick
+							(~user@host) has quit”.
+						</div>
 					</section>
 
 					<section class="settings-section">
@@ -518,6 +531,62 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 						<div class="settings-note">
 							Colors and links nicknames mentioned inside message text (right-click for
 							the user menu). The sender’s name is always highlighted.
+						</div>
+						<div class="pref-row">
+							<span class="pref-name">Mode symbols on nicks</span>
+							<Seg
+								value={prefs.nickPrefixes ? "on" : "off"}
+								options={["off", "on"]}
+								labels={["Off", "On"]}
+								onPick={(v) => onPrefs({ ...prefs, nickPrefixes: v === "on" })}
+							/>
+						</div>
+						<div class="settings-note">
+							Prefix a sender’s nick with its channel status (@ for ops, + for voice)
+							in the message list.
+						</div>
+					</section>
+
+					<section class="settings-section">
+						<div class="settings-label">Tab title</div>
+						<div class="pref-row">
+							<span class="pref-name">Unread count</span>
+							<Seg
+								value={prefs.titleUnread ? "on" : "off"}
+								options={["off", "on"]}
+								labels={["Off", "On"]}
+								onPick={(v) => onPrefs({ ...prefs, titleUnread: v === "on" })}
+							/>
+						</div>
+						<div class="pref-row">
+							<span class="pref-name">Active channel name</span>
+							<Seg
+								value={prefs.titleChannel ? "on" : "off"}
+								options={["off", "on"]}
+								labels={["Off", "On"]}
+								onPick={(v) => onPrefs({ ...prefs, titleChannel: v === "on" })}
+							/>
+						</div>
+						<div class="settings-note">
+							What the browser tab shows — e.g. “(3) #channel — ircthing”. The
+							favicon badge always shows the unread count.
+						</div>
+					</section>
+
+					<section class="settings-section">
+						<div class="settings-label">Typing indicators</div>
+						<div class="pref-row">
+							<span class="pref-name">Send when I’m typing</span>
+							<Seg
+								value={prefs.sendTyping ? "on" : "off"}
+								options={["off", "on"]}
+								labels={["Off", "On"]}
+								onPick={(v) => onPrefs({ ...prefs, sendTyping: v === "on" })}
+							/>
+						</div>
+						<div class="settings-note">
+							Tells others in the channel when you’re composing (on servers that
+							support it). Off keeps your typing private; you still see theirs.
 						</div>
 					</section>
 

@@ -37,7 +37,12 @@ export function parseLine(raw) {
 		const sp = rest.indexOf(" ");
 		const prefix = rest.slice(1, sp);
 		const bang = prefix.indexOf("!");
-		out.prefix = { name: bang === -1 ? prefix : prefix.slice(0, bang) };
+		// mask is the "user@host" portion (empty for a server/bare-nick prefix);
+		// the join/part "full details" pref renders it (see renderable).
+		out.prefix = {
+			name: bang === -1 ? prefix : prefix.slice(0, bang),
+			mask: bang === -1 ? "" : prefix.slice(bang + 1),
+		};
 		rest = rest.slice(sp + 1);
 	}
 	let trailing = null;
@@ -66,23 +71,27 @@ function renderMessage(command, line, last) {
 // renderable turns a protocol EventData into what a row displays:
 //   { kind: "msg" | "action" | "notice", text }
 //   { kind: "system", mark, markClass, text }
-export function renderable(ev) {
+// statusHost (the "full join/part details" pref) appends the sender's
+// ident@host to join/part/quit lines: "nick (~user@host) has quit".
+export function renderable(ev, statusHost) {
 	if (ev.redacted) {
 		const why = ev.redact_reason ? ` (${ev.redact_reason})` : "";
 		return { kind: "redacted", mark: "⌫", markClass: "mode", text: `message deleted${why}` };
 	}
 	const line = parseLine(ev.raw);
 	const last = line.params.at(-1) ?? "";
+	// "nick (~user@host)" when the pref is on and the raw line carried a mask.
+	const who = statusHost && line.prefix?.mask ? `${ev.sender} (${line.prefix.mask})` : ev.sender;
 	switch (ev.command) {
 		case "PRIVMSG":
 		case "NOTICE":
 			return renderMessage(ev.command, line, last);
 		case "JOIN":
-			return { kind: "system", mark: "→", markClass: "join", text: `${ev.sender} has joined` };
+			return { kind: "system", mark: "→", markClass: "join", text: `${who} has joined` };
 		case "PART":
 			return {
 				kind: "system", mark: "←", markClass: "part",
-				text: `${ev.sender} has left` + (line.params.length > 1 ? ` (${last})` : ""),
+				text: `${who} has left` + (line.params.length > 1 ? ` (${last})` : ""),
 			};
 		case "KICK":
 			return {
@@ -93,7 +102,7 @@ export function renderable(ev) {
 		case "QUIT":
 			return {
 				kind: "system", mark: "←", markClass: "part",
-				text: `${ev.sender} has quit` + (line.params.length > 0 && last ? ` (${last})` : ""),
+				text: `${who} has quit` + (line.params.length > 0 && last ? ` (${last})` : ""),
 			};
 		case "NICK":
 			return {

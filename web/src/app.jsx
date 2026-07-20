@@ -882,7 +882,9 @@ export function App() {
 	activeKeyRef.current = activeKey;
 
 	// Favicon + tab title reflect total unread, red when any is a
-	// highlight. Runs whenever unread state changes.
+	// highlight. The title's unread-count and active-channel parts are
+	// pref-gated (see applyBadge); recompute when the active buffer changes
+	// so the channel name in the title tracks selection.
 	useEffect(() => {
 		let unread = 0;
 		let mention = false;
@@ -890,8 +892,12 @@ export function App() {
 			unread += b.unread || 0;
 			if (b.mention) mention = true;
 		}
-		applyBadge(unread, mention);
-	}, [buffers, theme, prefs]);
+		const ab = activeKey ? buffers[activeKey] : null;
+		const channel = prefs.titleChannel && ab
+			? (ab.buffer === SERVER_BUFFER ? ab.network : ab.buffer)
+			: "";
+		applyBadge(unread, mention, { showCount: prefs.titleUnread, channel });
+	}, [buffers, theme, prefs, activeKey]);
 
 	function updateRules(next) {
 		setRules(next);
@@ -1511,6 +1517,17 @@ export function App() {
 		}
 		return m;
 	}, [chanInfo]);
+	// Lowercased nick -> highest mode symbol (@, +, …) for the active channel,
+	// so the message list can prefix a sender's nick with their status (the
+	// nickPrefixes pref). Empty for queries (no roster).
+	const memberPrefixes = useMemo(() => {
+		const m = new Map();
+		for (const mem of chanInfo?.members || []) {
+			const p = (mem.prefix || "")[0];
+			if (p) m.set(mem.nick.toLowerCase(), p);
+		}
+		return m;
+	}, [chanInfo]);
 	const ignoredHere = activeBuf ? ignores[activeBuf.network] || [] : [];
 	const mutedSet = new Set(mutes);
 	const timeFmt = { clock: prefs.clock, seconds: prefs.seconds, ampm: prefs.ampm };
@@ -1550,9 +1567,12 @@ export function App() {
 							: [activeBuf.buffer]}
 						ignoredNicks={ignoredHere}
 						statusMode={prefs.statusMsgs}
+						statusHost={prefs.statusHost}
 						timeFmt={timeFmt} nickSep={prefs.nickSep} previews={previews}
 						highlightNames={prefs.highlightNames}
 						userhosts={userhosts}
+						nickPrefixes={prefs.nickPrefixes}
+						memberPrefixes={memberPrefixes}
 						composerApi={composerApi}
 						onNick={(nick, x, y) => openUserMenu(activeBuf.network, nick, x, y)}
 						isHighlight={(t) => highlightText(t, selfNick, rules, activeBuf.network)}
@@ -1561,10 +1581,16 @@ export function App() {
 								network: activeBuf.network, buffer: activeBuf.buffer, msgid,
 							}).catch((e) => setCmdError(e.message || "delete failed"))}
 						onSend={sendInput} onLoadOlder={loadOlder} onReloadTail={reloadTail} onRead={markRead}
-						onTyping={(state, net, bufName) =>
+						onTyping={(state, net, bufName) => {
+							// The sendTyping pref gates ALL our typing tags (including
+							// the trailing "done") — off means other clients never see
+							// us typing. Remote indicators self-expire (6s/30s), so a
+							// suppressed "done" clears on its own.
+							if (!prefs.sendTyping) return;
 							sock.current?.notify("typing", {
 								network: net ?? activeBuf.network, buffer: bufName ?? activeBuf.buffer, state,
-							})}
+							});
+						}}
 					/>
 				) : (
 					<div class="empty-state">no buffers yet — waiting for traffic</div>
