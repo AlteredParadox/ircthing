@@ -150,18 +150,24 @@ func TestManagerSTSPolicyState(t *testing.T) {
 }
 
 // fakeSTSStore returns a fixed policy/error; err is the fail-closed signal.
+// setDur records the duration passed to the last SetSTSPolicy.
 type fakeSTSStore struct {
-	port  int
-	until time.Time
-	ok    bool
-	err   error
+	port     int
+	until    time.Time
+	duration time.Duration
+	ok       bool
+	err      error
+	setDur   time.Duration
 }
 
-func (f *fakeSTSStore) STSPolicy(_ context.Context, _ string) (int, time.Time, bool, error) {
-	return f.port, f.until, f.ok, f.err
+func (f *fakeSTSStore) STSPolicy(_ context.Context, _ string) (int, time.Time, time.Duration, bool, error) {
+	return f.port, f.until, f.duration, f.ok, f.err
 }
-func (f *fakeSTSStore) SetSTSPolicy(context.Context, string, int, time.Time) error { return nil }
-func (f *fakeSTSStore) ClearSTSPolicy(context.Context, string) error               { return nil }
+func (f *fakeSTSStore) SetSTSPolicy(_ context.Context, _ string, _ int, _ time.Time, d time.Duration) error {
+	f.setDur = d
+	return nil
+}
+func (f *fakeSTSStore) ClearSTSPolicy(context.Context, string) error { return nil }
 
 // loadSTS must FAIL CLOSED on an indeterminate policy state (store error or a
 // corrupt record): it returns a non-nil error, which Run turns into "do not
@@ -195,6 +201,28 @@ func TestLoadSTSFailClosed(t *testing.T) {
 	}
 	if addr, secure := m.effectiveAddr(); addr != "irc.test:6697" || !secure {
 		t.Fatalf("after recovery effectiveAddr = %q/%v, want the TLS port", addr, secure)
+	}
+}
+
+// A restored policy must carry its DURATION forward: without it, rescheduleSTS
+// (the on-disconnect expiry refresh the STS spec requires) can't extend a
+// cached policy, so it would expire at its stored `until` unless the server
+// re-advertised STS. loadSTS restores the duration; rescheduleSTS persists the
+// refreshed expiry using it.
+func TestLoadSTSRestoresDuration(t *testing.T) {
+	store := &fakeSTSStore{ok: true, port: 6697, until: time.Now().Add(time.Hour), duration: 2 * time.Hour}
+	m, err := NewManager(Config{Addr: "irc.test:6667", Nick: "AlteredParadox", AllowPlaintext: true, STS: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.loadSTS(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// On disconnect the expiry is rescheduled to now + the restored duration
+	// and persisted with that same duration.
+	m.rescheduleSTS(context.Background())
+	if store.setDur != 2*time.Hour {
+		t.Fatalf("reschedule persisted duration %v, want 2h (restored duration lost)", store.setDur)
 	}
 }
 

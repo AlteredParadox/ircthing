@@ -139,15 +139,16 @@ type Manager struct {
 	// maybeWHOX). Only the read loop touches it.
 	whoxDone map[string]bool
 
-	// monActive is the FOLDED set of nicks currently MONITORed on THIS
-	// connection — the server's own list, tracked so live adds respect the
-	// limit and never re-add a duplicate, and removes act only on nicks
-	// actually being watched (an overflow/inactive nick must not send a
-	// spurious MONITOR - or perturb the count). Reset per connection (the
-	// server clears its list on a new connection). Guarded by monActiveMu:
+	// monActive maps FOLDED nick -> wire spelling for the nicks currently
+	// MONITORed on THIS connection (the server's own list). ReconcileMonitored
+	// diffs the desired list against it; the wire spelling is kept so a removal
+	// sends the exact form that was added. monLimit734 records a capacity a 734
+	// revealed (0 = only the ISUPPORT limit applies). Both reset per connection
+	// (the server clears its list on a new one). Guarded by monActiveMu:
 	// mutations arrive from the hub goroutine, the reset from the run loop.
 	monActiveMu sync.Mutex
-	monActive   map[string]bool
+	monActive   map[string]string
+	monLimit734 int
 
 	// stsMu guards the active STS policy (sts.go): connect to stsPort
 	// with TLS until stsUntil (zero stsUntil with a port = session-only
@@ -209,7 +210,7 @@ func NewManager(cfg Config) (*Manager, error) {
 		joined:         make(map[string]string),
 		namesReq:       make(map[string]bool),
 		whoxDone:       make(map[string]bool),
-		monActive:      make(map[string]bool),
+		monActive:      make(map[string]string),
 		pendingCapVals: make(map[string]string),
 	}
 	for _, ch := range cfg.Channels {
@@ -425,91 +426,111 @@ func ValidMonitorTarget(nick string) bool {
 	return nick != "" && len(nick) <= maxMonitorNickLen && !strings.ContainsAny(nick, " ,\r\n\x00")
 }
 
-// SetMonitored replaces the MONITOR list with nicks (MONITOR extension,
-// https://ircv3.net/specs/extensions/monitor, fetched 2026-07-15). The
-// hub drives this on every registration from the persisted buddy list, so
-// the list is re-established after reconnects. Invalid persisted entries
-// are dropped (see ValidMonitorTarget); requests are clamped to the
-// ISUPPORT MONITOR limit and chunked to stay within the line length; the
-// server replies 730/731 with each target's current presence.
-func (m *Manager) SetMonitored(nicks []string) {
-	if !m.registered.Load() {
-		return
+// ReconcileMonitored drives the server's MONITOR list toward `desired` (the
+// persisted buddy list) incrementally — the hub calls it on registration and
+// after every add/remove. It diffs the desired snapshot (validated, folded-
+// deduped, clamped to the effective limit) against monActive, the set actually
+// watched on THIS connection, and enqueues only the delta: MONITOR - for nicks
+// no longer wanted, MONITOR + for newly wanted ones. This is what gives us:
+//
+//   - Atomic restoration (finding: never record an unqueued command): the whole
+//     delta goes out as ONE all-or-none sendAll, and monActive is updated only
+//     on success — a full send queue leaves monActive unchanged and the next
+//     reconcile (or reconnect) retries.
+//   - Overflow promotion (finding: freed slots stay empty): removing an active
+//     buddy shrinks the target's tail back into range, so the earliest
+//     previously-overflowed buddy becomes a wanted addition on the same call.
+//   - No MONITOR C flicker: a fresh/ reconnected connection has an empty
+//     monActive, so the diff is pure additions — nothing to clear.
+//
+// https://ircv3.net/specs/extensions/monitor (fetched 2026-07-15).
+func (m *Manager) ReconcileMonitored(desired []string) error {
+	if !m.registered.Load() || !m.monitorAdvertised() {
+		return nil // no MONITOR to drive
 	}
-	valid := make([]string, 0, len(nicks))
-	for _, n := range nicks {
-		if ValidMonitorTarget(n) {
-			valid = append(valid, n)
+	m.monActiveMu.Lock()
+	defer m.monActiveMu.Unlock()
+
+	limit := m.effectiveMonitorLimitLocked()
+	targetSet := make(map[string]bool, len(desired))
+	var targetOrder []string // wire spellings, in desired order, clamped to limit
+	for _, n := range desired {
+		if !ValidMonitorTarget(n) {
+			continue
+		}
+		f := m.isup.Fold(n)
+		if targetSet[f] {
+			continue // folded duplicate
+		}
+		if limit > 0 && len(targetOrder) >= limit {
+			break
+		}
+		targetSet[f] = true
+		targetOrder = append(targetOrder, n)
+	}
+
+	// Removals: active nicks no longer in the (clamped) target.
+	var removeWire, removeFolded []string
+	for f, spelling := range m.monActive {
+		if !targetSet[f] {
+			removeWire = append(removeWire, spelling)
+			removeFolded = append(removeFolded, f)
 		}
 	}
-	if !m.monitorAdvertised() {
-		return // server doesn't offer MONITOR; nothing to establish
+	// Additions: target nicks not already active.
+	var addWire []string
+	for _, n := range targetOrder {
+		if _, active := m.monActive[m.isup.Fold(n)]; !active {
+			addWire = append(addWire, n)
+		}
 	}
-	if limit := m.monitorLimit(); limit > 0 && len(valid) > limit {
-		log.Printf("irc[%s]: MONITOR list (%d) exceeds server limit %d; monitoring the first %d only", m.cfg.Name, len(valid), limit, limit)
-		valid = valid[:limit]
+	if len(removeWire) == 0 && len(addWire) == 0 {
+		return nil // already in sync
 	}
-	_ = m.Send(newMsg("MONITOR", "C")) // clear any stale list on this connection
-	for _, chunk := range chunkTargets(valid, 10) {
-		_ = m.Send(newMsg("MONITOR", "+", strings.Join(chunk, ",")))
+
+	var msgs []*ircv4.Message
+	for _, chunk := range chunkTargets(removeWire, 10) {
+		msgs = append(msgs, newMsg("MONITOR", "-", strings.Join(chunk, ",")))
 	}
-	m.monActiveMu.Lock()
-	m.monActive = make(map[string]bool, len(valid))
-	for _, n := range valid {
-		m.monActive[m.isup.Fold(n)] = true
+	for _, chunk := range chunkTargets(addWire, 10) {
+		msgs = append(msgs, newMsg("MONITOR", "+", strings.Join(chunk, ",")))
 	}
-	m.monActiveMu.Unlock()
+	// ONE atomic enqueue: on a full queue nothing is sent and monActive stays
+	// as-is, so a partial list can never be recorded as active.
+	if err := m.sendAll(msgs); err != nil {
+		return err
+	}
+	for _, f := range removeFolded {
+		delete(m.monActive, f)
+	}
+	for _, n := range addWire {
+		m.monActive[m.isup.Fold(n)] = n
+	}
+	return nil
 }
 
-// MonitorAdd starts monitoring one nick; MonitorRemove stops. Both no-op
-// before registration (the hub re-sends the whole list on registration).
-// Live adds enforce the same constraints restoration does: MONITOR must be
-// advertised, the ISUPPORT limit is respected, and a duplicate (per the spec,
-// duplicates are not re-added) is a no-op — so the active-set count stays
-// authoritative instead of drifting on exact-duplicate adds.
-func (m *Manager) MonitorAdd(nick string) {
-	if !m.registered.Load() || !m.monitorAdvertised() {
-		return
+// effectiveMonitorLimitLocked is the tighter of the ISUPPORT MONITOR limit and
+// any limit a 734 revealed on this connection (some servers enforce a cap they
+// don't advertise). Caller holds monActiveMu.
+func (m *Manager) effectiveMonitorLimitLocked() int {
+	lim := m.monitorLimit()
+	if m.monLimit734 > 0 && (lim == 0 || m.monLimit734 < lim) {
+		lim = m.monLimit734
 	}
-	folded := m.isup.Fold(nick)
-	m.monActiveMu.Lock()
-	defer m.monActiveMu.Unlock()
-	if m.monActive[folded] {
-		return // already monitored on this connection
-	}
-	if limit := m.monitorLimit(); limit > 0 && len(m.monActive) >= limit {
-		log.Printf("irc[%s]: MONITOR list at server limit %d; %q not monitored on this connection (restored on reconnect if room)", m.cfg.Name, limit, nick)
-		return
-	}
-	if m.Send(newMsg("MONITOR", "+", nick)) == nil {
-		m.monActive[folded] = true
-	}
+	return lim
 }
 
-func (m *Manager) MonitorRemove(nick string) {
-	if !m.registered.Load() || !m.monitorAdvertised() {
-		return
-	}
-	folded := m.isup.Fold(nick)
-	m.monActiveMu.Lock()
-	defer m.monActiveMu.Unlock()
-	if !m.monActive[folded] {
-		return // not actually being watched (overflow/inactive) — nothing to send
-	}
-	if m.Send(newMsg("MONITOR", "-", nick)) == nil {
-		delete(m.monActive, folded)
-	}
-}
-
-// MonitorRejected drops nicks the server refused (ERR_MONLISTFULL / 734) from
-// the active set, so the count reflects the server's real list — otherwise an
-// optimistically-counted add that was rejected would wrongly block later adds.
+// MonitorRejected handles ERR_MONLISTFULL (734): it drops the refused nicks
+// from the active set and records the server's real capacity (the count that
+// remains) as the effective limit for this connection, so later reconciles
+// don't keep trying to overfill a list the server won't grow.
 func (m *Manager) MonitorRejected(nicks []string) {
 	m.monActiveMu.Lock()
 	defer m.monActiveMu.Unlock()
 	for _, n := range nicks {
 		delete(m.monActive, m.isup.Fold(n))
 	}
+	m.monLimit734 = len(m.monActive)
 }
 
 // monitorAdvertised reports whether the server offers MONITOR at all
@@ -881,7 +902,7 @@ func (m *Manager) loadSTS(ctx context.Context) error {
 	if err != nil {
 		return nil // a malformed addr fails at dial time; nothing to load here
 	}
-	port, until, ok, err := m.cfg.STS.STSPolicy(ctx, host)
+	port, until, duration, ok, err := m.cfg.STS.STSPolicy(ctx, host)
 	if err != nil {
 		return err
 	}
@@ -890,6 +911,12 @@ func (m *Manager) loadSTS(ctx context.Context) error {
 	}
 	m.stsMu.Lock()
 	m.stsPort, m.stsUntil = port, until
+	// Restore the last advertised duration so rescheduleSTS can extend the
+	// expiry on disconnect after a restart — without it, a cached policy would
+	// expire at its stored `until` unless the server re-advertised STS.
+	if duration > 0 {
+		m.stsLastDur = duration
+	}
 	m.stsMu.Unlock()
 	return nil
 }
@@ -951,7 +978,7 @@ func (m *Manager) applySTS(ctx context.Context, connAddr string, d time.Duration
 		}
 		return
 	}
-	if err := m.cfg.STS.SetSTSPolicy(ctx, host, port, until); err != nil {
+	if err := m.cfg.STS.SetSTSPolicy(ctx, host, port, until, d); err != nil {
 		log.Printf("irc[%s]: STS POLICY PERSIST FAILED (%v) — downgrade protection for %s will be lost on restart", m.cfg.Name, err, host)
 	}
 }
@@ -972,7 +999,7 @@ func (m *Manager) rescheduleSTS(ctx context.Context) {
 		return
 	}
 	if host, _, err := net.SplitHostPort(m.cfg.Addr); err == nil {
-		if perr := m.cfg.STS.SetSTSPolicy(context.WithoutCancel(ctx), host, port, until); perr != nil {
+		if perr := m.cfg.STS.SetSTSPolicy(context.WithoutCancel(ctx), host, port, until, d); perr != nil {
 			log.Printf("irc[%s]: STS POLICY RESCHEDULE PERSIST FAILED (%v) — downgrade protection for %s will be lost on restart", m.cfg.Name, perr, host)
 		}
 	}
@@ -1057,10 +1084,12 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	defer m.roster.clear()
 	m.resetNames()
 	m.whoxDone = make(map[string]bool)
-	// New connection: the server's MONITOR list starts empty (SetMonitored
-	// re-establishes it on registration).
+	// New connection: the server's MONITOR list starts empty, and any
+	// 734-revealed limit is stale (ReconcileMonitored re-establishes on
+	// registration).
 	m.monActiveMu.Lock()
-	m.monActive = make(map[string]bool)
+	m.monActive = make(map[string]string)
+	m.monLimit734 = 0
 	m.monActiveMu.Unlock()
 
 	addr, secure := m.effectiveAddr()

@@ -47,9 +47,11 @@ import (
 // implements this on its settings table.
 type STSStore interface {
 	// STSPolicy returns the stored policy for host; ok is false when none
-	// is stored (expiry is not checked here — callers do that).
-	STSPolicy(ctx context.Context, host string) (port int, until time.Time, ok bool, err error)
-	SetSTSPolicy(ctx context.Context, host string, port int, until time.Time) error
+	// is stored (expiry is not checked here — callers do that). duration is
+	// the last advertised policy duration, used to reschedule the expiry on
+	// disconnect after a restart; 0 when the record predates its persistence.
+	STSPolicy(ctx context.Context, host string) (port int, until time.Time, duration time.Duration, ok bool, err error)
+	SetSTSPolicy(ctx context.Context, host string, port int, until time.Time, duration time.Duration) error
 	ClearSTSPolicy(ctx context.Context, host string) error
 }
 

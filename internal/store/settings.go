@@ -24,16 +24,27 @@ import (
 
 // Setting returns the stored value for key, or "" when unset.
 func (s *Store) Setting(ctx context.Context, key string) (string, error) {
+	v, _, err := s.settingValue(ctx, key)
+	return v, err
+}
+
+// settingValue reads a setting and reports whether the row is PRESENT, so a
+// caller can tell an absent key ("" , present=false) from a stored empty value
+// ("", present=true) — the STS lookup needs that distinction to treat a
+// present-but-empty (tampered) record as corrupt rather than "no policy".
+func (s *Store) settingValue(ctx context.Context, key string) (value string, present bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var v string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
+	err = s.db.QueryRowContext(ctx,
+		`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
+		return "", false, nil
 	}
-	return v, err
+	if err != nil {
+		return "", false, err
+	}
+	return value, true, nil
 }
 
 // SetSetting stores (or replaces) the value for key.

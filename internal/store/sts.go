@@ -23,37 +23,57 @@ import (
 	"time"
 )
 
-// STS policy persistence on the settings table (key "sts:<host>", value
-// JSON {"port": N, "until": <unix ms>}), so a server's upgrade-to-TLS
-// policy survives restarts. Implements irc.STSStore.
-
+// STS policy persistence on the settings table (key "sts:<host>", value JSON
+// {"port": N, "until": <unix ms>, "duration": <ms>}), so a server's
+// upgrade-to-TLS policy — and the duration needed to reschedule its expiry on
+// disconnect — survives restarts. Implements irc.STSStore.
+//
+// until and duration are POINTERS so an absent field is distinguishable from a
+// zero one: a record missing (or zero/negative) `until` is corrupt, not an
+// "expired-at-epoch" policy that would silently permit a plaintext downgrade.
 type stsRecord struct {
-	Port  int   `json:"port"`
-	Until int64 `json:"until"`
+	Port     int    `json:"port"`
+	Until    *int64 `json:"until"`
+	Duration *int64 `json:"duration,omitempty"` // absent in pre-existing records
 }
 
 func stsKey(host string) string { return "sts:" + host }
 
-// STSPolicy returns the stored policy for host; ok is false when none is
-// stored. Expiry is not checked here — callers decide what stale means.
-func (s *Store) STSPolicy(ctx context.Context, host string) (port int, until time.Time, ok bool, err error) {
-	v, err := s.Setting(ctx, stsKey(host))
-	if err != nil || v == "" {
-		return 0, time.Time{}, false, err
+func ptrInt64(v int64) *int64 { return &v }
+
+// STSPolicy returns the stored policy for host; ok is false when NONE is stored
+// (absent row). A present row that is empty, malformed, or missing a valid port
+// or a positive `until` is CORRUPT — returned as an error so the caller fails
+// closed (refuses a plaintext downgrade) rather than treating it as absent or
+// as expired-at-epoch. A positive `until` in the past is a legitimately expired
+// policy (ok, with the past time); the caller decides staleness. duration is 0
+// when the record predates duration persistence.
+func (s *Store) STSPolicy(ctx context.Context, host string) (port int, until time.Time, duration time.Duration, ok bool, err error) {
+	v, present, err := s.settingValue(ctx, stsKey(host))
+	if err != nil {
+		return 0, time.Time{}, 0, false, err
+	}
+	if !present {
+		return 0, time.Time{}, 0, false, nil // genuinely no policy
 	}
 	var rec stsRecord
-	if json.Unmarshal([]byte(v), &rec) != nil || rec.Port <= 0 || rec.Port > 65535 {
-		// A NONEMPTY but unusable record is NOT "no policy": a policy was set
-		// (the host had STS) and we can't honor it. Returning an error lets the
-		// caller fail closed (refuse a plaintext downgrade) per the STS spec,
-		// rather than silently treating a corrupt record as absent.
-		return 0, time.Time{}, false, fmt.Errorf("sts: unreadable policy record for %q", host)
+	if json.Unmarshal([]byte(v), &rec) != nil ||
+		rec.Port <= 0 || rec.Port > 65535 ||
+		rec.Until == nil || *rec.Until <= 0 {
+		return 0, time.Time{}, 0, false, fmt.Errorf("sts: unreadable policy record for %q", host)
 	}
-	return rec.Port, time.UnixMilli(rec.Until), true, nil
+	if rec.Duration != nil && *rec.Duration > 0 {
+		duration = time.Duration(*rec.Duration) * time.Millisecond
+	}
+	return rec.Port, time.UnixMilli(*rec.Until), duration, true, nil
 }
 
-func (s *Store) SetSTSPolicy(ctx context.Context, host string, port int, until time.Time) error {
-	b, err := json.Marshal(stsRecord{Port: port, Until: until.UnixMilli()})
+func (s *Store) SetSTSPolicy(ctx context.Context, host string, port int, until time.Time, duration time.Duration) error {
+	b, err := json.Marshal(stsRecord{
+		Port:     port,
+		Until:    ptrInt64(until.UnixMilli()),
+		Duration: ptrInt64(duration.Milliseconds()),
+	})
 	if err != nil {
 		return err
 	}
