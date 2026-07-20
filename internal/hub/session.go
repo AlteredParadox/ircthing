@@ -385,36 +385,47 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		return
 	}
 	conn := s.hub.network(d.Network)
+	var err error
 	if add {
 		// Reject a casemapping-equivalent duplicate (Alice vs alice): SQLite
 		// uniqueness is byte-exact, but the server folds both to ONE monitor —
 		// presence keyed by fold would collapse them while the list renders
 		// both spellings, one stuck perpetually offline, and removing either
 		// would interrupt monitoring for both. Fold with the live connection's
-		// CASEMAPPING when connected, ASCII lowercase otherwise (covers the
-		// common conflict; rfc1459's []{}|~ extras need the server's mapping).
-		fold := strings.ToLower
+		// CASEMAPPING when connected, ASCII-only lowercase otherwise (covers
+		// the common conflict; rfc1459's []{}|~ extras need the server's
+		// mapping, and any residual pair is individually removable). The
+		// check and the insert run under monMu so two concurrent adds can't
+		// both pass the check and both persist.
+		fold := asciiFold
 		if conn != nil {
 			fold = conn.Fold
 		}
-		if existing, lerr := s.hub.store.Monitors(ctx, d.Network); lerr == nil {
+		s.hub.monMu.Lock()
+		existing, lerr := s.hub.store.Monitors(ctx, d.Network)
+		if lerr == nil {
 			for _, nk := range existing {
 				if nk != d.Nick && fold(nk) == fold(d.Nick) {
+					s.hub.monMu.Unlock()
 					s.push(errEnvelope(env.Seq, "bad_request", "already monitored as "+nk))
 					return
 				}
 			}
 		}
-	}
-	var err error
-	if add {
 		err = s.hub.store.AddMonitor(ctx, d.Network, d.Nick)
+		s.hub.monMu.Unlock()
 	} else {
 		err = s.hub.store.RemoveMonitor(ctx, d.Network, d.Nick)
 	}
 	if err != nil {
 		s.push(errEnvelope(env.Seq, "internal", "updating the monitor list failed"))
 		return
+	}
+	if !add {
+		// Drop the removed nick's cached presence: a stale entry would be
+		// served straight back by get_monitors if the nick is re-added
+		// before a fresh 730/731 arrives (or while disconnected).
+		s.hub.removePresence(d.Network, d.Nick)
 	}
 	if conn != nil {
 		if add {
@@ -429,6 +440,21 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		}
 	}
 	s.push(envelope("ok", env.Seq, nil))
+}
+
+// asciiFold lowercases A–Z only — the monitor-duplicate fallback when no
+// connection (hence no authoritative CASEMAPPING) exists. strings.ToLower is
+// the wrong tool here: it is Unicode-aware, so it both misses rfc1459's
+// []{}|~ equivalences AND folds non-ASCII codepoints (İ→i̇, Σ→σ) that IRC
+// servers treat as distinct bytes — rejecting legitimately different nicks.
+func asciiFold(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + 32
+		}
+	}
+	return string(b)
 }
 
 // handleRedact issues a REDACT for one of our messages

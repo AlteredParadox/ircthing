@@ -731,6 +731,19 @@ func TestMonitorFlow(t *testing.T) {
 		t.Fatalf("bad nick code = %q", got.Code)
 	}
 
+	// Removal clears cached presence: re-adding alice must not resurface her
+	// pre-removal "online" state before a fresh 730/731 arrives.
+	s.Handle(ctx, request(t, "monitor_add", 8, MonitorReq{Network: "libera", Nick: "alice"}))
+	recv(t, s, "ok")
+	s.Handle(ctx, request(t, "get_monitors", 9, map[string]string{"network": "libera"}))
+	for _, m := range decode[MonitorsData](t, recv(t, s, "monitors")).Monitors {
+		if m.Nick == "alice" && m.Online {
+			t.Fatal("re-added alice shows stale pre-removal presence")
+		}
+	}
+	s.Handle(ctx, request(t, "monitor_remove", 10, MonitorReq{Network: "libera", Nick: "alice"}))
+	recv(t, s, "ok", "presence")
+
 	// A casemapping-equivalent duplicate is rejected: the server folds BOB to
 	// the existing bob, so a second row would render two entries sharing one
 	// server-side monitor (one stuck offline; removing either breaks both).
@@ -1720,6 +1733,17 @@ func TestServerInfoFlow(t *testing.T) {
 	recv(t, s, "server_info")
 	recv(t, s, "server_info")
 	conn.ch <- ev(":srv 372 AlteredParadox :- late line after the gate closed")
+	expectSilence(t, s)
+
+	// A targeted /motd naming a nonexistent server terminates with 402, not
+	// 376/422 — the error must consume the gate, or the next unsolicited
+	// MOTD burst would be forwarded as if requested.
+	s.Handle(ctx, request(t, "command", 9, CommandData{Network: "libera", Command: "MOTD", Params: []string{"no.such.server"}}))
+	recv(t, s, "ok")
+	conn.ch <- ev(":srv 402 AlteredParadox no.such.server :No such server")
+	recv(t, s, "server_info") // the error itself is shown
+	conn.ch <- ev(":srv 375 AlteredParadox :- message of the day -")
+	conn.ch <- ev(":srv 376 AlteredParadox :End of /MOTD")
 	expectSilence(t, s)
 
 	// A /motd interrupted by a disconnect must NOT leave the gate armed: the

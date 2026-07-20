@@ -106,6 +106,12 @@ type Hub struct {
 	// resurrecting an orphan networks row.
 	lifecycleGate sync.RWMutex
 
+	// monMu serializes the monitor-add folded-duplicate check with its
+	// insert: SQLite uniqueness is byte-exact, so without this two
+	// concurrent adds of Alice and alice each pass the check and both
+	// persist — the casemapped-duplicate state the check exists to prevent.
+	monMu sync.Mutex
+
 	mu         sync.Mutex
 	networks   map[string]Conn
 	states     map[string]string          // last known connection state per network
@@ -744,6 +750,17 @@ func (h *Hub) clearPresence(network string) {
 	h.mu.Unlock()
 }
 
+// removePresence forgets one nick's cached presence — on monitor removal, so
+// a re-add doesn't resurface the stale state via monitorList before a fresh
+// 730/731 arrives.
+func (h *Hub) removePresence(network, nick string) {
+	h.mu.Lock()
+	if p := h.presence[network]; p != nil {
+		delete(p, nick)
+	}
+	h.mu.Unlock()
+}
+
 // monitorList returns the persisted buddy list for a network with each
 // nick's last-known presence (false when unknown).
 func (h *Hub) monitorList(ctx context.Context, network string) ([]MonitorEntry, error) {
@@ -875,6 +892,16 @@ func (h *Hub) serverInfo(ev irc.Event) (ServerInfoData, bool) {
 		if !h.motdExpected(ev.Network, cmd) {
 			return ServerInfoData{}, false
 		}
+	case cmd == "402":
+		// ERR_NOSUCHSERVER is the TERMINAL reply of a targeted "MOTD <server>"
+		// naming a nonexistent server — no 376/422 will follow, so it must
+		// also consume an armed gate or the count stays armed until
+		// disconnect, forwarding a later unsolicited MOTD as if requested.
+		// (An unrelated 402 while a /motd is genuinely pending can consume
+		// the gate early; both replies race on the same connection and the
+		// error is still shown, so nothing is silently lost.) It then falls
+		// through to the generic error-numeric forwarding below.
+		h.consumeMOTD(ev.Network)
 	case serverInfoNumerics[cmd]:
 	case n >= 400 && n < 600:
 	default:
@@ -1102,6 +1129,18 @@ func (h *Hub) retractMOTD(network string) {
 func (h *Hub) clearMOTD(network string) {
 	h.mu.Lock()
 	delete(h.motdWanted, network)
+	h.mu.Unlock()
+}
+
+// consumeMOTD decrements one armed gate, if any — the terminal-error path
+// (402 on a targeted MOTD), mirroring what 376/422 do inside motdExpected.
+func (h *Hub) consumeMOTD(network string) {
+	h.mu.Lock()
+	if n := h.motdWanted[network]; n > 1 {
+		h.motdWanted[network] = n - 1
+	} else {
+		delete(h.motdWanted, network)
+	}
 	h.mu.Unlock()
 }
 
