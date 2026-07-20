@@ -334,11 +334,26 @@ func TestConfigRetentionAndSessionRuntime(t *testing.T) {
 		return resp
 	}
 
-	resp := do("PUT", "/api/config", `{"retention_days":7,"retention_max_messages":500,"session_ttl_days":14}`)
+	// One logical group per request (both retention dimensions are one group):
+	// the two dimensions may share a PUT, but session_ttl is a separate group.
+	resp := do("PUT", "/api/config", `{"retention_days":7,"retention_max_messages":500}`)
 	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("PUT = %d", resp.StatusCode)
+		t.Fatalf("retention PUT = %d", resp.StatusCode)
 	}
 	resp.Body.Close()
+	resp = do("PUT", "/api/config", `{"session_ttl_days":14}`)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("session PUT = %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// A patch spanning two groups is rejected outright (non-atomic across
+	// groups), changing nothing.
+	if resp = do("PUT", "/api/config", `{"retention_days":1,"session_ttl_days":1}`); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("cross-group PUT = %d, want 400", resp.StatusCode)
+	} else {
+		resp.Body.Close()
+	}
 
 	var cfg struct {
 		RetentionDays        int `json:"retention_days"`
@@ -388,7 +403,7 @@ func TestConfigRetentionAndSessionRuntime(t *testing.T) {
 func TestChangePassword(t *testing.T) {
 	ts, srv := newTestServerWithRef(t)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
-	var rotated *http.Cookie // fresh session cookie from a successful rotation
+	var rotated *http.Cookie // session cookie the rotation response set (expect a deletion cookie)
 	change := func(current, newpw string) int {
 		req, _ := http.NewRequest("POST", ts.URL+"/api/password",
 			strings.NewReader(`{"current":"`+current+`","new":"`+newpw+`"}`))
@@ -400,7 +415,7 @@ func TestChangePassword(t *testing.T) {
 		}
 		resp.Body.Close()
 		for _, c := range resp.Cookies() {
-			if c.Name == cookie.Name && c.Value != "" {
+			if c.Name == cookie.Name {
 				rotated = c
 			}
 		}
@@ -423,9 +438,10 @@ func TestChangePassword(t *testing.T) {
 	if code := login(t, ts, "AlteredParadox", "hunter2").StatusCode; code != http.StatusUnauthorized {
 		t.Fatalf("login with old password = %d, want 401", code)
 	}
-	// The requester's PRE-ROTATION token is revoked too (a stolen copy must
-	// not survive the recovery action); the response carried a fresh cookie
-	// that IS valid — the requester stays logged in on the new token.
+	// Rotation revokes EVERY session including the requester's (a stolen copy
+	// must not survive the recovery action) and mints NO replacement — the
+	// response carries a deletion cookie, and the requester logs in again.
+	// This removes the mint/logout ordering race entirely.
 	authProbe := func(c *http.Cookie) int {
 		req, _ := http.NewRequest("GET", ts.URL+"/api/ws", nil)
 		req.AddCookie(c)
@@ -440,10 +456,10 @@ func TestChangePassword(t *testing.T) {
 		t.Fatalf("old token after rotation = %d, want 401 (stolen copies must die)", code)
 	}
 	if rotated == nil {
-		t.Fatal("rotation response carried no fresh session cookie")
+		t.Fatal("rotation response carried no cookie at all (expected a deletion cookie)")
 	}
-	if code := authProbe(rotated); code == http.StatusUnauthorized {
-		t.Fatal("fresh rotation cookie rejected; requester was logged out entirely")
+	if rotated.Value != "" || rotated.MaxAge >= 0 {
+		t.Fatalf("rotation minted a replacement session (value=%q maxAge=%d); want a deletion cookie", rotated.Value, rotated.MaxAge)
 	}
 
 	// The override is persisted and read back over the config hash.
@@ -712,6 +728,7 @@ func (f *fakeConn) SendMultiline(string, []string) error { return nil }
 func (f *fakeConn) SetMonitored([]string)                {}
 func (f *fakeConn) MonitorAdd(string)                    {}
 func (f *fakeConn) MonitorRemove(string)                 {}
+func (f *fakeConn) MonitorRejected([]string)             {}
 
 func (f *fakeConn) privmsg(line string) irc.Event {
 	return irc.Event{

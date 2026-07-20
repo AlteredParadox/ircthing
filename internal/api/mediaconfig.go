@@ -126,8 +126,30 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 	// decode to nil pointers (e.g. a frontend serializing Infinity produces
 	// null), and 204-ing it would let the client record an unpersisted value
 	// as confirmed.
-	if body.Previews == nil && body.SessionTTLDays == nil && !body.setsRetention() {
+	//
+	// A patch may touch at most ONE logical group: previews, retention (both
+	// dimensions count as one), or session TTL. applyConfigPatch persists the
+	// groups sequentially and is NOT a cross-store transaction, so a mixed
+	// patch that fails partway could leave one group changed (previews enabled,
+	// or pruning rescheduled) and return 500. The frontend always sends one
+	// group per request, so rejecting multi-group patches costs nothing and
+	// keeps every accepted request single-group — hence trivially atomic.
+	groups := 0
+	if body.Previews != nil {
+		groups++
+	}
+	if body.setsRetention() {
+		groups++
+	}
+	if body.SessionTTLDays != nil {
+		groups++
+	}
+	if groups == 0 {
 		http.Error(w, "empty config patch", http.StatusBadRequest)
+		return
+	}
+	if groups > 1 {
+		http.Error(w, "one setting group per request", http.StatusBadRequest)
 		return
 	}
 
@@ -142,6 +164,16 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 	// Re-validate the session at commit time, not just at the router: a PUT
 	// dispatched before a logout can reach here after it, and committing
 	// would overwrite a setting the NEXT session (or another device) owns.
+	//
+	// This recheck under settingsMu closes all but a microscopic window (the
+	// gap between authed() returning and the store write a few lines down). A
+	// truly gap-free guarantee would need a global read/write "auth barrier"
+	// that every token-revocation path also takes — an invasive lock across
+	// logout/rotation/expiry/eviction with real deadlock-ordering risk, for a
+	// residual whose worst case is the SAME user's own (non-security) settings
+	// write landing microseconds after their own logout on a single-user box.
+	// That is disproportionate; the commit-time recheck is the proportionate
+	// close. (Reviewed against GPT audit #5, 2026-07-19.)
 	if !s.authed(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return

@@ -141,64 +141,35 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	// s.mu that issueToken takes. This closes the login race: a concurrent
 	// old-password login either loses this lock (issueToken then observes the
 	// new generation and refuses to mint) or wins it (and this revoke deletes
-	// the session it just inserted). The requester's own token is revoked too
-	// — password rotation is the compromise-recovery action, and if that
-	// exact token was stolen, keeping it valid would keep the thief logged in
-	// through the rotation. The requester is rotated onto a FRESH token via
-	// Set-Cookie below; their open WebSocket drops and reconnects with it.
-	// Whether the requester's own token is STILL LIVE is decided atomically
-	// with the revoke: a logout racing this rotation deletes the token first,
-	// and minting a replacement regardless would re-authenticate a browser
-	// that already signed out (whichever response lands last would win).
-	requester := ""
-	if c, err := r.Cookie(s.cookieName()); err == nil {
-		requester = c.Value
-	}
-	// Generate the replacement token BEFORE the lock (crypto/rand can block);
-	// whether it is actually installed is decided inside the critical section.
-	replacement, tokErr := randomToken()
+	// the session it just inserted). The requester's own session is revoked
+	// too — rotation is the compromise-recovery action, so a stolen copy of
+	// that exact cookie must not survive it.
+	//
+	// NO replacement token is minted: rotation revokes all and sends a
+	// deletion cookie, and the requester logs in again with the new password.
+	// This is strictly simpler than rotating onto a fresh cookie and removes
+	// the mint/logout ordering race entirely — a concurrent logout and this
+	// rotation both end in "no valid token, deletion cookie", regardless of
+	// which HTTP response the browser processes last (RFC 6265 §4.1.1 leaves
+	// concurrent Set-Cookie ordering undefined, so there must be nothing to
+	// reorder).
 	s.mu.Lock()
 	s.credGen.Add(1) // invalidate any login that verified the old hash
-	_, requesterLive := s.tokens[requester]
 	var cancels []context.CancelFunc
 	for tok := range s.tokens {
 		// deleteTokenLocked drops the revoked session's live sockets
 		// immediately, same as logout — not on the 30 s ticker.
 		cancels = append(cancels, s.deleteTokenLocked(tok)...)
 	}
-	// Mint INSIDE the same critical section as the revoke. Minting after the
-	// unlock left an ordering where a concurrent logout processed the (just-
-	// revoked, hence missing) old token as a no-op between revoke and mint —
-	// and the mint then resurrected a session the user had explicitly ended.
-	// Atomically, a logout is either wholly before (requester token gone → no
-	// mint) or wholly after (it deletes the OLD token, which no longer
-	// exists; the browser's cookie jar is governed by whichever response it
-	// processes last, which no server can reorder).
-	minted := false
-	if requesterLive && tokErr == nil {
-		s.tokens[replacement] = time.Now().Add(s.sessionTTLDur())
-		minted = true
-	}
 	s.mu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
 	}
-	if !minted {
-		// Already logged out/expired (no replacement for a token that was
-		// gone), or token generation failed (rotation still succeeded; the
-		// requester logs in again with the new password).
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	token := replacement
+	// Deletion cookie: same attributes as the session cookie so the browser
+	// treats it as the same cookie and drops it.
 	http.SetCookie(w, &http.Cookie{
-		Name:     s.cookieName(),
-		Value:    token,
-		Path:     "/",
-		MaxAge:   int(s.sessionTTLDur().Seconds()),
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		Secure:   s.cfg.SecureCookies,
+		Name: s.cookieName(), Value: "", Path: "/", MaxAge: -1, HttpOnly: true,
+		SameSite: http.SameSiteStrictMode, Secure: s.cfg.SecureCookies,
 	})
 	w.WriteHeader(http.StatusNoContent)
 }

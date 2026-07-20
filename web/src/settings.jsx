@@ -61,7 +61,7 @@ function Seg({ value, options, labels, onPick }) {
 // ChangePassword posts to /api/password: verify current, set new (8–72 bytes,
 // confirmed). The server rotates the stored login hash and revokes other
 // sessions.
-function ChangePassword() {
+function ChangePassword({ onRotated }) {
 	const [current, setCurrent] = useState("");
 	const [next, setNext] = useState("");
 	const [confirm, setConfirm] = useState("");
@@ -94,10 +94,15 @@ function ChangePassword() {
 				body: JSON.stringify({ current, new: next }),
 			});
 			if (r.ok) {
-				setMsg({ ok: true, text: "Password changed." });
+				// The server revoked EVERY session (including this one) and set a
+				// deletion cookie — there is no replacement token. Tell the user
+				// and route back to login rather than leaving the modal open over
+				// a now-dead session.
+				setMsg({ ok: true, text: "Password changed — sign in again." });
 				setCurrent("");
 				setNext("");
 				setConfirm("");
+				onRotated?.();
 			} else {
 				setMsg({ ok: false, text: (await r.text()).trim() || "Change failed." });
 			}
@@ -612,7 +617,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 						<button class="btn-accent" onClick={logout}>Sign out</button>
 					</section>
 
-					<ChangePassword />
+					<ChangePassword onRotated={() => setTimeout(() => onLogout?.(), 1200)} />
 
 					<section class="settings-section">
 						<div class="settings-label">Desktop notifications</div>
