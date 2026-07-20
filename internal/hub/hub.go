@@ -597,18 +597,23 @@ func replayTarget(m *ircv4.Message, batchTarget string, c Conn) (string, bool) {
 	if t == "" {
 		return "", false
 	}
-	// Mirror live NOTICE routing (noticeTarget), which classifies by the
-	// message's TARGET, not its sender: an incoming private NOTICE addressed
-	// to us is filed in the network server buffer, not the query. Key on the
-	// replayed line's own target param (chathistory preserves it) so this
-	// stays correct even when the correspondent's send-time nick differs from
-	// the batch/buffer name (a rename between the notice and the replay) —
-	// keying on the sender would refile it into the query and duplicate it
-	// against the live "*" copy. Our own echoed notice has target == the
-	// correspondent (the batch target), so it stays in the query.
+	// Mirror live NOTICE routing (noticeTarget): an incoming private NOTICE
+	// files under an OPEN query with the sender, else the network server
+	// buffer. During replay the query we are backfilling is the batch target
+	// t, and that it is being backfilled means it is open — so a notice whose
+	// SENDER is that correspondent stays in t (the query); anything else falls
+	// to "*". This keys on the sender (fold(prefix) == fold(t)), which agrees
+	// with the live path: when the correspondent renamed since (sender != t),
+	// live had no open query under the new nick and filed the notice in "*",
+	// so replay does too. Our own echoed notice (sender == our nick) has
+	// target == the correspondent (the batch target), so it stays in t.
 	if m.Command == "NOTICE" && !c.IsChannel(t) {
-		notifTarget := stripStatusPrefix(m.Param(0), c.StatusPrefixes(), c.IsChannel)
-		if c.Fold(notifTarget) != c.Fold(t) {
+		own := m.Prefix != nil && c.Nick() != "" && c.Fold(m.Prefix.Name) == c.Fold(c.Nick())
+		sender := ""
+		if m.Prefix != nil {
+			sender = m.Prefix.Name
+		}
+		if !own && c.Fold(sender) != c.Fold(t) {
 			return serverBufferTarget, true
 		}
 	}
@@ -621,18 +626,28 @@ func replayTarget(m *ircv4.Message, batchTarget string, c Conn) (string, bool) {
 // CURRENT nick (persistTarget → directTarget) would misfile PM history after
 // a /nick or a reconnect collision-fallback changed our nick since. Live
 // traffic routes by the current nick, correct in the moment.
-func persistBuffer(ev irc.Event, c Conn, replay bool, batch *histBatch) (string, bool) {
+func persistBuffer(ev irc.Event, c Conn, replay bool, batch *histBatch, queryOpen func(string) bool) (string, bool) {
 	if replay && batch != nil && batch.target != "" &&
 		(ev.Msg.Command == "PRIVMSG" || ev.Msg.Command == "NOTICE") {
 		return replayTarget(ev.Msg, batch.target, c)
 	}
-	return persistTarget(ev.Msg, c.Nick(), c.IsChannel, c.Fold, c.StatusPrefixes())
+	return persistTarget(ev.Msg, c.Nick(), c.IsChannel, c.Fold, c.StatusPrefixes(), queryOpen)
 }
 
 // persistEvent stores a message in its buffer and, when live, broadcasts
 // it. Duplicate msgids (overlapping backfill) are silently dropped.
 func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay bool, batch *histBatch) error {
-	target, ok := persistBuffer(ev, c, replay, batch)
+	// queryOpen reports whether a NON-channel query buffer with the given nick
+	// is already open, so an incoming private NOTICE from a service or bot
+	// files under that conversation instead of the lobby (see noticeTarget).
+	// Evaluated lazily — only noticeTarget's addressed-to-us branch calls it,
+	// so channel traffic and PMs never pay for the buffer scan. A lookup error
+	// yields false (fall back to the lobby), never a misroute.
+	queryOpen := func(nick string) bool {
+		name, found, err := h.store.FindBuffer(ctx, ev.Network, nick, c.Fold)
+		return err == nil && found && !c.IsChannel(name)
+	}
+	target, ok := persistBuffer(ev, c, replay, batch, queryOpen)
 	if !ok {
 		return nil
 	}
@@ -1632,10 +1647,10 @@ func (h *Hub) membershipTargets(ctx context.Context, ev irc.Event, replay bool, 
 // persistTarget decides which buffer a message lands in, or none.
 // isChan and fold are the network's ISUPPORT-driven channel detection
 // and casemapping.
-func persistTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fold func(string) string, statusPrefixes string) (string, bool) {
+func persistTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fold func(string) string, statusPrefixes string, queryOpen func(string) bool) (string, bool) {
 	switch m.Command {
 	case "PRIVMSG", "NOTICE":
-		return directTarget(m, ourNick, isChan, fold, statusPrefixes)
+		return directTarget(m, ourNick, isChan, fold, statusPrefixes, queryOpen)
 	case "JOIN", "PART", "TOPIC", "KICK", "MODE":
 		if t := m.Param(0); isChan(t) {
 			return t, true
@@ -1659,7 +1674,7 @@ func stripStatusPrefix(target, statusPrefixes string, isChan func(string) bool) 
 // directTarget files a PRIVMSG/NOTICE: channels under themselves,
 // messages addressed to us under the sender (queries, NickServ, server
 // notices), and our own echoes under the recipient.
-func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fold func(string) string, statusPrefixes string) (string, bool) {
+func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fold func(string) string, statusPrefixes string, queryOpen func(string) bool) (string, bool) {
 	// Non-ACTION CTCP (VERSION probes, PING, and their reply NOTICEs) is
 	// protocol chatter, not conversation: persisting it would open
 	// unread query buffers for every probe.
@@ -1672,7 +1687,7 @@ func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fo
 		return t, true
 	}
 	if m.Command == "NOTICE" {
-		return noticeTarget(m, t, ourNick, fold)
+		return noticeTarget(m, t, ourNick, fold, queryOpen)
 	}
 	if m.Prefix == nil || m.Prefix.Name == "" || ourNick == "" {
 		return "", false
@@ -1688,12 +1703,17 @@ func directTarget(m *ircv4.Message, ourNick string, isChan func(string) bool, fo
 	return "", false
 }
 
-// noticeTarget files a NOTICE that is not addressed to a channel. Server
-// "***" notices and service messages (NickServ/ChanServ/SaslServ) — anything
-// addressed to us or the pre-registration "*" — collect in the network server
-// buffer (The Lounge lobby) rather than spawning a per-sender query that would
-// clutter the sidebar. Our own echoed notice goes to its recipient's buffer.
-func noticeTarget(m *ircv4.Message, t, ourNick string, fold func(string) string) (string, bool) {
+// noticeTarget files a NOTICE that is not addressed to a channel. An
+// incoming private NOTICE addressed to us collects in the network server
+// buffer (The Lounge lobby) — server "***" notices and service messages
+// (NickServ/ChanServ/SaslServ) — UNLESS a query buffer with the sender is
+// already open, in which case it files there: this keeps a live conversation
+// with a service or an opped bot (which reply via NOTICE, not PRIVMSG) in the
+// buffer the user opened, rather than scattering the replies to the lobby. We
+// only redirect to an EXISTING query (queryOpen), never spawn one, so an
+// unsolicited service notice still lands in the lobby and does not clutter the
+// sidebar. Our own echoed notice goes to its recipient's buffer.
+func noticeTarget(m *ircv4.Message, t, ourNick string, fold func(string) string, queryOpen func(string) bool) (string, bool) {
 	own := m.Prefix != nil && ourNick != "" && fold(m.Prefix.Name) == fold(ourNick)
 	if own {
 		if t != "" && fold(t) != fold(ourNick) {
@@ -1703,6 +1723,11 @@ func noticeTarget(m *ircv4.Message, t, ourNick string, fold func(string) string)
 	}
 	// Addressed to us (t == our nick) or the pre-registration "*".
 	if t == serverBufferTarget || ourNick == "" || fold(t) == fold(ourNick) {
+		// An open query with the sender wins over the lobby: file the notice
+		// where the user is talking to them.
+		if m.Prefix != nil && m.Prefix.Name != "" && queryOpen != nil && queryOpen(m.Prefix.Name) {
+			return m.Prefix.Name, true
+		}
 		return serverBufferTarget, true
 	}
 	return "", false

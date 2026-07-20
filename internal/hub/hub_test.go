@@ -144,43 +144,53 @@ func TestPersistAutojoinDoesNotBlockUnderNetOps(t *testing.T) {
 
 func TestPersistTarget(t *testing.T) {
 	cases := []struct {
-		name    string
-		line    string
-		ourNick string
-		want    string
-		ok      bool
+		name string
+		line string
+		// openQuery, when non-empty, is the sender nick that has an open query
+		// buffer — the queryOpen predicate returns true for it (folded), false
+		// for everyone else. Empty means no query is open.
+		openQuery string
+		ourNick   string
+		want      string
+		ok        bool
 	}{
-		{"channel privmsg", ":alice!u@h PRIVMSG #go :hi", "AlteredParadox", "#go", true},
-		{"ampersand channel", ":alice!u@h PRIVMSG &local :hi", "AlteredParadox", "&local", true},
-		{"channel notice", ":alice!u@h NOTICE #go :psst", "AlteredParadox", "#go", true},
-		{"query files under sender", ":alice!u@h PRIVMSG AlteredParadox :hello", "AlteredParadox", "alice", true},
-		{"query nick is case-insensitive", ":alice!u@h PRIVMSG ALTEREDPARADOX :hello", "AlteredParadox", "alice", true},
-		{"nickserv notice files under the server buffer", ":NickServ!s@services NOTICE AlteredParadox :identify pls", "AlteredParadox", "*", true},
-		{"server notice files under the server buffer", ":irc.test NOTICE AlteredParadox :*** Looking up your hostname", "AlteredParadox", "*", true},
-		{"pre-registration server notice to * files under the server buffer", ":irc.test NOTICE * :*** hi", "", "*", true},
-		{"user notice files under the server buffer", ":alice!u@h NOTICE AlteredParadox :ping", "AlteredParadox", "*", true},
-		{"privmsg to someone else dropped", ":alice!u@h PRIVMSG bob :hi", "AlteredParadox", "", false},
-		{"our echoed pm files under the recipient", ":AlteredParadox!u@h PRIVMSG alice :hi", "AlteredParadox", "alice", true},
-		{"our echoed notice files under the recipient", ":AlteredParadox!u@h NOTICE alice :psst", "AlteredParadox", "alice", true},
-		{"privmsg to us with no prefix dropped", "PRIVMSG AlteredParadox :hi", "AlteredParadox", "", false},
-		{"pm before nick known dropped", ":alice!u@h PRIVMSG AlteredParadox :hi", "", "", false},
-		{"join", ":alice!u@h JOIN #go", "AlteredParadox", "#go", true},
-		{"part", ":alice!u@h PART #go :bye", "AlteredParadox", "#go", true},
-		{"topic", ":alice!u@h TOPIC #go :new topic", "AlteredParadox", "#go", true},
-		{"kick", ":op!u@h KICK #go alice :out", "AlteredParadox", "#go", true},
-		{"channel mode", ":op!u@h MODE #go +o alice", "AlteredParadox", "#go", true},
-		{"user mode dropped", ":AlteredParadox MODE AlteredParadox :+i", "AlteredParadox", "", false},
+		{"channel privmsg", ":alice!u@h PRIVMSG #go :hi", "", "AlteredParadox", "#go", true},
+		{"ampersand channel", ":alice!u@h PRIVMSG &local :hi", "", "AlteredParadox", "&local", true},
+		{"channel notice", ":alice!u@h NOTICE #go :psst", "", "AlteredParadox", "#go", true},
+		{"query files under sender", ":alice!u@h PRIVMSG AlteredParadox :hello", "", "AlteredParadox", "alice", true},
+		{"query nick is case-insensitive", ":alice!u@h PRIVMSG ALTEREDPARADOX :hello", "", "AlteredParadox", "alice", true},
+		{"nickserv notice files under the server buffer", ":NickServ!s@services NOTICE AlteredParadox :identify pls", "", "AlteredParadox", "*", true},
+		// With an open query for the sender, the notice files there instead of
+		// the lobby (bug fix: services/opped bots reply via NOTICE).
+		{"nickserv notice with open query files under it", ":NickServ!s@services NOTICE AlteredParadox :identify pls", "NickServ", "AlteredParadox", "NickServ", true},
+		{"open query match is case-insensitive", ":NickServ!s@services NOTICE AlteredParadox :hi", "nickserv", "AlteredParadox", "NickServ", true},
+		{"opped bot notice with open query files under it", ":chat!bot@h NOTICE AlteredParadox :beep", "chat", "AlteredParadox", "chat", true},
+		{"open query for a different nick does not redirect", ":NickServ!s@services NOTICE AlteredParadox :hi", "alice", "AlteredParadox", "*", true},
+		{"server notice files under the server buffer", ":irc.test NOTICE AlteredParadox :*** Looking up your hostname", "", "AlteredParadox", "*", true},
+		{"pre-registration server notice to * files under the server buffer", ":irc.test NOTICE * :*** hi", "", "", "*", true},
+		{"user notice files under the server buffer", ":alice!u@h NOTICE AlteredParadox :ping", "", "AlteredParadox", "*", true},
+		{"privmsg to someone else dropped", ":alice!u@h PRIVMSG bob :hi", "", "AlteredParadox", "", false},
+		{"our echoed pm files under the recipient", ":AlteredParadox!u@h PRIVMSG alice :hi", "", "AlteredParadox", "alice", true},
+		{"our echoed notice files under the recipient", ":AlteredParadox!u@h NOTICE alice :psst", "", "AlteredParadox", "alice", true},
+		{"privmsg to us with no prefix dropped", "PRIVMSG AlteredParadox :hi", "", "AlteredParadox", "", false},
+		{"pm before nick known dropped", ":alice!u@h PRIVMSG AlteredParadox :hi", "", "", "", false},
+		{"join", ":alice!u@h JOIN #go", "", "AlteredParadox", "#go", true},
+		{"part", ":alice!u@h PART #go :bye", "", "AlteredParadox", "#go", true},
+		{"topic", ":alice!u@h TOPIC #go :new topic", "", "AlteredParadox", "#go", true},
+		{"kick", ":op!u@h KICK #go alice :out", "", "AlteredParadox", "#go", true},
+		{"channel mode", ":op!u@h MODE #go +o alice", "", "AlteredParadox", "#go", true},
+		{"user mode dropped", ":AlteredParadox MODE AlteredParadox :+i", "", "AlteredParadox", "", false},
 		// QUIT/NICK never resolve to a single target here — the hub's
 		// persistMembership fans them out per shared channel instead.
-		{"quit has no single target", ":alice!u@h QUIT :bye", "AlteredParadox", "", false},
-		{"nick change has no single target", ":alice!u@h NICK alicia", "AlteredParadox", "", false},
-		{"numeric dropped", ":irc.test 001 AlteredParadox :Welcome", "AlteredParadox", "", false},
-		{"ping dropped", "PING :x", "AlteredParadox", "", false},
-		{"ctcp query dropped", ":alice!u@h PRIVMSG AlteredParadox :\x01VERSION\x01", "AlteredParadox", "", false},
-		{"ctcp reply notice dropped", ":alice!u@h NOTICE AlteredParadox :\x01VERSION theirclient\x01", "AlteredParadox", "", false},
-		{"ctcp action persists", ":alice!u@h PRIVMSG #go :\x01ACTION waves\x01", "AlteredParadox", "#go", true},
-		{"statusmsg op-only files under bare channel", ":op!u@h PRIVMSG @#go :ops only", "AlteredParadox", "#go", true},
-		{"statusmsg voice-only files under bare channel", ":op!u@h PRIVMSG +#go :voiced only", "AlteredParadox", "#go", true},
+		{"quit has no single target", ":alice!u@h QUIT :bye", "", "AlteredParadox", "", false},
+		{"nick change has no single target", ":alice!u@h NICK alicia", "", "AlteredParadox", "", false},
+		{"numeric dropped", ":irc.test 001 AlteredParadox :Welcome", "", "AlteredParadox", "", false},
+		{"ping dropped", "PING :x", "", "AlteredParadox", "", false},
+		{"ctcp query dropped", ":alice!u@h PRIVMSG AlteredParadox :\x01VERSION\x01", "", "AlteredParadox", "", false},
+		{"ctcp reply notice dropped", ":alice!u@h NOTICE AlteredParadox :\x01VERSION theirclient\x01", "", "AlteredParadox", "", false},
+		{"ctcp action persists", ":alice!u@h PRIVMSG #go :\x01ACTION waves\x01", "", "AlteredParadox", "#go", true},
+		{"statusmsg op-only files under bare channel", ":op!u@h PRIVMSG @#go :ops only", "", "AlteredParadox", "#go", true},
+		{"statusmsg voice-only files under bare channel", ":op!u@h PRIVMSG +#go :voiced only", "", "AlteredParadox", "#go", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -188,7 +198,12 @@ func TestPersistTarget(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse %q: %v", tc.line, err)
 			}
-			got, ok := persistTarget(m, tc.ourNick, defaultIsChannel, foldRFC1459, "~&@%+")
+			// queryOpen is true only for tc.openQuery (folded), modeling one
+			// open query buffer with that sender.
+			queryOpen := func(nick string) bool {
+				return tc.openQuery != "" && foldRFC1459(nick) == foldRFC1459(tc.openQuery)
+			}
+			got, ok := persistTarget(m, tc.ourNick, defaultIsChannel, foldRFC1459, "~&@%+", queryOpen)
 			if got != tc.want || ok != tc.ok {
 				t.Fatalf("persistTarget = (%q, %v), want (%q, %v)", got, ok, tc.want, tc.ok)
 			}
@@ -196,11 +211,15 @@ func TestPersistTarget(t *testing.T) {
 	}
 }
 
-// replayTarget must file a REPLAYED private NOTICE from a correspondent in the
-// server buffer "*" — the same place live noticeTarget files it — so a
-// reconnect chathistory replay does not duplicate it into the query buffer
+// replayTarget must file a REPLAYED private NOTICE in the SAME buffer live
+// noticeTarget would, so a reconnect chathistory replay does not duplicate it
 // (per-buffer msgid dedup would let both persist: a duplicate row + phantom
-// unread). Channel notices and our own echoed notice keep the batch target.
+// unread). Live now files a correspondent's notice under an open query with
+// that sender — and the query being backfilled IS open — so a notice whose
+// sender matches the batch target lands in the query, not "*". A sender that
+// differs (a rename since) still falls to "*", matching live (no open query
+// under the new nick). Channel notices and our own echoed notice keep the
+// batch target.
 func TestReplayTargetNoticeRouting(t *testing.T) {
 	c := &fakeConn{nick: "AlteredParadox"}
 	cases := []struct {
@@ -210,11 +229,13 @@ func TestReplayTargetNoticeRouting(t *testing.T) {
 		want        string
 		ok          bool
 	}{
-		{"incoming private notice -> server buffer", ":alice!u@h NOTICE AlteredParadox :ping", "alice", "*", true},
-		{"incoming private notice, case-variant batch", ":Alice!u@h NOTICE AlteredParadox :ping", "alice", "*", true},
-		// The correspondent renamed between the notice and the replay: routing
-		// keys on the message's target (our nick), not the sender, so it still
-		// lands in "*" instead of duplicating into the query buffer.
+		// The query we are backfilling is the sender's: file the notice there,
+		// mirroring live routing into the open query (services/opped bots).
+		{"incoming private notice -> the query", ":alice!u@h NOTICE AlteredParadox :ping", "alice", "alice", true},
+		{"incoming private notice, case-variant batch -> the query", ":Alice!u@h NOTICE AlteredParadox :ping", "alice", "alice", true},
+		// The correspondent renamed between the notice and the replay: the
+		// sender no longer matches the batch/query name, so it lands in "*"
+		// (matching live, which had no open query under the new nick).
 		{"incoming notice, sender renamed since -> server buffer", ":alice2!u@h NOTICE AlteredParadox :ping", "alice", "*", true},
 		{"our own echoed notice -> recipient query", ":AlteredParadox!u@h NOTICE alice :psst", "alice", "alice", true},
 		{"channel notice -> the channel", ":alice!u@h NOTICE #go :psst", "#go", "#go", true},
@@ -231,6 +252,53 @@ func TestReplayTargetNoticeRouting(t *testing.T) {
 				t.Fatalf("replayTarget = (%q, %v), want (%q, %v)", got, ok, tc.want, tc.ok)
 			}
 		})
+	}
+}
+
+// End-to-end wiring for the notice-redirect fix: an incoming private NOTICE
+// files in an OPEN query with the sender (a service or an opped bot replying
+// via NOTICE), and in the lobby "*" when no such query exists. Exercises the
+// queryOpen predicate (store.FindBuffer) that persistEvent builds.
+func TestNoticeRoutingWithOpenQuery(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+	// A PRIVMSG from the bot opens its query; the bot's NOTICE reply must then
+	// land in that query, not the lobby. NickServ has no open query, so its
+	// notice stays in "*".
+	conn.ch <- ev(":chat!bot@h PRIVMSG AlteredParadox :hi there")
+	conn.ch <- ev(":chat!bot@h NOTICE AlteredParadox :beep boop")
+	conn.ch <- ev(":NickServ!s@services NOTICE AlteredParadox :please identify")
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		chatMsgs, err := h.store.Latest(ctxb, "libera", "chat", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		starMsgs, err := h.store.Latest(ctxb, "libera", serverBufferTarget, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(chatMsgs) == 2 && len(starMsgs) == 1 {
+			// The bot's notice is in its query; NickServ's is in the lobby.
+			if starMsgs[0].Sender != "NickServ" {
+				t.Fatalf("lobby message sender = %q, want NickServ", starMsgs[0].Sender)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("routing: chat=%d (want 2), *=%d (want 1)", len(chatMsgs), len(starMsgs))
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
