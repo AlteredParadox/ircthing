@@ -198,14 +198,21 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 		return
 	}
 
-	// Fallback: one PRIVMSG per non-empty line.
-	for _, line := range nonEmptyLines(d.Text) {
-		msg := newPrivmsg(d.Target, line)
-		if err := conn.Send(msg); err != nil {
-			s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
-			return
-		}
-		if !echo {
+	// Fallback: one PRIVMSG per non-empty line, enqueued ATOMICALLY (all or
+	// none). Per-line sends could fail midway — an oversized later line, a
+	// filled queue — after earlier lines already went out; the composer still
+	// holds the whole draft, so a retry would duplicate the delivered prefix.
+	lines := nonEmptyLines(d.Text)
+	msgs := make([]*ircv4.Message, len(lines))
+	for i, line := range lines {
+		msgs[i] = newPrivmsg(d.Target, line)
+	}
+	if err := conn.SendAll(msgs); err != nil {
+		s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
+		return
+	}
+	if !echo {
+		for _, line := range lines {
 			s.persistOwn(ctx, conn, d.Network, d.Target, line)
 		}
 	}
@@ -459,7 +466,17 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 			s.hub.broadcast(envelope("presence", 0, PresenceData{Network: d.Network, Nick: nick, Online: false}))
 		}
 	}
+	// Tell every session (other tabs/devices included) the authoritative list
+	// changed, so their buddy lists refetch instead of drifting on local
+	// optimistic state.
+	s.hub.broadcast(envelope("monitors_changed", 0, MonitorsChangedData{Network: d.Network}))
 	s.push(envelope("ok", env.Seq, nil))
+}
+
+// MonitorsChangedData announces that a network's persisted monitor list
+// changed; clients refetch via get_monitors.
+type MonitorsChangedData struct {
+	Network string `json:"network"`
 }
 
 // asciiFold lowercases A–Z only — the monitor-duplicate fallback when no

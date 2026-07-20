@@ -353,6 +353,16 @@ func (f *fakeConn) Send(m *ircv4.Message) error {
 	return nil
 }
 
+func (f *fakeConn) SendAll(msgs []*ircv4.Message) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sendErr != nil {
+		return f.sendErr // atomic: nothing appended on failure
+	}
+	f.sent = append(f.sent, msgs...)
+	return nil
+}
+
 func (f *fakeConn) sentMsgs() []*ircv4.Message {
 	f.mu.Lock()
 	defer f.mu.Unlock()

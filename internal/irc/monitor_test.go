@@ -51,6 +51,9 @@ func TestSetMonitoredDropsInvalidEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.setRegistered(true)
+	// SetMonitored now refuses to send anything to a server that doesn't
+	// advertise MONITOR; this unit test drives the token in directly.
+	m.isup.applyToken("MONITOR", "")
 	m.SetMonitored([]string{"alice", "bad nick", "b\x00b", strings.Repeat("n", maxMonitorNickLen+1), "bob"})
 	if got := (<-m.out).Command; got != "MONITOR" { // MONITOR C
 		t.Fatalf("first queued command = %q, want MONITOR", got)

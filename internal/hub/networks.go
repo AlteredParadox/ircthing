@@ -420,8 +420,14 @@ func (s *Session) handleJoinChannel(ctx context.Context, env Envelope, join bool
 		s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
 		return
 	}
+	// A failed autojoin update is an ERROR, not a logged shrug: the client
+	// gates the follow-up close_buffer (history delete) on this request
+	// succeeding, and reporting success with the part not durably persisted
+	// meant the channel could rejoin after a restart with its history gone.
 	if err := s.hub.updateAutojoin(ctx, d.Network, []string{d.Channel}, join, c.Fold); err != nil {
 		log.Printf("network %q: updating autojoin for %s: %v", d.Network, d.Channel, err)
+		s.push(errEnvelope(env.Seq, "internal", "persisting the channel change failed"))
+		return
 	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcast(envelope("networks_changed", 0, nil))

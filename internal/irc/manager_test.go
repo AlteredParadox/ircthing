@@ -613,13 +613,19 @@ func TestManagerMonitor(t *testing.T) {
 		t.Fatalf("MONITOR + = %q, want a,b,c (clamped)", add.String())
 	}
 
+	// At the server limit (3 of 3) a live add is SKIPPED — the server would
+	// 734 it, and silently sending it left the persisted row looking
+	// monitored while upstream never watched it. The next wire command being
+	// the remove (not "+e") proves nothing was sent.
 	m.MonitorAdd("e")
-	if got := s.readCmd("MONITOR"); got.Param(0) != "+" || got.Param(1) != "e" {
-		t.Fatalf("MonitorAdd = %q", got.String())
-	}
 	m.MonitorRemove("a")
 	if got := s.readCmd("MONITOR"); got.Param(0) != "-" || got.Param(1) != "a" {
-		t.Fatalf("MonitorRemove = %q", got.String())
+		t.Fatalf("MonitorRemove = %q (an over-limit add leaked first?)", got.String())
+	}
+	// The remove freed a slot; the same add now goes out.
+	m.MonitorAdd("e")
+	if got := s.readCmd("MONITOR"); got.Param(0) != "+" || got.Param(1) != "e" {
+		t.Fatalf("MonitorAdd after free slot = %q", got.String())
 	}
 }
 
@@ -1099,7 +1105,9 @@ func TestManagerWHOXOnJoin(t *testing.T) {
 	s.send(":srv 353 AlteredParadox = #go :alice AlteredParadox")
 	s.send(":srv 366 AlteredParadox #go :End of /NAMES list")
 
-	s.send(":srv 005 AlteredParadox WHOX :are supported by this server")
+	// MONITOR is advertised too: the tail of this test uses MonitorAdd as a
+	// wire fence, and live adds now no-op on servers without the token.
+	s.send(":srv 005 AlteredParadox WHOX MONITOR :are supported by this server")
 	s.send(":AlteredParadox!u@h JOIN #rust")
 	s.send(":srv 353 AlteredParadox = #rust :bob AlteredParadox")
 	s.send(":srv 366 AlteredParadox #rust :End of /NAMES list")

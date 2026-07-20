@@ -58,6 +58,9 @@ type Conn interface {
 	Nick() string
 	Events() <-chan irc.Event
 	Send(*ircv4.Message) error
+	// SendAll queues msgs atomically — all or none — so a multi-message user
+	// action can't deliver a partial prefix when a later line fails.
+	SendAll([]*ircv4.Message) error
 	Channel(name string) (topic string, members []irc.Member, ok bool)
 	CapEnabled(name string) bool
 	IsChannel(target string) bool // per the network's ISUPPORT CHANTYPES
@@ -1120,9 +1123,20 @@ func midParams(m *ircv4.Message, from int) []string {
 // registration burst can still be mis-attributed. Full correlation needs
 // labeled-response; this queue just keeps the common cases (unrelated 402s,
 // concurrent requests) from consuming the wrong gate.
+// maxPendingMOTD caps the queue: a server that never terminates its replies
+// (no 376/422/402) would otherwise let repeated /motd grow it forever. At the
+// cap the OLDEST entry is dropped — it belongs to the request most likely
+// already orphaned. (The complete fix for correlation AND leakage here is
+// labeled-response on the outgoing MOTD; until then this stays best-effort.)
+const maxPendingMOTD = 8
+
 func (h *Hub) expectMOTD(network, target string) {
 	h.mu.Lock()
-	h.motdWanted[network] = append(h.motdWanted[network], target)
+	q := append(h.motdWanted[network], target)
+	if len(q) > maxPendingMOTD {
+		q = q[len(q)-maxPendingMOTD:]
+	}
+	h.motdWanted[network] = q
 	h.mu.Unlock()
 }
 

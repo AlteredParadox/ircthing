@@ -139,6 +139,13 @@ type Manager struct {
 	// maybeWHOX). Only the read loop touches it.
 	whoxDone map[string]bool
 
+	// monCount approximates the server-side MONITOR list size on this
+	// connection, so live MonitorAdd can respect the ISUPPORT limit instead
+	// of silently sending an add the server will 734. Set by SetMonitored at
+	// registration, adjusted by MonitorAdd/MonitorRemove (which the hub
+	// serializes under its monitor mutex).
+	monCount atomic.Int64
+
 	// stsMu guards the active STS policy (sts.go): connect to stsPort
 	// with TLS until stsUntil (zero stsUntil with a port = session-only
 	// upgrade). stsLastDur is the most recently advertised duration, used
@@ -431,27 +438,55 @@ func (m *Manager) SetMonitored(nicks []string) {
 			valid = append(valid, n)
 		}
 	}
+	if !m.monitorAdvertised() {
+		return // server doesn't offer MONITOR; nothing to establish
+	}
 	if limit := m.monitorLimit(); limit > 0 && len(valid) > limit {
+		log.Printf("irc[%s]: MONITOR list (%d) exceeds server limit %d; monitoring the first %d only", m.cfg.Name, len(valid), limit, limit)
 		valid = valid[:limit]
 	}
 	_ = m.Send(newMsg("MONITOR", "C")) // clear any stale list on this connection
 	for _, chunk := range chunkTargets(valid, 10) {
 		_ = m.Send(newMsg("MONITOR", "+", strings.Join(chunk, ",")))
 	}
+	m.monCount.Store(int64(len(valid)))
 }
 
 // MonitorAdd starts monitoring one nick; MonitorRemove stops. Both no-op
 // before registration (the hub re-sends the whole list on registration).
+// Live adds enforce the same constraints restoration does: MONITOR must be
+// advertised, and the ISUPPORT limit is respected — the server would 734 the
+// overflow anyway, but silently sending it left the persisted row appearing
+// monitored while upstream never watched it.
 func (m *Manager) MonitorAdd(nick string) {
-	if m.registered.Load() {
-		_ = m.Send(newMsg("MONITOR", "+", nick))
+	if !m.registered.Load() || !m.monitorAdvertised() {
+		return
+	}
+	if limit := m.monitorLimit(); limit > 0 && m.monCount.Load() >= int64(limit) {
+		log.Printf("irc[%s]: MONITOR list at server limit %d; %q not monitored on this connection (restored on reconnect if room)", m.cfg.Name, limit, nick)
+		return
+	}
+	if m.Send(newMsg("MONITOR", "+", nick)) == nil {
+		m.monCount.Add(1)
 	}
 }
 
 func (m *Manager) MonitorRemove(nick string) {
-	if m.registered.Load() {
-		_ = m.Send(newMsg("MONITOR", "-", nick))
+	if !m.registered.Load() || !m.monitorAdvertised() {
+		return
 	}
+	if m.Send(newMsg("MONITOR", "-", nick)) == nil {
+		if m.monCount.Add(-1) < 0 {
+			m.monCount.Store(0)
+		}
+	}
+}
+
+// monitorAdvertised reports whether the server offers MONITOR at all
+// (ISUPPORT token present, with or without a limit value).
+func (m *Manager) monitorAdvertised() bool {
+	_, ok := m.isup.Raw("MONITOR")
+	return ok
 }
 
 // monitorLimit returns the ISUPPORT MONITOR target limit, or 0 for no
@@ -694,6 +729,15 @@ func (m *Manager) Send(msg *ircv4.Message) error {
 	return m.sendAll([]*ircv4.Message{msg})
 }
 
+// SendAll queues msgs atomically — all of them or none. For multi-message
+// user actions (the multiline fallback's one-PRIVMSG-per-line) a per-message
+// Send could fail midway (an oversized later line, a filled queue), leaving a
+// duplicate-prone partial prefix already delivered while the composer still
+// holds the whole draft.
+func (m *Manager) SendAll(msgs []*ircv4.Message) error {
+	return m.sendAll(msgs)
+}
+
 // sendAll enqueues msgs atomically: all of them or none (a batch must
 // never go out with lines missing because the queue filled partway).
 // Every message is checked against the server's line-length limit first
@@ -783,7 +827,16 @@ func (m *Manager) loadSTS(ctx context.Context) {
 		return
 	}
 	port, until, ok, err := m.cfg.STS.STSPolicy(ctx, host)
-	if err != nil || !ok || !time.Now().Before(until) {
+	if err != nil {
+		// A store READ error is ambiguous — a policy may exist that we cannot
+		// see, and silently proceeding fails OPEN: a plaintext-configured
+		// network would reconnect in cleartext despite an active STS policy.
+		// There is no port to fail closed onto (the policy is unreadable), so
+		// the strongest safe action is a loud, unambiguous log.
+		log.Printf("irc[%s]: STS POLICY LOAD FAILED (%v) — downgrade protection may be lost for %s; a plaintext config may connect in cleartext", m.cfg.Name, err, host)
+		return
+	}
+	if !ok || !time.Now().Before(until) {
 		return
 	}
 	m.stsMu.Lock()
@@ -839,11 +892,18 @@ func (m *Manager) applySTS(ctx context.Context, connAddr string, d time.Duration
 	if m.cfg.STS == nil {
 		return
 	}
+	// Persistence failures must be LOUD: the in-memory policy protects this
+	// process, but if the write never landed, a restart loses downgrade
+	// protection and a plaintext-configured network reconnects in cleartext.
 	if d == 0 {
-		_ = m.cfg.STS.ClearSTSPolicy(ctx, host)
+		if err := m.cfg.STS.ClearSTSPolicy(ctx, host); err != nil {
+			log.Printf("irc[%s]: STS policy clear failed (%v) — a stale policy may persist for %s", m.cfg.Name, err, host)
+		}
 		return
 	}
-	_ = m.cfg.STS.SetSTSPolicy(ctx, host, port, until)
+	if err := m.cfg.STS.SetSTSPolicy(ctx, host, port, until); err != nil {
+		log.Printf("irc[%s]: STS POLICY PERSIST FAILED (%v) — downgrade protection for %s will be lost on restart", m.cfg.Name, err, host)
+	}
 }
 
 // rescheduleSTS pushes the policy expiry to now + the last advertised
@@ -862,7 +922,9 @@ func (m *Manager) rescheduleSTS(ctx context.Context) {
 		return
 	}
 	if host, _, err := net.SplitHostPort(m.cfg.Addr); err == nil {
-		_ = m.cfg.STS.SetSTSPolicy(context.WithoutCancel(ctx), host, port, until)
+		if perr := m.cfg.STS.SetSTSPolicy(context.WithoutCancel(ctx), host, port, until); perr != nil {
+			log.Printf("irc[%s]: STS POLICY RESCHEDULE PERSIST FAILED (%v) — downgrade protection for %s will be lost on restart", m.cfg.Name, perr, host)
+		}
 	}
 }
 

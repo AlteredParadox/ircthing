@@ -681,9 +681,9 @@ func TestMonitorFlow(t *testing.T) {
 
 	// Add two buddies: persisted, and forwarded to the connection.
 	s.Handle(ctx, request(t, "monitor_add", 1, MonitorReq{Network: "libera", Nick: "alice"}))
-	recv(t, s, "ok")
+	recv(t, s, "ok", "monitors_changed")
 	s.Handle(ctx, request(t, "monitor_add", 2, MonitorReq{Network: "libera", Nick: "bob"}))
-	recv(t, s, "ok")
+	recv(t, s, "ok", "monitors_changed")
 	deadline := time.Now().Add(5 * time.Second)
 	for len(conn.monAdds()) < 2 {
 		if time.Now().After(deadline) {
@@ -717,7 +717,7 @@ func TestMonitorFlow(t *testing.T) {
 
 	// Removing forwards to the connection and pushes an offline presence.
 	s.Handle(ctx, request(t, "monitor_remove", 4, MonitorReq{Network: "libera", Nick: "alice"}))
-	recv(t, s, "ok", "presence")
+	recv(t, s, "ok", "presence", "monitors_changed")
 	if got := conn.monRemoves(); len(got) != 1 || got[0] != "alice" {
 		t.Fatalf("MonitorRemove = %v", got)
 	}
@@ -734,7 +734,7 @@ func TestMonitorFlow(t *testing.T) {
 	// Removal clears cached presence: re-adding alice must not resurface her
 	// pre-removal "online" state before a fresh 730/731 arrives.
 	s.Handle(ctx, request(t, "monitor_add", 8, MonitorReq{Network: "libera", Nick: "alice"}))
-	recv(t, s, "ok")
+	recv(t, s, "ok", "monitors_changed")
 	s.Handle(ctx, request(t, "get_monitors", 9, map[string]string{"network": "libera"}))
 	for _, m := range decode[MonitorsData](t, recv(t, s, "monitors")).Monitors {
 		if m.Nick == "alice" && m.Online {
@@ -742,7 +742,7 @@ func TestMonitorFlow(t *testing.T) {
 		}
 	}
 	s.Handle(ctx, request(t, "monitor_remove", 10, MonitorReq{Network: "libera", Nick: "alice"}))
-	recv(t, s, "ok", "presence")
+	recv(t, s, "ok", "presence", "monitors_changed")
 
 	// A casemapping-equivalent duplicate is rejected: the server folds BOB to
 	// the existing bob, so a second row would render two entries sharing one
@@ -759,12 +759,12 @@ func TestMonitorFlow(t *testing.T) {
 	// "BOB" must delete the "bob" row (byte-exact delete would miss it while
 	// the wire MONITOR - still stopped upstream monitoring).
 	s.Handle(ctx, request(t, "monitor_remove", 11, MonitorReq{Network: "libera", Nick: "BOB"}))
-	recv(t, s, "ok", "presence")
+	recv(t, s, "ok", "presence", "monitors_changed")
 	if list, _ := h.store.Monitors(ctx, "libera"); len(list) != 0 {
 		t.Fatalf("casemapped remove left rows: %v", list)
 	}
 	s.Handle(ctx, request(t, "monitor_add", 12, MonitorReq{Network: "libera", Nick: "bob"}))
-	recv(t, s, "ok") // restore for the assertions below
+	recv(t, s, "ok", "monitors_changed") // restore for the assertions below
 
 	// An INVALID legacy row (persisted by an older, laxer version) must still
 	// be removable — validation only gates adds. The removal deletes the row
@@ -774,7 +774,7 @@ func TestMonitorFlow(t *testing.T) {
 	}
 	wireRemoves := len(conn.monRemoves())
 	s.Handle(ctx, request(t, "monitor_remove", 6, MonitorReq{Network: "libera", Nick: "bad nick"}))
-	recv(t, s, "ok", "presence")
+	recv(t, s, "ok", "presence", "monitors_changed")
 	if list, _ := h.store.Monitors(ctx, "libera"); len(list) != 1 || list[0] != "bob" {
 		t.Fatalf("stored monitors after legacy remove = %v", list)
 	}
