@@ -603,47 +603,45 @@ func TestManagerMonitor(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 
-	// SetMonitored clears then adds, clamped to the ISUPPORT limit of 3.
-	m.SetMonitored([]string{"a", "b", "c", "d"})
-	if got := s.readCmd("MONITOR"); got.Param(0) != "C" {
-		t.Fatalf("first MONITOR = %q, want C", got.String())
+	// First reconcile with 4 desired at limit 3: pure additions (a fresh
+	// connection's server list is empty, so NO MONITOR C flicker), clamped to
+	// the first three.
+	if err := m.ReconcileMonitored([]string{"a", "b", "c", "d"}); err != nil {
+		t.Fatal(err)
 	}
-	add := s.readCmd("MONITOR")
-	if add.Param(0) != "+" || add.Param(1) != "a,b,c" {
-		t.Fatalf("MONITOR + = %q, want a,b,c (clamped)", add.String())
+	if add := s.readCmd("MONITOR"); add.Param(0) != "+" || add.Param(1) != "a,b,c" {
+		t.Fatalf("MONITOR + = %q, want a,b,c (clamped, no C on a fresh conn)", add.String())
 	}
 
-	// At the server limit (3 of 3) a live add is SKIPPED — the server would
-	// 734 it, and silently sending it left the persisted row looking
-	// monitored while upstream never watched it. The next wire command being
-	// the remove (not "+e") proves nothing was sent.
-	m.MonitorAdd("e")
-	m.MonitorRemove("a")
-	if got := s.readCmd("MONITOR"); got.Param(0) != "-" || got.Param(1) != "a" {
-		t.Fatalf("MonitorRemove = %q (an over-limit add leaked first?)", got.String())
+	// Removing "a" (reconcile to [b,c,d]) both drops a AND PROMOTES d — the
+	// previously-overflowed buddy fills the freed slot on the same call.
+	if err := m.ReconcileMonitored([]string{"b", "c", "d"}); err != nil {
+		t.Fatal(err)
 	}
-	// The remove freed a slot; the same add now goes out.
-	m.MonitorAdd("e")
-	if got := s.readCmd("MONITOR"); got.Param(0) != "+" || got.Param(1) != "e" {
-		t.Fatalf("MonitorAdd after free slot = %q", got.String())
+	if rem := s.readCmd("MONITOR"); rem.Param(0) != "-" || rem.Param(1) != "a" {
+		t.Fatalf("removal = %q, want -a", rem.String())
 	}
-	// Active set now {b,c,e}. An EXACT duplicate add is a no-op (spec: not
-	// re-added) — no wire traffic, no count drift. Removing an INACTIVE nick
-	// (never added: "a" was removed, "d" clamped away) also sends nothing.
-	// A subsequent remove of an ACTIVE nick proves neither leaked ahead of it.
-	m.MonitorAdd("e")    // duplicate
-	m.MonitorRemove("a") // inactive (already removed)
-	m.MonitorRemove("d") // inactive (clamped, never added)
-	m.MonitorRemove("b") // active → this is the only thing that should hit the wire
+	if promote := s.readCmd("MONITOR"); promote.Param(0) != "+" || promote.Param(1) != "d" {
+		t.Fatalf("promotion = %q, want +d (overflow promoted into the freed slot)", promote.String())
+	}
+
+	// Reconciling the SAME list is a no-op (in sync) — no wire traffic. Prove
+	// it: the only command after is the -b from the next real change.
+	if err := m.ReconcileMonitored([]string{"b", "c", "d"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ReconcileMonitored([]string{"c", "d"}); err != nil {
+		t.Fatal(err)
+	}
 	if got := s.readCmd("MONITOR"); got.Param(0) != "-" || got.Param(1) != "b" {
-		t.Fatalf("MONITOR = %q; a duplicate add or inactive remove leaked", got.String())
+		t.Fatalf("MONITOR = %q; the idempotent reconcile leaked", got.String())
 	}
 }
 
-// A 734 (list full) must drop the rejected nick from the connection's active
-// set, so a later add can reuse the accounting slot instead of being blocked
-// until reconnect. Uses an UNADVERTISED limit (MONITOR with no number) so the
-// client doesn't clamp and actually sends the add that the server then 734s.
+// A 734 (list full) records the server's real capacity, so a later reconcile
+// does not keep trying to overfill a list the server won't grow. Uses an
+// UNADVERTISED limit (MONITOR with no number) so the client doesn't clamp and
+// actually sends the adds the server then 734s.
 func TestManagerMonitorRejected(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -663,16 +661,26 @@ func TestManagerMonitorRejected(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 
-	m.MonitorAdd("full1")
-	if got := s.readCmd("MONITOR"); got.Param(1) != "full1" {
-		t.Fatalf("add = %q", got.String())
+	if err := m.ReconcileMonitored([]string{"full1", "full2"}); err != nil {
+		t.Fatal(err)
 	}
-	// Server rejects it (734). The manager must forget it from the active set.
-	m.MonitorRejected([]string{"full1"})
-	// Re-adding the same nick must now go out again (not suppressed as a dup).
-	m.MonitorAdd("full1")
-	if got := s.readCmd("MONITOR"); got.Param(0) != "+" || got.Param(1) != "full1" {
-		t.Fatalf("re-add after 734 = %q; rejection did not clear the active set", got.String())
+	if add := s.readCmd("MONITOR"); add.Param(0) != "+" || add.Param(1) != "full1,full2" {
+		t.Fatalf("initial add = %q", add.String())
+	}
+	// Server 734s full2 — its real cap is 1. MonitorRejected drops full2 and
+	// records the effective limit (the count that remains, 1).
+	m.MonitorRejected([]string{"full2"})
+	// Reconciling the same desired must NOT re-add full2 now (clamped to the
+	// learned limit of 1, and full1 is already active → no-op). Prove nothing
+	// leaked: the only wire command after is the -full1 from removing it.
+	if err := m.ReconcileMonitored([]string{"full1", "full2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ReconcileMonitored([]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.readCmd("MONITOR"); got.Param(0) != "-" || got.Param(1) != "full1" {
+		t.Fatalf("MONITOR = %q; a rejected nick was re-added past the 734 limit", got.String())
 	}
 }
 
@@ -1180,7 +1188,9 @@ func TestManagerWHOXOnJoin(t *testing.T) {
 	}
 	// Prove no second WHO was sent for either channel: solicit MONITOR
 	// output and assert nothing WHO-shaped precedes it on the wire.
-	m.MonitorAdd("x")
+	if err := m.ReconcileMonitored([]string{"x"}); err != nil {
+		t.Fatal(err)
+	}
 	for {
 		got := s.read()
 		if got.Command == "MONITOR" {

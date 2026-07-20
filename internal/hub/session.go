@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -455,14 +456,15 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		s.hub.removePresence(d.Network, nick)
 	}
 	if conn != nil {
-		if add {
-			conn.MonitorAdd(nick)
-		} else {
-			// An invalid legacy nick was never sent to the server (restore
-			// filters it), so don't put it on the wire now — just drop the row.
-			if irc.ValidMonitorTarget(nick) {
-				conn.MonitorRemove(nick)
+		// Reconcile the whole persisted list, not just this nick: it drives the
+		// exact delta atomically (so a full queue never records a half-sent
+		// list) and PROMOTES an overflow buddy into the slot a removal frees.
+		if desired, lerr := s.hub.store.Monitors(ctx, d.Network); lerr == nil {
+			if rerr := conn.ReconcileMonitored(desired); rerr != nil {
+				log.Printf("network %q: monitor reconcile: %v", d.Network, rerr)
 			}
+		}
+		if !add {
 			s.hub.broadcast(envelope("presence", 0, PresenceData{Network: d.Network, Nick: nick, Online: false}))
 		}
 	}

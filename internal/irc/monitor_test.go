@@ -42,24 +42,24 @@ func TestValidMonitorTarget(t *testing.T) {
 	}
 }
 
-// SetMonitored must drop invalid PERSISTED entries (added before validation
-// tightened, or by an older version) instead of letting one poison its
-// ten-nick chunk at send time.
-func TestSetMonitoredDropsInvalidEntries(t *testing.T) {
+// ReconcileMonitored must drop invalid PERSISTED entries (added before
+// validation tightened, or by an older version) instead of letting one poison
+// its ten-nick chunk at send time. On a fresh connection the delta is pure
+// additions of the valid entries only.
+func TestReconcileMonitoredDropsInvalidEntries(t *testing.T) {
 	m, err := NewManager(testCfg("127.0.0.1:0"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	m.setRegistered(true)
-	// SetMonitored now refuses to send anything to a server that doesn't
-	// advertise MONITOR; this unit test drives the token in directly.
+	// ReconcileMonitored refuses a server that doesn't advertise MONITOR; this
+	// unit test drives the token in directly.
 	m.isup.applyToken("MONITOR", "")
-	m.SetMonitored([]string{"alice", "bad nick", "b\x00b", strings.Repeat("n", maxMonitorNickLen+1), "bob"})
-	if got := (<-m.out).Command; got != "MONITOR" { // MONITOR C
-		t.Fatalf("first queued command = %q, want MONITOR", got)
+	if err := m.ReconcileMonitored([]string{"alice", "bad nick", "b\x00b", strings.Repeat("n", maxMonitorNickLen+1), "bob"}); err != nil {
+		t.Fatal(err)
 	}
 	add := <-m.out
 	if add.Command != "MONITOR" || add.Param(0) != "+" || add.Param(1) != "alice,bob" {
-		t.Fatalf("MONITOR add = %v, want + alice,bob", add)
+		t.Fatalf("MONITOR add = %v, want + alice,bob (invalid entries dropped)", add)
 	}
 }

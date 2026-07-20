@@ -88,11 +88,13 @@ type Conn interface {
 	SendMultiline(target string, lines []string) error
 	// SetMonitored replaces the MONITOR list; MonitorAdd/MonitorRemove
 	// adjust it by one nick (MONITOR extension).
-	SetMonitored(nicks []string)
-	MonitorAdd(nick string)
-	MonitorRemove(nick string)
-	// MonitorRejected drops server-refused (734) nicks from the active set so
-	// the connection's monitor accounting stays authoritative.
+	// ReconcileMonitored drives the server MONITOR list toward the persisted
+	// buddy list `desired`, sending only the incremental delta atomically. The
+	// hub calls it on registration and after each add/remove; it returns an
+	// error if the delta couldn't be enqueued (retried on the next call).
+	ReconcileMonitored(desired []string) error
+	// MonitorRejected handles a 734 (list full): drops the refused nicks and
+	// records the server's real capacity for this connection.
 	MonitorRejected(nicks []string)
 }
 
@@ -719,8 +721,12 @@ func (h *Hub) startMonitor(ctx context.Context, c Conn) {
 		log.Printf("irc[%s]: monitor load: %v", c.Name(), err)
 		return
 	}
-	if len(nicks) > 0 {
-		c.SetMonitored(nicks)
+	// Reconcile even for an empty list — the manager's active set is empty on a
+	// fresh connection, so an empty desired list is simply a no-op, and a
+	// non-empty one establishes the buddies. (No MONITOR C needed: the server's
+	// list starts empty on every new connection.)
+	if err := c.ReconcileMonitored(nicks); err != nil {
+		log.Printf("irc[%s]: monitor restore: %v", c.Name(), err)
 	}
 }
 

@@ -679,17 +679,23 @@ func TestMonitorFlow(t *testing.T) {
 		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
 	}
 
-	// Add two buddies: persisted, and forwarded to the connection.
+	monSet := func() map[string]bool {
+		m := map[string]bool{}
+		for _, n := range conn.monitoredNicks() {
+			m[n] = true
+		}
+		return m
+	}
+
+	// Add two buddies: persisted, and reconciled onto the connection. The
+	// reconcile runs synchronously before the "ok", so the desired list the
+	// connection last saw is up to date once recv returns.
 	s.Handle(ctx, request(t, "monitor_add", 1, MonitorReq{Network: "libera", Nick: "alice"}))
 	recv(t, s, "ok", "monitors_changed")
 	s.Handle(ctx, request(t, "monitor_add", 2, MonitorReq{Network: "libera", Nick: "bob"}))
 	recv(t, s, "ok", "monitors_changed")
-	deadline := time.Now().Add(5 * time.Second)
-	for len(conn.monAdds()) < 2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("MonitorAdd calls = %v", conn.monAdds())
-		}
-		time.Sleep(2 * time.Millisecond)
+	if m := monSet(); !m["alice"] || !m["bob"] || len(m) != 2 {
+		t.Fatalf("reconciled list = %v, want alice+bob", conn.monitoredNicks())
 	}
 
 	// The server reports alice online, bob offline (730/731); both push.
@@ -715,11 +721,12 @@ func TestMonitorFlow(t *testing.T) {
 		}
 	}
 
-	// Removing forwards to the connection and pushes an offline presence.
+	// Removing reconciles the connection to the shrunken list and pushes an
+	// offline presence.
 	s.Handle(ctx, request(t, "monitor_remove", 4, MonitorReq{Network: "libera", Nick: "alice"}))
 	recv(t, s, "ok", "presence", "monitors_changed")
-	if got := conn.monRemoves(); len(got) != 1 || got[0] != "alice" {
-		t.Fatalf("MonitorRemove = %v", got)
+	if got := conn.monitoredNicks(); len(got) != 1 || got[0] != "bob" {
+		t.Fatalf("reconciled after remove = %v, want [bob]", got)
 	}
 	if list, _ := h.store.Monitors(ctx, "libera"); len(list) != 1 || list[0] != "bob" {
 		t.Fatalf("stored monitors after remove = %v", list)
@@ -767,19 +774,17 @@ func TestMonitorFlow(t *testing.T) {
 	recv(t, s, "ok", "monitors_changed") // restore for the assertions below
 
 	// An INVALID legacy row (persisted by an older, laxer version) must still
-	// be removable — validation only gates adds. The removal deletes the row
-	// but puts nothing on the wire (the nick was never sent to the server).
+	// be removable — validation only gates adds. The removal deletes the row;
+	// the reconcile that follows never puts the invalid nick on the wire (the
+	// manager's ReconcileMonitored filters invalid targets — unit-tested in the
+	// irc package).
 	if err := h.store.AddMonitor(ctx, "libera", "bad nick"); err != nil {
 		t.Fatal(err)
 	}
-	wireRemoves := len(conn.monRemoves())
 	s.Handle(ctx, request(t, "monitor_remove", 6, MonitorReq{Network: "libera", Nick: "bad nick"}))
 	recv(t, s, "ok", "presence", "monitors_changed")
 	if list, _ := h.store.Monitors(ctx, "libera"); len(list) != 1 || list[0] != "bob" {
 		t.Fatalf("stored monitors after legacy remove = %v", list)
-	}
-	if got := conn.monRemoves(); len(got) != wireRemoves {
-		t.Fatalf("invalid nick reached the wire: MonitorRemove = %v", got)
 	}
 }
 
@@ -807,7 +812,7 @@ func TestMonitorReestablishedOnRegistration(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("SetMonitored not called with the persisted list; got %v", conn.monitoredNicks())
+			t.Fatalf("ReconcileMonitored not called with the persisted list; got %v", conn.monitoredNicks())
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
