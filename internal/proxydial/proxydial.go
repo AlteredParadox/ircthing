@@ -48,6 +48,33 @@ import (
 // %w-wrapped with it and carry no user input (credentials never reach a log).
 var ErrProxyConfig = errors.New("proxy: invalid configuration")
 
+// ErrProxyRejected wraps a DETERMINISTIC runtime rejection by the proxy itself —
+// SOCKS auth failure / no acceptable method / policy or unsupported-command
+// rejection, or an HTTP CONNECT 4xx other than 408/429. Retrying re-runs the
+// same rejected handshake, so the media layer classifies it PERMANENT. Genuine
+// network failures, 408/429, and 5xx stay unwrapped (transient).
+var ErrProxyRejected = errors.New("proxy: request rejected")
+
+// ParsePort strictly parses a decimal port: ASCII digits only (strconv.Atoi
+// otherwise accepts a leading '+'/'-' and Unicode digits, which are not valid
+// in a host:port authority) and in 1..65535. Shared with netconf's endpoint
+// validation so both reject the same malformed ports.
+func ParsePort(s string) (int, bool) {
+	if s == "" || len(s) > 5 {
+		return 0, false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 || n > 65535 {
+		return 0, false
+	}
+	return n, true
+}
+
 // CredsOverCleartext reports whether a proxy URL carries authentication to a
 // non-loopback host. SOCKS5 (RFC 1929) and HTTP Basic proxy auth are sent
 // unencrypted, so credentials to a remote proxy travel in the clear unless the
@@ -103,22 +130,23 @@ func validateProxyURL(u *url.URL) error {
 		return fmt.Errorf("%w: scheme must be socks5 or http", ErrProxyConfig)
 	}
 	// The RAW authority must be a bare host:port. A manually-constructed URL can
-	// smuggle userinfo into Host ("alice:secret@host:1080"), which Hostname()
-	// would then mis-split — and a later error could echo the secret. Reject any
-	// authority-delimiter or control byte in the raw Host up front (a real
-	// host:port has none). Credentials belong in u.User, validated below.
+	// smuggle userinfo into Host ("alice:secret@host:1080") or an extra colon
+	// ("alice:secret:1080", which Hostname() mis-splits to "alice:secret") —
+	// and a later dial error could echo the secret. net.SplitHostPort rejects
+	// both (an unbracketed extra colon is "too many colons"); the delimiter/
+	// control scan catches the rest. Credentials belong in u.User (validated
+	// below), never the authority.
 	if strings.ContainsAny(u.Host, "@/?# ") || hasControl(u.Host) {
 		return fmt.Errorf("%w: malformed proxy authority", ErrProxyConfig)
 	}
-	// url.Parse happily accepts "socks5://:1080" (empty host) and out-of-range
-	// ports; both must be present and sane.
-	if u.Hostname() == "" || u.Port() == "" {
+	host, port, err := net.SplitHostPort(u.Host)
+	if err != nil || host == "" {
 		return fmt.Errorf("%w: host:port required", ErrProxyConfig)
 	}
-	if port, err := strconv.Atoi(u.Port()); err != nil || port < 1 || port > 65535 {
-		return fmt.Errorf("%w: port must be 1-65535", ErrProxyConfig)
+	if _, ok := ParsePort(port); !ok {
+		return fmt.Errorf("%w: port must be a decimal 1-65535", ErrProxyConfig)
 	}
-	if len(u.Hostname()) > 255 {
+	if len(host) > 255 {
 		return fmt.Errorf("%w: proxy host too long", ErrProxyConfig)
 	}
 	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
@@ -144,7 +172,7 @@ func validateProxyTarget(target string) error {
 	if len(host) > 255 || strings.ContainsAny(host, "@/?#\\ \t\r\n") || hasControl(host) {
 		return fmt.Errorf("%w: malformed target host", ErrProxyConfig)
 	}
-	if p, perr := strconv.Atoi(port); perr != nil || p < 1 || p > 65535 {
+	if _, ok := ParsePort(port); !ok {
 		return fmt.Errorf("%w: malformed target port", ErrProxyConfig)
 	}
 	return nil
@@ -212,7 +240,10 @@ func Dial(ctx context.Context, proxy *url.URL, target string, timeout time.Durat
 	d := &net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp", proxy.Host)
 	if err != nil {
-		return nil, fmt.Errorf("proxy %s: %w", proxy.Host, err)
+		// Build the diagnostic from the VALIDATED structural fields, never the
+		// raw proxy.Host — a malformed authority could otherwise echo a smuggled
+		// secret into a log. (validateProxyURL guarantees these are clean.)
+		return nil, fmt.Errorf("proxy %s: %w", net.JoinHostPort(proxy.Hostname(), proxy.Port()), err)
 	}
 	conn.SetDeadline(time.Now().Add(timeout))
 	// Honor ctx during the handshake too (shutdown must not block until the
@@ -286,14 +317,16 @@ func socks5Negotiate(conn net.Conn, user *url.Userinfo) error {
 	case 0x02:
 		return socks5Auth(conn, user)
 	default:
-		return errors.New("socks5: no acceptable authentication method")
+		// The proxy accepts none of our offered methods: deterministic, retry
+		// won't change it.
+		return fmt.Errorf("%w: no acceptable authentication method", ErrProxyRejected)
 	}
 }
 
 // socks5Auth is the RFC 1929 §2 username/password subnegotiation.
 func socks5Auth(conn net.Conn, user *url.Userinfo) error {
 	if user == nil {
-		return errors.New("socks5: proxy requires authentication but none is configured")
+		return fmt.Errorf("%w: proxy requires authentication but none is configured", ErrProxyRejected)
 	}
 	// Defensive re-validation before writing (Dial already validated a parsed
 	// URL, but a directly-constructed one may reach here): RFC 1929 fields are
@@ -313,7 +346,7 @@ func socks5Auth(conn net.Conn, user *url.Userinfo) error {
 		return fmt.Errorf("socks5 auth: %w", err)
 	}
 	if st[1] != 0x00 {
-		return errors.New("socks5: authentication rejected")
+		return fmt.Errorf("%w: authentication rejected", ErrProxyRejected)
 	}
 	return nil
 }
@@ -325,9 +358,9 @@ func socks5Request(target string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return nil, fmt.Errorf("socks5: bad target port %q", portStr)
+	port, ok := ParsePort(portStr)
+	if !ok {
+		return nil, fmt.Errorf("%w: bad target port", ErrProxyConfig)
 	}
 	req := []byte{0x05, 0x01, 0x00}
 	switch ip := net.ParseIP(host); {
@@ -352,7 +385,16 @@ func socks5ReadReply(conn net.Conn) error {
 		return fmt.Errorf("socks5 reply: %w", err)
 	}
 	if head[1] != 0x00 {
-		return fmt.Errorf("socks5: connect failed: %s", socks5Error(head[1]))
+		// Classify by RFC 1928 §6 reply code: policy / unsupported-command /
+		// unsupported-address are DETERMINISTIC rejections (permanent); a
+		// network/host-unreachable, connection-refused, or TTL-expired is a
+		// target-side failure that may clear (transient).
+		switch head[1] {
+		case 0x02, 0x07, 0x08: // not-allowed-by-ruleset, command-not-supported, addr-not-supported
+			return fmt.Errorf("%w: %s", ErrProxyRejected, socks5Error(head[1]))
+		default:
+			return fmt.Errorf("socks5: connect failed: %s", socks5Error(head[1]))
+		}
 	}
 	var bound int
 	switch head[3] {
@@ -440,6 +482,12 @@ func httpConnect(conn net.Conn, user *url.Userinfo, target string) error {
 		return fmt.Errorf("http proxy: malformed response %q", status)
 	}
 	if f[1] != "200" {
+		// A 4xx (other than 408 request-timeout / 429 too-many-requests) is a
+		// DETERMINISTIC proxy rejection — 407 proxy-auth-required, 403 forbidden,
+		// etc.: retrying repeats it. 5xx and 408/429 stay transient.
+		if code, err := strconv.Atoi(f[1]); err == nil && code >= 400 && code < 500 && code != 408 && code != 429 {
+			return fmt.Errorf("%w: CONNECT %s", ErrProxyRejected, f[1])
+		}
 		return fmt.Errorf("http proxy: CONNECT refused: %s", status)
 	}
 	return nil

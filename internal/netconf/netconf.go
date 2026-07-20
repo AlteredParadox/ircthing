@@ -29,10 +29,10 @@ import (
 	"io"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 
 	"ircthing/internal/irc"
+	"ircthing/internal/proxydial"
 	"ircthing/internal/wgdial"
 )
 
@@ -137,8 +137,9 @@ func (n *Network) validateIdentity() error {
 	// shape here, loudly, like the WireGuard endpoint check does.
 	if host, port, err := net.SplitHostPort(n.Addr); err != nil || host == "" {
 		return fmt.Errorf("addr %q must be host:port", n.Addr)
-	} else if p, perr := strconv.Atoi(port); perr != nil || p < 1 || p > 65535 {
-		return fmt.Errorf("addr %q: port must be a number in 1–65535", n.Addr)
+	} else if _, ok := proxydial.ParsePort(port); !ok {
+		// Strict: ASCII digits in 1..65535 (strconv.Atoi would accept "+6667").
+		return fmt.Errorf("addr %q: port must be a decimal number in 1–65535", n.Addr)
 	}
 	if n.Nick == "" {
 		return errors.New("nick is required")

@@ -333,7 +333,9 @@ func TestDialProxyHTTPConnect(t *testing.T) {
 	if c, err := dialProxy(t.Context(), bad, "irc.test:6697", 5*time.Second); err == nil {
 		c.Close()
 		t.Fatal("wrong password accepted")
-	} else if !strings.Contains(err.Error(), "CONNECT refused") {
+	} else if !strings.Contains(err.Error(), "request rejected") {
+		// A 4xx (the fake returns 407 Proxy Authentication Required) is a
+		// deterministic proxy rejection, now surfaced as such.
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

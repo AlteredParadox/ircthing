@@ -37,6 +37,7 @@ func TestParseNeverLeaksCredentials(t *testing.T) {
 		"carol:hunter2@host:1080",                   // scheme-less
 		"socks5://u:first@SECRET@host:1080/path",    // multi-@
 		"socks5://alice:secret/path@proxy:1080",     // '@' after first '/' (redactor blind spot)
+		"socks5://alice:secret:1080",                // extra colon: Hostname() mis-splits to "alice:secret"
 	}
 	secrets := []string{"sup3rSecret", "alice", "s3cr3t", "hunter2", "carol", "SECRET", "secret"}
 	for _, s := range cases {
@@ -87,10 +88,27 @@ func TestParse(t *testing.T) {
 		// that is not tested here as an error.)
 		"http://a\x01b:pw@host:3128",   // control char in HTTP username
 		"http://user:p\x7fw@host:3128", // DEL in HTTP password
+		"socks5://host:+6667", // signed port — strconv.Atoi would accept it
+		"socks5://host:66 66", // whitespace in port
 	}
 	for _, s := range bad {
 		if _, err := Parse(s); err == nil {
 			t.Errorf("Parse(%q) = nil, want error", s)
+		}
+	}
+}
+
+func TestParsePort(t *testing.T) {
+	good := map[string]int{"1": 1, "6667": 6667, "65535": 65535}
+	for s, want := range good {
+		if got, ok := ParsePort(s); !ok || got != want {
+			t.Errorf("ParsePort(%q) = %d,%v, want %d,true", s, got, ok, want)
+		}
+	}
+	// Rejected: signed, zero, out-of-range, non-digit, unicode digit, empty.
+	for _, s := range []string{"", "0", "+6667", "-1", "65536", "99999", "6a", " 66", "6 6", "६६"} {
+		if _, ok := ParsePort(s); ok {
+			t.Errorf("ParsePort(%q) = ok, want rejected", s)
 		}
 	}
 }
