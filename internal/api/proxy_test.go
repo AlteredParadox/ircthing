@@ -370,6 +370,15 @@ func TestBodyReadErrorClassification(t *testing.T) {
 		{"deadline mid-body", &bodyReadError{context.DeadlineExceeded}, true},
 		{"bare connection cut", &bodyReadError{io.ErrUnexpectedEOF}, true},
 		{"wire budget through body phase", &bodyReadError{&net.OpError{Op: "read", Err: errWireBudget}}, false},
+		// Do-phase parser failures (malformed status/headers) — deterministic,
+		// and reachable only after the endpoint burned wire budget: permanent.
+		{"malformed status line", &url.Error{Op: "Get", URL: "https://x", Err: errors.New(`malformed HTTP response "x"`)}, false},
+		{"malformed header", &url.Error{Op: "Get", URL: "https://x", Err: errors.New("malformed MIME header line")}, false},
+		// Dial failures are the canonical transient class — a WireGuard tunnel
+		// warming up returns CUSTOM error types (not net.Error), so the dial
+		// tag must carry them through the url.Error chain.
+		{"tunnel dial failure", &url.Error{Op: "Get", URL: "https://x", Err: &dialPhaseError{errors.New("wireguard tunnel not up")}}, true},
+		{"early clean close", &url.Error{Op: "Get", URL: "https://x", Err: io.EOF}, true},
 	}
 	for _, tc := range cases {
 		if got := fetchErrorRetryable(tc.err); got != tc.want {
@@ -426,7 +435,11 @@ func TestFetchErrorRetryable(t *testing.T) {
 		{"upstream 429", &upstreamStatusError{429}, true},
 		{"upstream 500", &upstreamStatusError{500}, true},
 		{"upstream 503", &upstreamStatusError{503}, true},
-		{"dial/timeout", errors.New("dial tcp: i/o timeout"), true},
+		// Untyped errors now default PERMANENT; real dial failures arrive as
+		// dialPhaseError (the withWireBudget tag) or as a net.OpError.
+		{"tagged dial failure", &dialPhaseError{errors.New("dial tcp: i/o timeout")}, true},
+		{"socket op error", &net.OpError{Op: "dial", Err: errors.New("connection refused")}, true},
+		{"untyped unknown error", errors.New("mystery failure"), false},
 		// Redirect misbehavior is a deterministic property of the target: a
 		// retry of a five-hop loop re-walks every hop, so it must be permanent.
 		// client.Do wraps CheckRedirect errors in *url.Error, so test the
@@ -439,7 +452,11 @@ func TestFetchErrorRetryable(t *testing.T) {
 		{"cert verification", &url.Error{Op: "Get", URL: "https://x",
 			Err: &tls.CertificateVerificationError{Err: errors.New("x509: bad")}}, false},
 		// A generic TLS I/O failure (handshake cut short) stays transient.
-		{"tls io error", &url.Error{Op: "Get", URL: "https://x", Err: errors.New("EOF during handshake")}, true},
+		// A real TLS-handshake I/O failure surfaces as io.EOF (clean close),
+		// io.ErrUnexpectedEOF, or a socket net.OpError — all transient. An
+		// untyped string in the Do phase is the permanent default.
+		{"tls handshake cut (EOF)", &url.Error{Op: "Get", URL: "https://x", Err: io.EOF}, true},
+		{"tls handshake socket error", &url.Error{Op: "Get", URL: "https://x", Err: &net.OpError{Op: "read", Err: errors.New("connection reset by peer")}}, true},
 		// A malformed Location header is rejected inside net/http before
 		// CheckRedirect runs and surfaces as an untyped error in *url.Error
 		// (matched by message text) — deterministic, so permanent.

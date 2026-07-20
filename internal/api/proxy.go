@@ -184,20 +184,37 @@ func fetchErrorRetryable(err error) bool {
 			return false // 4xx and other permanent statuses
 		}
 	}
-	// Body-read phase: default PERMANENT (deterministic framing/parser
-	// failures must not get the retry budget), excepting genuine network
-	// failures — a socket-level error (reset, timeout), a deadline, or a
-	// bare mid-body connection cut.
-	var bre *bodyReadError
-	if errors.As(err, &bre) {
-		var ne net.Error
-		if errors.As(bre.err, &ne) || errors.Is(bre.err, context.DeadlineExceeded) ||
-			errors.Is(bre.err, context.Canceled) || errors.Is(bre.err, io.ErrUnexpectedEOF) {
-			return true
-		}
-		return false
+	// Explicitly TRANSIENT classes, whatever phase they surface in:
+	//   - dialPhaseError: TCP/proxy/tunnel dial failures — a WireGuard tunnel
+	//     warming up fails exactly here, and its errors are custom types, not
+	//     net.Errors, hence the tag.
+	//   - net.Error anywhere in the chain: socket-level resets/timeouts,
+	//     including mid-handshake and mid-body I/O failures.
+	//   - context deadline/cancel: the 15 s client timeout.
+	//   - io.ErrUnexpectedEOF / io.EOF: a bare connection cut (mid-body, or
+	//     closed before the response line — a restarting server does both).
+	// Look for net.Error BELOW the url.Error wrapper: *url.Error itself
+	// implements net.Error (delegating Timeout/Temporary), so matching the
+	// wrapper would classify EVERY client.Do failure — including malformed-
+	// response parser errors — as transient.
+	inner := err
+	var uw *url.Error
+	if errors.As(err, &uw) && uw.Err != nil {
+		inner = uw.Err
 	}
-	return true // dial/TLS handshake/timeout — transient (a WireGuard tunnel warming up fails here)
+	var dpe *dialPhaseError
+	var ne net.Error
+	if errors.As(err, &dpe) || errors.As(inner, &ne) ||
+		errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+	// DEFAULT: permanent. What remains is the deterministic residue of both
+	// phases — malformed status line/headers from client.Do, malformed
+	// chunked framing or trailers mid-body (bodyReadError) — and a hostile
+	// endpoint can burn the full wire budget before emitting any of them;
+	// handing them the client's retry budget multiplies that by four.
+	return false
 }
 
 type fetcher struct {
@@ -269,14 +286,26 @@ func (c *budgetConn) Read(p []byte) (int, error) {
 // get() to the dialer.
 type wireBudgetKey struct{}
 
+// dialPhaseError tags any failure from the dial func itself — TCP connect,
+// SOCKS/HTTP proxy handshake, or a WireGuard tunnel that is down or warming
+// up. These are the canonical TRANSIENT failures (the whole reason the client
+// retries), and tagging them here is what lets fetchErrorRetryable default
+// everything else in the Do phase — malformed status lines, bad headers —
+// to permanent without misclassifying custom (non-net.Error) dial errors.
+type dialPhaseError struct{ err error }
+
+func (e *dialPhaseError) Error() string { return "proxy: dial: " + e.err.Error() }
+func (e *dialPhaseError) Unwrap() error { return e.err }
+
 // withWireBudget wraps a dial func so every connection it returns draws from
-// the request's shared raw-byte budget. A dial without one (defensive; get()
-// always seeds it) gets a fresh single-connection budget.
+// the request's shared raw-byte budget, and tags dial failures as
+// dialPhaseError (transient). A dial without a seeded budget (defensive;
+// get() always seeds it) gets a fresh single-connection budget.
 func (f *fetcher) withWireBudget(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		c, err := dial(ctx, network, addr)
 		if err != nil {
-			return nil, err
+			return nil, &dialPhaseError{err}
 		}
 		budget, _ := ctx.Value(wireBudgetKey{}).(*atomic.Int64)
 		if budget == nil {
