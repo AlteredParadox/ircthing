@@ -725,9 +725,7 @@ func (f *fakeConn) HistoryPageSize() int                     { return 100 }
 func (f *fakeConn) EnsureNames(string) {}
 
 func (f *fakeConn) SendMultiline(string, []string) error { return nil }
-func (f *fakeConn) SetMonitored([]string)                {}
-func (f *fakeConn) MonitorAdd(string)                    {}
-func (f *fakeConn) MonitorRemove(string)                 {}
+func (f *fakeConn) ReconcileMonitored([]string) error    { return nil }
 func (f *fakeConn) MonitorRejected([]string)             {}
 
 func (f *fakeConn) privmsg(line string) irc.Event {
