@@ -463,6 +463,18 @@ export function App() {
 			.catch(() => setPhase("login"));
 	}, []);
 
+	// Leaving the authenticated phase resets the preview switches: they are
+	// server-session state, and letting them survive logout would (a) keep
+	// rendering preview components that fire requests the backend now refuses,
+	// and (b) leave previewsPinned latched so the config GET after RE-login is
+	// ignored permanently — the client would never re-adopt the authoritative
+	// value. Reset both; the next login re-fetches /api/config fail-closed.
+	useEffect(() => {
+		if (phase !== "login") return;
+		previewsPinned.current = false;
+		setPreviews(false);
+	}, [phase]);
+
 	// Server switches (whether link/media previews are enabled). Fetched
 	// once authed so the UI never requests previews the server disabled.
 	useEffect(() => {

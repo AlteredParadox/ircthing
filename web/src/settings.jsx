@@ -180,23 +180,47 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	}, []);
 
 	useEffect(() => {
-		fetch("/api/config")
-			.then((r) => (r.ok ? r.json() : null))
-			.then((d) => {
-				if (!d) return;
-				// Not `|0`: that wraps values above 2^31-1 negative, corrupting
-				// the display and making every later retention save a 400.
-				const num = (v) => Math.max(0, Math.floor(Number(v) || 0));
-				setPreviewsOn(!!d.previews);
+		// Load THROUGH the save queue, not alongside it: an unversioned GET racing
+		// an in-flight save (e.g. the modal reopened while a previous instance's
+		// PUT is still settling) would return the pre-save value and overwrite the
+		// confirmed baselines with a stale snapshot — a later edit would then
+		// silently undo the newer value. Enqueuing the fetch serializes it after
+		// every pending save; the per-field generation guards additionally skip
+		// applying any field the user re-edited while the GET itself was running.
+		let alive = true;
+		saveQueue.current = saveQueue.current.then(async () => {
+			const genR = retentionGen.current;
+			const genS = sessionGen.current;
+			const genP = previewsGen.current;
+			let d = null;
+			try {
+				const r = await fetch("/api/config");
+				d = r.ok ? await r.json() : null;
+			} catch {
+				d = null;
+			}
+			if (!d) return;
+			// Not `|0`: that wraps values above 2^31-1 negative, corrupting
+			// the display and making every later retention save a 400.
+			const num = (v) => Math.max(0, Math.floor(Number(v) || 0));
+			if (previewsGen.current === genP) {
+				previewsSaved.current = !!d.previews; // seed the confirmed baseline
+				if (alive) setPreviewsOn(!!d.previews);
+			}
+			if (retentionGen.current === genR) {
 				const ret = { days: num(d.retention_days), max: num(d.retention_max_messages) };
+				retentionSaved.current = ret;
+				if (alive) setRetention(ret);
+			}
+			if (sessionGen.current === genS) {
 				const sess = num(d.session_ttl_days);
-				setRetention(ret);
-				setSessionDays(sess);
-				retentionSaved.current = ret; // seed the confirmed-value baselines
 				sessionSaved.current = sess;
-				previewsSaved.current = !!d.previews;
-			})
-			.catch(() => {});
+				if (alive) setSessionDays(sess);
+			}
+		});
+		return () => {
+			alive = false;
+		};
 	}, []);
 
 	// Saves are serialized through the module-level saveQueue and versioned by
@@ -205,10 +229,20 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 		const next = { ...retention, ...patch };
 		setRetention(next);
 		const gen = ++retentionGen.current;
+		// Send ONLY the edited dimension. The API is a partial patch (pointer
+		// fields, read-modify-write under a server-side lock), so including the
+		// untouched field from this client's possibly-stale snapshot would
+		// overwrite a newer value another device (or a racing save) just wrote —
+		// premature deletion or indefinite retention, silently.
+		const body = {};
+		if ("days" in patch) body.retention_days = patch.days;
+		if ("max" in patch) body.retention_max_messages = patch.max;
 		saveQueue.current = saveQueue.current
-			.then(() => saveConfig({ retention_days: next.days, retention_max_messages: next.max }))
+			.then(() => saveConfig(body))
 			.then((ok) => {
-				if (ok) retentionSaved.current = next; // the server now holds this
+				// Confirm only what this PUT actually carried: merge the patch into
+				// the baseline rather than adopting the whole local snapshot.
+				if (ok) retentionSaved.current = { ...(retentionSaved.current || next), ...patch };
 				else if (gen === retentionGen.current && retentionSaved.current) setRetention(retentionSaved.current);
 			});
 	}

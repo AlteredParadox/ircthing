@@ -26,7 +26,14 @@ import { LRU } from "./lru.js";
 // flood of dead links cannot occupy the cache and a flaky preview
 // retries soon.
 
-const cache = new LRU(300, 60 * 60 * 1000); // url -> PreviewData | null
+// 30 min, matching the server thumbCache and Cache-Control TTLs deliberately:
+// redaction does not purge media caches (keys are (net,url), shared across
+// messages), so this chain of TTLs is what bounds how long a redacted image
+// stays renderable. A longer client TTL would quietly extend that bound past
+// the documented 30 minutes.
+const MEDIA_TTL = 30 * 60 * 1000;
+
+const cache = new LRU(300, MEDIA_TTL); // url -> PreviewData | null
 const FAIL_TTL = 5 * 60 * 1000; // a real failure (dead link, undecodable image)
 const RETRY_TTL = 12 * 1000; // a TRANSIENT failure (server slot busy / network) — retry soon
 const inflight = new Map(); // key -> { promise, controller, refs }
@@ -34,7 +41,7 @@ const inflight = new Map(); // key -> { promise, controller, refs }
 // Thumbnails are fetched as blobs and cached as object URLs (revoked on
 // eviction) so the target URL travels in a POST body, not a query string an
 // <img src> would put in reverse-proxy access logs.
-const thumbCache = new LRU(200, 60 * 60 * 1000, (u) => u && URL.revokeObjectURL(u));
+const thumbCache = new LRU(200, MEDIA_TTL, (u) => u && URL.revokeObjectURL(u));
 const thumbInflight = new Map();
 
 // Above this many concurrent distinct requests, new fetches are REJECTED
