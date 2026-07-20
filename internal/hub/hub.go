@@ -375,6 +375,15 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 	if h.accumulateWhois(c, ev, whois) {
 		return nil
 	}
+	// ERR_LINKCHANNEL (470): the join was refused and forwarded elsewhere, so
+	// the ORIGINAL channel must leave the stored autojoin list (see
+	// autojoinChange). Handled here because 470 is an error numeric: the
+	// serverInfo branch below consumes it before liveHints would run. It
+	// still falls through so the "Forwarding to another channel" line
+	// surfaces to the user.
+	if ev.Msg.Command == "470" {
+		h.persistAutojoin(ctx, c, ev)
+	}
 	// Other command replies (WHOWAS/WHO/LIST/AWAY/...) and error numerics
 	// are pushed as ephemeral "server_info" lines.
 	if info, ok := h.serverInfo(ev); ok {
@@ -497,19 +506,8 @@ const maxPersistedChannelLen = 200
 // Best-effort — a failure leaves the stored list stale but never drops the
 // event; editChannelList makes a repeat (initial rejoin echo) a no-op.
 func (h *Hub) persistAutojoin(ctx context.Context, c Conn, ev irc.Event) {
-	if ev.Msg.Prefix == nil || c.Nick() == "" || c.Fold(ev.Msg.Prefix.Name) != c.Fold(c.Nick()) {
-		return // not our own membership change
-	}
-	var add bool
-	switch ev.Msg.Command {
-	case "JOIN":
-		add = true
-	case "PART":
-		add = false
-	default:
-		return
-	}
-	if ev.Msg.Param(0) == "" {
+	list, add := autojoinChange(c, ev)
+	if list == "" {
 		return
 	}
 	// TryLock, never Lock: this runs on the Hub event goroutine, and a network
@@ -530,7 +528,7 @@ func (h *Hub) persistAutojoin(ctx context.Context, c Conn, ev irc.Event) {
 	// (add) nor fold-match any stored ≤200-byte name (remove), so oversized junk
 	// is dropped before the fold, defusing the self-PART fold amplifier (F1).
 	var chans []string
-	for _, ch := range strings.Split(ev.Msg.Param(0), ",") {
+	for _, ch := range strings.Split(list, ",") {
 		if ch == "" || !c.IsChannel(ch) || len(ch) > maxPersistedChannelLen {
 			continue
 		}
@@ -555,6 +553,32 @@ func (h *Hub) persistAutojoin(ctx context.Context, c Conn, ev irc.Event) {
 	if err := h.updateAutojoinLocked(ctx, ev.Network, chans, add, c.Fold); err != nil {
 		log.Printf("irc[%s]: persist autojoin %s %d chans: %v", ev.Network, ev.Msg.Command, len(chans), err)
 	}
+}
+
+// autojoinChange maps one live event to the comma-list of channels whose
+// autojoin entries it changes and whether they are added ("" = no change).
+// Our own JOIN adds, our own PART removes — and ERR_LINKCHANNEL (470,
+// "<nick> <original> <target>": the server refused <original> and forwarded
+// the join) removes the ORIGINAL name. join_channel persists the requested
+// name before the server's verdict, and only the forward TARGET ever gets a
+// JOIN echo — so without this the refused original stays stored forever, and
+// every restart re-joins it, follows the forward, and resurrects a channel
+// the user has since left (join #chat -> land in ##chat, part ##chat, restart
+// brings ##chat back).
+func autojoinChange(c Conn, ev irc.Event) (list string, add bool) {
+	switch ev.Msg.Command {
+	case "JOIN", "PART":
+		if ev.Msg.Prefix == nil || c.Nick() == "" || c.Fold(ev.Msg.Prefix.Name) != c.Fold(c.Nick()) {
+			return "", false // not our own membership change
+		}
+		return ev.Msg.Param(0), ev.Msg.Command == "JOIN"
+	case "470": // ERR_LINKCHANNEL — addressed to our nick in param 0
+		if c.Nick() == "" || c.Fold(ev.Msg.Param(0)) != c.Fold(c.Nick()) {
+			return "", false
+		}
+		return ev.Msg.Param(1), false
+	}
+	return "", false
 }
 
 // adoptReplayedOwn handles a chathistory replay of one of our own messages

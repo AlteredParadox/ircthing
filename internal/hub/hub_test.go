@@ -98,6 +98,79 @@ func TestPersistAutojoinMirrorsMembership(t *testing.T) {
 	if ch := channels(); len(ch) != 0 {
 		t.Fatalf("oversized channel was persisted: %v", ch)
 	}
+
+	// ERR_LINKCHANNEL (470): the server refused #chat and forwarded us to
+	// ##chat. The refused ORIGINAL must leave the autojoin list (join_channel
+	// persisted it before the verdict), or every restart re-joins #chat,
+	// follows the forward, and resurrects ##chat after the user left it. The
+	// forward target itself arrives via its own JOIN echo.
+	feed(":AlteredParadox!u@h JOIN #chat") // join_channel's optimistic persist
+	feed(":irc.test 470 AlteredParadox #chat ##chat :Forwarding to another channel")
+	if ch := channels(); len(ch) != 0 {
+		t.Fatalf("after 470 forward: channels = %v, want []", ch)
+	}
+	feed(":AlteredParadox!u@h JOIN ##chat") // the forward target's echo
+	if ch := channels(); len(ch) != 1 || ch[0] != "##chat" {
+		t.Fatalf("after forwarded JOIN: channels = %v, want [##chat]", ch)
+	}
+	// A 470 addressed to someone else (or with folded-different casing of a
+	// third party) must not touch our list.
+	feed(":irc.test 470 bob ##chat #elsewhere :Forwarding to another channel")
+	if ch := channels(); len(ch) != 1 || ch[0] != "##chat" {
+		t.Fatalf("another user's 470 changed channels: %v", ch)
+	}
+	feed(":AlteredParadox!u@h PART ##chat")
+	if ch := channels(); len(ch) != 0 {
+		t.Fatalf("after PART ##chat: channels = %v, want []", ch)
+	}
+}
+
+// End-to-end wiring for the 470 cleanup: an ERR_LINKCHANNEL flowing through
+// the hub event loop must still reach persistAutojoin even though error
+// numerics are consumed by the serverInfo branch (which returns before
+// liveHints runs) — a placement regression here silently reintroduces the
+// forwarded-channel resurrection bug.
+func TestLinkChannelNumericPrunesAutojoin(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	raw, err := json.Marshal(netconf.Network{
+		Name: "libera", Addr: "irc.test:6697", Nick: "AlteredParadox",
+		Channels: []string{"#chat"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.PutNetworkConfig(ctx, "libera", string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	conn := &fakeConn{ch: make(chan irc.Event, 2), name: "libera", nick: "AlteredParadox"}
+	rctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(rctx, conn)
+	waitForNetwork(t, h, "libera")
+
+	conn.ch <- irc.Event{
+		Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+		Msg: ircv4.MustParseMessage(":irc.test 470 AlteredParadox #chat ##chat :Forwarding to another channel"),
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got, ok, err := h.store.NetworkConfig(ctx, "libera")
+		if err != nil || !ok {
+			t.Fatalf("read config: ok=%v err=%v", ok, err)
+		}
+		var parsed netconf.Network
+		if err := json.Unmarshal([]byte(got.Config), &parsed); err != nil {
+			t.Fatal(err)
+		}
+		if len(parsed.Channels) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("channels = %v, want [] after 470", parsed.Channels)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // persistAutojoin runs on the Hub event goroutine, which StopNetwork waits to
