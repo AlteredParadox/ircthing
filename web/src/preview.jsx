@@ -38,10 +38,21 @@ const FAIL_TTL = 5 * 60 * 1000; // a real failure (dead link, undecodable image)
 const RETRY_TTL = 12 * 1000; // a TRANSIENT failure (server slot busy / network) — retry soon
 const inflight = new Map(); // key -> { promise, controller, refs }
 
+// UNPREVIEWABLE marks a URL the server confirmed is a real image but declines
+// to thumbnail (too many megapixels for its decode budget, a re-encode over the
+// serving cap, or a body past the 10 MiB fetch cap — see thumbUnpreviewableHeader
+// server-side). Distinct from null (loading / transient / dead link / not an
+// image): ImageThumb renders a small "open original" fallback card for it rather
+// than a blank, so the reader knows a too-large image is there and can click
+// through. Cached like a normal value (permanent), so it neither retries nor
+// counts as a failure.
+const UNPREVIEWABLE = Symbol("unpreviewable");
+
 // Thumbnails are fetched as blobs and cached as object URLs (revoked on
 // eviction) so the target URL travels in a POST body, not a query string an
-// <img src> would put in reverse-proxy access logs.
-const thumbCache = new LRU(200, MEDIA_TTL, (u) => u && URL.revokeObjectURL(u));
+// <img src> would put in reverse-proxy access logs. Only string object URLs are
+// revocable — null and the UNPREVIEWABLE sentinel are cached values, not blobs.
+const thumbCache = new LRU(200, MEDIA_TTL, (u) => typeof u === "string" && URL.revokeObjectURL(u));
 const thumbInflight = new Map();
 
 // Above this many concurrent distinct requests, new fetches are REJECTED
@@ -219,7 +230,13 @@ function fetchThumb(url, net) {
 	if (spent(key)) return { promise: Promise.resolve(null), release() {} }; // budget gate (see fetchPreview)
 	return shared(thumbInflight, key, (signal) =>
 		mediaFetch503("/api/thumb", url, net, signal, key)
-			.then((r) => (r.ok ? r.blob().then((b) => ({ blob: b })) : { __fail: r.status === 503 ? RETRY_TTL : FAIL_TTL }))
+			.then((r) => {
+				if (r.ok) return r.blob().then((b) => ({ blob: b }));
+				// A real image the server won't inline (too large / undecodable): a
+				// definitive answer, not a failure — cache the sentinel, don't retry.
+				if (r.headers.get("X-Thumb-Unpreviewable")) return { unpreviewable: true };
+				return { __fail: r.status === 503 ? RETRY_TTL : FAIL_TTL };
+			})
 			.catch(() => ({ __fail: RETRY_TTL })) // network error: transient
 			.then((res) => {
 				if (res.blob) {
@@ -232,7 +249,12 @@ function fetchThumb(url, net) {
 					noteSuccess(key);
 					return obj;
 				}
-				if (signal.aborted) return null; // cancelled: don't cache the failure
+				if (signal.aborted) return null; // cancelled: don't cache the result
+				if (res.unpreviewable) {
+					thumbCache.set(key, UNPREVIEWABLE); // permanent (MEDIA_TTL), not a failure
+					noteSuccess(key); // definitive answer: clear any prior failure count
+					return UNPREVIEWABLE;
+				}
 				thumbCache.set(key, null, res.__fail); // transient → RETRY_TTL, real → FAIL_TTL
 				noteFailure(key); // a completed failed attempt: counts against auto-retry
 				return null;
@@ -375,11 +397,26 @@ function LinkCard({ url, net }) {
 
 function CardImg({ url, net }) {
 	const src = useThumb(url, net);
-	return src ? <img class="preview-card-img" src={src} alt="" /> : null;
+	// A card's og:image that's too large just goes without an image — the card
+	// already carries the title/description, so no fallback is needed here.
+	return typeof src === "string" ? <img class="preview-card-img" src={src} alt="" /> : null;
 }
 
 function ImageThumb({ url, net }) {
 	const src = useThumb(url, net);
+	// Too large / undecodable to thumbnail: show a compact card explaining why and
+	// linking to the original, instead of rendering nothing.
+	if (src === UNPREVIEWABLE) {
+		return (
+			<a class="preview-card preview-card-plain" href={url} target="_blank" rel="noopener noreferrer">
+				<div class="preview-card-body">
+					<div class="preview-card-site">{hostOf(url)}</div>
+					<div class="preview-card-title">Image too large to preview</div>
+					<div class="preview-card-desc">Open the full image ↗</div>
+				</div>
+			</a>
+		);
+	}
 	if (!src) return null;
 	return (
 		<a class="preview-thumb" href={url} target="_blank" rel="noopener noreferrer">

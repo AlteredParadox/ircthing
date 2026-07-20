@@ -156,6 +156,11 @@ func TestThumbRejectsNonImage(t *testing.T) {
 	if resp.StatusCode != http.StatusUnsupportedMediaType {
 		t.Fatalf("status = %d, want 415", resp.StatusCode)
 	}
+	// Not actually an image: no unpreviewable hint — the client blanks rather
+	// than offering an "open image" card for a non-image link.
+	if got := resp.Header.Get("X-Thumb-Unpreviewable"); got != "" {
+		t.Fatalf("X-Thumb-Unpreviewable = %q, want empty for a non-image", got)
+	}
 }
 
 // A PNG declaring huge dimensions is rejected at the header check, not
@@ -188,6 +193,11 @@ func TestThumbRejectsHugeDimensions(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnsupportedMediaType {
 		t.Fatalf("status = %d, want 415 (rejected before decode)", resp.StatusCode)
+	}
+	// A real image over the decode budget: flag it so the client offers the
+	// original via a fallback card instead of blanking.
+	if got := resp.Header.Get("X-Thumb-Unpreviewable"); got != "too-large" {
+		t.Fatalf("X-Thumb-Unpreviewable = %q, want %q", got, "too-large")
 	}
 }
 

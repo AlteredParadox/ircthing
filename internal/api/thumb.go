@@ -19,6 +19,7 @@ package api
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -30,6 +31,15 @@ import (
 
 	_ "golang.org/x/image/webp" // register the WebP decoder (see the VP8L restriction below)
 )
+
+// thumbUnpreviewableHeader flags an error response where we DID fetch a real
+// image but decline to inline it: too many megapixels for the decode-memory
+// budget, a re-encode that overran the serving cap, or a body over the 10 MiB
+// fetch cap. The client renders a small "open original" fallback card instead
+// of a blank (matching how The Lounge handles un-inlineable images) — this is
+// distinct from a dead link or a non-image, which stay blank. The value is a
+// short reason ("too-large") the client may surface.
+const thumbUnpreviewableHeader = "X-Thumb-Unpreviewable"
 
 // Image thumbnails: fetch an image through the proxy, downscale it
 // server-side, and serve a small re-encoded version so the browser never
@@ -364,6 +374,15 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	ct, _, body, err := f.get(r.Context(), target)
 	if err != nil {
+		// A body over the 10 MiB fetch cap is a real image we simply won't
+		// download in full — flag it unpreviewable so the client offers the
+		// original rather than blanking. (Still 502: permanent, don't retry.)
+		if errors.Is(err, errTooLarge) {
+			w.Header().Set(thumbUnpreviewableHeader, "too-large")
+			logMedia("thumb", target, start, "image too large (>10 MiB body)→502 unpreviewable")
+			http.Error(w, "image too large", http.StatusBadGateway)
+			return
+		}
 		if fetchErrorRetryable(err) {
 			logMedia("thumb", target, start, "fetch failed (transient→503): "+err.Error())
 			http.Error(w, "thumbnail fetch failed", http.StatusServiceUnavailable)
@@ -383,6 +402,9 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// committing to a full decode. (The concrete format no longer drives the
 	// re-encode — encodeThumb keys on actual opacity — so only the gate matters.)
 	if _, ok := decodableFormat(body); !ok {
+		// Real image, but its declared pixel area (or a lossless-WebP bitstream)
+		// exceeds the decode-memory budget — offer the original instead of a blank.
+		w.Header().Set(thumbUnpreviewableHeader, "too-large")
 		logMedia("thumb", target, start, fmt.Sprintf("decode gate rejected (ct=%q, %d bytes)→415", ct, len(body)))
 		http.Error(w, "unsupported image", http.StatusUnsupportedMediaType)
 		return
@@ -409,6 +431,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// thumbnail, exactly as it does for any thumb failure — which keeps browser
 	// blob residency at count × maxThumbCacheEntry.
 	if len(res.data) > maxThumbCacheEntry {
+		w.Header().Set(thumbUnpreviewableHeader, "too-large")
 		logMedia("thumb", target, start, fmt.Sprintf("thumbnail too large (%d > %d cap)→413", len(res.data), maxThumbCacheEntry))
 		http.Error(w, "thumbnail too large", http.StatusRequestEntityTooLarge)
 		return

@@ -837,6 +837,12 @@ input::placeholder {
 	text-decoration: none;
 }
 
+/* Image-less fallback card (e.g. an image too large to thumbnail): no image
+   pane, so hug the text rather than stretching to the full card width. */
+.preview-card-plain {
+	max-width: min(320px, 100%);
+}
+
 .preview-card-img {
 	width: 88px;
 	height: 88px;
