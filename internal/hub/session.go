@@ -385,37 +385,57 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		return
 	}
 	conn := s.hub.network(d.Network)
+	fold := asciiFold
+	if conn != nil {
+		fold = conn.Fold
+	}
+
+	// The WHOLE mutation — store write AND the wire send — runs under monMu,
+	// the same lock startMonitor's restoration (snapshot + MONITOR C + list)
+	// holds. Unserialized, a mutation could interleave with a reconnect's
+	// restoration ("+bob, C, +stale-list"), leaving SQLite and the server's
+	// monitor set disagreeing until the next reconnect.
+	s.hub.monMu.Lock()
+	defer s.hub.monMu.Unlock()
+
 	var err error
+	nick := d.Nick // the spelling used for store/presence/wire (resolved for removes)
 	if add {
 		// Reject a casemapping-equivalent duplicate (Alice vs alice): SQLite
 		// uniqueness is byte-exact, but the server folds both to ONE monitor —
 		// presence keyed by fold would collapse them while the list renders
-		// both spellings, one stuck perpetually offline, and removing either
-		// would interrupt monitoring for both. Fold with the live connection's
-		// CASEMAPPING when connected, ASCII-only lowercase otherwise (covers
-		// the common conflict; rfc1459's []{}|~ extras need the server's
-		// mapping, and any residual pair is individually removable). The
-		// check and the insert run under monMu so two concurrent adds can't
-		// both pass the check and both persist.
-		fold := asciiFold
-		if conn != nil {
-			fold = conn.Fold
-		}
-		s.hub.monMu.Lock()
+		// both spellings, one stuck perpetually offline. Fold with the live
+		// connection's CASEMAPPING when connected, ASCII-only lowercase
+		// otherwise (covers the common conflict; rfc1459's []{}|~ extras need
+		// the server's mapping, and any residual pair is removable). Under
+		// monMu, two concurrent adds can't both pass and both persist.
 		existing, lerr := s.hub.store.Monitors(ctx, d.Network)
 		if lerr == nil {
 			for _, nk := range existing {
 				if nk != d.Nick && fold(nk) == fold(d.Nick) {
-					s.hub.monMu.Unlock()
 					s.push(errEnvelope(env.Seq, "bad_request", "already monitored as "+nk))
 					return
 				}
 			}
 		}
 		err = s.hub.store.AddMonitor(ctx, d.Network, d.Nick)
-		s.hub.monMu.Unlock()
 	} else {
-		err = s.hub.store.RemoveMonitor(ctx, d.Network, d.Nick)
+		// Resolve the STORED spelling by fold before deleting: the store is
+		// byte-exact, so removing "alice" when the row says "Alice" would
+		// delete nothing — yet the wire MONITOR - (casemapped server-side)
+		// would still stop upstream monitoring, leaving a row (and cached
+		// presence) for a nick the server no longer watches.
+		if list, lerr := s.hub.store.Monitors(ctx, d.Network); lerr == nil {
+			for _, nk := range list {
+				if nk == d.Nick || fold(nk) == fold(d.Nick) {
+					nick = nk
+					if nk == d.Nick {
+						break // exact match wins over a fold match
+					}
+				}
+			}
+		}
+		err = s.hub.store.RemoveMonitor(ctx, d.Network, nick)
 	}
 	if err != nil {
 		s.push(errEnvelope(env.Seq, "internal", "updating the monitor list failed"))
@@ -425,18 +445,18 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		// Drop the removed nick's cached presence: a stale entry would be
 		// served straight back by get_monitors if the nick is re-added
 		// before a fresh 730/731 arrives (or while disconnected).
-		s.hub.removePresence(d.Network, d.Nick)
+		s.hub.removePresence(d.Network, nick)
 	}
 	if conn != nil {
 		if add {
-			conn.MonitorAdd(d.Nick)
+			conn.MonitorAdd(nick)
 		} else {
 			// An invalid legacy nick was never sent to the server (restore
 			// filters it), so don't put it on the wire now — just drop the row.
-			if irc.ValidMonitorTarget(d.Nick) {
-				conn.MonitorRemove(d.Nick)
+			if irc.ValidMonitorTarget(nick) {
+				conn.MonitorRemove(nick)
 			}
-			s.hub.broadcast(envelope("presence", 0, PresenceData{Network: d.Network, Nick: d.Nick, Online: false}))
+			s.hub.broadcast(envelope("presence", 0, PresenceData{Network: d.Network, Nick: nick, Online: false}))
 		}
 	}
 	s.push(envelope("ok", env.Seq, nil))
@@ -549,12 +569,16 @@ func (s *Session) handleCommand(ctx context.Context, env Envelope) {
 	// before a gate armed afterwards opens, leaving a stale gate that would
 	// expose the next unsolicited MOTD instead — and roll it back if the
 	// send fails.
+	motdTarget := ""
 	if cmd == "MOTD" {
-		s.hub.expectMOTD(d.Network)
+		if len(d.Params) > 0 {
+			motdTarget = d.Params[0] // targeted "MOTD <server>": lets a 402 correlate
+		}
+		s.hub.expectMOTD(d.Network, motdTarget)
 	}
 	if err := conn.Send(&ircv4.Message{Command: cmd, Params: d.Params}); err != nil {
 		if cmd == "MOTD" {
-			s.hub.retractMOTD(d.Network)
+			s.hub.retractMOTD(d.Network, motdTarget)
 		}
 		s.push(errEnvelope(env.Seq, "send_failed", err.Error()))
 		return

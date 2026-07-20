@@ -755,6 +755,17 @@ func TestMonitorFlow(t *testing.T) {
 		t.Fatalf("casemapped dup persisted: %v", list)
 	}
 
+	// Removal by a casemapped spelling resolves the STORED row: removing
+	// "BOB" must delete the "bob" row (byte-exact delete would miss it while
+	// the wire MONITOR - still stopped upstream monitoring).
+	s.Handle(ctx, request(t, "monitor_remove", 11, MonitorReq{Network: "libera", Nick: "BOB"}))
+	recv(t, s, "ok", "presence")
+	if list, _ := h.store.Monitors(ctx, "libera"); len(list) != 0 {
+		t.Fatalf("casemapped remove left rows: %v", list)
+	}
+	s.Handle(ctx, request(t, "monitor_add", 12, MonitorReq{Network: "libera", Nick: "bob"}))
+	recv(t, s, "ok") // restore for the assertions below
+
 	// An INVALID legacy row (persisted by an older, laxer version) must still
 	// be removable — validation only gates adds. The removal deletes the row
 	// but puts nothing on the wire (the nick was never sent to the server).
@@ -1745,6 +1756,19 @@ func TestServerInfoFlow(t *testing.T) {
 	conn.ch <- ev(":srv 375 AlteredParadox :- message of the day -")
 	conn.ch <- ev(":srv 376 AlteredParadox :End of /MOTD")
 	expectSilence(t, s)
+
+	// An UNRELATED 402 (e.g. a /whois routed via a bad server) must NOT eat a
+	// plain /motd's pending gate: its reply still forwards afterwards.
+	s.Handle(ctx, request(t, "command", 10, CommandData{Network: "libera", Command: "MOTD", Params: nil}))
+	recv(t, s, "ok")
+	conn.ch <- ev(":srv 402 AlteredParadox some.other.server :No such server")
+	recv(t, s, "server_info") // the unrelated error forwards
+	conn.ch <- ev(":srv 375 AlteredParadox :- message of the day -")
+	conn.ch <- ev(":srv 376 AlteredParadox :End of /MOTD")
+	if info := decode[ServerInfoData](t, recv(t, s, "server_info")); info.Text != "- message of the day -" {
+		t.Fatalf("motd after unrelated 402 = %+v (gate wrongly consumed)", info)
+	}
+	recv(t, s, "server_info") // the 376 line
 
 	// A /motd interrupted by a disconnect must NOT leave the gate armed: the
 	// next connection's unsolicited registration MOTD would be forwarded as

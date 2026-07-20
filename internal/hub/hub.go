@@ -116,7 +116,7 @@ type Hub struct {
 	networks   map[string]Conn
 	states     map[string]string          // last known connection state per network
 	presence   map[string]map[string]bool // network -> monitored nick -> online (MONITOR)
-	motdWanted map[string]int             // outstanding explicit /motd requests per network
+	motdWanted map[string][]string        // queued explicit /motd targets per network ("" = untargeted)
 	procs      map[string]*netProc        // running network lifecycles
 	sessions   map[*Session]struct{}
 	// recentClose bounds the buffer-resurrection race: a buffer closed
@@ -138,7 +138,7 @@ func New(st *store.Store) *Hub {
 		networks:    make(map[string]Conn),
 		states:      make(map[string]string),
 		presence:    make(map[string]map[string]bool),
-		motdWanted:  make(map[string]int),
+		motdWanted:  make(map[string][]string),
 		procs:       make(map[string]*netProc),
 		sessions:    make(map[*Session]struct{}),
 	}
@@ -685,6 +685,13 @@ func (h *Hub) graceGuard(ev irc.Event, c Conn, target string, selfPart, replay b
 // network after (re)registration; the server's 730/731 replies then seed
 // presence.
 func (h *Hub) startMonitor(ctx context.Context, c Conn) {
+	// Snapshot + send under monMu, the same lock handleMonitor's mutations
+	// hold across their store-write + wire-send. Unserialized, a concurrent
+	// add/remove could interleave with the restoration's MONITOR C + list
+	// (e.g. "+bob, C, +stale-list"), leaving SQLite and the server's monitor
+	// set disagreeing until the next reconnect.
+	h.monMu.Lock()
+	defer h.monMu.Unlock()
 	nicks, err := h.store.Monitors(ctx, c.Name())
 	if err != nil {
 		log.Printf("irc[%s]: monitor load: %v", c.Name(), err)
@@ -895,13 +902,15 @@ func (h *Hub) serverInfo(ev irc.Event) (ServerInfoData, bool) {
 	case cmd == "402":
 		// ERR_NOSUCHSERVER is the TERMINAL reply of a targeted "MOTD <server>"
 		// naming a nonexistent server — no 376/422 will follow, so it must
-		// also consume an armed gate or the count stays armed until
-		// disconnect, forwarding a later unsolicited MOTD as if requested.
-		// (An unrelated 402 while a /motd is genuinely pending can consume
-		// the gate early; both replies race on the same connection and the
-		// error is still shown, so nothing is silently lost.) It then falls
-		// through to the generic error-numeric forwarding below.
-		h.consumeMOTD(ev.Network)
+		// consume that request's gate or it stays armed until disconnect,
+		// forwarding a later unsolicited MOTD as if requested. Consumption is
+		// CORRELATED by the named server (params: <nick> <server> <text>): a
+		// 402 from an unrelated command (/whois via a bad server) matches no
+		// pending target and consumes nothing. It then falls through to the
+		// generic error-numeric forwarding below.
+		if len(ev.Msg.Params) > 1 {
+			h.consumeMOTDTarget(ev.Network, ev.Msg.Params[1])
+		}
 	case serverInfoNumerics[cmd]:
 	case n >= 400 && n < 600:
 	default:
@@ -1099,27 +1108,41 @@ func midParams(m *ircv4.Message, from int) []string {
 }
 
 // expectMOTD opens the MOTD gate for a network: the next MOTD reply is
-// user-requested and should be shown. The gate is a COUNT of outstanding
-// requests, not a boolean — two concurrent /motd requests each arm it, and
-// one's rollback (retractMOTD) must not retract the other's still-pending
-// request. motdExpected consumes one at each end-of-MOTD numeric, and a
-// disconnect clears the count outright (clearMOTD): the owning connection
-// can no longer deliver the reply.
-func (h *Hub) expectMOTD(network string) {
+// user-requested and should be shown. The gate is a QUEUE of outstanding
+// request targets ("" for a plain /motd) — two concurrent requests each arm
+// it, one's rollback must not retract the other's, and a 402 terminal error
+// consumes only an entry whose target it actually names. motdExpected
+// consumes one entry at each end-of-MOTD numeric, and a disconnect clears the
+// queue outright (clearMOTD): the owning connection can no longer reply.
+//
+// Correlation is deliberately BEST-EFFORT: MOTD numerics carry no request
+// association (no label), so a plain-/motd reply racing the tail of a
+// registration burst can still be mis-attributed. Full correlation needs
+// labeled-response; this queue just keeps the common cases (unrelated 402s,
+// concurrent requests) from consuming the wrong gate.
+func (h *Hub) expectMOTD(network, target string) {
 	h.mu.Lock()
-	h.motdWanted[network]++
+	h.motdWanted[network] = append(h.motdWanted[network], target)
 	h.mu.Unlock()
 }
 
 // retractMOTD rolls back ONE expectMOTD whose command never reached the send
-// queue (the send failed). Without the rollback, the stale gate would expose
-// the next UNSOLICITED MOTD burst — e.g. a reconnect's — as if requested.
-func (h *Hub) retractMOTD(network string) {
+// queue (the send failed) — the most recently armed entry for that target.
+// Without the rollback, the stale gate would expose the next UNSOLICITED MOTD
+// burst — e.g. a reconnect's — as if requested.
+func (h *Hub) retractMOTD(network, target string) {
 	h.mu.Lock()
-	if n := h.motdWanted[network]; n > 1 {
-		h.motdWanted[network] = n - 1
-	} else {
+	q := h.motdWanted[network]
+	for i := len(q) - 1; i >= 0; i-- {
+		if q[i] == target {
+			q = append(q[:i], q[i+1:]...)
+			break
+		}
+	}
+	if len(q) == 0 {
 		delete(h.motdWanted, network)
+	} else {
+		h.motdWanted[network] = q
 	}
 	h.mu.Unlock()
 }
@@ -1132,14 +1155,26 @@ func (h *Hub) clearMOTD(network string) {
 	h.mu.Unlock()
 }
 
-// consumeMOTD decrements one armed gate, if any — the terminal-error path
-// (402 on a targeted MOTD), mirroring what 376/422 do inside motdExpected.
-func (h *Hub) consumeMOTD(network string) {
+// consumeMOTDTarget consumes an armed gate whose target matches a 402's
+// named server, case-insensitively (servers case-fold names). It does NOT
+// touch untargeted ("" ) entries: an unrelated 402 (a /whois against a bad
+// server, say) must not eat a pending plain /motd's gate.
+func (h *Hub) consumeMOTDTarget(network, target string) {
+	if target == "" {
+		return
+	}
 	h.mu.Lock()
-	if n := h.motdWanted[network]; n > 1 {
-		h.motdWanted[network] = n - 1
-	} else {
+	q := h.motdWanted[network]
+	for i, tgt := range q {
+		if tgt != "" && strings.EqualFold(tgt, target) {
+			q = append(q[:i], q[i+1:]...)
+			break
+		}
+	}
+	if len(q) == 0 {
 		delete(h.motdWanted, network)
+	} else {
+		h.motdWanted[network] = q
 	}
 	h.mu.Unlock()
 }
@@ -1147,10 +1182,11 @@ func (h *Hub) consumeMOTD(network string) {
 func (h *Hub) motdExpected(network, cmd string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	want := h.motdWanted[network] > 0
+	q := h.motdWanted[network]
+	want := len(q) > 0
 	if cmd == "376" || cmd == "422" { // RPL_ENDOFMOTD / ERR_NOMOTD
-		if n := h.motdWanted[network]; n > 1 {
-			h.motdWanted[network] = n - 1
+		if len(q) > 1 {
+			h.motdWanted[network] = q[1:]
 		} else {
 			delete(h.motdWanted, network)
 		}
