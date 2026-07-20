@@ -93,10 +93,12 @@ type Conn interface {
 	// hub calls it on registration and after each add/remove; it returns an
 	// error if the delta couldn't be enqueued (retried on the next call).
 	ReconcileMonitored(desired []string) error
-	// MonitorRejected handles a 734 (list full): drops the refused nicks and
-	// records the server's real capacity. limit is the AUTHORITATIVE cap the
-	// numeric carries (0 when unparseable, in which case the manager infers it).
-	MonitorRejected(nicks []string, limit int)
+	// MonitorRejected handles a 734 (list full): drops the refused nicks,
+	// records the server's real capacity, and re-reconciles `desired` (skipping
+	// the just-rejected nicks so it can't loop). limit is the AUTHORITATIVE cap
+	// the numeric carries (0 => the manager infers it); gen is the event's
+	// connection generation, so a 734 from a superseded connection is ignored.
+	MonitorRejected(nicks []string, limit int, gen uint64, desired []string) error
 }
 
 type Hub struct {
@@ -347,13 +349,14 @@ func (h *Hub) handleControlNumeric(ctx context.Context, c Conn, ev irc.Event) bo
 		if len(ev.Msg.Params) > 2 {
 			limit, _ := strconv.Atoi(ev.Msg.Params[1])
 			h.monMu.Lock()
-			c.MonitorRejected(strings.Split(ev.Msg.Params[2], ","), limit)
 			if desired, lerr := h.store.Monitors(ctx, ev.Network); lerr == nil {
-				if rerr := c.ReconcileMonitored(desired); rerr != nil {
+				// One atomic, gen-checked call: drop the rejected nicks, record
+				// the authoritative limit, and re-reconcile (skipping them).
+				if rerr := c.MonitorRejected(strings.Split(ev.Msg.Params[2], ","), limit, ev.Gen, desired); rerr != nil {
 					log.Printf("irc[%s]: monitor re-reconcile after 734: %v", ev.Network, rerr)
 				}
 			} else {
-				log.Printf("irc[%s]: monitor re-reconcile after 734 skipped (list read failed): %v", ev.Network, lerr)
+				log.Printf("irc[%s]: monitor 734 skipped (list read failed): %v", ev.Network, lerr)
 			}
 			h.monMu.Unlock()
 		}

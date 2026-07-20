@@ -415,10 +415,13 @@ func (f *fakeConn) ReconcileMonitored(desired []string) error {
 	return nil
 }
 
-func (f *fakeConn) MonitorRejected(nicks []string, _ int) {
+func (f *fakeConn) MonitorRejected(nicks []string, _ int, _ uint64, desired []string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.monRejected = append(f.monRejected, nicks...)
+	// Model the re-reconcile: record the desired list, as ReconcileMonitored does.
+	f.monitored = append([]string(nil), desired...)
+	return nil
 }
 
 func (f *fakeConn) monitoredNicks() []string {

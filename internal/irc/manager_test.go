@@ -667,20 +667,27 @@ func TestManagerMonitorRejected(t *testing.T) {
 	if add := s.readCmd("MONITOR"); add.Param(0) != "+" || add.Param(1) != "full1,full2" {
 		t.Fatalf("initial add = %q", add.String())
 	}
-	// Server 734s full2 — its real cap is 1. MonitorRejected drops full2 and
-	// records the effective limit (the count that remains, 1).
-	m.MonitorRejected([]string{"full2"}, 1)
-	// Reconciling the same desired must NOT re-add full2 now (clamped to the
-	// learned limit of 1, and full1 is already active → no-op). Prove nothing
-	// leaked: the only wire command after is the -full1 from removing it.
-	if err := m.ReconcileMonitored([]string{"full1", "full2"}); err != nil {
+	gen := m.monGen.Load()
+
+	// A 734 from a SUPERSEDED connection (wrong gen) is ignored — it must not
+	// install its limit or drop a nick from the current connection.
+	if err := m.MonitorRejected([]string{"full1"}, 1, gen-1, []string{"full1", "full2"}); err != nil {
 		t.Fatal(err)
 	}
+
+	// The real 734: full2 rejected, authoritative cap 1. Drops full2, records
+	// the limit, and re-reconciles EXCLUDING full2 — so it is NOT immediately
+	// re-added (which would loop +full2/734 against the still-full server).
+	if err := m.MonitorRejected([]string{"full2"}, 1, gen, []string{"full1", "full2"}); err != nil {
+		t.Fatal(err)
+	}
+	// Prove nothing leaked (no +full2 from either the stale or the real 734):
+	// the next wire command is the -full1 from clearing the list.
 	if err := m.ReconcileMonitored([]string{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.readCmd("MONITOR"); got.Param(0) != "-" || got.Param(1) != "full1" {
-		t.Fatalf("MONITOR = %q; a rejected nick was re-added past the 734 limit", got.String())
+		t.Fatalf("MONITOR = %q; a rejected nick was re-added or a stale 734 applied", got.String())
 	}
 }
 

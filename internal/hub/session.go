@@ -460,14 +460,20 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		// byte-exact, so removing "alice" when the row says "Alice" would
 		// delete nothing — yet the wire MONITOR - (casemapped server-side)
 		// would still stop upstream monitoring, leaving a row (and cached
-		// presence) for a nick the server no longer watches.
-		if list, lerr := s.hub.store.Monitors(ctx, d.Network); lerr == nil {
-			for _, nk := range list {
-				if nk == d.Nick || fold(nk) == fold(d.Nick) {
-					nick = nk
-					if nk == d.Nick {
-						break // exact match wins over a fold match
-					}
+		// presence) for a nick the server no longer watches. FAIL CLOSED on a
+		// read failure (as the add path does): without the list we can't
+		// resolve the stored spelling, so don't report success for a delete
+		// that may have removed nothing.
+		list, lerr := s.hub.store.Monitors(ctx, d.Network)
+		if lerr != nil {
+			s.push(errEnvelope(env.Seq, "internal", "monitor list unavailable"))
+			return
+		}
+		for _, nk := range list {
+			if nk == d.Nick || fold(nk) == fold(d.Nick) {
+				nick = nk
+				if nk == d.Nick {
+					break // exact match wins over a fold match
 				}
 			}
 		}

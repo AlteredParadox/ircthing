@@ -85,6 +85,10 @@ type Event struct {
 	State State
 	Err   error
 	Time  time.Time
+	// Gen is the connection generation this event belongs to (see monGen). A
+	// consumer acting on connection-scoped state (e.g. a MONITOR 734) uses it
+	// to ignore a numeric that was buffered from a now-superseded connection.
+	Gen uint64
 }
 
 var (
@@ -149,6 +153,11 @@ type Manager struct {
 	monActiveMu sync.Mutex
 	monActive   map[string]string
 	monLimit734 int
+	// monGen is the connection generation, bumped at the start of every
+	// connection (runOnce). emit stamps it onto each event so a delayed
+	// MONITOR 734 buffered from an old connection can be ignored rather than
+	// installing its limit into the current connection's state.
+	monGen atomic.Uint64
 
 	// stsMu guards the active STS policy (sts.go): connect to stsPort
 	// with TLS until stsUntil (zero stsUntil with a port = session-only
@@ -457,7 +466,14 @@ func (m *Manager) ReconcileMonitored(desired []string) error {
 	}
 	m.monActiveMu.Lock()
 	defer m.monActiveMu.Unlock()
+	return m.reconcileLocked(desired, nil)
+}
 
+// reconcileLocked drives the server list toward desired, skipping any folded
+// nick in exclude (used by the 734 path to avoid immediately re-adding a
+// just-rejected nick, which would loop against a still-full server). Caller
+// holds monActiveMu.
+func (m *Manager) reconcileLocked(desired []string, exclude map[string]bool) error {
 	// Clamp to the tighter of the server limit and a hard maximum. The hard
 	// cap defends against a server that advertises NO limit paired with a
 	// legacy oversized persisted list (predating the hub's add-time cap): it
@@ -474,8 +490,8 @@ func (m *Manager) ReconcileMonitored(desired []string) error {
 			continue
 		}
 		f := m.isup.Fold(n)
-		if targetSet[f] {
-			continue // folded duplicate
+		if targetSet[f] || exclude[f] {
+			continue // folded duplicate, or a just-rejected nick to skip this pass
 		}
 		if len(targetOrder) >= limit {
 			break
@@ -536,20 +552,35 @@ func (m *Manager) effectiveMonitorLimitLocked() int {
 }
 
 // MonitorRejected handles ERR_MONLISTFULL (734): it drops the refused nicks
-// from the active set and records the effective capacity for this connection.
+// from the active set, records the effective capacity, and re-reconciles the
+// desired list — atomically, under the same lock. It is a NO-OP when gen does
+// not match the current connection, so a 734 buffered from a superseded
+// connection cannot install its (stale) limit into the new one (#2). The
+// re-reconcile EXCLUDES the just-rejected nicks this pass (#1): re-adding a
+// nick the server just refused would loop +nick/734 when a stale entry the
+// client forgot still occupies a slot; the excluded nicks are retried on the
+// next mutation (which clears the exclusion) or the next reconnect.
+//
 // limit is the AUTHORITATIVE cap from the numeric; when it is 0 (unparseable)
 // we fall back to the count that remains after removing the rejected nicks.
-func (m *Manager) MonitorRejected(nicks []string, limit int) {
+func (m *Manager) MonitorRejected(nicks []string, limit int, gen uint64, desired []string) error {
 	m.monActiveMu.Lock()
 	defer m.monActiveMu.Unlock()
+	if gen != m.monGen.Load() {
+		return nil // a rejection from a superseded connection — ignore
+	}
+	exclude := make(map[string]bool, len(nicks))
 	for _, n := range nicks {
-		delete(m.monActive, m.isup.Fold(n))
+		f := m.isup.Fold(n)
+		delete(m.monActive, f)
+		exclude[f] = true
 	}
 	if limit > 0 {
 		m.monLimit734 = limit
 	} else {
 		m.monLimit734 = len(m.monActive)
 	}
+	return m.reconcileLocked(desired, exclude)
 }
 
 // monitorAdvertised reports whether the server offers MONITOR at all
@@ -1027,6 +1058,7 @@ func (m *Manager) rescheduleSTS(ctx context.Context) {
 func (m *Manager) emit(ctx context.Context, ev Event) {
 	ev.Network = m.cfg.Name
 	ev.Time = time.Now()
+	ev.Gen = m.monGen.Load()
 	select {
 	case m.events <- ev:
 	case <-ctx.Done():
@@ -1103,9 +1135,10 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	defer m.roster.clear()
 	m.resetNames()
 	m.whoxDone = make(map[string]bool)
-	// New connection: the server's MONITOR list starts empty, and any
-	// 734-revealed limit is stale (ReconcileMonitored re-establishes on
-	// registration).
+	// New connection: bump the generation (so a 734 buffered from the previous
+	// connection is ignored), and reset the server's MONITOR list to empty with
+	// no 734-limit (ReconcileMonitored re-establishes on registration).
+	m.monGen.Add(1)
 	m.monActiveMu.Lock()
 	m.monActive = make(map[string]string)
 	m.monLimit734 = 0
