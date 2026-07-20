@@ -976,7 +976,14 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 			log.Printf("irc[%s] >> %s", m.cfg.Name, redactRaw(line))
 		}
 	}
-	internal := make(chan *ircv4.Message, 16)
+	// Snapshot the rejoin set BEFORE creating the internal lane so it can be
+	// sized to hold every rejoin JOIN at once (plus headroom for handshake
+	// traffic). m.joined cannot change between here and the enqueue below:
+	// its only other writer is serveLoop's trackJoinIntent, and serveLoop
+	// hasn't started. Worst case (maxChannels=4096) this is ~32 KiB of
+	// pointers for the connection's lifetime.
+	rejoins := m.rejoinList()
+	internal := make(chan *ircv4.Message, 16+len(rejoins))
 	urgent := make(chan *ircv4.Message, 8)
 	go m.writeLoop(cctx, cancel, conn, w, urgent, internal)
 
@@ -1000,27 +1007,29 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	m.nick.Store(hs.nick)
 	m.applyCaps(hs)
 
-	// Read and rejoin concurrently. rejoins are paced by the flood token
-	// bucket (~1 JOIN / 2s after the burst); doing them inline before
-	// serveLoop — as this used to — blocked the read loop for a many-channel
-	// reconnect, freezing all input (PINGs, MOTD, NAMES, new messages) for
-	// up to minutes and risking the server's SendQ limit for exactly the
-	// 50-channel load this bouncer targets. Snapshot the rejoin set first
-	// (serveLoop's trackJoinIntent is the only other writer of m.joined),
-	// then read while the JOINs trickle out from this goroutine.
-	rejoins := m.rejoinList()
+	// Enqueue EVERY rejoin JOIN before exposing send-readiness. The internal
+	// lane was sized for the whole set, so this is instant (no waiting on the
+	// paced writer — the old inline-send-before-serveLoop design blocked the
+	// read loop for minutes on a many-channel reconnect). The writer drains
+	// `internal` strictly ahead of `m.out`, and user/hub traffic can only
+	// enter `m.out` after setRegistered(true) below — so every JOIN reaches
+	// the wire before any user message. Enqueueing after registered (as this
+	// used to, from a producer loop) left a window where a PRIVMSG accepted
+	// right at registration overtook the still-unqueued JOINs: sent to a
+	// channel we hadn't rejoined yet, and a PART could be undone by its
+	// channel's later JOIN.
+	for _, ch := range rejoins {
+		if err := send([]*ircv4.Message{newMsg("JOIN", ch)}); err != nil {
+			return err // connection scope canceled; nothing started yet
+		}
+	}
 
-	// Expose send-readiness BEFORE serveLoop starts, then feed the JOINs on
-	// the priority `internal` path: the writer drains `internal` ahead of
-	// `m.out`, and this loop keeps `internal` fed, so the JOINs still
-	// effectively precede user/hub traffic without waiting for the full
-	// throttled drain. Registered-before-serveLoop closes two races the old
-	// ordering left open: any self-JOIN processed by serveLoop — our own
-	// echo AND a server/services-originated one (a bouncer replaying
-	// membership right after 001, a +f forward, SVSJOIN) — triggers a
-	// one-shot channel history request in the hub, and one arriving before
-	// the flag flipped failed that request with ErrNotConnected, a silent
-	// history gap until the next reconnect.
+	// Registered-before-serveLoop closes two races: any self-JOIN processed
+	// by serveLoop — our own echo AND a server/services-originated one (a
+	// bouncer replaying membership right after 001, a +f forward, SVSJOIN) —
+	// triggers a one-shot channel history request in the hub, and one
+	// arriving before the flag flipped failed that request with
+	// ErrNotConnected, a silent history gap until the next reconnect.
 	defer m.setRegistered(false)
 	m.setRegistered(true)
 	bo.reset()
@@ -1028,23 +1037,8 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 
 	readDone := make(chan error, 1)
 	go func() {
-		err := m.serveLoop(ctx, lc)
-		// Cancel the connection scope so the paced rejoin producer below
-		// stops immediately. Without this, a read loop that exits on an
-		// application-level protocol error while the socket stays writable
-		// (e.g. an over-cap authoritative NICK) left the producer feeding
-		// throttled JOINs to a connection already condemned — delaying the
-		// reconnect by ~2s per remaining channel (hours at the 4,096 cap).
-		cancel(err)
-		readDone <- err
+		readDone <- m.serveLoop(ctx, lc)
 	}()
-
-	for _, ch := range rejoins {
-		if err := send([]*ircv4.Message{newMsg("JOIN", ch)}); err != nil {
-			cancel(err) // writer gone; serveLoop's read fails too
-			return <-readDone
-		}
-	}
 	return <-readDone
 }
 

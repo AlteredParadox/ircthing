@@ -730,6 +730,33 @@ func TestMonitorFlow(t *testing.T) {
 	if got := decode[ErrorData](t, recv(t, s, "error")); got.Code != "bad_request" {
 		t.Fatalf("bad nick code = %q", got.Code)
 	}
+
+	// A casemapping-equivalent duplicate is rejected: the server folds BOB to
+	// the existing bob, so a second row would render two entries sharing one
+	// server-side monitor (one stuck offline; removing either breaks both).
+	s.Handle(ctx, request(t, "monitor_add", 7, MonitorReq{Network: "libera", Nick: "BOB"}))
+	if got := decode[ErrorData](t, recv(t, s, "error")); got.Code != "bad_request" {
+		t.Fatalf("casemapped dup code = %q", got.Code)
+	}
+	if list, _ := h.store.Monitors(ctx, "libera"); len(list) != 1 {
+		t.Fatalf("casemapped dup persisted: %v", list)
+	}
+
+	// An INVALID legacy row (persisted by an older, laxer version) must still
+	// be removable — validation only gates adds. The removal deletes the row
+	// but puts nothing on the wire (the nick was never sent to the server).
+	if err := h.store.AddMonitor(ctx, "libera", "bad nick"); err != nil {
+		t.Fatal(err)
+	}
+	wireRemoves := len(conn.monRemoves())
+	s.Handle(ctx, request(t, "monitor_remove", 6, MonitorReq{Network: "libera", Nick: "bad nick"}))
+	recv(t, s, "ok", "presence")
+	if list, _ := h.store.Monitors(ctx, "libera"); len(list) != 1 || list[0] != "bob" {
+		t.Fatalf("stored monitors after legacy remove = %v", list)
+	}
+	if got := conn.monRemoves(); len(got) != wireRemoves {
+		t.Fatalf("invalid nick reached the wire: MonitorRemove = %v", got)
+	}
 }
 
 func TestMonitorReestablishedOnRegistration(t *testing.T) {
@@ -1693,6 +1720,22 @@ func TestServerInfoFlow(t *testing.T) {
 	recv(t, s, "server_info")
 	recv(t, s, "server_info")
 	conn.ch <- ev(":srv 372 AlteredParadox :- late line after the gate closed")
+	expectSilence(t, s)
+
+	// A /motd interrupted by a disconnect must NOT leave the gate armed: the
+	// next connection's unsolicited registration MOTD would be forwarded as
+	// if requested.
+	s.Handle(ctx, request(t, "command", 2, CommandData{Network: "libera", Command: "MOTD", Params: nil}))
+	recv(t, s, "ok")
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateDisconnected, Time: time.Now()}
+	recv(t, s, "state")
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateConnecting, Time: time.Now()}
+	recv(t, s, "state")
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered, Time: time.Now()}
+	recv(t, s, "state")
+	conn.ch <- ev(":srv 375 AlteredParadox :- message of the day -")
+	conn.ch <- ev(":srv 372 AlteredParadox :- reconnect burst, unsolicited")
+	conn.ch <- ev(":srv 376 AlteredParadox :End of /MOTD")
 	expectSilence(t, s)
 }
 

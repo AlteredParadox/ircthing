@@ -355,10 +355,18 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		s.push(errEnvelope(env.Seq, "bad_request", "malformed monitor data"))
 		return
 	}
+	if d.Network == "" || d.Nick == "" {
+		s.push(errEnvelope(env.Seq, "bad_request", "monitor needs a network and a nick"))
+		return
+	}
 	// ValidMonitorTarget also rejects NUL and excessive length — an invalid
 	// value must not be PERSISTED, or it would poison its ten-nick MONITOR
-	// chunk on every reconnect (the live send would reject it anyway).
-	if d.Network == "" || !irc.ValidMonitorTarget(d.Nick) {
+	// chunk on every reconnect (the live send would reject it anyway). Gate
+	// ADDS only: a REMOVE of an invalid nick must still delete the row —
+	// rows persisted by older, laxer versions are filtered from IRC
+	// restoration but would otherwise be stuck visible forever, removable
+	// only by editing SQLite. The wire MONITOR - below is skipped for them.
+	if add && !irc.ValidMonitorTarget(d.Nick) {
 		s.push(errEnvelope(env.Seq, "bad_request", "monitor needs a network and a valid nick"))
 		return
 	}
@@ -376,6 +384,28 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		s.push(errEnvelope(env.Seq, "bad_request", "unknown network"))
 		return
 	}
+	conn := s.hub.network(d.Network)
+	if add {
+		// Reject a casemapping-equivalent duplicate (Alice vs alice): SQLite
+		// uniqueness is byte-exact, but the server folds both to ONE monitor —
+		// presence keyed by fold would collapse them while the list renders
+		// both spellings, one stuck perpetually offline, and removing either
+		// would interrupt monitoring for both. Fold with the live connection's
+		// CASEMAPPING when connected, ASCII lowercase otherwise (covers the
+		// common conflict; rfc1459's []{}|~ extras need the server's mapping).
+		fold := strings.ToLower
+		if conn != nil {
+			fold = conn.Fold
+		}
+		if existing, lerr := s.hub.store.Monitors(ctx, d.Network); lerr == nil {
+			for _, nk := range existing {
+				if nk != d.Nick && fold(nk) == fold(d.Nick) {
+					s.push(errEnvelope(env.Seq, "bad_request", "already monitored as "+nk))
+					return
+				}
+			}
+		}
+	}
 	var err error
 	if add {
 		err = s.hub.store.AddMonitor(ctx, d.Network, d.Nick)
@@ -386,11 +416,15 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		s.push(errEnvelope(env.Seq, "internal", "updating the monitor list failed"))
 		return
 	}
-	if conn := s.hub.network(d.Network); conn != nil {
+	if conn != nil {
 		if add {
 			conn.MonitorAdd(d.Nick)
 		} else {
-			conn.MonitorRemove(d.Nick)
+			// An invalid legacy nick was never sent to the server (restore
+			// filters it), so don't put it on the wire now — just drop the row.
+			if irc.ValidMonitorTarget(d.Nick) {
+				conn.MonitorRemove(d.Nick)
+			}
 			s.hub.broadcast(envelope("presence", 0, PresenceData{Network: d.Network, Nick: d.Nick, Online: false}))
 		}
 	}

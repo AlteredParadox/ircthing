@@ -110,7 +110,7 @@ type Hub struct {
 	networks   map[string]Conn
 	states     map[string]string          // last known connection state per network
 	presence   map[string]map[string]bool // network -> monitored nick -> online (MONITOR)
-	motdWanted map[string]bool            // networks with an explicit /motd pending
+	motdWanted map[string]int             // outstanding explicit /motd requests per network
 	procs      map[string]*netProc        // running network lifecycles
 	sessions   map[*Session]struct{}
 	// recentClose bounds the buffer-resurrection race: a buffer closed
@@ -132,7 +132,7 @@ func New(st *store.Store) *Hub {
 		networks:    make(map[string]Conn),
 		states:      make(map[string]string),
 		presence:    make(map[string]map[string]bool),
-		motdWanted:  make(map[string]bool),
+		motdWanted:  make(map[string]int),
 		procs:       make(map[string]*netProc),
 		sessions:    make(map[*Session]struct{}),
 	}
@@ -272,6 +272,11 @@ func (h *Hub) onState(ctx context.Context, c Conn, ev irc.Event, reg *regSync) {
 	}
 	if ev.State == irc.StateDisconnected {
 		h.clearPresence(ev.Network)
+		// Drop any armed /motd gate with the connection that owned it: its
+		// reply can no longer arrive, and a gate surviving the disconnect
+		// would forward the NEXT registration's unsolicited MOTD burst as if
+		// it had been requested.
+		h.clearMOTD(ev.Network)
 	}
 }
 
@@ -1067,18 +1072,34 @@ func midParams(m *ircv4.Message, from int) []string {
 }
 
 // expectMOTD opens the MOTD gate for a network: the next MOTD reply is
-// user-requested and should be shown. motdExpected consumes the gate at
-// the end-of-MOTD numerics.
+// user-requested and should be shown. The gate is a COUNT of outstanding
+// requests, not a boolean — two concurrent /motd requests each arm it, and
+// one's rollback (retractMOTD) must not retract the other's still-pending
+// request. motdExpected consumes one at each end-of-MOTD numeric, and a
+// disconnect clears the count outright (clearMOTD): the owning connection
+// can no longer deliver the reply.
 func (h *Hub) expectMOTD(network string) {
 	h.mu.Lock()
-	h.motdWanted[network] = true
+	h.motdWanted[network]++
 	h.mu.Unlock()
 }
 
-// retractMOTD closes an expectMOTD gate that never had its command sent
-// (the send failed). Without the rollback, the stale gate would expose the
-// next UNSOLICITED MOTD burst — e.g. a reconnect's — as if requested.
+// retractMOTD rolls back ONE expectMOTD whose command never reached the send
+// queue (the send failed). Without the rollback, the stale gate would expose
+// the next UNSOLICITED MOTD burst — e.g. a reconnect's — as if requested.
 func (h *Hub) retractMOTD(network string) {
+	h.mu.Lock()
+	if n := h.motdWanted[network]; n > 1 {
+		h.motdWanted[network] = n - 1
+	} else {
+		delete(h.motdWanted, network)
+	}
+	h.mu.Unlock()
+}
+
+// clearMOTD drops every armed gate for the network — called on disconnect,
+// which orphans all outstanding requests at once.
+func (h *Hub) clearMOTD(network string) {
 	h.mu.Lock()
 	delete(h.motdWanted, network)
 	h.mu.Unlock()
@@ -1087,9 +1108,13 @@ func (h *Hub) retractMOTD(network string) {
 func (h *Hub) motdExpected(network, cmd string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	want := h.motdWanted[network]
+	want := h.motdWanted[network] > 0
 	if cmd == "376" || cmd == "422" { // RPL_ENDOFMOTD / ERR_NOMOTD
-		delete(h.motdWanted, network)
+		if n := h.motdWanted[network]; n > 1 {
+			h.motdWanted[network] = n - 1
+		} else {
+			delete(h.motdWanted, network)
+		}
 	}
 	return want
 }
