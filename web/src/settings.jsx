@@ -66,9 +66,15 @@ function ChangePassword() {
 	const [next, setNext] = useState("");
 	const [confirm, setConfirm] = useState("");
 	const [msg, setMsg] = useState(null); // { ok, text } | null
+	// Single-flight: without this, a double submit sends two requests — the
+	// first rotates the password, the serialized second then fails against
+	// the NEW hash and its later response overwrites the success message
+	// with "current password is incorrect".
+	const [busy, setBusy] = useState(false);
 
 	async function submit(e) {
 		e.preventDefault();
+		if (busy) return;
 		setMsg(null);
 		// bcrypt (and the server) bound the password in BYTES, not JS code units.
 		const bytes = new TextEncoder().encode(next).length;
@@ -80,6 +86,7 @@ function ChangePassword() {
 			setMsg({ ok: false, text: "New passwords do not match." });
 			return;
 		}
+		setBusy(true);
 		try {
 			const r = await fetch("/api/password", {
 				method: "POST",
@@ -96,6 +103,8 @@ function ChangePassword() {
 			}
 		} catch {
 			setMsg({ ok: false, text: "Change failed." });
+		} finally {
+			setBusy(false);
 		}
 	}
 
@@ -115,7 +124,7 @@ function ChangePassword() {
 				<input class="pref-input" type="password" autocomplete="new-password" value={confirm} onInput={(e) => setConfirm(e.currentTarget.value)} />
 			</div>
 			{msg && <div class={msg.ok ? "settings-note" : "cmd-error"}>{msg.text}</div>}
-			<button class="btn-accent" type="submit" disabled={!current || !next}>Change password</button>
+			<button class="btn-accent" type="submit" disabled={busy || !current || !next}>{busy ? "Changing…" : "Change password"}</button>
 		</form>
 	);
 }
@@ -169,20 +178,28 @@ const authEpoch = { current: 0 };
 
 // enqueue serializes work on the save queue, dropping it (and anything it
 // would have applied) if a logout/login boundary was crossed since it was
-// queued.
+// queued. work receives a stale() probe and MUST recheck it after every
+// await: the pre-call check alone can't stop a request already in flight
+// when the epoch bumps, and its post-await callbacks would apply results
+// (or re-pin preview state) into the NEXT session's UI.
 function enqueue(work) {
 	const epoch = authEpoch.current;
+	const stale = () => epoch !== authEpoch.current;
 	saveQueue.current = saveQueue.current.then(() => {
-		if (epoch !== authEpoch.current) return undefined; // crossed a logout: drop
-		return work();
+		if (stale()) return undefined; // crossed a logout: drop
+		return work(stale);
 	});
 }
 
 // resetSettingsSession invalidates every queued settings mutation and pending
 // callback, and clears the confirmed-value baselines. Called by the app shell
-// when the authenticated phase ends (logout, session expiry).
+// when the authenticated phase ends (logout, session expiry). Replacing the
+// queue head DETACHES the new session from the old chain: a hung old request
+// can no longer block the next session's saves (its own continuations still
+// no-op via the epoch).
 export function resetSettingsSession() {
 	authEpoch.current++;
+	saveQueue.current = Promise.resolve();
 	retentionSaved.current = null;
 	sessionSaved.current = null;
 	previewsSaved.current = null;
@@ -219,7 +236,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 		// every pending save; the per-field generation guards additionally skip
 		// applying any field the user re-edited while the GET itself was running.
 		let alive = true;
-		enqueue(async () => {
+		enqueue(async (stale) => {
 			const genD = retentionGens.days.current;
 			const genM = retentionGens.max.current;
 			const genS = sessionGen.current;
@@ -231,7 +248,7 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 			} catch {
 				d = null;
 			}
-			if (!d) return;
+			if (!d || stale()) return; // logged out while the GET ran: drop it
 			// Not `|0`: that wraps values above 2^31-1 negative, corrupting
 			// the display and making every later retention save a 400.
 			const num = (v) => Math.max(0, Math.floor(Number(v) || 0));
@@ -268,8 +285,9 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 		// overwrite a newer value another device (or a racing save) just wrote —
 		// premature deletion or indefinite retention, silently.
 		const body = dim === "days" ? { retention_days: patch.days } : { retention_max_messages: patch.max };
-		enqueue(async () => {
+		enqueue(async (stale) => {
 			const ok = await saveConfig(body);
+			if (stale()) return; // logged out while the PUT ran: don't touch UI or baselines
 			// Confirm only what this PUT actually carried: merge the patch into
 			// the baseline rather than adopting the whole local snapshot.
 			if (ok) retentionSaved.current = { ...(retentionSaved.current || next), ...patch };
@@ -285,8 +303,9 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 	function saveSessionDays(days) {
 		setSessionDays(days);
 		const gen = ++sessionGen.current;
-		enqueue(async () => {
+		enqueue(async (stale) => {
 			const ok = await saveConfig({ session_ttl_days: days });
+			if (stale()) return;
 			if (ok) sessionSaved.current = days;
 			else if (gen === sessionGen.current && sessionSaved.current != null) setSessionDays(sessionSaved.current);
 		});
@@ -301,8 +320,9 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 		// their PUTs, and the response completing LAST — not the one carrying the
 		// user's final choice — would set the visible state.
 		const gen = ++previewsGen.current;
-		enqueue(async () => {
+		enqueue(async (stale) => {
 			const ok = await saveConfig({ previews: on });
+			if (stale()) return; // logged out mid-flight: a late callback must not re-pin previews
 			if (ok) {
 				previewsSaved.current = on; // record every server-confirmed value
 				if (gen === previewsGen.current) {
