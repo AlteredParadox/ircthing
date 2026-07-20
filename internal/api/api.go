@@ -625,18 +625,19 @@ func (s *Server) issueToken(gen uint64) (string, error) {
 	}
 	token := hex.EncodeToString(buf)
 	now := time.Now()
+	var cancels []context.CancelFunc
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	// Close the rotation race: handleChangePassword bumps credGen and revokes
 	// other sessions under this same s.mu. If it committed after the caller's
 	// snapshot, refuse — otherwise a login that verified the OLD hash could
 	// insert a token the revoke loop has already passed.
 	if s.credGen.Load() != gen {
+		s.mu.Unlock()
 		return "", errCredRotated
 	}
 	for t, exp := range s.tokens {
 		if now.After(exp) {
-			delete(s.tokens, t)
+			cancels = append(cancels, s.deleteTokenLocked(t)...)
 		}
 	}
 	for len(s.tokens) >= maxSessions {
@@ -646,20 +647,26 @@ func (s *Server) issueToken(gen uint64) (string, error) {
 				oldest, oldestExp = t, exp
 			}
 		}
-		delete(s.tokens, oldest)
+		cancels = append(cancels, s.deleteTokenLocked(oldest)...)
 	}
 	s.tokens[token] = now.Add(s.sessionTTLDur())
+	s.mu.Unlock()
+	// Expired/evicted sessions may still have open sockets; drop them now
+	// rather than leaving them to the revalidation ticker.
+	for _, cancel := range cancels {
+		cancel()
+	}
 	return token, nil
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(s.cookieName()); err == nil {
+		// deleteTokenLocked tears down this token's live WebSockets NOW — the
+		// write pump's 30 s revalidation ticker would otherwise let an
+		// already-open (possibly stolen) socket keep receiving and sending
+		// IRC traffic after logout.
 		s.mu.Lock()
-		delete(s.tokens, c.Value)
-		// Tear down this token's live WebSockets NOW — the write pump's 30 s
-		// revalidation ticker would otherwise let an already-open (possibly
-		// stolen) socket keep receiving and sending IRC traffic after logout.
-		cancels := s.cancelSocketsLocked(c.Value)
+		cancels := s.deleteTokenLocked(c.Value)
 		s.mu.Unlock()
 		for _, cancel := range cancels {
 			cancel()
@@ -679,38 +686,46 @@ func (s *Server) authed(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	expiry, ok := s.tokens[c.Value]
-	if ok && time.Now().After(expiry) {
-		delete(s.tokens, c.Value)
-		return false
-	}
-	return ok
+	return s.tokenValid(c.Value)
 }
 
-// tokenValid reports whether a session token is still live — used to
-// revoke an already-open WebSocket after logout or expiry.
+// tokenValid reports whether a session token is still live — used on every
+// authenticated request and to revoke an already-open WebSocket after
+// logout or expiry. An expired token is deleted AND its live sockets are
+// canceled (deleteTokenLocked), so expiry mid-session doesn't leave a
+// socket running until the ticker.
 func (s *Server) tokenValid(token string) bool {
+	var cancels []context.CancelFunc
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	expiry, ok := s.tokens[token]
 	if ok && time.Now().After(expiry) {
-		delete(s.tokens, token)
-		return false
+		cancels = s.deleteTokenLocked(token)
+		ok = false
+	}
+	s.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
 	}
 	return ok
 }
 
 // registerWSCancel records a live socket's cancel func under its session
-// token and returns the matching unregister. Registration is skipped for an
-// empty token (no cookie reached the handler; authed would have refused it,
-// but stay defensive) — such a socket still has the ticker backstop.
-func (s *Server) registerWSCancel(token string, cancel context.CancelFunc) func() {
+// token and returns the matching unregister. It VALIDATES the token under the
+// same lock: authentication happened before the WebSocket upgrade, and a
+// logout/rotation landing in that window has already deleted the token — its
+// cancel sweep ran before this registration, so registering blind would leave
+// the socket live until the ticker. ok=false means the token is gone/expired
+// and the handler must refuse the socket.
+func (s *Server) registerWSCancel(token string, cancel context.CancelFunc) (unregister func(), ok bool) {
 	if token == "" {
-		return func() {}
+		return func() {}, false
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	expiry, live := s.tokens[token]
+	if !live || time.Now().After(expiry) {
+		return func() {}, false
+	}
 	id := s.wsNextID
 	s.wsNextID++
 	m := s.wsCancels[token]
@@ -719,7 +734,6 @@ func (s *Server) registerWSCancel(token string, cancel context.CancelFunc) func(
 		s.wsCancels[token] = m
 	}
 	m[id] = cancel
-	s.mu.Unlock()
 	return func() {
 		s.mu.Lock()
 		if m := s.wsCancels[token]; m != nil {
@@ -729,7 +743,17 @@ func (s *Server) registerWSCancel(token string, cancel context.CancelFunc) func(
 			}
 		}
 		s.mu.Unlock()
-	}
+	}, true
+}
+
+// deleteTokenLocked removes a session token and collects its live sockets'
+// cancel funcs. EVERY token deletion must go through here (logout, rotation,
+// expiry, capacity eviction) — a deletion that skips the sweep leaves the
+// token's sockets running until the revalidation ticker. Caller holds s.mu
+// and must invoke the returned funcs AFTER releasing it.
+func (s *Server) deleteTokenLocked(token string) []context.CancelFunc {
+	delete(s.tokens, token)
+	return s.cancelSocketsLocked(token)
 }
 
 // cancelSocketsLocked collects the cancel funcs of every live socket on
@@ -849,8 +873,16 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	// Register so logout/password-rotation revokes this socket immediately;
-	// the write pump's ticker remains the expiry backstop.
-	defer s.registerWSCancel(token, cancel)()
+	// the write pump's ticker remains the expiry backstop. Registration
+	// re-validates the token atomically — a logout that landed between the
+	// auth check and this point already ran its cancel sweep, so a blind
+	// registration would leave this socket alive until the ticker.
+	unregister, live := s.registerWSCancel(token, cancel)
+	if !live {
+		c.Close(websocket.StatusPolicyViolation, "session ended")
+		return
+	}
+	defer unregister()
 
 	go func() {
 		defer cancel()

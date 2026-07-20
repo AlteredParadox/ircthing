@@ -111,30 +111,42 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	nh := string(newHash)
 	s.passwordHash.Store(&nh)
 
-	// Bump the generation and revoke every OTHER session ATOMICALLY under the
-	// same s.mu that issueToken takes. This closes the login race: a concurrent
-	// old-password login either loses this lock (issueToken then observes the new
-	// generation and refuses to mint) or wins it (and this revoke deletes the
-	// session it just inserted). The browser making the change keeps its own
-	// cookie; an authenticated request without one revokes everything (fail-safe).
-	keep := ""
-	if c, err := r.Cookie(s.cookieName()); err == nil {
-		keep = c.Value
-	}
+	// Bump the generation and revoke EVERY session ATOMICALLY under the same
+	// s.mu that issueToken takes. This closes the login race: a concurrent
+	// old-password login either loses this lock (issueToken then observes the
+	// new generation and refuses to mint) or wins it (and this revoke deletes
+	// the session it just inserted). The requester's own token is revoked too
+	// — password rotation is the compromise-recovery action, and if that
+	// exact token was stolen, keeping it valid would keep the thief logged in
+	// through the rotation. The requester is rotated onto a FRESH token via
+	// Set-Cookie below; their open WebSocket drops and reconnects with it.
 	s.mu.Lock()
 	s.credGen.Add(1) // invalidate any login that verified the old hash
 	var cancels []context.CancelFunc
 	for tok := range s.tokens {
-		if tok != keep {
-			delete(s.tokens, tok)
-			// Drop the revoked session's live sockets immediately, same as
-			// logout — don't leave them running until the 30 s ticker.
-			cancels = append(cancels, s.cancelSocketsLocked(tok)...)
-		}
+		// deleteTokenLocked drops the revoked session's live sockets
+		// immediately, same as logout — not on the 30 s ticker.
+		cancels = append(cancels, s.deleteTokenLocked(tok)...)
 	}
 	s.mu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
 	}
+	token, err := s.issueToken(s.credGen.Load())
+	if err != nil {
+		// The rotation itself succeeded; the requester just has to log in
+		// again with the new password (same as any other revoked session).
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     s.cookieName(),
+		Value:    token,
+		Path:     "/",
+		MaxAge:   int(s.sessionTTLDur().Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   s.cfg.SecureCookies,
+	})
 	w.WriteHeader(http.StatusNoContent)
 }

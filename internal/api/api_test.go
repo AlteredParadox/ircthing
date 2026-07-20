@@ -388,6 +388,7 @@ func TestConfigRetentionAndSessionRuntime(t *testing.T) {
 func TestChangePassword(t *testing.T) {
 	ts, srv := newTestServerWithRef(t)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	var rotated *http.Cookie // fresh session cookie from a successful rotation
 	change := func(current, newpw string) int {
 		req, _ := http.NewRequest("POST", ts.URL+"/api/password",
 			strings.NewReader(`{"current":"`+current+`","new":"`+newpw+`"}`))
@@ -398,6 +399,11 @@ func TestChangePassword(t *testing.T) {
 			t.Fatal(err)
 		}
 		resp.Body.Close()
+		for _, c := range resp.Cookies() {
+			if c.Name == cookie.Name && c.Value != "" {
+				rotated = c
+			}
+		}
 		return resp.StatusCode
 	}
 
@@ -417,6 +423,29 @@ func TestChangePassword(t *testing.T) {
 	if code := login(t, ts, "AlteredParadox", "hunter2").StatusCode; code != http.StatusUnauthorized {
 		t.Fatalf("login with old password = %d, want 401", code)
 	}
+	// The requester's PRE-ROTATION token is revoked too (a stolen copy must
+	// not survive the recovery action); the response carried a fresh cookie
+	// that IS valid — the requester stays logged in on the new token.
+	authProbe := func(c *http.Cookie) int {
+		req, _ := http.NewRequest("GET", ts.URL+"/api/ws", nil)
+		req.AddCookie(c)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := authProbe(cookie); code != http.StatusUnauthorized {
+		t.Fatalf("old token after rotation = %d, want 401 (stolen copies must die)", code)
+	}
+	if rotated == nil {
+		t.Fatal("rotation response carried no fresh session cookie")
+	}
+	if code := authProbe(rotated); code == http.StatusUnauthorized {
+		t.Fatal("fresh rotation cookie rejected; requester was logged out entirely")
+	}
+
 	// The override is persisted and read back over the config hash.
 	h, err := loadPasswordHash(context.Background(), srv.hub.Store(), Config{PasswordHash: "seed-ignored"})
 	if err != nil {
