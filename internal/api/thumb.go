@@ -19,12 +19,14 @@ package api
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"image"
 	"image/color"
 	_ "image/gif" // register the GIF decoder (first frame only)
 	"image/jpeg"
 	"image/png"
 	"net/http"
+	"time"
 
 	_ "golang.org/x/image/webp" // register the WebP decoder (see the VP8L restriction below)
 )
@@ -359,16 +361,20 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// over the 10 MiB cap, upstream 4xx) → 502 so it caches the failure instead of
 	// re-downloading up to ~10 MiB per retry to the same end. Fail closed either
 	// way: no direct fetch.
+	start := time.Now()
 	ct, _, body, err := f.get(r.Context(), target)
 	if err != nil {
 		if fetchErrorRetryable(err) {
+			logMedia("thumb", target, start, "fetch failed (transient→503): "+err.Error())
 			http.Error(w, "thumbnail fetch failed", http.StatusServiceUnavailable)
 		} else {
+			logMedia("thumb", target, start, "fetch failed (permanent→502): "+err.Error())
 			http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
 		}
 		return
 	}
 	if !isImageType(ct) && !isImageType(http.DetectContentType(body)) {
+		logMedia("thumb", target, start, fmt.Sprintf("not an image (ct=%q, %d bytes)→415", ct, len(body)))
 		http.Error(w, "not an image", http.StatusUnsupportedMediaType)
 		return
 	}
@@ -377,12 +383,14 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// committing to a full decode. (The concrete format no longer drives the
 	// re-encode — encodeThumb keys on actual opacity — so only the gate matters.)
 	if _, ok := decodableFormat(body); !ok {
+		logMedia("thumb", target, start, fmt.Sprintf("decode gate rejected (ct=%q, %d bytes)→415", ct, len(body)))
 		http.Error(w, "unsupported image", http.StatusUnsupportedMediaType)
 		return
 	}
 
 	src, _, err := image.Decode(bytes.NewReader(body))
 	if err != nil {
+		logMedia("thumb", target, start, "decode failed: "+err.Error())
 		http.Error(w, "decode failed", http.StatusUnsupportedMediaType)
 		return
 	}
@@ -390,6 +398,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	out := thumbnail(src, thumbMaxDim)
 	res, err := encodeThumb(out)
 	if err != nil {
+		logMedia("thumb", target, start, "encode failed: "+err.Error())
 		http.Error(w, "encode failed", http.StatusInternalServerError)
 		return
 	}
@@ -400,9 +409,11 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// thumbnail, exactly as it does for any thumb failure — which keeps browser
 	// blob residency at count × maxThumbCacheEntry.
 	if len(res.data) > maxThumbCacheEntry {
+		logMedia("thumb", target, start, fmt.Sprintf("thumbnail too large (%d > %d cap)→413", len(res.data), maxThumbCacheEntry))
 		http.Error(w, "thumbnail too large", http.StatusRequestEntityTooLarge)
 		return
 	}
+	logMedia("thumb", target, start, fmt.Sprintf("ok (%d src bytes → %s %d bytes)", len(body), res.contentType, len(res.data)))
 	s.thumbCache.put(ck, res)
 	writeThumb(w, res)
 }

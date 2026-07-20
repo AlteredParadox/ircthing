@@ -18,11 +18,13 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"html"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Link previews: fetch a URL server-side and return a compact card
@@ -165,11 +167,14 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	// failure and does NOT retry — retrying a dead link is four tracking hits and,
 	// for an over-size image, ~40 MiB re-downloaded to the same end. Fail closed
 	// either way: no direct fetch.
+	start := time.Now()
 	ct, finalURL, body, err := f.get(r.Context(), target)
 	if err != nil {
 		if fetchErrorRetryable(err) {
+			logMedia("preview", target, start, "fetch failed (transient→503): "+err.Error())
 			http.Error(w, "preview fetch failed", http.StatusServiceUnavailable)
 		} else {
+			logMedia("preview", target, start, "fetch failed (permanent→502): "+err.Error())
 			http.Error(w, "preview unavailable", http.StatusBadGateway)
 		}
 		return
@@ -184,10 +189,13 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	if isImageType(ct) || isImageType(http.DetectContentType(body)) {
 		pv.Kind = "image"
 		pv.Image = target
+		logMedia("preview", target, start, fmt.Sprintf("ok image (ct=%q, %d bytes)", ct, len(body)))
 	} else {
 		// Resolve relative og:image against the FINAL (post-redirect) URL, or a
 		// redirect would resolve them against the wrong origin/path.
 		extractMeta(string(body), finalURL, &pv)
+		blank := pv.Title == "" && pv.Description == "" && pv.Image == ""
+		logMedia("preview", target, start, fmt.Sprintf("ok card (%d bytes, title=%q, blank=%v)", len(body), pv.Title, blank))
 	}
 	s.previewCache.put(ck, pv)
 	writeJSON(w, pv)

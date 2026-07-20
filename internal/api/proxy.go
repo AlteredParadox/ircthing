@@ -22,10 +22,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -53,6 +55,21 @@ import (
 //     network whose proxy you don't trust to restrict destinations.
 
 const proxyUserAgent = "ircthing-media-proxy/1.0 (+https://github.com/ircthing)"
+
+// mediaDebug enables per-fetch phase logging (IRCTHING_DEBUG_MEDIA=1). Off by
+// default — media fetches are frequent and carry full target URLs. When on,
+// every /api/preview and /api/thumb outcome is logged with its phase, status,
+// byte count, and duration, so a preview that never appears can be diagnosed
+// (dial vs headers vs slow body vs decode vs size cap) instead of guessed at.
+var mediaDebug = os.Getenv("IRCTHING_DEBUG_MEDIA") != ""
+
+// logMedia records one media-fetch outcome when mediaDebug is on. kind is
+// "preview"/"thumb"; result is the phase and disposition.
+func logMedia(kind, target string, start time.Time, result string) {
+	if mediaDebug {
+		log.Printf("media[%s] %q: %s (%dms)", kind, target, result, time.Since(start).Milliseconds())
+	}
+}
 
 // mediaSlots is the IMAGE-DECODE concurrency: each slot admits one whole
 // thumbnail request (fetch through decode + encode), bounding in-flight bodies
