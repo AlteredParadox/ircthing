@@ -726,7 +726,7 @@ func (f *fakeConn) EnsureNames(string) {}
 
 func (f *fakeConn) SendMultiline(string, []string) error { return nil }
 func (f *fakeConn) ReconcileMonitored([]string) error    { return nil }
-func (f *fakeConn) MonitorRejected([]string)             {}
+func (f *fakeConn) MonitorRejected([]string, int)        {}
 
 func (f *fakeConn) privmsg(line string) irc.Event {
 	return irc.Event{

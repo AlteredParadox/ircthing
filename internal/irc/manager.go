@@ -521,16 +521,20 @@ func (m *Manager) effectiveMonitorLimitLocked() int {
 }
 
 // MonitorRejected handles ERR_MONLISTFULL (734): it drops the refused nicks
-// from the active set and records the server's real capacity (the count that
-// remains) as the effective limit for this connection, so later reconciles
-// don't keep trying to overfill a list the server won't grow.
-func (m *Manager) MonitorRejected(nicks []string) {
+// from the active set and records the effective capacity for this connection.
+// limit is the AUTHORITATIVE cap from the numeric; when it is 0 (unparseable)
+// we fall back to the count that remains after removing the rejected nicks.
+func (m *Manager) MonitorRejected(nicks []string, limit int) {
 	m.monActiveMu.Lock()
 	defer m.monActiveMu.Unlock()
 	for _, n := range nicks {
 		delete(m.monActive, m.isup.Fold(n))
 	}
-	m.monLimit734 = len(m.monActive)
+	if limit > 0 {
+		m.monLimit734 = limit
+	} else {
+		m.monLimit734 = len(m.monActive)
+	}
 }
 
 // monitorAdvertised reports whether the server offers MONITOR at all

@@ -52,6 +52,13 @@ type Session struct {
 // can open many connections. Generous for one user across devices/tabs.
 const maxHubSessions = 64
 
+// maxMonitorsPerNetwork bounds the persisted MONITOR buddy list. A reconnect
+// reconciles the whole list as one atomic send; 1024 buddies is ~103 chunked
+// MONITOR + messages (plus any removals) — comfortably under the manager's
+// 512-message send queue even for a full replacement — while being far above
+// any real buddy list.
+const maxMonitorsPerNetwork = 1024
+
 // NewSession registers a session, or returns nil when the session cap is
 // reached (the caller rejects the upgrade). A nil session needs no
 // Close.
@@ -419,6 +426,16 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		// monMu, two concurrent adds can't both pass and both persist.
 		existing, lerr := s.hub.store.Monitors(ctx, d.Network)
 		if lerr == nil {
+			// Cap the persisted list. A reconnect reconciles the WHOLE list as
+			// one atomic delta (up to a full remove+re-add), so an unbounded
+			// list could eventually exceed the send queue and become
+			// permanently unreconcilable on a server that advertises no limit.
+			// maxMonitorsPerNetwork keeps even a complete replacement well under
+			// the queue; it is far above any real buddy list.
+			if len(existing) >= maxMonitorsPerNetwork {
+				s.push(errEnvelope(env.Seq, "bad_request", "monitor list is full"))
+				return
+			}
 			for _, nk := range existing {
 				if nk != d.Nick && fold(nk) == fold(d.Nick) {
 					s.push(errEnvelope(env.Seq, "bad_request", "already monitored as "+nk))

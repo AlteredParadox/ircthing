@@ -415,7 +415,7 @@ func (f *fakeConn) ReconcileMonitored(desired []string) error {
 	return nil
 }
 
-func (f *fakeConn) MonitorRejected(nicks []string) {
+func (f *fakeConn) MonitorRejected(nicks []string, _ int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.monRejected = append(f.monRejected, nicks...)

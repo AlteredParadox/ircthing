@@ -669,7 +669,7 @@ func TestManagerMonitorRejected(t *testing.T) {
 	}
 	// Server 734s full2 — its real cap is 1. MonitorRejected drops full2 and
 	// records the effective limit (the count that remains, 1).
-	m.MonitorRejected([]string{"full2"})
+	m.MonitorRejected([]string{"full2"}, 1)
 	// Reconciling the same desired must NOT re-add full2 now (clamped to the
 	// learned limit of 1, and full1 is already active → no-op). Prove nothing
 	// leaked: the only wire command after is the -full1 from removing it.

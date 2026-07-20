@@ -94,8 +94,9 @@ type Conn interface {
 	// error if the delta couldn't be enqueued (retried on the next call).
 	ReconcileMonitored(desired []string) error
 	// MonitorRejected handles a 734 (list full): drops the refused nicks and
-	// records the server's real capacity for this connection.
-	MonitorRejected(nicks []string)
+	// records the server's real capacity. limit is the AUTHORITATIVE cap the
+	// numeric carries (0 when unparseable, in which case the manager infers it).
+	MonitorRejected(nicks []string, limit int)
 }
 
 type Hub struct {
@@ -334,12 +335,17 @@ func (h *Hub) handleControlNumeric(ctx context.Context, c Conn, ev irc.Event) bo
 		return true
 	case "734": // ERR_MONLISTFULL
 		// Format: <nick> <limit> <rejected,targets> :message. The server did
-		// NOT add these, so drop them from the connection's active set —
-		// otherwise an optimistically-counted add that was rejected would
-		// wrongly block later adds until reconnect. The persisted "desired"
-		// row stays (buddy shows offline; re-established on reconnect if room).
+		// NOT add these, so drop them from the connection's active set, and use
+		// the AUTHORITATIVE <limit> the numeric carries rather than inferring
+		// capacity from the local count. The persisted "desired" row stays
+		// (buddy shows offline; re-established on reconnect / next reconcile if
+		// room). NB: 734 identifies targets by nick with no request
+		// correlation, so a delayed rejection racing a remove/re-add of the
+		// same nick can transiently drop the newer entry — self-healed by the
+		// next reconcile, which re-syncs the active set to the desired list.
 		if len(ev.Msg.Params) > 2 {
-			c.MonitorRejected(strings.Split(ev.Msg.Params[2], ","))
+			limit, _ := strconv.Atoi(ev.Msg.Params[1])
+			c.MonitorRejected(strings.Split(ev.Msg.Params[2], ","), limit)
 		}
 		log.Printf("irc[%s]: MONITOR list full: %q", ev.Network, clampServerInfo(ev.Msg.Trailing()))
 		return true
