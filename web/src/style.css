@@ -643,6 +643,12 @@ input::placeholder {
 .msgs {
 	flex: 1;
 	padding: 14px 4px 18px;
+	/* The virtual list compensates scrollTop itself (prepend anchoring,
+	   ResizeObserver height corrections). The browser's native scroll
+	   anchoring reacts to the same mutations and adjusts scrollTop AGAIN,
+	   and the double compensation shows up as sudden jumps while paging
+	   up or right after a buffer switch. One adjuster only: ours. */
+	overflow-anchor: none;
 }
 
 .top-note {
