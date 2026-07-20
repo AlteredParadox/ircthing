@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -296,7 +297,9 @@ func TestWireBudget(t *testing.T) {
 				}
 			}
 		}()
-		bc := &budgetConn{Conn: sink, remaining: 10_000}
+		budget := new(atomic.Int64)
+		budget.Store(10_000)
+		bc := &budgetConn{Conn: sink, remaining: budget}
 		n, err := io.Copy(io.Discard, bc)
 		sink.Close()
 		if !errors.Is(err, errWireBudget) {
@@ -326,6 +329,79 @@ func TestWireBudget(t *testing.T) {
 			t.Fatalf("get = %q, %v", body, err)
 		}
 	})
+	t.Run("budget spans redirect hops", func(t *testing.T) {
+		// Each redirect hop dials a fresh connection (DisableKeepAlives); the
+		// budget must be REQUEST-wide, or five hops each get a fresh allowance
+		// (~52 MiB of TLS padding for one nominal 10 MiB thumbnail). Two conns
+		// drawing on ONE counter must drain it jointly: 600 bytes on the first
+		// leaves only 400 for the second.
+		budget := new(atomic.Int64)
+		budget.Store(1000)
+		a, b := net.Pipe()
+		c, d := net.Pipe()
+		defer a.Close()
+		defer c.Close()
+		go func() { a.Write(make([]byte, 600)); a.Close() }()
+		bc1 := &budgetConn{Conn: b, remaining: budget}
+		if _, err := io.ReadAll(bc1); err != nil {
+			t.Fatalf("hop 1 read: %v", err)
+		}
+		go func() { c.Write(make([]byte, 600)) }()
+		bc2 := &budgetConn{Conn: d, remaining: budget}
+		if _, err := io.Copy(io.Discard, bc2); !errors.Is(err, errWireBudget) {
+			t.Fatalf("hop 2 err = %v, want errWireBudget (shared budget must carry over)", err)
+		}
+	})
+}
+
+// TestBodyReadErrorClassification: a failure while reading the body defaults
+// PERMANENT (deterministic framing breaks — e.g. a malformed chunk terminator
+// after ~10 MiB — must not get the client's 4-download retry budget), while
+// genuine network-level failures stay transient.
+func TestBodyReadErrorClassification(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool // retryable
+	}{
+		{"malformed chunked framing", &bodyReadError{errors.New("malformed chunked encoding")}, false},
+		{"bad trailer", &bodyReadError{errors.New("http: invalid trailer")}, false},
+		{"socket reset mid-body", &bodyReadError{&net.OpError{Op: "read", Err: errors.New("connection reset by peer")}}, true},
+		{"deadline mid-body", &bodyReadError{context.DeadlineExceeded}, true},
+		{"bare connection cut", &bodyReadError{io.ErrUnexpectedEOF}, true},
+		{"wire budget through body phase", &bodyReadError{&net.OpError{Op: "read", Err: errWireBudget}}, false},
+	}
+	for _, tc := range cases {
+		if got := fetchErrorRetryable(tc.err); got != tc.want {
+			t.Errorf("%s: retryable = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	// End to end: a server that breaks chunked framing mid-body must surface a
+	// permanent (non-retryable) error through get().
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("no hijacker")
+			return
+		}
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf.WriteString("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+		buf.WriteString("5\r\nhello\r\nZZZ\r\n") // ZZZ: malformed chunk size
+		buf.Flush()
+	}))
+	defer srv.Close()
+	f := permissiveFetcher(t, 1024)
+	_, _, _, err := f.get(context.Background(), srv.URL)
+	if err == nil {
+		t.Fatal("malformed chunking succeeded")
+	}
+	if fetchErrorRetryable(err) {
+		t.Fatalf("malformed chunked body classified retryable: %v", err)
+	}
 }
 
 // TestFetchErrorRetryable: only transient failures may be reported to the client

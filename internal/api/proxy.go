@@ -27,6 +27,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -100,6 +101,21 @@ var (
 	errRedirectScheme = errors.New("proxy: disallowed redirect scheme")
 )
 
+// bodyReadError tags a failure that happened while reading the RESPONSE BODY —
+// after the origin already answered 200 and streamed headers. In this phase a
+// deterministic protocol/framing failure (malformed chunk terminator, bad
+// trailer — untyped errors.New strings inside net/http) is indistinguishable
+// from hostility: an endpoint can stream ~10 MiB and then break the framing,
+// and a transient classification hands it the client's full retry budget
+// (~40 MiB and four tracking hits per URL). So the DEFAULT here is permanent;
+// the explicitly transient exceptions (fetchErrorRetryable) are genuine
+// network-level failures: net.Error (reset/timeout at the socket), context
+// deadline, and a bare connection cut (io.ErrUnexpectedEOF).
+type bodyReadError struct{ err error }
+
+func (e *bodyReadError) Error() string { return "proxy: reading body: " + e.err.Error() }
+func (e *bodyReadError) Unwrap() error { return e.err }
+
 // upstreamStatusError is get's error for a non-200 upstream response. It carries
 // the status so the caller can tell a transient upstream hiccup (5xx/429/408 —
 // worth a client retry) from a permanent one (403/404/410 — retrying just repeats
@@ -168,7 +184,20 @@ func fetchErrorRetryable(err error) bool {
 			return false // 4xx and other permanent statuses
 		}
 	}
-	return true // dial/TLS/timeout/network — transient
+	// Body-read phase: default PERMANENT (deterministic framing/parser
+	// failures must not get the retry budget), excepting genuine network
+	// failures — a socket-level error (reset, timeout), a deadline, or a
+	// bare mid-body connection cut.
+	var bre *bodyReadError
+	if errors.As(err, &bre) {
+		var ne net.Error
+		if errors.As(bre.err, &ne) || errors.Is(bre.err, context.DeadlineExceeded) ||
+			errors.Is(bre.err, context.Canceled) || errors.Is(bre.err, io.ErrUnexpectedEOF) {
+			return true
+		}
+		return false
+	}
+	return true // dial/TLS handshake/timeout — transient (a WireGuard tunnel warming up fails here)
 }
 
 type fetcher struct {
@@ -212,32 +241,49 @@ const wireBudgetAllowance = 512 << 10
 // then fail with a net.OpError wrapping errWireBudget — a net.Error, so
 // crypto/tls propagates it, and errors.Is still finds errWireBudget through
 // the url.Error/OpError chain for permanent classification.
+//
+// remaining is SHARED across every connection of one get() call (seeded into
+// the request context): redirects dial fresh connections (DisableKeepAlives),
+// and a per-connection budget would multiply by the five allowed hops —
+// ~52 MiB of padding for one nominal 10 MiB thumbnail. Atomic because the
+// transport may race a speculative next-hop dial against a body read.
 type budgetConn struct {
 	net.Conn
-	remaining int64 // raw bytes this connection may still read (single reader: the transport's read loop)
+	remaining *atomic.Int64
 }
 
 func (c *budgetConn) Read(p []byte) (int, error) {
-	if c.remaining <= 0 {
+	left := c.remaining.Load()
+	if left <= 0 {
 		return 0, &net.OpError{Op: "read", Net: "tcp", Err: errWireBudget}
 	}
-	if int64(len(p)) > c.remaining {
-		p = p[:c.remaining]
+	if int64(len(p)) > left {
+		p = p[:left]
 	}
 	n, err := c.Conn.Read(p)
-	c.remaining -= int64(n)
+	c.remaining.Add(-int64(n))
 	return n, err
 }
 
-// withWireBudget wraps a dial func so every connection it returns carries the
-// fetcher's raw-byte budget.
+// wireBudgetKey carries the request-wide raw-byte counter in the context from
+// get() to the dialer.
+type wireBudgetKey struct{}
+
+// withWireBudget wraps a dial func so every connection it returns draws from
+// the request's shared raw-byte budget. A dial without one (defensive; get()
+// always seeds it) gets a fresh single-connection budget.
 func (f *fetcher) withWireBudget(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		c, err := dial(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
-		return &budgetConn{Conn: c, remaining: f.maxBytes + wireBudgetAllowance}, nil
+		budget, _ := ctx.Value(wireBudgetKey{}).(*atomic.Int64)
+		if budget == nil {
+			budget = new(atomic.Int64)
+			budget.Store(f.maxBytes + wireBudgetAllowance)
+		}
+		return &budgetConn{Conn: c, remaining: budget}, nil
 	}
 }
 
@@ -374,6 +420,11 @@ func (f *fetcher) get(ctx context.Context, rawURL string) (contentType, finalURL
 	if f.proxied && !f.hostAllowed(u.Hostname()) {
 		return "", "", nil, errBlocked
 	}
+	// One raw-byte budget for the WHOLE request, including every redirect
+	// hop's fresh connection — see budgetConn.
+	budget := new(atomic.Int64)
+	budget.Store(f.maxBytes + wireBudgetAllowance)
+	ctx = context.WithValue(ctx, wireBudgetKey{}, budget)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return "", "", nil, err
@@ -391,7 +442,9 @@ func (f *fetcher) get(ctx context.Context, rawURL string) (contentType, finalURL
 	}
 	body, err = io.ReadAll(io.LimitReader(resp.Body, f.maxBytes+1))
 	if err != nil {
-		return "", "", nil, err
+		// Tag the phase: a failure while READING THE BODY (headers already
+		// received) is classified permanent-by-default — see bodyReadError.
+		return "", "", nil, &bodyReadError{err}
 	}
 	if int64(len(body)) > f.maxBytes {
 		if !f.truncate {
