@@ -62,17 +62,38 @@ func (s *Store) STSPolicy(ctx context.Context, host string) (port int, until tim
 		rec.Until == nil || *rec.Until <= 0 {
 		return 0, time.Time{}, 0, false, fmt.Errorf("sts: unreadable policy record for %q", host)
 	}
-	if rec.Duration != nil && *rec.Duration > 0 {
+	// A duration is used only to RESCHEDULE the expiry on disconnect; it is not
+	// the security-relevant field (`until` is), so a present-but-invalid one is
+	// NOT fail-closed — it simply disables rescheduling (duration 0), exactly
+	// like a legacy record with no stored duration. But it must be range-checked
+	// BEFORE the ms→ns conversion below, or a huge value overflows int64. Only an
+	// ABSENT duration is a legacy record; a present zero/negative/over-cap value
+	// is discarded (rescheduling lost) rather than trusted.
+	if rec.Duration != nil && *rec.Duration >= 1 && *rec.Duration <= maxSTSDurationMs {
 		duration = time.Duration(*rec.Duration) * time.Millisecond
 	}
 	return rec.Port, time.UnixMilli(*rec.Until), duration, true, nil
 }
 
+// maxSTSDurationMs caps a stored STS duration at ~100 years in milliseconds —
+// far longer than any real policy, and small enough that the ms→ns conversion
+// (×1e6) stays well within int64. Mirrors the parse-time clamp in internal/irc.
+const maxSTSDurationMs = int64(100*365*24*60*60) * 1000
+
 func (s *Store) SetSTSPolicy(ctx context.Context, host string, port int, until time.Time, duration time.Duration) error {
+	// Clamp what we WRITE to the same valid range we accept on read, so a
+	// caller bug can never persist a duration that read-back would discard
+	// (silently losing rescheduling) or that would overflow.
+	ms := duration.Milliseconds()
+	if ms < 1 {
+		ms = 1
+	} else if ms > maxSTSDurationMs {
+		ms = maxSTSDurationMs
+	}
 	b, err := json.Marshal(stsRecord{
 		Port:     port,
 		Until:    ptrInt64(until.UnixMilli()),
-		Duration: ptrInt64(duration.Milliseconds()),
+		Duration: ptrInt64(ms),
 	})
 	if err != nil {
 		return err

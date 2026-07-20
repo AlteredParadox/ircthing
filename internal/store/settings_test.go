@@ -135,3 +135,43 @@ func TestSTSPolicyRejectsMalformed(t *testing.T) {
 		t.Fatalf("expired policy: ok=%v err=%v, want ok with no error", ok, err)
 	}
 }
+
+// A present-but-invalid `duration` (zero, negative, over-cap, or overflow-prone)
+// must NOT fail the policy — `until` is the security field — but must be
+// DISCARDED (duration 0, rescheduling lost) rather than trusted or converted
+// into an int64 overflow. Only an ABSENT duration is a legacy record.
+func TestSTSPolicyDurationValidation(t *testing.T) {
+	s, _ := openTest(t, 10)
+	future := time.Now().Add(time.Hour).UnixMilli()
+	base := func(dur string) string {
+		r := `{"port":6697,"until":` + strconv.FormatInt(future, 10)
+		if dur != "" {
+			r += `,"duration":` + dur
+		}
+		return r + `}`
+	}
+	cases := []struct {
+		dur     string
+		wantDur time.Duration
+	}{
+		{"", 0},                                                     // absent → legacy, no reschedule
+		{"0", 0},                                                    // present zero → discarded
+		{"-5", 0},                                                   // negative → discarded
+		{strconv.FormatInt(1<<62, 10), 0},                           // MaxInt-ish → over cap, discarded (no overflow)
+		{strconv.FormatInt(maxSTSDurationMs+1, 10), 0},              // just over 100y → discarded
+		{"3600000", time.Hour},                                      // 1h, valid
+		{strconv.FormatInt(maxSTSDurationMs, 10), time.Duration(maxSTSDurationMs) * time.Millisecond}, // max valid
+	}
+	for _, tc := range cases {
+		if err := s.SetSetting(ctx, stsKey("d.example"), base(tc.dur)); err != nil {
+			t.Fatal(err)
+		}
+		_, _, dur, ok, err := s.STSPolicy(ctx, "d.example")
+		if err != nil || !ok {
+			t.Fatalf("duration=%q: ok=%v err=%v, want a valid policy", tc.dur, ok, err)
+		}
+		if dur != tc.wantDur {
+			t.Errorf("duration=%q: got %v, want %v", tc.dur, dur, tc.wantDur)
+		}
+	}
+}
