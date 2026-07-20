@@ -70,9 +70,12 @@ func putWSBuf(buf *bytes.Buffer) {
 const wsEnvelopeHeadroom = 16 * 1024
 
 // sessionRecheckInterval is how often a live WebSocket re-validates its
-// session token, so logout/expiry revokes an already-open connection.
-// A var so tests can shorten it.
-var sessionRecheckInterval = 30 * time.Second
+// session token — the EXPIRY backstop (logout and password rotation revoke
+// live sockets immediately via wsCancels). Atomic (nanoseconds) so tests can
+// adjust it while socket goroutines that read it are still running.
+var sessionRecheckInterval atomic.Int64
+
+func init() { sessionRecheckInterval.Store(int64(30 * time.Second)) }
 
 // maxSessions caps concurrently valid login sessions; the oldest is
 // evicted at issue time. Generous for one user across devices/tabs.
@@ -133,6 +136,14 @@ type Server struct {
 
 	mu     sync.Mutex
 	tokens map[string]time.Time // session token -> expiry
+	// wsCancels tracks the cancel func of every live WebSocket by session
+	// token, so revoking a token (logout, password rotation) tears its
+	// sockets down IMMEDIATELY instead of waiting out the 30 s revalidation
+	// ticker — a stolen already-open socket must not keep receiving IRC
+	// traffic for that window. Guarded by mu (paired with tokens). The
+	// ticker in wsWritePump stays as the expiry backstop.
+	wsCancels map[string]map[uint64]context.CancelFunc
+	wsNextID  uint64
 
 	// sessionTTL is the effective session-cookie lifetime in nanoseconds,
 	// runtime-settable (Settings → Session). Atomic so the login path reads it
@@ -209,6 +220,7 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		previewSem: make(chan struct{}, previewSlots),
 		login:      newLoginLimiter(),
 		tokens:     make(map[string]time.Time),
+		wsCancels:  make(map[string]map[uint64]context.CancelFunc),
 	}
 	s.sessionTTL.Store(int64(loadSessionTTL(context.Background(), h.Store(), cfg)))
 	initHash, err := loadPasswordHash(context.Background(), h.Store(), cfg)
@@ -493,6 +505,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Frame-Options", "DENY")
+	// Message links are attacker-controlled remote anchors; hyperlink DNS
+	// prefetch would leak a DNS query for every rendered hostname without a
+	// click (a viewing tracker). Chromium already disables prefetch for
+	// pages served over HTTPS, so this protects the residual cases: plain-
+	// HTTP access, altered browser settings, and other engines.
+	// chromium.org/developers/design-documents/dns-prefetching/
+	h.Set("X-DNS-Prefetch-Control", "off")
 	// img-src includes blob: for thumbnails: they are fetched from the media
 	// proxy as blobs and rendered from object URLs (preview.jsx), which
 	// Firefox blocks under 'self' unless blob: is listed explicitly.
@@ -637,7 +656,14 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(s.cookieName()); err == nil {
 		s.mu.Lock()
 		delete(s.tokens, c.Value)
+		// Tear down this token's live WebSockets NOW — the write pump's 30 s
+		// revalidation ticker would otherwise let an already-open (possibly
+		// stolen) socket keep receiving and sending IRC traffic after logout.
+		cancels := s.cancelSocketsLocked(c.Value)
 		s.mu.Unlock()
+		for _, cancel := range cancels {
+			cancel()
+		}
 	}
 	// The deletion cookie carries the same attributes as the session
 	// cookie so every browser treats it as the same cookie.
@@ -676,12 +702,59 @@ func (s *Server) tokenValid(token string) bool {
 	return ok
 }
 
+// registerWSCancel records a live socket's cancel func under its session
+// token and returns the matching unregister. Registration is skipped for an
+// empty token (no cookie reached the handler; authed would have refused it,
+// but stay defensive) — such a socket still has the ticker backstop.
+func (s *Server) registerWSCancel(token string, cancel context.CancelFunc) func() {
+	if token == "" {
+		return func() {}
+	}
+	s.mu.Lock()
+	id := s.wsNextID
+	s.wsNextID++
+	m := s.wsCancels[token]
+	if m == nil {
+		m = make(map[uint64]context.CancelFunc)
+		s.wsCancels[token] = m
+	}
+	m[id] = cancel
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		if m := s.wsCancels[token]; m != nil {
+			delete(m, id)
+			if len(m) == 0 {
+				delete(s.wsCancels, token)
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+// cancelSocketsLocked collects the cancel funcs of every live socket on
+// `token` and removes them from the registry. Caller holds s.mu; the returned
+// funcs must be called AFTER the lock is released (a cancel wakes the socket
+// goroutines, which may immediately try to unregister and take s.mu).
+func (s *Server) cancelSocketsLocked(token string) []context.CancelFunc {
+	m := s.wsCancels[token]
+	if m == nil {
+		return nil
+	}
+	delete(s.wsCancels, token)
+	out := make([]context.CancelFunc, 0, len(m))
+	for _, c := range m {
+		out = append(out, c)
+	}
+	return out
+}
+
 // wsWritePump writes the session's outbound envelopes to the socket,
 // periodically re-validating the session token (revoking the socket on
 // logout/expiry) and closing on a slow consumer. Returns when the
 // context is canceled or a write fails.
 func (s *Server) wsWritePump(ctx context.Context, c *websocket.Conn, sess *hub.Session, token string) {
-	revoke := time.NewTicker(sessionRecheckInterval)
+	revoke := time.NewTicker(time.Duration(sessionRecheckInterval.Load()))
 	defer revoke.Stop()
 	for {
 		select {
@@ -775,6 +848,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	// Register so logout/password-rotation revokes this socket immediately;
+	// the write pump's ticker remains the expiry backstop.
+	defer s.registerWSCancel(token, cancel)()
 
 	go func() {
 		defer cancel()

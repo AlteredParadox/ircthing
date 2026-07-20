@@ -255,6 +255,31 @@ func TestFetcherRejects(t *testing.T) {
 	})
 }
 
+// TestFetcherRequestsIdentityEncoding: the fetcher must not negotiate transparent
+// gzip. With auto-gzip, the LimitReader caps DECOMPRESSED bytes — a hostile origin
+// could stream unbounded wire bytes that decompress to almost nothing, burning
+// bandwidth/CPU until the client timeout. Identity keeps the cap a wire-byte cap.
+func TestFetcherRequestsIdentityEncoding(t *testing.T) {
+	var acceptEncoding string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		acceptEncoding = r.Header.Get("Accept-Encoding")
+		w.Write([]byte("plain"))
+	}))
+	defer srv.Close()
+
+	f := permissiveFetcher(t, 1024)
+	_, _, body, err := f.get(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if strings.Contains(acceptEncoding, "gzip") {
+		t.Fatalf("fetcher negotiated gzip (Accept-Encoding: %q); the byte cap would measure decompressed bytes", acceptEncoding)
+	}
+	if string(body) != "plain" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
 // TestFetchErrorRetryable: only transient failures may be reported to the client
 // as retryable (503). Permanent ones (bad/blocked URL, over-size body, upstream
 // 4xx) must be non-retryable so the browser caches the failure instead of

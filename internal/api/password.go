@@ -123,11 +123,18 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	s.credGen.Add(1) // invalidate any login that verified the old hash
+	var cancels []context.CancelFunc
 	for tok := range s.tokens {
 		if tok != keep {
 			delete(s.tokens, tok)
+			// Drop the revoked session's live sockets immediately, same as
+			// logout — don't leave them running until the 30 s ticker.
+			cancels = append(cancels, s.cancelSocketsLocked(tok)...)
 		}
 	}
 	s.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
 	w.WriteHeader(http.StatusNoContent)
 }

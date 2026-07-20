@@ -203,8 +203,16 @@ func newFetcher(maxBytes int64, proxy *url.URL) *fetcher {
 			TLSHandshakeTimeout:    8 * time.Second,
 			ResponseHeaderTimeout:  8 * time.Second,
 			MaxResponseHeaderBytes: 64 << 10, // hostile targets can otherwise stream ~10 MiB of headers (Go default) outside the body budget
-			DisableKeepAlives:      true,
-			MaxIdleConns:           0,
+			// Identity only: with transparent gzip, the LimitReader in get caps
+			// DECOMPRESSED bytes, so a hostile origin could stream unbounded wire
+			// bytes (e.g. empty gzip members) that decompress to almost nothing,
+			// burning bandwidth and CPU until the client timeout. Identity makes
+			// the cap a true network-byte cap. Cost: HTML previews arrive
+			// uncompressed — bounded by the same cap, and images (the bulk) were
+			// never compressible anyway.
+			DisableCompression: true,
+			DisableKeepAlives:  true,
+			MaxIdleConns:       0,
 		},
 		CheckRedirect: f.checkRedirect,
 	}
@@ -231,6 +239,7 @@ func newTunnelFetcher(maxBytes int64, dial func(ctx context.Context, addr string
 			TLSHandshakeTimeout:    8 * time.Second,
 			ResponseHeaderTimeout:  8 * time.Second,
 			MaxResponseHeaderBytes: 64 << 10, // hostile targets can otherwise stream ~10 MiB of headers (Go default) outside the body budget
+			DisableCompression:     true,     // identity only — see newFetcher: keep the byte cap a WIRE-byte cap
 			DisableKeepAlives:      true,
 			MaxIdleConns:           0,
 		},

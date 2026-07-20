@@ -878,6 +878,7 @@ func TestSecurityHeaders(t *testing.T) {
 		"X-Content-Type-Options": "nosniff",
 		"Referrer-Policy":        "no-referrer",
 		"X-Frame-Options":        "DENY",
+		"X-DNS-Prefetch-Control": "off", // rendered links are attacker-controlled; no per-hostname DNS leak
 	} {
 		if got := resp.Header.Get(k); got != want {
 			t.Fatalf("%s = %q, want %q", k, got, want)
@@ -1046,9 +1047,9 @@ func TestWSLargePrefs(t *testing.T) {
 // A live WebSocket is revoked when its session token is invalidated
 // (logout or expiry), not left working until the socket happens to drop.
 func TestWSRevokedOnLogout(t *testing.T) {
-	old := sessionRecheckInterval
-	sessionRecheckInterval = 50 * time.Millisecond
-	defer func() { sessionRecheckInterval = old }()
+	old := sessionRecheckInterval.Load()
+	sessionRecheckInterval.Store(int64(50 * time.Millisecond))
+	defer sessionRecheckInterval.Store(old)
 
 	ts, h := newTestServer(t)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
@@ -1084,6 +1085,52 @@ func TestWSRevokedOnLogout(t *testing.T) {
 		t.Fatal("read succeeded after logout; socket not revoked")
 	} else if rctx.Err() != nil {
 		t.Fatal("socket still open 3s after logout")
+	}
+}
+
+// Logout must tear the token's live sockets down IMMEDIATELY, not on the next
+// revalidation tick — a stolen already-open socket must not keep receiving IRC
+// traffic for up to 30 s. The ticker is set absurdly long so only the immediate
+// cancel path can close the socket within the deadline.
+func TestWSRevokedImmediatelyOnLogout(t *testing.T) {
+	old := sessionRecheckInterval.Load()
+	sessionRecheckInterval.Store(int64(time.Hour))
+	defer sessionRecheckInterval.Store(old)
+
+	ts, h := newTestServer(t)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn := &fakeConn{ch: make(chan irc.Event, 4), name: "libera", nick: "AlteredParadox"}
+	go h.Run(ctx, conn)
+
+	header := http.Header{}
+	header.Set("Cookie", cookie.Name+"="+cookie.Value)
+	header.Set("Origin", ts.URL)
+	c, _, err := websocket.Dial(ctx, ts.URL+"/api/ws", &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.CloseNow()
+
+	req, _ := http.NewRequest("POST", ts.URL+"/api/logout", nil)
+	req.Header.Set("Origin", ts.URL)
+	req.AddCookie(cookie)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// With the ticker out of the picture, only the logout-path cancel can close
+	// this socket. 3 s is generous for a context cancel + close.
+	rctx, rcancel := context.WithTimeout(ctx, 3*time.Second)
+	defer rcancel()
+	if _, _, err := c.Read(rctx); err == nil {
+		t.Fatal("read succeeded after logout; socket not revoked")
+	} else if rctx.Err() != nil {
+		t.Fatal("socket still open 3s after logout — immediate revocation not wired")
 	}
 }
 
