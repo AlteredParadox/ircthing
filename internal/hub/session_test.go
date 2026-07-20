@@ -826,9 +826,9 @@ func TestMonitorReestablishedOnRegistration(t *testing.T) {
 	}
 }
 
-// A 734 (list full) both records the rejection AND re-reconciles against the
-// persisted list — so a delayed rejection can't leave the connection out of
-// sync until the next mutation/reconnect.
+// A 734 (list full) passes the rejection and complete persisted snapshot to the
+// connection, which can authoritatively clear+rebuild without racing a monitor
+// mutation.
 func TestMonitor734ReReconciles(t *testing.T) {
 	h := newTestHub(t)
 	for _, n := range []string{"alice", "bob"} {
@@ -852,8 +852,8 @@ func TestMonitor734ReReconciles(t *testing.T) {
 		r := conn.rejectedNicks()
 		return len(r) == 1 && r[0] == "bob"
 	})
-	// The follow-up reconcile ran with the full desired list (bob re-added as a
-	// harmless duplicate if the server actually has it).
+	// The recovery received the full desired list; the real manager clears and
+	// rebuilds this snapshot at the newly learned cap.
 	if got := conn.monitoredNicks(); len(got) != 2 {
 		t.Fatalf("post-734 reconcile list = %v, want the full desired list", got)
 	}

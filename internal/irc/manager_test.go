@@ -638,10 +638,10 @@ func TestManagerMonitor(t *testing.T) {
 	}
 }
 
-// A 734 (list full) records the server's real capacity, so a later reconcile
-// does not keep trying to overfill a list the server won't grow. Uses an
-// UNADVERTISED limit (MONITOR with no number) so the client doesn't clamp and
-// actually sends the adds the server then 734s.
+// A 734 (list full) records the server's real capacity and authoritatively
+// clears+rebuilds the list. Uses an UNADVERTISED limit (MONITOR with no number)
+// so the client doesn't clamp and actually sends the adds the server then
+// rejects.
 func TestManagerMonitorRejected(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -675,19 +675,30 @@ func TestManagerMonitorRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The real 734: full2 rejected, authoritative cap 1. Drops full2, records
-	// the limit, and re-reconciles EXCLUDING full2 — so it is NOT immediately
-	// re-added (which would loop +full2/734 against the still-full server).
+	// The real 734: full2 rejected, authoritative cap 1. The manager cannot know
+	// whether a delayed numeric still describes current server state, so it
+	// clears and rebuilds the desired list at the learned cap.
 	if err := m.MonitorRejected([]string{"full2"}, 1, gen, []string{"full1", "full2"}); err != nil {
 		t.Fatal(err)
 	}
-	// Prove nothing leaked (no +full2 from either the stale or the real 734):
-	// the next wire command is the -full1 from clearing the list.
+	if clear := s.readCmd("MONITOR"); clear.Param(0) != "C" {
+		t.Fatalf("MONITOR recovery = %q, want C", clear.String())
+	}
+	if add := s.readCmd("MONITOR"); add.Param(0) != "+" || add.Param(1) != "full1" {
+		t.Fatalf("MONITOR recovery = %q, want +full1 (clamped to learned cap)", add.String())
+	}
+
+	// A same-cap repeat is stale after the authoritative rebuild. It must not
+	// delete full1 locally or enqueue another C/add pair; the next wire command
+	// must therefore be the real removal below.
+	if err := m.MonitorRejected([]string{"full1"}, 1, gen, []string{"full1", "full2"}); err != nil {
+		t.Fatal(err)
+	}
 	if err := m.ReconcileMonitored([]string{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := s.readCmd("MONITOR"); got.Param(0) != "-" || got.Param(1) != "full1" {
-		t.Fatalf("MONITOR = %q; a rejected nick was re-added or a stale 734 applied", got.String())
+		t.Fatalf("MONITOR = %q; stale/wrong-gen 734 changed recovered state", got.String())
 	}
 }
 

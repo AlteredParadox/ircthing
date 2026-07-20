@@ -419,7 +419,7 @@ func (f *fakeConn) MonitorRejected(nicks []string, _ int, _ uint64, desired []st
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.monRejected = append(f.monRejected, nicks...)
-	// Model the re-reconcile: record the desired list, as ReconcileMonitored does.
+	// Record the desired snapshot passed to the real manager's rebuild.
 	f.monitored = append([]string(nil), desired...)
 	return nil
 }

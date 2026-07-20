@@ -93,11 +93,12 @@ type Conn interface {
 	// hub calls it on registration and after each add/remove; it returns an
 	// error if the delta couldn't be enqueued (retried on the next call).
 	ReconcileMonitored(desired []string) error
-	// MonitorRejected handles a 734 (list full): drops the refused nicks,
-	// records the server's real capacity, and re-reconciles `desired` (skipping
-	// the just-rejected nicks so it can't loop). limit is the AUTHORITATIVE cap
-	// the numeric carries (0 => the manager infers it); gen is the event's
-	// connection generation, so a 734 from a superseded connection is ignored.
+	// MonitorRejected handles a 734 (list full): records the server's real
+	// capacity and authoritatively clears+rebuilds the MONITOR list. Repeated
+	// stale numerics at the same cap are ignored so delayed replies cannot drive
+	// an add/reject loop. limit is the AUTHORITATIVE cap the numeric carries
+	// (0 => the manager infers it); gen is the event's connection generation,
+	// so a 734 from a superseded connection is ignored.
 	MonitorRejected(nicks []string, limit int, gen uint64, desired []string) error
 }
 
@@ -336,25 +337,22 @@ func (h *Hub) handleControlNumeric(ctx context.Context, c Conn, ev irc.Event) bo
 		h.updatePresence(ctx, c, ev.Network, ev.Msg, false)
 		return true
 	case "734": // ERR_MONLISTFULL
-		// Format: <nick> <limit> <rejected,targets> :message. Record the
-		// AUTHORITATIVE <limit> and drop the rejected nicks, then IMMEDIATELY
-		// re-reconcile against the persisted desired list — under monMu, same as
-		// a mutation. 734 carries no request correlation, so a delayed rejection
-		// can race a remove/re-add of the same nick; the follow-up reconcile
-		// converges both cases: a nick still desired but dropped from the active
-		// set is re-added (a duplicate MONITOR + is a server no-op), and a truly
-		// over-limit nick stays out (clamped past the now-known limit). Without
-		// the re-reconcile a delayed 734 could leave the server monitoring a nick
-		// the user removed until the next reconnect.
+		// Format: <nick> <limit> <rejected,targets> :message. Under monMu (the
+		// same lock as mutations), pass the persisted desired list to the manager.
+		// A 734 has no request correlation, so the manager cannot safely delete
+		// only the named targets: a delayed rejection may predate a successful
+		// remove/re-add. It instead performs one atomic MONITOR C + cap-clamped
+		// rebuild, then ignores stale same-cap repeats so they cannot alternate
+		// additions forever.
 		if len(ev.Msg.Params) > 2 {
 			limit, _ := strconv.Atoi(ev.Msg.Params[1])
 			h.monMu.Lock()
 			if desired, lerr := h.store.Monitors(ctx, ev.Network); lerr == nil {
-				// One atomic, gen-checked call: drop the rejected nicks, record
-				// the authoritative limit, and re-reconcile (skipping them).
-				if rerr := c.MonitorRejected(strings.Split(ev.Msg.Params[2], ","), limit, ev.Gen, desired); rerr != nil {
-					log.Printf("irc[%s]: monitor re-reconcile after 734: %v", ev.Network, rerr)
-				}
+				// One atomic, gen-checked call: learn the authoritative limit
+					// and clear+rebuild if this connection has not recovered at it.
+					if rerr := c.MonitorRejected(strings.Split(ev.Msg.Params[2], ","), limit, ev.Gen, desired); rerr != nil {
+						log.Printf("irc[%s]: monitor rebuild after 734: %v", ev.Network, rerr)
+					}
 			} else {
 				log.Printf("irc[%s]: monitor 734 skipped (list read failed): %v", ev.Network, lerr)
 			}

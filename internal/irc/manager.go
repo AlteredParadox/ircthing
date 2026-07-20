@@ -147,12 +147,22 @@ type Manager struct {
 	// MONITORed on THIS connection (the server's own list). ReconcileMonitored
 	// diffs the desired list against it; the wire spelling is kept so a removal
 	// sends the exact form that was added. monLimit734 records a capacity a 734
-	// revealed (0 = only the ISUPPORT limit applies). Both reset per connection
-	// (the server clears its list on a new one). Guarded by monActiveMu:
-	// mutations arrive from the hub goroutine, the reset from the run loop.
-	monActiveMu sync.Mutex
-	monActive   map[string]string
-	monLimit734 int
+	// revealed (0 = only the ISUPPORT limit applies).
+	//
+	// A delayed 734 makes an incremental update ambiguous: the rejected nick may
+	// have been removed and successfully re-added since the server generated the
+	// numeric. monRebuildPending therefore forces the next reconcile to clear and
+	// rebuild the whole server list. After a successful rebuild,
+	// monRecovered734/monRecoveredCap suppress stale same-or-higher-cap 734s;
+	// only a genuinely tighter cap can trigger another rebuild. All fields reset
+	// per connection and are guarded by monActiveMu; mutations arrive from the
+	// hub goroutine, the reset from the run loop.
+	monActiveMu       sync.Mutex
+	monActive         map[string]string
+	monLimit734       int
+	monRebuildPending bool
+	monRecovered734   bool
+	monRecoveredCap   int
 	// monGen is the connection generation, bumped at the start of every
 	// connection (runOnce). emit stamps it onto each event so a delayed
 	// MONITOR 734 buffered from an old connection can be ignored rather than
@@ -466,14 +476,16 @@ func (m *Manager) ReconcileMonitored(desired []string) error {
 	}
 	m.monActiveMu.Lock()
 	defer m.monActiveMu.Unlock()
-	return m.reconcileLocked(desired, nil)
+	if m.monRebuildPending {
+		return m.completeMonitorRebuildLocked(desired)
+	}
+	return m.reconcileLocked(desired)
 }
 
-// reconcileLocked drives the server list toward desired, skipping any folded
-// nick in exclude (used by the 734 path to avoid immediately re-adding a
-// just-rejected nick, which would loop against a still-full server). Caller
-// holds monActiveMu.
-func (m *Manager) reconcileLocked(desired []string, exclude map[string]bool) error {
+// monitorTargetLimitLocked returns the effective limit used to construct a
+// desired server list, including the hard local ceiling. Caller holds
+// monActiveMu.
+func (m *Manager) monitorTargetLimitLocked() int {
 	// Clamp to the tighter of the server limit and a hard maximum. The hard
 	// cap defends against a server that advertises NO limit paired with a
 	// legacy oversized persisted list (predating the hub's add-time cap): it
@@ -483,6 +495,14 @@ func (m *Manager) reconcileLocked(desired []string, exclude map[string]bool) err
 	if limit <= 0 || limit > maxReconcileTargets {
 		limit = maxReconcileTargets
 	}
+	return limit
+}
+
+// monitorTargetsLocked validates, fold-deduplicates, and clamps desired to the
+// effective server limit. It returns both the folded membership set and wire
+// spellings in persisted order. Caller holds monActiveMu.
+func (m *Manager) monitorTargetsLocked(desired []string) (map[string]bool, []string) {
+	limit := m.monitorTargetLimitLocked()
 	targetSet := make(map[string]bool, len(desired))
 	var targetOrder []string // wire spellings, in desired order, clamped to limit
 	for _, n := range desired {
@@ -490,8 +510,8 @@ func (m *Manager) reconcileLocked(desired []string, exclude map[string]bool) err
 			continue
 		}
 		f := m.isup.Fold(n)
-		if targetSet[f] || exclude[f] {
-			continue // folded duplicate, or a just-rejected nick to skip this pass
+		if targetSet[f] {
+			continue // folded duplicate
 		}
 		if len(targetOrder) >= limit {
 			break
@@ -499,6 +519,13 @@ func (m *Manager) reconcileLocked(desired []string, exclude map[string]bool) err
 		targetSet[f] = true
 		targetOrder = append(targetOrder, n)
 	}
+	return targetSet, targetOrder
+}
+
+// reconcileLocked incrementally drives the server list toward desired. Caller
+// holds monActiveMu.
+func (m *Manager) reconcileLocked(desired []string) error {
+	targetSet, targetOrder := m.monitorTargetsLocked(desired)
 
 	// Removals: active nicks no longer in the (clamped) target.
 	var removeWire, removeFolded []string
@@ -540,6 +567,43 @@ func (m *Manager) reconcileLocked(desired []string, exclude map[string]bool) err
 	return nil
 }
 
+// rebuildMonitoredLocked authoritatively replaces the server's MONITOR list.
+// MONITOR C and every clamped addition are one atomic local enqueue, and the
+// local active set is replaced only after that enqueue succeeds. This is used
+// only to recover from an ambiguous 734; ordinary mutations remain incremental
+// and avoid presence flicker. Caller holds monActiveMu.
+func (m *Manager) rebuildMonitoredLocked(desired []string) error {
+	_, targetOrder := m.monitorTargetsLocked(desired)
+	msgs := []*ircv4.Message{newMsg("MONITOR", "C")}
+	for _, chunk := range chunkTargets(targetOrder, 10) {
+		msgs = append(msgs, newMsg("MONITOR", "+", strings.Join(chunk, ",")))
+	}
+	if err := m.sendAll(msgs); err != nil {
+		return err
+	}
+	next := make(map[string]string, len(targetOrder))
+	for _, n := range targetOrder {
+		next[m.isup.Fold(n)] = n
+	}
+	m.monActive = next
+	return nil
+}
+
+// completeMonitorRebuildLocked retries/finishes an authoritative 734 recovery.
+// A failed enqueue deliberately leaves the pending flag and local active set
+// untouched, so the next normal reconcile retries a clear+rebuild instead of
+// applying an incremental delta to ambiguous server state. Caller holds
+// monActiveMu.
+func (m *Manager) completeMonitorRebuildLocked(desired []string) error {
+	if err := m.rebuildMonitoredLocked(desired); err != nil {
+		return err
+	}
+	m.monRebuildPending = false
+	m.monRecovered734 = true
+	m.monRecoveredCap = m.monitorTargetLimitLocked()
+	return nil
+}
+
 // effectiveMonitorLimitLocked is the tighter of the ISUPPORT MONITOR limit and
 // any limit a 734 revealed on this connection (some servers enforce a cap they
 // don't advertise). Caller holds monActiveMu.
@@ -551,36 +615,53 @@ func (m *Manager) effectiveMonitorLimitLocked() int {
 	return lim
 }
 
-// MonitorRejected handles ERR_MONLISTFULL (734): it drops the refused nicks
-// from the active set, records the effective capacity, and re-reconciles the
-// desired list — atomically, under the same lock. It is a NO-OP when gen does
-// not match the current connection, so a 734 buffered from a superseded
-// connection cannot install its (stale) limit into the new one (#2). The
-// re-reconcile EXCLUDES the just-rejected nicks this pass (#1): re-adding a
-// nick the server just refused would loop +nick/734 when a stale entry the
-// client forgot still occupies a slot; the excluded nicks are retried on the
-// next mutation (which clears the exclusion) or the next reconnect.
+// MonitorRejected handles ERR_MONLISTFULL (734). A 734 is not correlated to a
+// particular MONITOR command, so deleting its rejected nicks from monActive is
+// unsafe: a delayed numeric may refer to an add that predates a successful
+// remove/re-add. Instead, the first 734 (or one revealing a tighter cap) forces
+// an atomic MONITOR C + clamped rebuild, establishing known server state.
+// Same-or-higher-cap repeats after that rebuild are stale under the protocol's
+// authoritative-cap and ordered-command guarantees, so they are ignored rather
+// than allowed to alternate rejected targets forever. A mismatched generation
+// is also a no-op.
 //
 // limit is the AUTHORITATIVE cap from the numeric; when it is 0 (unparseable)
-// we fall back to the count that remains after removing the rejected nicks.
+// we retain the existing fallback: the local active count less rejected nicks.
 func (m *Manager) MonitorRejected(nicks []string, limit int, gen uint64, desired []string) error {
 	m.monActiveMu.Lock()
 	defer m.monActiveMu.Unlock()
 	if gen != m.monGen.Load() {
 		return nil // a rejection from a superseded connection — ignore
 	}
-	exclude := make(map[string]bool, len(nicks))
-	for _, n := range nicks {
-		f := m.isup.Fold(n)
-		delete(m.monActive, f)
-		exclude[f] = true
+	// Once an authoritative rebuild succeeded, an unparseable repeat carries
+	// no evidence of a tighter cap. Ignore it rather than deriving a succession
+	// of ever-smaller limits from delayed rejected-nick lists.
+	if m.monRecovered734 && limit <= 0 {
+		return nil
 	}
-	if limit > 0 {
-		m.monLimit734 = limit
-	} else {
-		m.monLimit734 = len(m.monActive)
+	learned := limit
+	if learned <= 0 {
+		learned = len(m.monActive)
+		seen := make(map[string]bool, len(nicks))
+		for _, n := range nicks {
+			f := m.isup.Fold(n)
+			if _, active := m.monActive[f]; active && !seen[f] {
+				learned--
+				seen[f] = true
+			}
+		}
 	}
-	return m.reconcileLocked(desired, exclude)
+	// Capacity can only tighten within this connection. A delayed higher-cap
+	// numeric must not undo a lower cap already learned from a later command.
+	if learned > 0 && (m.monLimit734 == 0 || learned < m.monLimit734) {
+		m.monLimit734 = learned
+	}
+	effective := m.monitorTargetLimitLocked()
+	if m.monRecovered734 && effective >= m.monRecoveredCap {
+		return nil // stale/duplicate 734; rebuilding again could self-amplify
+	}
+	m.monRebuildPending = true
+	return m.completeMonitorRebuildLocked(desired)
 }
 
 // monitorAdvertised reports whether the server offers MONITOR at all
@@ -1142,6 +1223,9 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	m.monActiveMu.Lock()
 	m.monActive = make(map[string]string)
 	m.monLimit734 = 0
+	m.monRebuildPending = false
+	m.monRecovered734 = false
+	m.monRecoveredCap = 0
 	m.monActiveMu.Unlock()
 
 	addr, secure := m.effectiveAddr()
