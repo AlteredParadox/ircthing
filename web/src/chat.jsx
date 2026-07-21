@@ -23,6 +23,7 @@ import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
 import { WhoisCard } from "./whois.jsx";
 import { estimateMsgHeight } from "./vmath.js";
+import { readTimestamp } from "./readts.js";
 
 
 // MAX_BODY_NODES caps the DOM nodes ONE message may render across all passes
@@ -277,12 +278,10 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 	const completer = useMemo(() => new Completer(), [buf?.key]);
 	const list = msgs?.list || [];
 	const last = list[list.length - 1];
-	// The read marker must track the NEWEST message by server-time, not the
-	// last-ARRIVED one: live events append in arrival order (app.jsx), so a
-	// backdated relay/bridge line lands at the tail with an older time. Marking
-	// list[last].time there would rewind the marker and re-badge genuinely-newer
-	// messages as unread. Max time is monotonic (budget trims drop the oldest).
-	const readTS = useMemo(() => list.reduce((mx, m) => Math.max(mx, m.time), 0), [list]);
+	// Max server-stamped time, excluding browser-clock-stamped local info
+	// rows — see readTimestamp for why both matter. Monotonic under budget
+	// trims (they drop the oldest).
+	const readTS = useMemo(() => readTimestamp(list), [list]);
 	// Hide ignored senders from view (they are still stored, so
 	// un-ignoring reveals them live). Zero cost when nobody is ignored.
 	const ignoreKey = (ignoredNicks || []).join("\n");

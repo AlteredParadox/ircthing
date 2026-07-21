@@ -902,7 +902,11 @@ export function App() {
 				// the server buffer's history loads — unpadded, "si10" sorts
 				// before "si2", scrambling the lines.
 				id: `si${String(++infoSeq).padStart(9, "0")}`, network: d.network, buffer: SERVER_BUFFER,
-				time: Date.now(), sender: "", command: "INFO", raw: d.text,
+				// local: browser-clock time, display/ordering only — a flagged
+				// event must never advance the read marker (chat.jsx readTS),
+				// or clock skew would set a future marker that hides unread
+				// badges for real messages on every device.
+				time: Date.now(), sender: "", command: "INFO", raw: d.text, local: true,
 			};
 			setMsgs((m) => appendInfoLine(m, key, ev, true));
 		});
@@ -921,7 +925,9 @@ export function App() {
 				// Zero-padded like the server_info ids so same-ms cards keep
 				// insertion order through mergeById's string tie-break.
 				id: `wh${String(++whoisSeq).padStart(9, "0")}`, network: d.network, buffer: d.nick,
-				time: Date.now(), sender: "", command: "WHOIS", raw: "", whois: d,
+				// local: browser-clock stamp, excluded from read-marker
+				// computation (see the server_info handler above).
+				time: Date.now(), sender: "", command: "WHOIS", raw: "", whois: d, local: true,
 			};
 			setMsgs((m) => appendInfoLine(m, key, ev));
 			if (activeKeyRef.current !== key) select(d.network, d.nick);
