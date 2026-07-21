@@ -12,10 +12,9 @@ database it creates. The binary is ~16 MB; the web bundle inside it is
 ~53 KB gzipped; a working setup with 5 networks and 10k messages of hot
 scrollback runs in ~32 MB of RSS.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/main_dark.png">
-  <img src="docs/screenshots/main_light.png" alt="ircthing: channel view with an image thumbnail and an inline audio player, member list on the right">
-</picture>
+<img src="docs/screenshots/main_dark.png" alt="ircthing in dark mode: channel view with an image thumbnail and an inline audio player, member list on the right">
+
+<img src="docs/screenshots/main_light.png" alt="The same channel view in light mode">
 
 ## Features
 
