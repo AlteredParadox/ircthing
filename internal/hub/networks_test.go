@@ -490,7 +490,12 @@ func TestCloseBufferResurrectionGuard(t *testing.T) {
 	s := h.NewSession()
 	defer s.Close()
 	s.Handle(ctxb, request(t, "close_buffer", 1, BufferRef{Network: "libera", Buffer: "#go"}))
-	recv(t, s, "ok", "buffer_closed", "event") // a racing seed event may arrive
+	recv(t, s, "ok", "event") // a racing seed event may arrive
+	// A bare close (no purge field) resolves to the destructive default and
+	// the broadcast says so: purge=true, always present.
+	if closed := decode[BufferRef](t, recv(t, s, "buffer_closed", "event")); closed.Purge == nil || !*closed.Purge {
+		t.Fatalf("bare close_buffer broadcast = %+v, want resolved purge=true", closed)
+	}
 	conn.ch <- ev(":bob!u@h PRIVMSG #GO :straggler")
 
 	// Give the event loop time to (not) recreate it.
@@ -1282,10 +1287,13 @@ func archiveTestSetup(t *testing.T) (*Hub, *fakeConn, *Session, func(string, ...
 	s.Handle(ctxb, request(t, "close_buffer", 1,
 		BufferRef{Network: "libera", Buffer: "#FOO", Purge: boolPtr(false)}))
 	env := recv(t, s, "ok", "event") // a racing seed event may arrive
-	if ref := decode[BufferRef](t, env); ref.Buffer != "#foo" || ref.Network != "libera" {
-		t.Fatalf("ok payload = %+v, want canonical libera/#foo", ref)
+	if ref := decode[BufferRef](t, env); ref.Buffer != "#foo" || ref.Network != "libera" ||
+		ref.Purge == nil || *ref.Purge {
+		t.Fatalf("ok payload = %+v, want canonical libera/#foo with resolved purge=false", ref)
 	}
-	recv(t, s, "buffer_closed", "event")
+	if closed := decode[BufferRef](t, recv(t, s, "buffer_closed", "event")); closed.Purge == nil || *closed.Purge {
+		t.Fatalf("buffer_closed payload = %+v, want resolved purge=false (archive)", closed)
+	}
 	return h, conn, s, ev
 }
 
@@ -1333,8 +1341,12 @@ func TestCloseBufferPurgeTrueStillDeletes(t *testing.T) {
 	defer s.Close()
 	s.Handle(ctxb, request(t, "close_buffer", 1,
 		BufferRef{Network: "libera", Buffer: "#foo", Purge: boolPtr(true)}))
-	recv(t, s, "ok", "event")
-	recv(t, s, "buffer_closed", "event")
+	if ref := decode[BufferRef](t, recv(t, s, "ok", "event")); ref.Purge == nil || !*ref.Purge {
+		t.Fatalf("ok payload = %+v, want resolved purge=true", ref)
+	}
+	if closed := decode[BufferRef](t, recv(t, s, "buffer_closed", "event")); closed.Purge == nil || !*closed.Purge {
+		t.Fatalf("buffer_closed payload = %+v, want resolved purge=true (destructive)", closed)
+	}
 	if msgs, _ := h.store.Latest(ctxb, "libera", "#foo", 5); len(msgs) != 0 {
 		t.Fatalf("purge:true left %d history rows", len(msgs))
 	}
@@ -1371,6 +1383,52 @@ func TestArchivedForeignMembershipStaysHidden(t *testing.T) {
 	expectNoEvent(t, s)
 	if bufs, _ := h.store.Buffers(ctxb); len(bufs) != 0 {
 		t.Fatalf("foreign membership resurfaced the archived buffer: %+v", bufs)
+	}
+}
+
+// A KICK touching the channel is presence traffic like PART/QUIT (it
+// renders as a system row and never bumps unread) and must not resurface
+// an archived buffer either.
+func TestArchivedKickStaysHidden(t *testing.T) {
+	h, conn, s, ev := archiveTestSetup(t)
+	ctxb := context.Background()
+
+	conn.ch <- ev(":op!u@h KICK #foo bob :bye")
+	time.Sleep(200 * time.Millisecond)
+	expectNoEvent(t, s)
+	if bufs, _ := h.store.Buffers(ctxb); len(bufs) != 0 {
+		t.Fatalf("KICK resurfaced the archived buffer: %+v", bufs)
+	}
+}
+
+// unarchivePolicy pins the resurface rules directly: live conversation
+// resurfaces an archived buffer; membership fan-out (including KICK)
+// never does; REPLAYED content never does (a chathistory page in flight
+// when the user archives is backfill, not intent); our own live JOIN is a
+// deliberate rejoin, a replayed one is not.
+func TestUnarchivePolicy(t *testing.T) {
+	cases := []struct {
+		command     string
+		own, replay bool
+		want        bool
+	}{
+		{"PRIVMSG", false, false, true}, // live conversation resurfaces
+		{"PRIVMSG", false, true, false}, // replayed content is backfill
+		{"NOTICE", false, true, false},
+		{"TOPIC", false, false, true},
+		{"KICK", false, false, false}, // live KICK is presence traffic
+		{"KICK", false, true, false},
+		{"PART", false, false, false},
+		{"QUIT", false, false, false},
+		{"JOIN", true, false, true}, // own live JOIN = deliberate rejoin
+		{"JOIN", true, true, false}, // replayed self-JOIN = backfill
+		{"JOIN", false, false, false},
+	}
+	for _, c := range cases {
+		if got := unarchivePolicy(c.command, c.own, c.replay); got != c.want {
+			t.Errorf("unarchivePolicy(%q, own=%v, replay=%v) = %v, want %v",
+				c.command, c.own, c.replay, got, c.want)
+		}
 	}
 }
 

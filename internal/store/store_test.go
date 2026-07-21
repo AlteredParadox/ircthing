@@ -928,3 +928,37 @@ func TestArchivedMigrationAppliesToExistingDB(t *testing.T) {
 		t.Fatalf("Buffers = %v, %v; want the pre-existing buffer visible", infos, err)
 	}
 }
+
+// Archived buffers (close_buffer purge:false) do not erode the per-network
+// admission quota: bufferID counts ACTIVE rows only, so a user with many
+// archived buffers still receives messages for new targets. The
+// server-forgeable population stays bounded regardless because server
+// traffic can never archive a buffer — only an authenticated close_buffer
+// does. (Refusal at the cap with ACTIVE rows is pinned by
+// TestBufferCountCap.)
+func TestBufferCapIgnoresArchived(t *testing.T) {
+	s, _ := openTest(t, 10)
+	msg := Message{Time: time.Now(), Sender: "x", Command: "PRIVMSG", Raw: ":x PRIVMSG t :hi"}
+	// Fill to the cap, archiving every buffer as it is created.
+	for i := 0; i < maxBuffersPerNetwork; i++ {
+		name := fmt.Sprintf("#c%d", i)
+		if _, err := s.Append(ctx, "net", name, msg); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ArchiveBufferFolded(ctx, "net", name, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A brand-new buffer is still admitted: only active rows count.
+	got, err := s.Append(ctx, "net", "#fresh", msg)
+	if err != nil || got.ID == 0 {
+		t.Fatalf("Append with cap-many archived buffers = %+v, %v; want stored", got, err)
+	}
+	bufs, err := s.Buffers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bufs) != 1 || bufs[0].Target != "#fresh" {
+		t.Fatalf("active buffers = %+v, want just #fresh", bufs)
+	}
+}

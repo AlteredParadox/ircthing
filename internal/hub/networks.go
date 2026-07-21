@@ -657,7 +657,10 @@ func (s *Session) handleCloseBuffer(ctx context.Context, env Envelope) {
 	// purge defaults to true: an older client's bare close_buffer keeps its
 	// destructive delete semantics unchanged.
 	purge := d.Purge == nil || *d.Purge
-	d.Purge = nil // ok/buffer_closed payloads keep their pre-purge wire shape
+	// ok/buffer_closed payloads carry the RESOLVED boolean so every device
+	// can tell a destructive purge from an archive. (&purge always
+	// serializes — omitempty omits only a nil pointer, not *false.)
+	d.Purge = &purge
 	// Resolve/mutate (and for purge, install the close tombstone) under the
 	// store lock, the same ordering used by guarded appends. No append can
 	// land in a gap between those operations.

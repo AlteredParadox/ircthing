@@ -1019,14 +1019,23 @@ func (s *Store) bufferID(ctx context.Context, network, target string, create boo
 		// traffic: server-controlled target/sender names would otherwise
 		// create buffers (and rings, and message rows) without limit —
 		// the last unbounded server-fed structure. A legitimate user's
-		// channels + queries stay far below this.
+		// channels + queries stay far below this. Only ACTIVE rows count
+		// toward the cap: archived=1 is set solely by an explicit
+		// authenticated user action (close_buffer purge:false), never by
+		// server traffic, so the server-forgeable population stays bounded
+		// at the cap while a user's archived buffers do not erode it.
 		var count int
 		if err := s.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM buffers WHERE network_id = ?`, netID).Scan(&count); err != nil {
+			`SELECT COUNT(*) FROM buffers WHERE network_id = ? AND archived = 0`, netID).Scan(&count); err != nil {
 			return 0, err
 		}
 		if count >= maxBuffersPerNetwork {
-			return 0, nil // at cap: drop rather than create
+			// At cap: drop rather than create. Logged because callers report
+			// ID 0 as a benign msgid dedup — without this line quota
+			// exhaustion would be silent.
+			log.Printf("store[%s]: buffer cap (%d) reached, refusing new buffer %q (message dropped)",
+				network, maxBuffersPerNetwork, target)
+			return 0, nil
 		}
 		res, err := s.db.ExecContext(ctx,
 			`INSERT INTO buffers (network_id, name) VALUES (?, ?)`, netID, target)

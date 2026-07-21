@@ -741,7 +741,9 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 		return nil
 	}
 	if stored.ID == 0 {
-		return nil // duplicate msgid: already stored and announced
+		// Duplicate msgid (already stored and announced) or an at-cap
+		// buffer-quota refusal (logged by the store).
+		return nil
 	}
 	if stillArchived {
 		// Persisted into a buffer that stays archived: publish nothing — an
@@ -768,22 +770,26 @@ func (h *Hub) queryOpenFn(ctx context.Context, network string, c Conn) func(stri
 }
 
 // unarchivePolicy decides whether persisting this event resurfaces an
-// archived (close_buffer purge:false) buffer: real conversation
+// archived (close_buffer purge:false) buffer: real LIVE conversation
 // (PRIVMSG/NOTICE/TOPIC/...) resurfaces a hidden buffer so its history
 // returns on new activity; membership fan-out must not — the PART echo
 // that races a purge:false close lands after the archive and would
 // otherwise resurrect the buffer (the mirror of the deleted path's close
-// tombstone). Our own LIVE JOIN is a deliberate rejoin and does resurface
-// it — the same intent rule as persistEvent's unmarkClosed; a REPLAYED
-// self-JOIN is backfill, not intent.
+// tombstone). KICK is presence traffic like the rest (it renders as a
+// system row and never bumps unread — see Buffers' classification) and
+// stays hidden too. REPLAYED content never unarchives: a chathistory page
+// still in flight when the user archives is backfill, not new
+// conversation. Our own LIVE JOIN is a deliberate rejoin and does
+// resurface it — the same intent rule as persistEvent's unmarkClosed; a
+// REPLAYED self-JOIN is backfill, not intent.
 func unarchivePolicy(command string, own, replay bool) bool {
 	switch command {
 	case "JOIN":
 		return own && !replay
-	case "PART", "QUIT", "NICK", "MODE":
+	case "PART", "QUIT", "NICK", "MODE", "KICK":
 		return false
 	}
-	return true
+	return !replay
 }
 
 // publishPersisted announces a freshly stored, non-archived event: live

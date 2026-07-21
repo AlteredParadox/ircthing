@@ -83,10 +83,10 @@ func appliedVersions(db *sql.DB) (map[int64]bool, int64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var v int64
 		if err := rows.Scan(&v); err != nil {
-			rows.Close()
 			return nil, 0, err
 		}
 		applied[v] = true
@@ -94,7 +94,10 @@ func appliedVersions(db *sql.DB) (map[int64]bool, int64, error) {
 			maxApplied = v
 		}
 	}
-	return applied, maxApplied, rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return applied, maxApplied, nil
 }
 
 // knownMigrations lists the embedded migration files in apply order and
