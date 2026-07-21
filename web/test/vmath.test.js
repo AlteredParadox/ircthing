@@ -27,6 +27,7 @@ import {
 	prependedCount,
 	restoreViewportAnchor,
 	scrollSettleStep,
+	touchGestureEnds,
 } from "../src/vmath.js";
 
 const items = (n, from = 0) =>
@@ -364,6 +365,153 @@ test("scrollSettleStep: wheel-then-drag cannot re-arm into a held thumb", () => 
 	// the single settle window after the last wheel event (a motionless grab
 	// always had that hole). Everything after it must wait for the release.
 	eq(r.fires, [3, 6], "after the wheel window, only the release scrollend fires");
+});
+
+test("scrollSettleStep: touch transitions", () => {
+	// [hasScrollEnd, event, pending-in, touch, want]
+	const cases = [
+		// touchstart clears any armed countdown but keeps a latched pending.
+		[false, "touchstart", false, true, { pending: false, timer: "clear", fire: false }],
+		[false, "touchstart", true, true, { pending: true, timer: "clear", fire: false }],
+		[true, "touchstart", true, true, { pending: true, timer: "clear", fire: false }],
+		// A finger on the glass never arms the quiet countdown, even on legacy
+		// engines: a resting finger is quiet but the gesture is still alive.
+		[false, "scroll", false, true, { pending: true, timer: "keep", fire: false }],
+		[false, "scroll", true, true, { pending: true, timer: "keep", fire: false }],
+		[true, "scroll", true, true, { pending: true, timer: "keep", fire: false }],
+		// A timer/scrollend arriving mid-touch defers: latch pending, no fire.
+		[false, "timer", true, true, { pending: true, timer: "clear", fire: false }],
+		[true, "timer", true, true, { pending: true, timer: "clear", fire: false }],
+		[true, "scrollend", true, true, { pending: true, timer: "keep", fire: false }],
+		// Finger lift: legacy engines arm the quiet window (momentum scroll
+		// events re-arm it, so the fire lands after momentum stops); scrollend
+		// engines wait for their authoritative scrollend instead.
+		[false, "touchend", true, false, { pending: true, timer: "arm", fire: false }],
+		[false, "touchend", false, false, { pending: false, timer: "arm", fire: false }],
+		[true, "touchend", true, false, { pending: true, timer: "keep", fire: false }],
+		[true, "touchend", false, false, { pending: false, timer: "keep", fire: false }],
+	];
+	for (const [hse, event, pending, touch, want] of cases) {
+		eq(scrollSettleStep(hse, pending, event, touch), want,
+			`${event} hse=${hse} pending=${pending} touch=${touch}`);
+	}
+});
+
+test("touchGestureEnds", () => {
+	// [hasScrollEnd, event, touchActive, touchScrolled, want]
+	const cases = [
+		// Nothing ends a gesture while a finger is still down.
+		[false, "timer", true, true, false],
+		[true, "scrollend", true, true, false],
+		[false, "touchend", true, false, false], // a finger remains (multi-touch)
+		// A tap (no scrolling) ends immediately: no settle event will follow.
+		[false, "touchend", false, false, true],
+		[true, "touchend", false, false, true],
+		// A pan/fling waits for the engine's settle signal.
+		[false, "touchend", false, true, false],
+		[true, "touchend", false, true, false],
+		[false, "timer", false, true, true], // legacy quiet: momentum stopped
+		[true, "timer", false, true, false], // wheel timer never ends a touch gesture
+		[true, "scrollend", false, true, true],
+		[false, "scroll", false, true, false],
+		[false, "cancel", false, true, true],
+		[true, "cancel", false, false, true],
+	];
+	for (const [hse, event, active, scrolled, want] of cases) {
+		is(touchGestureEnds(hse, event, active, scrolled), want,
+			`${event} hse=${hse} active=${active} scrolled=${scrolled}`);
+	}
+});
+
+// runTouchSettle mirrors the component's touch wiring around the pure
+// machine: touchActive from touchstart/touchend, touchScrolled from scroll
+// events while a finger is down, the touchGesture latch cleared by
+// touchGestureEnds, and the timer-armed flag from the step results.
+function runTouchSettle(hasScrollEnd, events) {
+	let pending = false;
+	let armed = false;
+	let touch = false;
+	let gesture = false;
+	let scrolled = false;
+	const fires = [];
+	const armedAt = [];
+	const gestureAt = [];
+	events.forEach((ev, i) => {
+		if (ev === "timer") is(armed, true, `event ${i}: timer fired while unarmed`);
+		if (ev === "touchstart") {
+			if (!touch) scrolled = false;
+			touch = true;
+			gesture = true;
+		}
+		if (ev === "touchend") touch = false;
+		if (ev === "scroll" && touch) scrolled = true;
+		const r = scrollSettleStep(hasScrollEnd, pending, ev, touch);
+		pending = r.pending;
+		if (r.timer === "arm") armed = true;
+		else if (r.timer === "clear") armed = false;
+		if (r.fire) fires.push(i);
+		if (gesture && touchGestureEnds(hasScrollEnd, ev, touch, scrolled)) gesture = false;
+		armedAt.push(armed);
+		gestureAt.push(gesture);
+	});
+	return { pending, armed, fires, armedAt, gestureAt };
+}
+
+test("touch settle: a pan with a mid-drag rest never fires until lift (iOS)", () => {
+	// Legacy engine (iOS Safari has no scrollend). The finger pauses between
+	// the scroll events; since no timer is ever armed while it is down, the
+	// old quiet-window fallback cannot fire a load into the live gesture.
+	const r = runTouchSettle(false, ["touchstart", "scroll", "scroll", "touchend", "timer"]);
+	eq(r.armedAt.slice(0, 3), [false, false, false], "no arm while the finger is down");
+	eq(r.fires, [4], "the near-top check fires only after lift + quiet");
+	eq(r.gestureAt, [true, true, true, true, false], "gesture latch holds until the quiet timer");
+});
+
+test("touch settle: momentum after lift fires once the scroll goes quiet", () => {
+	const r = runTouchSettle(false,
+		["touchstart", "scroll", "touchend", "scroll", "scroll", "timer"]);
+	eq(r.fires, [5], "momentum scroll events defer the fire; quiet fires it");
+	eq(r.gestureAt.at(-2), true, "gesture spans the momentum phase");
+	eq(r.gestureAt.at(-1), false, "quiet ends the gesture");
+	is(r.pending, false);
+});
+
+test("touch settle: repeated swipes keep suppression latched", () => {
+	// Grab mid-momentum (touchstart during the fling), swipe again: the
+	// armed countdown is cleared, the gesture latch never drops, and exactly
+	// one fire lands at the final quiet.
+	const events = ["touchstart", "scroll", "touchend", "scroll",
+		"touchstart", "scroll", "touchend", "scroll", "timer"];
+	const r = runTouchSettle(false, events);
+	is(r.armedAt[4], false, "the second touchstart clears the momentum countdown");
+	eq(r.fires, [8], "one fire, at the final settle");
+	eq(r.gestureAt.slice(0, 8), Array(8).fill(true), "latch holds across swipes");
+	is(r.gestureAt[8], false);
+});
+
+test("touch settle: a tap ends the gesture immediately and fires nothing", () => {
+	const r = runTouchSettle(false, ["touchstart", "touchend", "timer"]);
+	eq(r.fires, [], "nothing pending, nothing fires");
+	eq(r.gestureAt, [true, false, false], "no settle event needed to end a tap");
+});
+
+test("touch settle: tap-to-stop momentum fires the latched check after the stop", () => {
+	// Flick, then a touchdown stops the momentum and lifts without moving:
+	// the gesture ends at that touchend, and the latched near-top check
+	// fires via the touchend-armed quiet timer.
+	const events = ["touchstart", "scroll", "touchend", "scroll",
+		"touchstart", "touchend", "timer"];
+	const r = runTouchSettle(false, events);
+	eq(r.gestureAt[5], false, "the stopping tap ends the gesture at its touchend");
+	eq(r.fires, [6], "the latched pending check still fires after the stop");
+});
+
+test("touch settle: scrollend engines defer to scrollend, never a touch timer", () => {
+	const r = runTouchSettle(true, ["touchstart", "scroll", "touchend", "scroll", "scrollend"]);
+	eq(r.armedAt, [false, false, false, false, false],
+		"touch never arms a timer on scrollend engines");
+	eq(r.fires, [4], "the authoritative scrollend fires the check");
+	eq(r.gestureAt.at(-1), false, "and ends the gesture");
 });
 
 test("scrollSettleStep: cancel clears a pending gesture", () => {

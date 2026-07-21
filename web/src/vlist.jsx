@@ -25,6 +25,7 @@ import {
 	prependedCount,
 	restoreViewportAnchor,
 	scrollSettleStep,
+	touchGestureEnds,
 } from "./vmath.js";
 
 const SCROLL_SETTLE_MS = 160;
@@ -32,8 +33,14 @@ const SCROLL_SETTLE_MS = 160;
 // writeScroll is the only path for code-owned scroll changes. Remembering the
 // browser-clamped result lets handleScroll distinguish those events from a
 // Firefox thumb/wheel movement without a timeout that could swallow real input.
+// A write whose clamped target is within 1px of the current position skips the
+// DOM assignment: iOS WebKit cancels an active touch pan/momentum on ANY
+// scrollTop write, even one that does not change the value. Writes that do
+// move (prepend compensation, tail restore) stay exact.
 function writeScroll(sc, position, top) {
-	sc.scrollTop = top;
+	const maxTop = Math.max(0, sc.scrollHeight - sc.clientHeight);
+	const target = Math.min(Math.max(0, top), maxTop);
+	if (Math.abs(sc.scrollTop - target) >= 1) sc.scrollTop = top;
 	const actual = sc.scrollTop;
 	position.current.internalTop = actual;
 	position.current.knownTop = actual;
@@ -143,6 +150,18 @@ export function VirtualList({
 	const tailNeedsRestore = useRef(true);
 	const onPinnedRef = useRef(onPinned);
 	onPinnedRef.current = onPinned;
+	// Touch gesture state. touchActive mirrors "a finger is on the glass";
+	// touchGesture latches from touchstart until the gesture INCLUDING its
+	// momentum phase settles (touchGestureEnds in vmath.js decides when).
+	// While latched, every code-owned scrollTop write is deferred, because on
+	// iOS WebKit any programmatic write cancels the pan/momentum — a live
+	// append's tail pin, a row measurement's compensation, or a near-top
+	// prepend landing mid-gesture made the list stop dead under the finger.
+	const touchActive = useRef(false);
+	const touchScrolled = useRef(false); // any scroll event while a finger was down
+	const touchGesture = useRef(false);
+	const deferredMeasure = useRef(new Map()); // id -> px, applied at gesture settle
+	const lastWindow = useRef(null); // { start, end } rendered by the last commit
 	const el = scroller.current;
 	const origin = el ? contentOrigin(el, headerEl.current) : 0;
 	const actualViewTop = el ? Math.max(0, el.scrollTop - origin) : 0;
@@ -234,6 +253,7 @@ export function VirtualList({
 
 	const topPad = geo.offsetOf(start);
 	const bottomPad = geo.total() - geo.offsetOf(end);
+	lastWindow.current = { start, end };
 
 	// One ResizeObserver for every row: correct heights, keep the
 	// viewport still, then re-render with the fixed geometry.
@@ -242,6 +262,18 @@ export function VirtualList({
 			new ResizeObserver((entries) => {
 				const sc = scroller.current;
 				if (!sc) return;
+				// Mid touch gesture, applying a measurement means either writing
+				// scrollTop (cancels the iOS pan/momentum) or letting the spacers
+				// shift the content under the finger. Queue the heights instead;
+				// the gesture-settle path applies them with one compensation
+				// write. Until then windowing keeps using the estimates the
+				// current spacers were built from, so nothing on screen moves.
+				if (touchGesture.current) {
+					for (const b of classifyEntries(entries, geo, 0, 0)) {
+						deferredMeasure.current.set(b.id, b.h);
+					}
+					return;
+				}
 				// Two passes so the offset table is rebuilt once, not per
 				// entry: classify rows against pre-measure geometry, then
 				// apply all measurements.
@@ -302,7 +334,10 @@ export function VirtualList({
 			}
 			if (pinned.current) {
 				tailNeedsRestore.current = true;
-				if (canRestoreTail(
+				// Mobile browser chrome collapses/expands DURING a touch scroll;
+				// the restore write would cancel the gesture. The latch above
+				// keeps the intent for the gesture-settle path.
+				if (!touchGesture.current && canRestoreTail(
 					sc, position, pinned, tailNeedsRestore, onPinnedRef.current,
 				)) writeScroll(sc, position, sc.scrollHeight);
 			}
@@ -358,6 +393,9 @@ export function VirtualList({
 	// of drag-produced events can push a fire into a held drag. The transitions
 	// live in scrollSettleStep (vmath.js) with the full state enumeration;
 	// engines without scrollend keep the legacy quiet-period fallback there.
+	// Touch gestures get the same deferral: while a finger is down (or its
+	// momentum has not settled) no load may fire, because the prepend's
+	// scrollTop compensation would cancel the gesture on iOS WebKit.
 	const onNearTopRef = useRef(onNearTop);
 	onNearTopRef.current = onNearTop;
 	const nearTopPxRef = useRef(nearTopPx);
@@ -367,7 +405,8 @@ export function VirtualList({
 	const userScrollPending = useRef(false);
 
 	function applySettle(event) {
-		const r = scrollSettleStep(nativeScrollEnd.current, userScrollPending.current, event);
+		const touch = touchActive.current;
+		const r = scrollSettleStep(nativeScrollEnd.current, userScrollPending.current, event, touch);
 		userScrollPending.current = r.pending;
 		if (r.timer === "arm") {
 			if (settleTimer.current !== null) clearTimeout(settleTimer.current);
@@ -379,11 +418,62 @@ export function VirtualList({
 			clearTimeout(settleTimer.current);
 			settleTimer.current = null;
 		}
+		// End-of-gesture work runs before the near-top check so the deferred
+		// measurements and tail restore settle the geometry first.
+		if (touchGesture.current &&
+			touchGestureEnds(nativeScrollEnd.current, event, touch, touchScrolled.current)) {
+			settleTouchGesture();
+		}
 		if (r.fire) {
 			const sc = scroller.current;
 			if (sc && !pinned.current && sc.scrollTop < nearTopPxRef.current) {
 				onNearTopRef.current?.();
 			}
+		}
+	}
+
+	// applyDeferredMeasurements replays row heights queued while a touch
+	// gesture owned the viewport: same two-pass shape as the live
+	// ResizeObserver path, classified against the now-settled scroll position.
+	function applyDeferredMeasurements(sc) {
+		const q = deferredMeasure.current;
+		if (q.size === 0) return;
+		const origin = contentOrigin(sc, headerEl.current);
+		const batch = [];
+		for (const [id, h] of q) {
+			const i = geo.indexOf(id);
+			if (i === -1) continue; // trimmed away meanwhile
+			batch.push({ id, h, above: geo.offsetOf(i + 1) + origin <= sc.scrollTop });
+		}
+		q.clear();
+		let above = 0;
+		let changed = false;
+		for (const b of batch) {
+			const d = geo.measure(b.id, b.h);
+			if (d !== 0) {
+				changed = true;
+				if (b.above) above += d;
+			}
+		}
+		if (!changed) return;
+		if (pinned.current) tailNeedsRestore.current = true;
+		else if (above !== 0) writeScroll(sc, position, sc.scrollTop + above);
+		bump();
+	}
+
+	// settleTouchGesture releases the write latch once no pan/momentum can be
+	// canceled, then lands everything deferred during the gesture.
+	function settleTouchGesture() {
+		touchGesture.current = false;
+		const sc = scroller.current;
+		if (!sc) return;
+		applyDeferredMeasurements(sc);
+		if (pinned.current && tailNeedsRestore.current) {
+			if (canRestoreTail(
+				sc, position, pinned, tailNeedsRestore, onPinnedRef.current,
+			)) writeScroll(sc, position, sc.scrollHeight);
+			tailNeedsRestore.current = false;
+			bump();
 		}
 	}
 
@@ -395,8 +485,32 @@ export function VirtualList({
 		if (nativeScrollEnd.current) {
 			sc.addEventListener("scrollend", onScrollEnd);
 		}
+		// All of these are passive: none ever calls preventDefault, and a
+		// non-passive wheel/touch listener on the scroller adds scroll latency
+		// (Preact's JSX onWheel would register non-passive). The touch pair
+		// maintains the gesture latch; iOS has no scrollend, so touchend hands
+		// the settle machine the job of detecting the end of momentum.
+		const onTouchStart = () => {
+			if (!touchActive.current) touchScrolled.current = false;
+			touchActive.current = true;
+			touchGesture.current = true;
+			applySettle("touchstart");
+		};
+		const onTouchEnd = (e) => {
+			if (e.touches.length > 0 || !touchActive.current) return;
+			touchActive.current = false;
+			applySettle("touchend");
+		};
+		sc.addEventListener("wheel", handleWheel, { passive: true });
+		sc.addEventListener("touchstart", onTouchStart, { passive: true });
+		sc.addEventListener("touchend", onTouchEnd, { passive: true });
+		sc.addEventListener("touchcancel", onTouchEnd, { passive: true });
 		return () => {
 			sc.removeEventListener("scrollend", onScrollEnd);
+			sc.removeEventListener("wheel", handleWheel);
+			sc.removeEventListener("touchstart", onTouchStart);
+			sc.removeEventListener("touchend", onTouchEnd);
+			sc.removeEventListener("touchcancel", onTouchEnd);
 			if (settleTimer.current !== null) clearTimeout(settleTimer.current);
 		};
 	}, []);
@@ -411,25 +525,59 @@ export function VirtualList({
 			Math.abs(top - position.current.internalTop) <= 1;
 		position.current.internalTop = null;
 
+		// Wheel-parity for touch (handleWheel's deltaY<0 branch): an untagged
+		// finger-down movement toward older content unpins immediately. The
+		// threshold alone cannot decide this — a live append landing between
+		// the physical movement and its scroll event grows the gap, making a
+		// 5px pan look far from the bottom (wrong unpin reason) or, inside
+		// the threshold, re-pinning against the finger.
+		const touchUp = touchActive.current && !internal &&
+			top < position.current.knownTop - 0.5 && maxTop - top > 1;
 		const wasPinned = pinned.current;
-		const nowPinned = pinnedAfterScroll(wasPinned, internal, top, maxTop);
+		const nowPinned = touchUp ? false : pinnedAfterScroll(wasPinned, internal, top, maxTop);
+		if (touchUp) tailNeedsRestore.current = false;
 		if (nowPinned !== wasPinned) {
 			pinned.current = nowPinned;
 			onPinnedRef.current?.(nowPinned);
 		}
 		// A row grew underneath a tail-following viewport. Preserve the intent
-		// immediately instead of treating the temporary gap as a user unpin.
+		// immediately instead of treating the temporary gap as a user unpin —
+		// but never by writing into a live touch gesture; latch it instead.
 		if (nowPinned && maxTop - top >= 40) {
-			writeScroll(sc, position, sc.scrollHeight);
+			if (touchGesture.current) tailNeedsRestore.current = true;
+			else writeScroll(sc, position, sc.scrollHeight);
 		}
 
-		if (!internal) applySettle("scroll");
+		if (!internal && top !== position.current.knownTop) {
+			// Untagged AND moved: user/browser scrolling. A burst of code-owned
+			// writes can queue several scroll events; the first consumes the
+			// internal tag and the coalesced stragglers all read the same final
+			// scrollTop — an unchanged position is not user movement and must
+			// not latch a pending near-top check or arm the legacy quiet timer.
+			if (touchActive.current) touchScrolled.current = true;
+			applySettle("scroll");
+		}
 		position.current.knownTop = sc.scrollTop;
 		// One re-render per frame, however many scroll events arrive.
 		if (scrollScheduled.current) return;
 		scrollScheduled.current = true;
 		requestAnimationFrame(() => {
 			scrollScheduled.current = false;
+			// A full subtree re-render per scroll frame is what phones cannot
+			// afford. Two binary searches decide whether this frame's row
+			// window differs from the one already rendered; identical windows
+			// (most frames, and every frame while pinned) skip the render.
+			const cur = scroller.current;
+			const lw = lastWindow.current;
+			if (cur && lw && !pendingFocus.current && pendingPrepend.current === 0 &&
+				!pendingLayoutAnchor.current) {
+				const vt = Math.max(0, cur.scrollTop - contentOrigin(cur, headerEl.current));
+				const w = computeWindow(geo, geo.items.length, {
+					viewTop: vt, viewH: cur.clientHeight, overscan,
+					pinned: pinned.current, focusing: false, focusIdx: -1, prepended: 0,
+				});
+				if (w.start === lw.start && w.end === lw.end) return;
+			}
 			bump();
 		});
 	}
@@ -533,6 +681,10 @@ export function VirtualList({
 	// thumb movement and its queued scroll event and must not erase it.
 	function applyTailCommit(sc) {
 		if (pinned.current && tailNeedsRestore.current) {
+			// Mid touch gesture the restore write would cancel the pan/momentum
+			// (iOS) and fight the finger; keep the latch — settleTouchGesture
+			// places the tail once the gesture is over.
+			if (touchGesture.current) return;
 			if (canRestoreTail(
 				sc, position, pinned, tailNeedsRestore, onPinnedRef.current,
 			)) writeScroll(sc, position, sc.scrollHeight);
@@ -574,7 +726,7 @@ export function VirtualList({
 	});
 
 	return (
-		<div class="msgs scroll" ref={scroller} onScroll={handleScroll} onWheel={handleWheel}>
+		<div class="msgs scroll" ref={scroller} onScroll={handleScroll}>
 			<div ref={headerEl}>{header}</div>
 			<div style={{ height: topPad }} />
 			{items.slice(start, end).map((item, j) => (

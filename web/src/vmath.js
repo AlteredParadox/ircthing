@@ -321,9 +321,10 @@ export function pinnedAfterScroll(wasPinned, internal, top, maxTop, threshold = 
 // at moments that cannot be mid-drag.
 //
 // Inputs: hasScrollEnd (engine dispatches scrollend), pending (a user scroll
-// awaits its settle decision), event. Returns { pending, timer, fire }:
-// timer is "arm" (start/restart the settle countdown), "clear", or "keep";
-// fire asks the caller to run its near-top check now.
+// awaits its settle decision), event, touch (a finger is currently on the
+// glass). Returns { pending, timer, fire }: timer is "arm" (start/restart the
+// settle countdown), "clear", or "keep"; fire asks the caller to run its
+// near-top check now.
 //
 // States on scrollend engines (pending, timer armed):
 //   IDLE (false, false) --wheel--> WHEEL-SETTLING (true, true)
@@ -351,18 +352,69 @@ export function pinnedAfterScroll(wasPinned, internal, top, maxTop, threshold = 
 // Engines WITHOUT scrollend keep the legacy quiet-period fallback: every
 // scroll event re-arms the countdown and the load fires after the quiet
 // window. A mid-drag fire is possible there; accepted for old engines.
-export function scrollSettleStep(hasScrollEnd, pending, event) {
+//
+// Touch (iOS WebKit has no scrollend, so it lives on the legacy path): ANY
+// programmatic scrollTop write during an active pan or its momentum phase
+// cancels the gesture, and a resting finger emits no scroll events — quiet is
+// NOT idle. So while `touch` is true (finger down):
+//   - "scroll" never arms the quiet countdown (a pause mid-pan must not fire
+//     a load whose prepend compensation would kill the gesture);
+//   - a stray "timer"/"scrollend" keeps `pending` latched and never fires.
+// "touchstart" clears any armed countdown (a repeated swipe grabbing mid-
+// momentum re-latches suppression); "touchend" arms the quiet countdown on
+// legacy engines — momentum scroll events keep re-arming it, so the fire
+// lands one quiet window after the momentum truly stops — while scrollend
+// engines just wait for their authoritative scrollend.
+export function scrollSettleStep(hasScrollEnd, pending, event, touch = false) {
 	switch (event) {
 		case "wheel":
 			return { pending: true, timer: "arm", fire: false };
 		case "scroll":
+			if (touch) return { pending: true, timer: "keep", fire: false };
 			return { pending: true, timer: hasScrollEnd ? "keep" : "arm", fire: false };
 		case "scrollend":
+			if (touch) return { pending, timer: "keep", fire: false };
 			return { pending: false, timer: "keep", fire: pending };
 		case "timer":
+			if (touch) return { pending, timer: "clear", fire: false };
 			return { pending: false, timer: "clear", fire: pending };
+		case "touchstart":
+			return { pending, timer: "clear", fire: false };
+		case "touchend":
+			return { pending, timer: hasScrollEnd ? "keep" : "arm", fire: false };
 		case "cancel":
 			return { pending: false, timer: "clear", fire: false };
+	}
+}
+
+// touchGestureEnds: has a latched touch gesture (touchstart .. last finger up
+// .. momentum settled) finished at this settle event? The component keeps the
+// latch (touchGesture) and defers every code-owned scrollTop write — tail
+// pinning, ResizeObserver height compensation — while it is set, because any
+// write cancels an iOS pan/momentum mid-flight. Inputs: hasScrollEnd (engine
+// dispatches scrollend), event (the settle event just stepped), touchActive
+// (a finger is still down AFTER this event), touchScrolled (any scroll event
+// occurred while a finger was down during this gesture).
+//
+// End conditions: a tap (touchend with no scrolling) ends immediately — no
+// settle event would ever follow it; scrollend engines end at scrollend
+// (their spec fires it only once the whole gesture, momentum included, is
+// over); legacy engines end when the post-touchend quiet timer fires (a
+// 160ms scroll-event gap after finger-up means momentum has stopped);
+// "cancel" (a focus jump owns the viewport) always ends the gesture.
+export function touchGestureEnds(hasScrollEnd, event, touchActive, touchScrolled) {
+	if (touchActive) return false;
+	switch (event) {
+		case "cancel":
+			return true;
+		case "touchend":
+			return !touchScrolled;
+		case "scrollend":
+			return true;
+		case "timer":
+			return !hasScrollEnd;
+		default:
+			return false;
 	}
 }
 
