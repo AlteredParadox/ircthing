@@ -152,7 +152,8 @@ export function VirtualList({
 	// render around its new estimated offset in this same commit. Doing this
 	// during render (the layoutKey prop caused the render) avoids one frame whose
 	// spacers still use stale font/density/CSS heights.
-	if (prevLayoutKey.current !== layoutKey) {
+	function syncLayoutKey() {
+		if (prevLayoutKey.current === layoutKey) return;
 		if (!pinned.current && el) {
 			pendingLayoutAnchor.current = captureViewportAnchor(geo, geo.items, actualViewTop);
 		}
@@ -161,8 +162,10 @@ export function VirtualList({
 		if (pinned.current) tailNeedsRestore.current = true;
 	}
 
-	let forceIndexRebuild = false;
-	if (prevItems.current !== items) {
+	// syncItems absorbs a changed items prop and reports whether the id->index
+	// map must be rebuilt from scratch (a structural rewrite).
+	function syncItems() {
+		if (prevItems.current === items) return false;
 		// Same-id rows can change their rendered body (redaction, collapsed-run
 		// membership, preview data). A filter/collapse rewrite can instead remove
 		// rows while every survivor keeps the same object identity, so detect that
@@ -172,7 +175,6 @@ export function VirtualList({
 			? captureViewportAnchor(geo, oldItems, actualViewTop)
 			: null;
 		const structuralChange = hasNonAppendIdentityChange(oldItems, items);
-		forceIndexRebuild = structuralChange;
 		const tailAppend = !structuralChange && items.length > oldItems.length;
 		// Collapse mode rebuilds synthetic row objects when the source list grows,
 		// even when their stable ids/content did not change. Keep those useful
@@ -185,24 +187,30 @@ export function VirtualList({
 		}
 		prevItems.current = items;
 		tailNeedsRestore.current = true;
+		return structuralChange;
 	}
-
-	geo.setItems(items, forceIndexRebuild);
 
 	// A new focus target (a search jump) unpins and requests a scroll-to
 	// once the item is present. Set synchronously so the window below
 	// renders around the target rather than the tail.
+	function syncFocus(focusIdx) {
+		if (focusId !== prevFocus.current) {
+			prevFocus.current = focusId;
+			pendingFocus.current = focusId != null;
+		}
+		// A search page and its focus id can arrive in separate renders. Keep the
+		// request armed until the target exists instead of consuming it early.
+		if (pendingFocus.current && focusId != null && focusIdx !== -1) {
+			if (pinned.current) pendingFocusUnpin.current = true;
+			pinned.current = false;
+		}
+	}
+
+	syncLayoutKey();
+	geo.setItems(items, syncItems());
+
 	const focusIdx = focusId == null ? -1 : geo.indexOf(focusId);
-	if (focusId !== prevFocus.current) {
-		prevFocus.current = focusId;
-		pendingFocus.current = focusId != null;
-	}
-	// A search page and its focus id can arrive in separate renders. Keep the
-	// request armed until the target exists instead of consuming it early.
-	if (pendingFocus.current && focusId != null && focusIdx !== -1) {
-		if (pinned.current) pendingFocusUnpin.current = true;
-		pinned.current = false;
-	}
+	syncFocus(focusIdx);
 
 	// Detect a prepend during render; the layout effect below compensates
 	// scrollTop after the new spacers apply.
@@ -447,51 +455,63 @@ export function VirtualList({
 		applySettle("wheel");
 	}
 
-	// After every commit: apply focus/prepend/header anchoring and restore a
-	// tail position only when an actual geometry change requested it.
-	useLayoutEffect(() => {
-		const sc = scroller.current;
-		if (!sc) return;
+	// headerDeltaThisCommit tracks the header's height across commits and
+	// returns how much it changed since the last one.
+	function headerDeltaThisCommit() {
 		const hh = headerEl.current?.offsetHeight || 0;
 		const headerDelta = headerHeight.current === null ? 0 : hh - headerHeight.current;
 		headerHeight.current = hh;
 		if (pinned.current && headerDelta !== 0) tailNeedsRestore.current = true;
-		if (pendingFocus.current && focusIdx !== -1) {
-			// A focus jump replaces the window wholesale, so discard any prepend
-			// detected in the same commit — otherwise it fires on the next commit
-			// and scrolls the view off the focused row.
-			pendingPrepend.current = 0;
-			pendingLayoutAnchor.current = null;
-			tailNeedsRestore.current = false;
-			applySettle("cancel");
-			centerRow(sc, position, geo, contentOrigin(sc, headerEl.current), focusIdx);
-			pendingFocus.current = false;
-			if (pendingFocusUnpin.current) {
-				pendingFocusUnpin.current = false;
-				onPinnedRef.current?.(false);
-			}
-			if (!pinned.current && sc.scrollHeight - sc.clientHeight < 40) {
-				pinned.current = true;
-				onPinnedRef.current?.(true);
-			}
-			return;
+		return headerDelta;
+	}
+
+	// applyFocusCommit centers a rendered focus target (search jump); true when
+	// it owned this commit.
+	function applyFocusCommit(sc) {
+		if (!pendingFocus.current || focusIdx === -1) return false;
+		// A focus jump replaces the window wholesale, so discard any prepend
+		// detected in the same commit — otherwise it fires on the next commit
+		// and scrolls the view off the focused row.
+		pendingPrepend.current = 0;
+		pendingLayoutAnchor.current = null;
+		tailNeedsRestore.current = false;
+		applySettle("cancel");
+		centerRow(sc, position, geo, contentOrigin(sc, headerEl.current), focusIdx);
+		pendingFocus.current = false;
+		if (pendingFocusUnpin.current) {
+			pendingFocusUnpin.current = false;
+			onPinnedRef.current?.(false);
 		}
-		if (!pinned.current && pendingLayoutAnchor.current) {
-			// The window above was deliberately rendered around this id using
-			// the new estimates. Place it at the same intra-row pixel before paint;
-			// ResizeObserver then compensates as the rendered neighborhood acquires
-			// real heights.
-			const top = restoreViewportAnchor(geo, pendingLayoutAnchor.current);
-			pendingLayoutAnchor.current = null;
-			pendingPrepend.current = 0; // the stable-id anchor subsumes prepend math
-			tailNeedsRestore.current = false;
-			if (top !== null) writeScroll(sc, position, contentOrigin(sc, headerEl.current) + top);
-			if (sc.scrollHeight - sc.clientHeight < 40) {
-				pinned.current = true;
-				onPinnedRef.current?.(true);
-			}
-			return;
+		if (!pinned.current && sc.scrollHeight - sc.clientHeight < 40) {
+			pinned.current = true;
+			onPinnedRef.current?.(true);
 		}
+		return true;
+	}
+
+	// applyLayoutAnchorCommit restores a captured viewport anchor after a
+	// layout/filter rewrite; true when it owned this commit.
+	function applyLayoutAnchorCommit(sc) {
+		if (pinned.current || !pendingLayoutAnchor.current) return false;
+		// The window above was deliberately rendered around this id using
+		// the new estimates. Place it at the same intra-row pixel before paint;
+		// ResizeObserver then compensates as the rendered neighborhood acquires
+		// real heights.
+		const top = restoreViewportAnchor(geo, pendingLayoutAnchor.current);
+		pendingLayoutAnchor.current = null;
+		pendingPrepend.current = 0; // the stable-id anchor subsumes prepend math
+		tailNeedsRestore.current = false;
+		if (top !== null) writeScroll(sc, position, contentOrigin(sc, headerEl.current) + top);
+		if (sc.scrollHeight - sc.clientHeight < 40) {
+			pinned.current = true;
+			onPinnedRef.current?.(true);
+		}
+		return true;
+	}
+
+	// applyPrependCommit compensates scrollTop for rows prepended (and a header
+	// height change) in this commit.
+	function applyPrependCommit(sc, headerDelta) {
 		if (pendingPrepend.current > 0) {
 			if (pinned.current) {
 				// The user returned to the live tail while this page was in flight;
@@ -505,9 +525,13 @@ export function VirtualList({
 		} else if (!pinned.current && headerDelta !== 0) {
 			writeScroll(sc, position, sc.scrollTop + headerDelta);
 		}
-		// Tail-following is an intent, but only write when mount/items/geometry
-		// actually moved. An unrelated parent render can land between native
-		// thumb movement and its queued scroll event and must not erase it.
+	}
+
+	// applyTailCommit re-places a tail-following viewport at the bottom.
+	// Tail-following is an intent, but only write when mount/items/geometry
+	// actually moved. An unrelated parent render can land between native
+	// thumb movement and its queued scroll event and must not erase it.
+	function applyTailCommit(sc) {
 		if (pinned.current && tailNeedsRestore.current) {
 			if (canRestoreTail(
 				sc, position, pinned, tailNeedsRestore, onPinnedRef.current,
@@ -519,18 +543,34 @@ export function VirtualList({
 		} else if (!pinned.current) {
 			tailNeedsRestore.current = false;
 		}
-		// A list whose content is shorter than the viewport never fires a scroll
-		// event, so handleScroll can't flip `pinned` true. Signal it here so a
-		// search-jump into a buffer whose whole window fits on screen still
-		// reports pinned — otherwise the parent never reloads the live tail and
-		// incoming messages are silently blocked (atTail stays false) until the
-		// buffer is manually re-selected. Harmless when already at the tail
-		// (the parent's reloadTail no-ops on an atTail buffer).
+	}
+
+	// pinShortList: a list whose content is shorter than the viewport never
+	// fires a scroll event, so handleScroll can't flip `pinned` true. Signal it
+	// here so a search-jump into a buffer whose whole window fits on screen
+	// still reports pinned — otherwise the parent never reloads the live tail
+	// and incoming messages are silently blocked (atTail stays false) until the
+	// buffer is manually re-selected. Harmless when already at the tail
+	// (the parent's reloadTail no-ops on an atTail buffer).
+	function pinShortList(sc) {
 		if (!pendingFocus.current && !pinned.current &&
 			sc.scrollHeight - sc.clientHeight < 40) {
 			pinned.current = true;
 			onPinnedRef.current?.(true);
 		}
+	}
+
+	// After every commit: apply focus/prepend/header anchoring and restore a
+	// tail position only when an actual geometry change requested it.
+	useLayoutEffect(() => {
+		const sc = scroller.current;
+		if (!sc) return;
+		const headerDelta = headerDeltaThisCommit();
+		if (applyFocusCommit(sc)) return;
+		if (applyLayoutAnchorCommit(sc)) return;
+		applyPrependCommit(sc, headerDelta);
+		applyTailCommit(sc);
+		pinShortList(sc);
 	});
 
 	return (

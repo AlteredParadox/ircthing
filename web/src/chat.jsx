@@ -469,6 +469,97 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 		});
 	}
 
+	// Ctrl/Cmd+B/I/U insert mIRC formatting toggles. Strikethrough/monospace/
+	// colours live in the format panel only (no conflict-free chords; Ctrl+S
+	// stays the browser's). Ctrl+K is NOT handled here — it must fall through
+	// to the global channel-switcher shortcut.
+	function handleFormatShortcut(e) {
+		if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return false;
+		const k = e.key.toLowerCase();
+		let code = null;
+		if (k === "b") code = BOLD;
+		else if (k === "i") code = ITALIC;
+		else if (k === "u") code = UNDERLINE;
+		// Any other Ctrl/Cmd chord falls through
+		// (Ctrl+Enter must still reach the send branch).
+		if (!code) return false;
+		e.preventDefault(); // Ctrl+U is view-source etc.
+		applyFmt(code);
+		return true;
+	}
+
+	// Alt+F toggles the format panel (free in-app: the global shortcuts only
+	// use Alt+arrows; browsers' Alt+F menus honour preventDefault).
+	function handleFormatPanelToggle(e) {
+		if (!e.altKey || e.ctrlKey || e.metaKey || e.key.toLowerCase() !== "f") return false;
+		e.preventDefault();
+		setFmtOpen((o) => !o);
+		return true;
+	}
+
+	// Plain Up/Down recall sent-message history — but only from the FIRST line
+	// (Up) / LAST line (Down) with no selection, so arrows inside a multiline
+	// draft keep their native line movement. A null from navigate also falls
+	// through to the native caret move. Down while typing a fresh draft clears
+	// the composer (and past the newest entry it clears too — Down at the
+	// bottom always ends empty).
+	function handleHistoryNav(e) {
+		if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return false;
+		if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return false;
+		const ta = e.currentTarget;
+		if (ta.selectionStart !== ta.selectionEnd) return true;
+		const dir = e.key === "ArrowDown" ? 1 : -1;
+		const atEdge = dir < 0
+			? isFirstLine(ta.value, ta.selectionStart)
+			: isLastLine(ta.value, ta.selectionEnd);
+		if (!atEdge) return true;
+		const r = inputHistory.navigate(activeDraftKey, dir, ta.value);
+		if (!r) return true;
+		e.preventDefault();
+		draftChanged(r.text);
+		requestAnimationFrame(() => ta.setSelectionRange(r.text.length, r.text.length));
+		return true;
+	}
+
+	// Tab completes commands/emoji/nicks and cycles on repeat; Shift+Tab
+	// cycles backwards.
+	function handleTabComplete(e) {
+		if (e.key !== "Tab") return false;
+		e.preventDefault();
+		const ta = e.currentTarget;
+		const r = completer.next(ta.value, ta.selectionStart, e.shiftKey ? -1 : 1, {
+			nicks: completionNicks || [],
+		});
+		if (r) {
+			draftChanged(r.text);
+			requestAnimationFrame(() => ta.setSelectionRange(r.caret, r.caret));
+		}
+		return true;
+	}
+
+	// Enter sends; Shift+Enter inserts a newline (multiline).
+	function handleComposerEnter(e) {
+		if (e.key === "Enter" && !e.shiftKey) {
+			e.preventDefault();
+			submit(e);
+		}
+	}
+
+	function composerKeyDown(e) {
+		// Per UI Events, the keystroke that commits an IME conversion candidate
+		// fires keydown with key=="Enter" and isComposing==true (keyCode 229 in
+		// Chromium) BEFORE compositionend. Without this guard that Enter would
+		// preventDefault the commit and send the half-composed draft. Mirrors
+		// the type-anywhere handler's isComposing check above. This guard MUST
+		// stay first.
+		if (e.isComposing || e.keyCode === 229) return;
+		if (handleFormatShortcut(e)) return;
+		if (handleFormatPanelToggle(e)) return;
+		if (handleHistoryNav(e)) return;
+		if (handleTabComplete(e)) return;
+		handleComposerEnter(e);
+	}
+
 	const header = msgs?.loaded
 		? (msgs.reachedTop && list.length > 0 && <div class="top-note">beginning of history</div>)
 		: <div class="top-note">loading…</div>;
@@ -521,80 +612,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 						rows={draft.includes("\n") ? Math.min(draft.split("\n").length, 8) : 1}
 						value={draft}
 						onInput={(e) => draftChanged(e.currentTarget.value)}
-						onKeyDown={(e) => {
-							// Per UI Events, the keystroke that commits an IME
-							// conversion candidate fires keydown with key=="Enter"
-							// and isComposing==true (keyCode 229 in Chromium)
-							// BEFORE compositionend. Without this guard that Enter
-							// would preventDefault the commit and send the
-							// half-composed draft. Mirrors the type-anywhere
-							// handler's isComposing check above.
-							if (e.isComposing || e.keyCode === 229) return;
-							// Ctrl/Cmd+B/I/U insert mIRC formatting toggles.
-							// Strikethrough/monospace/colours live in the format
-							// panel only (no conflict-free chords; Ctrl+S stays
-							// the browser's). Ctrl+K is NOT handled here — it
-							// must fall through to the global channel-switcher
-							// shortcut.
-							if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
-								const k = e.key.toLowerCase();
-								const code = k === "b" ? BOLD : k === "i" ? ITALIC : k === "u" ? UNDERLINE : null;
-								if (code) {
-									e.preventDefault(); // Ctrl+U is view-source etc.
-									applyFmt(code);
-									return;
-								}
-								// Any other Ctrl/Cmd chord falls through
-								// (Ctrl+Enter must still reach the send branch).
-							}
-							// Alt+F toggles the format panel (free in-app: the
-							// global shortcuts only use Alt+arrows; browsers'
-							// Alt+F menus honour preventDefault).
-							if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "f") {
-								e.preventDefault();
-								setFmtOpen((o) => !o);
-								return;
-							}
-							// Plain Up/Down recall sent-message history — but
-							// only from the FIRST line (Up) / LAST line (Down)
-							// with no selection, so arrows inside a multiline
-							// draft keep their native line movement. A null from
-							// navigate also falls through to the native caret
-							// move. Down while typing a fresh draft clears the
-							// composer (and past the newest entry it clears too
-							// — Down at the bottom always ends empty).
-							if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
-								const ta = e.currentTarget;
-								if (ta.selectionStart !== ta.selectionEnd) return;
-								const dir = e.key === "ArrowDown" ? 1 : -1;
-								if (dir < 0 ? !isFirstLine(ta.value, ta.selectionStart) : !isLastLine(ta.value, ta.selectionEnd)) return;
-								const r = inputHistory.navigate(activeDraftKey, dir, ta.value);
-								if (!r) return;
-								e.preventDefault();
-								draftChanged(r.text);
-								requestAnimationFrame(() => ta.setSelectionRange(r.text.length, r.text.length));
-								return;
-							}
-							// Tab completes commands/emoji/nicks and cycles on
-							// repeat; Shift+Tab cycles backwards.
-							if (e.key === "Tab") {
-								e.preventDefault();
-								const ta = e.currentTarget;
-								const r = completer.next(ta.value, ta.selectionStart, e.shiftKey ? -1 : 1, {
-									nicks: completionNicks || [],
-								});
-								if (r) {
-									draftChanged(r.text);
-									requestAnimationFrame(() => ta.setSelectionRange(r.caret, r.caret));
-								}
-								return;
-							}
-							// Enter sends; Shift+Enter inserts a newline (multiline).
-							if (e.key === "Enter" && !e.shiftKey) {
-								e.preventDefault();
-								submit(e);
-							}
-						}}
+						onKeyDown={composerKeyDown}
 						placeholder={connected ? `Message ${buf?.buffer || ""}` : "disconnected — reconnecting…"}
 						disabled={!connected}
 					/>

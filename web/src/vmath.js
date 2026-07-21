@@ -174,52 +174,66 @@ export function captureViewportAnchor(geo, items, viewTop) {
 	};
 }
 
-export function restoreViewportAnchor(geo, anchor) {
-	if (!anchor) return null;
-	// Collapse-member lookup, built lazily on the first miss of the exact-id
-	// fast path so the common restore pays nothing. The nearest-survivor loop
-	// below can probe O(removed run) candidates; resolving each one with a
-	// fresh full findIndex over items-with-collapse made a large ignore-filter
-	// rewrite O(removed × list) — seconds of stall on a 4000-row run. One map
-	// makes the whole fallback O(list + removed run).
-	let memberIndex = null; // collapse-member event id -> row index
-	const memberLookup = (member) => {
-		if (memberIndex === null) {
-			memberIndex = new Map();
-			for (let j = 0; j < geo.items.length; j++) {
-				const run = geo.items[j].collapse;
-				if (!run) continue;
-				// First containing row wins, matching a forward scan.
-				for (const ev of run) {
-					if (!memberIndex.has(ev.id)) memberIndex.set(ev.id, j);
-				}
-			}
-		}
-		return memberIndex.get(member) ?? -1;
-	};
-	const locate = (ref) => {
-		// Exact top-level identity always wins. This is what distinguishes an
-		// expanded run's summary row from its real last child.
-		const i = geo.indexOf(ref.id);
-		if (i !== -1) return i;
-		// A status-mode change may replace a real presence row with a collapsed
-		// synthetic row, or extend a run and change its synthetic id.
-		return memberLookup(ref.member);
-	};
-	let i = locate(anchor);
-	if (i === -1 && anchor.source) {
-		const ref = (item) => ({ id: item.id, member: anchorId(item) });
-		for (let distance = 1; distance < anchor.source.length; distance++) {
-			// Prefer the following row at each distance: when the anchored row was
-			// filtered, it naturally moves into the vacated viewport position.
-			const after = anchor.index + distance;
-			if (after < anchor.source.length) i = locate(ref(anchor.source[after]));
-			if (i !== -1) break;
-			const before = anchor.index - distance;
-			if (before >= 0) i = locate(ref(anchor.source[before]));
-			if (i !== -1) break;
+// buildCollapseMemberIndex maps every collapse-member event id to its row
+// index. First containing row wins, matching a forward scan.
+function buildCollapseMemberIndex(items) {
+	const memberIndex = new Map();
+	for (let j = 0; j < items.length; j++) {
+		const run = items[j].collapse;
+		if (!run) continue;
+		for (const ev of run) {
+			if (!memberIndex.has(ev.id)) memberIndex.set(ev.id, j);
 		}
 	}
+	return memberIndex;
+}
+
+// locateAnchorRow resolves an { id, member } reference to a row index, or -1.
+// `state.memberIndex` is the collapse-member lookup, built lazily on the first
+// miss of the exact-id fast path so the common restore pays nothing. The
+// nearest-survivor scan can probe O(removed run) candidates; resolving each one
+// with a fresh full findIndex over items-with-collapse made a large
+// ignore-filter rewrite O(removed × list) — seconds of stall on a 4000-row run.
+// One map (shared via `state` across every probe of a single restore) makes the
+// whole fallback O(list + removed run).
+function locateAnchorRow(geo, state, id, member) {
+	// Exact top-level identity always wins. This is what distinguishes an
+	// expanded run's summary row from its real last child.
+	const i = geo.indexOf(id);
+	if (i !== -1) return i;
+	// A status-mode change may replace a real presence row with a collapsed
+	// synthetic row, or extend a run and change its synthetic id.
+	if (state.memberIndex === null) state.memberIndex = buildCollapseMemberIndex(geo.items);
+	return state.memberIndex.get(member) ?? -1;
+}
+
+// nearestSurvivorIndex scans outward from the captured position in the
+// previous list for the closest row that still exists, or -1.
+function nearestSurvivorIndex(geo, state, anchor) {
+	for (let distance = 1; distance < anchor.source.length; distance++) {
+		// Prefer the following row at each distance: when the anchored row was
+		// filtered, it naturally moves into the vacated viewport position.
+		const after = anchor.index + distance;
+		if (after < anchor.source.length) {
+			const item = anchor.source[after];
+			const i = locateAnchorRow(geo, state, item.id, anchorId(item));
+			if (i !== -1) return i;
+		}
+		const before = anchor.index - distance;
+		if (before >= 0) {
+			const item = anchor.source[before];
+			const i = locateAnchorRow(geo, state, item.id, anchorId(item));
+			if (i !== -1) return i;
+		}
+	}
+	return -1;
+}
+
+export function restoreViewportAnchor(geo, anchor) {
+	if (!anchor) return null;
+	const state = { memberIndex: null }; // lazy collapse-member event id -> row index
+	let i = locateAnchorRow(geo, state, anchor.id, anchor.member);
+	if (i === -1 && anchor.source) i = nearestSurvivorIndex(geo, state, anchor);
 	if (i === -1) return null;
 	const height = geo.offsetOf(i + 1) - geo.offsetOf(i);
 	return geo.offsetOf(i) + Math.min(anchor.intra, Math.max(0, height - 1));
@@ -256,10 +270,10 @@ export function computeWindow(
 		// another half viewport so a tall display cannot briefly expose a blank
 		// band while ResizeObserver replaces estimates with real heights.
 		const tailOverscan = Math.max(overscan, viewH / 2);
-		({ start, end } = geo.range(
+		start = geo.range(
 			Math.max(0, bottom - viewH - tailOverscan),
 			bottom,
-		));
+		).start;
 		end = itemCount;
 	}
 	if (focusing && focusIdx !== -1) {
