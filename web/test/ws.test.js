@@ -99,6 +99,118 @@ test("a closed socket suppresses queued replies and pushes", () => {
 	is(resolved, false);
 });
 
+// withFakeWS swaps in a WebSocket stub that records every constructed
+// transport, so tests can drive onopen/onmessage/onclose by hand.
+function withFakeWS(fn) {
+	const previous = globalThis.WebSocket;
+	const made = [];
+	class FakeWebSocket {
+		static OPEN = 1;
+		constructor() {
+			this.readyState = FakeWebSocket.OPEN;
+			made.push(this);
+		}
+		close() {}
+	}
+	globalThis.WebSocket = FakeWebSocket;
+	try {
+		return fn(made);
+	} finally {
+		globalThis.WebSocket = previous;
+	}
+}
+
+// Reconnect-storm guard: a backend that accepts the WS handshake and then
+// dies immediately (proxy read timeout, crash loop) must NOT reset backoff
+// on the bare open — it keeps doubling toward the cap.
+test("backoff keeps doubling when connections open then immediately drop", () => {
+	withFakeWS((made) => {
+		const s = new Socket("ws://x");
+		let stables = 0;
+		s.on("_stable", () => stables++);
+		try {
+			s.connect();
+			made[0].onopen();
+			is(s.backoff, 1000); // open alone must not reset anything
+			made[0].onclose();
+			is(s.backoff, 2000);
+			// Stand in for the reconnect timer (cleared so it can't fire later).
+			clearTimeout(s.reconnectTimer);
+			s.connect();
+			made[1].onopen();
+			made[1].onclose();
+			is(s.backoff, 4000);
+			is(stables, 0); // never stable, app failure counter never resets
+		} finally {
+			s.close();
+		}
+	});
+});
+
+test("first server frame marks the connection stable and resets backoff", () => {
+	withFakeWS((made) => {
+		const s = new Socket("ws://x");
+		let stables = 0;
+		let pushed = 0;
+		s.on("_stable", () => stables++);
+		s.on("event", () => pushed++);
+		try {
+			s.backoff = 8000; // several failed cycles behind us
+			s.connect();
+			made[0].onopen();
+			is(s.backoff, 8000); // handshake alone is not stability
+			is(stables, 0);
+			made[0].onmessage({ data: JSON.stringify({ v: 1, seq: 0, type: "event", data: {} }) });
+			is(s.backoff, 1000);
+			is(stables, 1);
+			is(pushed, 1); // the frame still dispatches normally
+			// Further frames are idempotent for stability.
+			made[0].onmessage({ data: JSON.stringify({ v: 1, seq: 0, type: "event", data: {} }) });
+			is(stables, 1);
+		} finally {
+			s.close();
+		}
+	});
+});
+
+test("a connection that stays open goes stable on the timer without traffic", (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	withFakeWS((made) => {
+		const s = new Socket("ws://x");
+		let stables = 0;
+		s.on("_stable", () => stables++);
+		s.backoff = 8000;
+		s.connect();
+		made[0].onopen();
+		is(stables, 0);
+		t.mock.timers.tick(5000); // STABLE_MS
+		is(stables, 1);
+		is(s.backoff, 1000);
+		s.close();
+	});
+});
+
+test("a drop before the stability timer fires never marks stable", (t) => {
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	withFakeWS((made) => {
+		const s = new Socket("ws://x");
+		let stables = 0;
+		s.on("_stable", () => stables++);
+		s.connect();
+		made[0].onopen();
+		made[0].onclose(); // dies at 0ms; must cancel the pending stability timer
+		is(s.backoff, 2000);
+		t.mock.timers.tick(60000); // fires the reconnect (made[1]) AND any leaked
+		// stability timer from made[0] — which must have been canceled on close.
+		is(stables, 0);
+		made[1].onopen();
+		made[1].onclose();
+		is(stables, 0);
+		is(s.backoff, 4000);
+		s.close();
+	});
+});
+
 test("a superseded transport close cannot tear down the current transport", () => {
 	const previous = globalThis.WebSocket;
 	const made = [];

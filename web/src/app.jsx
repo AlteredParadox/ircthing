@@ -694,8 +694,13 @@ export function App() {
 		});
 
 		const wsFailures = { n: 0 };
-		on("_open", async () => {
+		// The failure counter resets on _stable, not _open: a backend that
+		// accepts the WS handshake and immediately dies would otherwise reset
+		// it every cycle and the 3-close auth re-probe below could never fire.
+		on("_stable", () => {
 			wsFailures.n = 0;
+		});
+		on("_open", async () => {
 			failedHistory.current.clear(); // fresh connection: let loads retry
 			setConnected(true);
 			s.request("get_prefs", null)

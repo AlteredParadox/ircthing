@@ -20,6 +20,13 @@
 
 const V = 1;
 
+// A connection only counts as "stable" — resetting reconnect backoff and
+// emitting _stable — once it has stayed open this long or delivered its
+// first server frame, whichever comes first. Resetting on the bare open
+// handshake let an accept-then-immediate-drop loop (reverse proxy with a
+// tiny read timeout, crash-looping backend) reconnect at ~1-1.5s forever.
+const STABLE_MS = 5000;
+
 export class Socket {
 	constructor(url) {
 		this.url = url;
@@ -29,6 +36,18 @@ export class Socket {
 		this.handlers = new Map(); // type -> [fn]
 		this.backoff = 1000;
 		this.closed = false;
+		this.stable = false; // current connection survived STABLE_MS or got a frame
+	}
+
+	// markStable: the current connection is trustworthy — reset reconnect
+	// backoff to base and tell the app (which gates its own failure counter
+	// on it). Idempotent per connection; onclose re-arms it.
+	markStable() {
+		if (this.stable || this.closed) return;
+		this.stable = true;
+		clearTimeout(this.stableTimer);
+		this.backoff = 1000;
+		this.emit("_stable");
 	}
 
 	on(type, fn) {
@@ -80,15 +99,25 @@ export class Socket {
 
 	connect() {
 		if (this.closed) return; // don't revive a socket closed during backoff
+		this.stable = false; // each transport must re-prove itself
 		const ws = new WebSocket(this.url);
 		this.ws = ws;
 		ws.onopen = () => {
 			if (this.closed || this.ws !== ws) return;
-			this.backoff = 1000;
+			// Backoff does NOT reset here — only once the connection proves
+			// stable (see STABLE_MS / markStable), so a handshake-succeeds-
+			// then-dies loop keeps doubling toward the cap instead of
+			// hammering the server and wiping scrollback every ~1s.
+			clearTimeout(this.stableTimer);
+			this.stableTimer = setTimeout(() => this.markStable(), STABLE_MS);
 			this.emit("_open");
 		};
 		ws.onmessage = (e) => {
 			if (this.closed || this.ws !== ws) return;
+			// Any server frame proves the connection is real, not an
+			// accept-then-drop; don't make a quiet-but-working link wait out
+			// the timer.
+			this.markStable();
 			let env;
 			try {
 				env = JSON.parse(e.data);
@@ -102,6 +131,8 @@ export class Socket {
 			// callback is delivered. That retired callback must not reject the new
 			// transport's requests or schedule a second reconnect loop.
 			if (this.ws !== ws) return;
+			clearTimeout(this.stableTimer);
+			this.stable = false;
 			this.ws = null;
 			this.rejectPending();
 			if (this.closed) return;
@@ -147,6 +178,7 @@ export class Socket {
 		// fires after close() and revives a zombie socket that double-
 		// processes every push once the app reconnects.
 		clearTimeout(this.reconnectTimer);
+		clearTimeout(this.stableTimer);
 		// Settle callers NOW. Waiting for the browser's asynchronous close event
 		// leaves old request continuations alive across a rapid logout/re-login.
 		this.rejectPending();
