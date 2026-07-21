@@ -541,10 +541,15 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, o
 	if bufID == 0 {
 		return Message{}, false, nil // no such buffer and create is off
 	}
-	// Insert and archive settlement commit as one transaction: a message
-	// must never become durable with its buffer's archived flag unsettled,
-	// because a retry of the same msgid deduplicates before settlement and
-	// would leave the buffer hidden until unrelated traffic arrived.
+	return s.commitAppendLocked(ctx, bufID, r, m, opts.unarchive)
+}
+
+// commitAppendLocked inserts m and settles the buffer's archived flag as one
+// transaction, then updates the hot ring (caller holds s.mu). One
+// transaction because a message must never become durable with the flag
+// unsettled: a retry of the same msgid deduplicates before settlement and
+// would leave the buffer hidden until unrelated traffic arrived.
+func (s *Store) commitAppendLocked(ctx context.Context, bufID int64, r *ring, m Message, unarchive bool) (Message, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Message{}, false, err
@@ -556,7 +561,7 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, o
 		tx.Rollback()
 		return msg, false, err
 	}
-	stillArchived, err := s.applyArchiveTx(ctx, tx, bufID, opts.unarchive)
+	stillArchived, err := s.applyArchiveTx(ctx, tx, bufID, unarchive)
 	if err != nil {
 		tx.Rollback()
 		return Message{}, false, err

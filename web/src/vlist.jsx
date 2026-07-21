@@ -515,16 +515,11 @@ export function VirtualList({
 		};
 	}, []);
 
-	const scrollScheduled = useRef(false);
-	function handleScroll() {
-		const sc = scroller.current;
-		if (!sc) return;
-		const top = sc.scrollTop;
-		const maxTop = Math.max(0, sc.scrollHeight - sc.clientHeight);
-		const internal = position.current.internalTop !== null &&
-			Math.abs(top - position.current.internalTop) <= 1;
-		position.current.internalTop = null;
-
+	// syncPinnedFromScroll owns one scroll event's pin bookkeeping: the
+	// touch-parity unpin, the pin-threshold decision, and the
+	// grew-under-tail restore (latched, never written, during a live touch
+	// gesture).
+	function syncPinnedFromScroll(sc, top, maxTop, internal) {
 		// Wheel-parity for touch (handleWheel's deltaY<0 branch): an untagged
 		// finger-down movement toward older content unpins immediately. The
 		// threshold alone cannot decide this — a live append landing between
@@ -547,6 +542,19 @@ export function VirtualList({
 			if (touchGesture.current) tailNeedsRestore.current = true;
 			else writeScroll(sc, position, sc.scrollHeight);
 		}
+	}
+
+	const scrollScheduled = useRef(false);
+	function handleScroll() {
+		const sc = scroller.current;
+		if (!sc) return;
+		const top = sc.scrollTop;
+		const maxTop = Math.max(0, sc.scrollHeight - sc.clientHeight);
+		const internal = position.current.internalTop !== null &&
+			Math.abs(top - position.current.internalTop) <= 1;
+		position.current.internalTop = null;
+
+		syncPinnedFromScroll(sc, top, maxTop, internal);
 
 		if (!internal && top !== position.current.knownTop) {
 			// Untagged AND moved: user/browser scrolling. A burst of code-owned
