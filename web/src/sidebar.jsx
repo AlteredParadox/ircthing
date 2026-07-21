@@ -59,9 +59,9 @@ export function Sidebar({ networks, buffers, activeKey, monitors, truncated, the
 				<button class="monitor-addbtn" title="Add network" onClick={onAddNetwork}>+</button>
 			</div>
 			{truncated && (
-				<div class="data-warning" role="status" title="The server response reached its safety limit.">
+				<output class="data-warning" title="The server response reached its safety limit.">
 					Buffer list incomplete — server limit reached
-				</div>
+				</output>
 			)}
 			<div class="side-list scroll">
 				{sections.map((sec) => (

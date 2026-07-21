@@ -562,7 +562,7 @@ export function parseInput(input, buffer, chantypes) {
 	// The command name is untrusted composer input. Never walk Object.prototype:
 	// `/constructor` used to select the inherited constructor function, while
 	// `/__proto__` selected an object and then threw when invoked.
-	const parse = Object.prototype.hasOwnProperty.call(CMD_PARSERS, cmd) ? CMD_PARSERS[cmd] : null;
+	const parse = Object.hasOwn(CMD_PARSERS, cmd) ? CMD_PARSERS[cmd] : null;
 	return parse ? parse(rest, buffer, chantypes, err) : err("unknown command /" + cmd);
 }
 
@@ -806,17 +806,24 @@ export function updateTypingState(all, key, d, knownBuffer, now = Date.now()) {
 	return next;
 }
 
+// expireBufferTypers returns `cur` itself when nothing expired, else a copy
+// with the expired nicks removed.
+function expireBufferTypers(cur, now) {
+	let nicks = cur;
+	for (const [nick, v] of cur) {
+		if (!typingExpired(v.state, v.at, now)) continue;
+		if (nicks === cur) nicks = new Map(cur);
+		nicks.delete(nick);
+	}
+	return nicks;
+}
+
 export function expireTypingState(all, now = Date.now()) {
 	let next = all;
 	for (const [key, cur] of all) {
-		let nicks = cur;
-		for (const [nick, v] of cur) {
-			if (!typingExpired(v.state, v.at, now)) continue;
-			if (next === all) next = new Map(all);
-			if (nicks === cur) nicks = new Map(cur);
-			nicks.delete(nick);
-		}
+		const nicks = expireBufferTypers(cur, now);
 		if (nicks === cur) continue;
+		if (next === all) next = new Map(all);
 		if (nicks.size) next.set(key, nicks);
 		else next.delete(key);
 	}

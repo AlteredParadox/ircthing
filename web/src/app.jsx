@@ -1025,9 +1025,10 @@ export function App() {
 			if (b.mention) mention = true;
 		}
 		const ab = activeKey ? buffers[activeKey] : null;
-		const channel = prefs.titleChannel && ab
-			? (ab.buffer === SERVER_BUFFER ? ab.network : ab.buffer)
-			: "";
+		let channel = "";
+		if (prefs.titleChannel && ab) {
+			channel = ab.buffer === SERVER_BUFFER ? ab.network : ab.buffer;
+		}
 		applyBadge(unread, mention, { showCount: prefs.titleUnread, channel });
 	}, [buffers, theme, prefs, activeKey]);
 
@@ -1075,34 +1076,34 @@ export function App() {
 		}
 		const key = buf.key;
 		let alive = true;
-		const t = setTimeout(() => {
-			fetchAllMembers({
-				request: (after) =>
-					s.request("get_channel", {
-						network: buf.network,
-						buffer: buf.buffer,
-						...(after ? { after } : {}),
-					}).then((d) => {
-						if (d?.network !== buf.network || d?.buffer !== buf.buffer) {
-							throw new Error("mismatched channel response");
-						}
-						return d;
-					}),
-				isStale: () => !alive || sock.current !== s || activeKeyRef.current !== key,
-				onPage: (st) => {
-					setChanInfo({
-						network: buf.network,
-						buffer: buf.buffer,
-						joined: st.meta.joined,
-						topic: st.meta.topic,
-						members: st.members,
-						// Only a walk that genuinely stopped early marks the
-						// list incomplete; while more pages are inbound the
-						// panel just shows what has arrived so far.
-						truncated: st.done && st.degraded,
-					});
-				},
+		const checkChannelMatch = (d) => {
+			if (d?.network !== buf.network || d?.buffer !== buf.buffer) {
+				throw new Error("mismatched channel response");
+			}
+			return d;
+		};
+		const requestPage = (after) =>
+			s.request("get_channel", {
+				network: buf.network,
+				buffer: buf.buffer,
+				...(after ? { after } : {}),
+			}).then(checkChannelMatch);
+		const isStale = () => !alive || sock.current !== s || activeKeyRef.current !== key;
+		const onPage = (st) => {
+			setChanInfo({
+				network: buf.network,
+				buffer: buf.buffer,
+				joined: st.meta.joined,
+				topic: st.meta.topic,
+				members: st.members,
+				// Only a walk that genuinely stopped early marks the
+				// list incomplete; while more pages are inbound the
+				// panel just shows what has arrived so far.
+				truncated: st.done && st.degraded,
 			});
+		};
+		const t = setTimeout(() => {
+			fetchAllMembers({ request: requestPage, isStale, onPage });
 		}, 150);
 		return () => {
 			alive = false;
@@ -1808,7 +1809,7 @@ export function App() {
 					})
 					.catch(oops);
 			}
-			case "cmd":
+			case "cmd": {
 				if (p.command === "WHOIS") rememberPendingWhois(buf.network, p.params?.[0]);
 				const s = sock.current;
 				if (!s) return Promise.reject(new Error("not connected")).catch(oops);
@@ -1825,6 +1826,7 @@ export function App() {
 						if (joinToken) clearPendingJoin(pendingJoins.current, joinToken);
 						return oops(e);
 					});
+			}
 			default:
 				return Promise.reject(new Error("unknown input"));
 		}

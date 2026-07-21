@@ -213,7 +213,7 @@ function fetchPreview(url, net) {
 			.catch(() => ({ __fail: RETRY_TTL })) // network error: transient, retry soon
 			.then((res) => {
 				if (signal.aborted) return null; // don't cache a cancelled fetch
-				if (res && res.__fail !== undefined) {
+				if (res?.__fail !== undefined) {
 					cache.set(key, null, res.__fail); // transient → RETRY_TTL, real → FAIL_TTL
 					noteFailure(key); // a completed failed attempt: counts against auto-retry
 					return null;
@@ -224,7 +224,9 @@ function fetchPreview(url, net) {
 			}));
 }
 
-// fetchThumb returns { promise, release }; promise resolves to an object URL or null.
+// fetchThumb returns { promise, release }; promise resolves to an object URL
+// (string), the UNPREVIEWABLE sentinel, or null — the same tri-state useThumb
+// caches and its consumers branch on.
 function fetchThumb(url, net) {
 	const key = ck(url, net);
 	const cached = thumbCache.get(key);
@@ -373,7 +375,7 @@ function MediaLink({ url, net, kind }) {
 function MediaCard({ url, net, kind }) {
 	// phase: idle | minting | playing | error
 	const [phase, setPhase] = useState("idle");
-	const [tok, setTok] = useState(null); // { token, exp }
+	const [tok, setTok] = useState(null); // null until minted, then the server's token + exp pair
 	const reminted = useRef(false); // one expiry re-mint per card, then give up
 	const elRef = useRef(null);
 
@@ -418,6 +420,9 @@ function MediaCard({ url, net, kind }) {
 					<span class="preview-card-site">{hostOf(url)}</span>
 					<a class="media-card-name" href={url} target="_blank" rel="noopener noreferrer">{mediaFileName(url)}</a>
 				</div>
+				{/* No captions <track>: these are arbitrary remote media files
+				    streamed verbatim through the proxy — no caption data exists
+				    or can be synthesized for them. */}
 				{kind === "audio" ? (
 					<audio ref={elRef} controls preload="metadata" src={src} onError={onElementError} />
 				) : (

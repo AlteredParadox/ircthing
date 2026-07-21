@@ -109,7 +109,7 @@ export function FormatPanel({ open, onToggle, onClose, onApply }) {
 					<div class="fmt-colors">
 						{IRC_PALETTE.slice(0, 16).map((hex, i) => (
 							<button
-								key={i}
+								key={hex}
 								type="button"
 								class="fmt-swatch"
 								style={{ background: hex }}

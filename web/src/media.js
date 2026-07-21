@@ -67,7 +67,7 @@ export function shouldRemint(expSec, now = Date.now()) {
 export function mediaFileName(u) {
 	try {
 		const url = new URL(u);
-		const seg = url.pathname.split("/").filter(Boolean).pop() || "";
+		const seg = url.pathname.split("/").findLast(Boolean) || "";
 		if (!seg) return url.host;
 		try {
 			return decodeURIComponent(seg);

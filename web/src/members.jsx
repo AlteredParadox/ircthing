@@ -140,13 +140,12 @@ export function Members({ info, theme, ignoredNicks, onNick }) {
 				<div class="side-meta">{q ? `${shown.length}/${members.length}` : members.length}</div>
 			</div>
 			{info?.truncated === true && (
-				<div
+				<output
 					class="data-warning"
-					role="status"
 					title="Fetching the membership stopped early (server without paging support, or a safety stop), so some members are not shown."
 				>
 					Member list incomplete — paging stopped early
-				</div>
+				</output>
 			)}
 			<div
 				class="side-list scroll"

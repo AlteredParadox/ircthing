@@ -52,7 +52,12 @@ export function colorCode(n) {
 // selection exists — everything after it renders unstyled anyway).
 export function applyFormat(text, selStart, selEnd, code) {
 	const open = code;
-	let close = code === RESET ? "" : code.startsWith(COLOR) ? COLOR : code;
+	// RESET is unpaired; a colour closes with a bare \x03; other attribute
+	// codes are toggles that close with themselves.
+	let close;
+	if (code === RESET) close = "";
+	else if (code.startsWith(COLOR)) close = COLOR;
+	else close = code;
 	// A bare closing \x03 immediately before a digit ("\x0304abc" + "\x03" +
 	// "5…") would be parsed as a NEW colour code and eat the digit; same for
 	// ",digit" (consumed as a background). Close with a full reset in that

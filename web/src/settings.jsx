@@ -362,7 +362,7 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 		setLogoutErr(false);
 		try {
 			const r = await fetch("/api/logout", { method: "POST" });
-			if (!r.ok) throw new Error();
+			if (!r.ok) throw new Error("logout failed: HTTP " + r.status);
 			onLogout?.();
 		} catch {
 			setLogoutErr(true);
