@@ -176,15 +176,35 @@ export function captureViewportAnchor(geo, items, viewTop) {
 
 export function restoreViewportAnchor(geo, anchor) {
 	if (!anchor) return null;
+	// Collapse-member lookup, built lazily on the first miss of the exact-id
+	// fast path so the common restore pays nothing. The nearest-survivor loop
+	// below can probe O(removed run) candidates; resolving each one with a
+	// fresh full findIndex over items-with-collapse made a large ignore-filter
+	// rewrite O(removed × list) — seconds of stall on a 4000-row run. One map
+	// makes the whole fallback O(list + removed run).
+	let memberIndex = null; // collapse-member event id -> row index
+	const memberLookup = (member) => {
+		if (memberIndex === null) {
+			memberIndex = new Map();
+			for (let j = 0; j < geo.items.length; j++) {
+				const run = geo.items[j].collapse;
+				if (!run) continue;
+				// First containing row wins, matching a forward scan.
+				for (const ev of run) {
+					if (!memberIndex.has(ev.id)) memberIndex.set(ev.id, j);
+				}
+			}
+		}
+		return memberIndex.get(member) ?? -1;
+	};
 	const locate = (ref) => {
 		// Exact top-level identity always wins. This is what distinguishes an
 		// expanded run's summary row from its real last child.
-		let i = geo.indexOf(ref.id);
+		const i = geo.indexOf(ref.id);
 		if (i !== -1) return i;
 		// A status-mode change may replace a real presence row with a collapsed
 		// synthetic row, or extend a run and change its synthetic id.
-		return geo.items.findIndex((it) =>
-			it.collapse?.some((ev) => ev.id === ref.member));
+		return memberLookup(ref.member);
 	};
 	let i = locate(anchor);
 	if (i === -1 && anchor.source) {
@@ -271,6 +291,65 @@ export function computeWindow(
 export function pinnedAfterScroll(wasPinned, internal, top, maxTop, threshold = 40) {
 	if (maxTop - top < threshold) return true;
 	return internal && wasPinned;
+}
+
+// scrollSettleStep: decision core for when a user scroll has settled enough
+// to load older history (VirtualList's onNearTop). Pure so node:test can
+// cover the state machine; the component owns the real timer and the DOM
+// near-top check.
+//
+// The hazard: while a native scrollbar thumb is HELD, a prepend that grows
+// scrollHeight makes the browser re-derive scrollTop proportionally from the
+// thumb position and teleport the viewport. Firefox delivers no pointer
+// events for scrollbar interactions, so a drag is invisible except as
+// unattributable scroll events — and a stationary held thumb emits no events
+// at all, indistinguishable from settled quiet. Loads may therefore fire only
+// at moments that cannot be mid-drag.
+//
+// Inputs: hasScrollEnd (engine dispatches scrollend), pending (a user scroll
+// awaits its settle decision), event. Returns { pending, timer, fire }:
+// timer is "arm" (start/restart the settle countdown), "clear", or "keep";
+// fire asks the caller to run its near-top check now.
+//
+// States on scrollend engines (pending, timer armed):
+//   IDLE (false, false) --wheel--> WHEEL-SETTLING (true, true)
+//   IDLE --scroll--> DRAGGABLE-PENDING (true, false)
+//   WHEEL-SETTLING --scroll--> WHEEL-SETTLING (timer NOT extended)
+//   any --scrollend--> fire; pending false; timer untouched
+//   WHEEL-SETTLING --timer--> fire; IDLE
+//   any --cancel--> IDLE (focus jump owns the viewport)
+// Invariants that fall out:
+//   - Only a wheel event arms the timer. Wheel input proves the hand was on
+//     the wheel, not the thumb, at that instant; scroll events carry no
+//     source and must never arm or EXTEND the countdown, so no chain of
+//     drag-produced scroll events can push a timer fire into a held drag.
+//     After the last wheel event + one settle window, only scrollend (drag
+//     release or wheel settle) can fire a load. Residual: a thumb grabbed
+//     inside that one bounded window can still see a single timer fire; a
+//     motionless grab always had that hole, and nothing can close it without
+//     scrollbar pointer events.
+//   - scrollend fires the pending check unconditionally (drag release and
+//     settled wheel motion both end in scrollend) but deliberately KEEPS an
+//     armed wheel timer: Firefox 140 can emit its last scrollend before the
+//     last wheel-driven scroll events arrive, and the still-armed timer
+//     catches a near-top crossing by those trailing events (they re-set
+//     pending; the timer fires within the settle window of the last wheel).
+// Engines WITHOUT scrollend keep the legacy quiet-period fallback: every
+// scroll event re-arms the countdown and the load fires after the quiet
+// window. A mid-drag fire is possible there; accepted for old engines.
+export function scrollSettleStep(hasScrollEnd, pending, event) {
+	switch (event) {
+		case "wheel":
+			return { pending: true, timer: "arm", fire: false };
+		case "scroll":
+			return { pending: true, timer: hasScrollEnd ? "keep" : "arm", fire: false };
+		case "scrollend":
+			return { pending: false, timer: "keep", fire: pending };
+		case "timer":
+			return { pending: false, timer: "clear", fire: pending };
+		case "cancel":
+			return { pending: false, timer: "clear", fire: false };
+	}
 }
 
 // findIndex: largest i in [0, n-1] with offsets[i] <= y (binary search).

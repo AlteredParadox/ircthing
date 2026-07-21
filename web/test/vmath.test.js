@@ -26,6 +26,7 @@ import {
 	pinnedAfterScroll,
 	prependedCount,
 	restoreViewportAnchor,
+	scrollSettleStep,
 } from "../src/vmath.js";
 
 const items = (n, from = 0) =>
@@ -238,6 +239,138 @@ test("viewport fallback crosses a long run of removed rows", () => {
 	g.setItems(filtered, true);
 	is(restoreViewportAnchor(g, anchor), g.offsetOf(1) + 11,
 		"the next survivor wins even when more than a small neighbor window was removed");
+});
+
+test("anchor fallback crosses a huge removed run to collapse-row survivors", () => {
+	// A 4000-row contiguous run (an ignored spammer) is removed from a
+	// 5000-row buffer, and the survivors past the run are collapsed synthetic
+	// rows — the shape that made the naive per-candidate findIndex fallback
+	// O(removed x list). The lazy member index must land on the same row the
+	// naive outward scan would: the first following survivor, at the same
+	// intra-row offset.
+	const list = items(5000);
+	const g = geo(list);
+	const anchor = captureViewportAnchor(g, list, g.offsetOf(2500) + 12);
+	is(anchor.id, 2500);
+	const head = list.slice(0, 500); // rows 500..4499 removed
+	const runs = [];
+	for (let i = 4500; i < 5000; i += 10) {
+		runs.push({ id: `clp-${i + 9}`, collapse: list.slice(i, i + 10) });
+	}
+	g.setItems([...head, ...runs], true);
+	// The nearest following survivor of removed row 2500 is row 4500, now a
+	// member of the first collapse row (index 500 in the new list).
+	is(restoreViewportAnchor(g, anchor), g.offsetOf(500) + 12,
+		"first following collapse survivor keeps the viewport position");
+	// A preceding survivor wins when it is strictly nearer than any follower.
+	const g2 = geo(list);
+	const anchor2 = captureViewportAnchor(g2, list, g2.offsetOf(600) + 3);
+	const farRuns = [{ id: "clp-4999", collapse: list.slice(4500, 5000) }];
+	g2.setItems([...list.slice(0, 500), ...farRuns], true);
+	is(restoreViewportAnchor(g2, anchor2), g2.offsetOf(499) + 3,
+		"nearest preceding real survivor beats the distant collapse run");
+});
+
+test("scrollSettleStep: transitions on scrollend-capable engines", () => {
+	// { pending-in, event } -> expected step result. The load-firing DOM
+	// check stays in the component; `fire` only asks for it.
+	const cases = [
+		["wheel", false, { pending: true, timer: "arm", fire: false }],
+		["wheel", true, { pending: true, timer: "arm", fire: false }],
+		// Scroll events carry no source (thumb drags emit only these), so they
+		// must never arm or extend the settle countdown.
+		["scroll", false, { pending: true, timer: "keep", fire: false }],
+		["scroll", true, { pending: true, timer: "keep", fire: false }],
+		// scrollend (drag release / settled wheel) always fires the pending
+		// check and keeps a wheel-armed timer for Firefox's early scrollend.
+		["scrollend", true, { pending: false, timer: "keep", fire: true }],
+		["scrollend", false, { pending: false, timer: "keep", fire: false }],
+		["timer", true, { pending: false, timer: "clear", fire: true }],
+		["timer", false, { pending: false, timer: "clear", fire: false }],
+		["cancel", true, { pending: false, timer: "clear", fire: false }],
+	];
+	for (const [event, pending, want] of cases) {
+		eq(scrollSettleStep(true, pending, event), want, `${event} pending=${pending}`);
+	}
+});
+
+test("scrollSettleStep: legacy engines re-arm the quiet timer on every scroll", () => {
+	eq(scrollSettleStep(false, false, "scroll"), { pending: true, timer: "arm", fire: false });
+	eq(scrollSettleStep(false, true, "scroll"), { pending: true, timer: "arm", fire: false });
+	eq(scrollSettleStep(false, true, "timer"), { pending: false, timer: "clear", fire: true });
+});
+
+// runSettle folds an event sequence through the pure machine, tracking the
+// armed flag the way the component's timer handle does, and records which
+// events fired the near-top check and whether the timer was armed at each
+// step.
+function runSettle(hasScrollEnd, events) {
+	let pending = false;
+	let armed = false;
+	const fires = [];
+	const armedAt = [];
+	events.forEach((ev, i) => {
+		if (ev === "timer") is(armed, true, `event ${i}: timer fired while unarmed`);
+		const r = scrollSettleStep(hasScrollEnd, pending, ev);
+		pending = r.pending;
+		if (r.timer === "arm") armed = true;
+		else if (r.timer === "clear") armed = false;
+		if (r.fire) fires.push(i);
+		armedAt.push(armed);
+	});
+	return { pending, armed, fires, armedAt };
+}
+
+test("scrollSettleStep: wheel gesture loads once motion settles", () => {
+	// Normal engine: wheel motion, scroll events, then a well-ordered
+	// scrollend. The scrollend fires the check; the kept timer later expires
+	// with nothing pending.
+	const r = runSettle(true, ["wheel", "scroll", "scroll", "scrollend", "timer"]);
+	eq(r.fires, [3], "scrollend fires; the stale timer expiry does not");
+	is(r.pending, false);
+});
+
+test("scrollSettleStep: Firefox early scrollend still loads via the wheel timer", () => {
+	// Firefox 140 can emit its last scrollend BEFORE the last wheel-driven
+	// scroll events. The trailing events re-set pending and the still-armed
+	// wheel timer (<=160ms after the last wheel) catches the near-top
+	// crossing — the hole the wheel fallback exists to close.
+	const r = runSettle(true, ["wheel", "scroll", "scrollend", "scroll", "scroll", "timer"]);
+	eq(r.fires, [2, 5], "early scrollend fires, and the timer catches the trailing events");
+	is(r.armed, false);
+});
+
+test("scrollSettleStep: a thumb drag never arms the settle timer", () => {
+	// Pure drag on a scrollend engine: only unattributable scroll events,
+	// stationary holds (no events at all), then release -> scrollend. No
+	// step may ever arm the timer, so no load can fire mid-drag.
+	const r = runSettle(true, ["scroll", "scroll", "scroll", "scrollend"]);
+	eq(r.armedAt, [false, false, false, false], "no drag event arms the timer");
+	eq(r.fires, [3], "the load fires exactly at drag release");
+});
+
+test("scrollSettleStep: wheel-then-drag cannot re-arm into a held thumb", () => {
+	// The regression this machine exists to prevent: wheel up, grab the thumb
+	// within the settle window, drag. Drag scroll events must not extend the
+	// wheel-armed countdown, so after the single bounded wheel window expires
+	// no timer exists to fire during a stationary hold; the load waits for
+	// the release scrollend.
+	const events = ["wheel", "scroll", "scroll", "timer", "scroll", "scroll", "scrollend"];
+	const r = runSettle(true, events);
+	is(r.armedAt[3], false, "the wheel window is one-shot");
+	eq(r.armedAt.slice(4), [false, false, false],
+		"drag scroll events after the window never re-arm");
+	// fires[0]=3 is the accepted bounded residual: one fire can land inside
+	// the single settle window after the last wheel event (a motionless grab
+	// always had that hole). Everything after it must wait for the release.
+	eq(r.fires, [3, 6], "after the wheel window, only the release scrollend fires");
+});
+
+test("scrollSettleStep: cancel clears a pending gesture", () => {
+	const r = runSettle(true, ["wheel", "scroll", "cancel", "scrollend"]);
+	eq(r.fires, [], "a focus jump consumes the pending scroll");
+	is(r.pending, false);
+	is(r.armed, false);
 });
 
 test("non-append identity changes distinguish filters from live tail appends", () => {

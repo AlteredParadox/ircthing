@@ -24,6 +24,7 @@ import {
 	pinnedAfterScroll,
 	prependedCount,
 	restoreViewportAnchor,
+	scrollSettleStep,
 } from "./vmath.js";
 
 const SCROLL_SETTLE_MS = 160;
@@ -313,77 +314,81 @@ export function VirtualList({
 		pendingFocusUnpin.current = false;
 	}, []);
 
-	// Row ref callback: (un)observe and track elements by id.
+	// Row ref callback: (un)observe and track elements by id. The callback per
+	// id is memoized and stable across renders: Preact compares refs by
+	// identity, so a fresh closure per render would run old(null)+new(node) —
+	// an unobserve/observe pair and a fresh initial ResizeObserver delivery —
+	// for every windowed row on every scroll frame and composer keystroke.
+	// Entries are pruned when the row unmounts (ref called with null), so the
+	// map only ever holds the currently windowed rows.
+	const refFns = useRef(new Map()); // id -> stable ref callback
 	function rowRef(id) {
-		return (node) => {
+		let fn = refFns.current.get(id);
+		if (fn) return fn;
+		fn = (node) => {
 			const old = rowEls.current.get(id);
-			if (old && old !== node) ro.unobserve(old);
+			if (old === node) return; // unchanged element: skip observer churn
+			if (old) ro.unobserve(old);
 			if (node) {
 				rowEls.current.set(id, node);
 				ro.observe(node);
 			} else {
 				rowEls.current.delete(id);
+				refFns.current.delete(id);
 			}
 		};
+		refFns.current.set(id, fn);
+		return fn;
 	}
 
 	// Loading a page while Firefox still owns a native scrollbar-thumb drag
 	// makes it recompute scrollTop against the newly-grown scrollHeight and can
-	// cascade the viewport toward the beginning. Wait for the browser's native
-	// scrollend before loading. Older engines use a quiet-period fallback.
+	// cascade the viewport toward the beginning. Loads therefore fire only at
+	// moments that cannot be mid-drag: the browser's native scrollend (drag
+	// release / settled wheel motion), or a settle timer that ONLY wheel input
+	// may arm — scroll events carry no source and never extend it, so no chain
+	// of drag-produced events can push a fire into a held drag. The transitions
+	// live in scrollSettleStep (vmath.js) with the full state enumeration;
+	// engines without scrollend keep the legacy quiet-period fallback there.
 	const onNearTopRef = useRef(onNearTop);
 	onNearTopRef.current = onNearTop;
 	const nearTopPxRef = useRef(nearTopPx);
 	nearTopPxRef.current = nearTopPx;
 	const nativeScrollEnd = useRef(false);
 	const settleTimer = useRef(null);
-	const fallbackActive = useRef(false);
 	const userScrollPending = useRef(false);
 
-	function clearUserScroll() {
-		if (settleTimer.current !== null) {
+	function applySettle(event) {
+		const r = scrollSettleStep(nativeScrollEnd.current, userScrollPending.current, event);
+		userScrollPending.current = r.pending;
+		if (r.timer === "arm") {
+			if (settleTimer.current !== null) clearTimeout(settleTimer.current);
+			settleTimer.current = setTimeout(() => {
+				settleTimer.current = null;
+				applySettle("timer");
+			}, SCROLL_SETTLE_MS);
+		} else if (r.timer === "clear" && settleTimer.current !== null) {
 			clearTimeout(settleTimer.current);
 			settleTimer.current = null;
 		}
-		fallbackActive.current = false;
-		userScrollPending.current = false;
-	}
-
-	function finishUserScroll() {
-		if (settleTimer.current !== null) clearTimeout(settleTimer.current);
-		settleTimer.current = null;
-		fallbackActive.current = false;
-		if (!userScrollPending.current) return;
-		userScrollPending.current = false;
-		const sc = scroller.current;
-		if (sc && !pinned.current && sc.scrollTop < nearTopPxRef.current) {
-			onNearTopRef.current?.();
+		if (r.fire) {
+			const sc = scroller.current;
+			if (sc && !pinned.current && sc.scrollTop < nearTopPxRef.current) {
+				onNearTopRef.current?.();
+			}
 		}
-	}
-
-	function armSettleFallback() {
-		userScrollPending.current = true;
-		fallbackActive.current = true;
-		if (settleTimer.current !== null) clearTimeout(settleTimer.current);
-		settleTimer.current = setTimeout(finishUserScroll, SCROLL_SETTLE_MS);
-	}
-
-	function finishNativeScroll() {
-		// Wheel/trackpad motion owns a quiet timer because Firefox can emit an
-		// early scrollend while its remaining wheel scroll events are still
-		// arriving. Native thumb drags never arm that timer.
-		if (!fallbackActive.current) finishUserScroll();
 	}
 
 	useLayoutEffect(() => {
 		const sc = scroller.current;
 		if (!sc) return;
 		nativeScrollEnd.current = "onscrollend" in sc;
+		const onScrollEnd = () => applySettle("scrollend");
 		if (nativeScrollEnd.current) {
-			sc.addEventListener("scrollend", finishNativeScroll);
+			sc.addEventListener("scrollend", onScrollEnd);
 		}
 		return () => {
-			sc.removeEventListener("scrollend", finishNativeScroll);
+			sc.removeEventListener("scrollend", onScrollEnd);
 			if (settleTimer.current !== null) clearTimeout(settleTimer.current);
 		};
 	}, []);
@@ -410,10 +415,7 @@ export function VirtualList({
 			writeScroll(sc, position, sc.scrollHeight);
 		}
 
-		if (!internal) {
-			userScrollPending.current = true;
-			if (!nativeScrollEnd.current || fallbackActive.current) armSettleFallback();
-		}
+		if (!internal) applySettle("scroll");
 		position.current.knownTop = sc.scrollTop;
 		// One re-render per frame, however many scroll events arrive.
 		if (scrollScheduled.current) return;
@@ -424,10 +426,12 @@ export function VirtualList({
 		});
 	}
 
-	// Firefox 140 advertises scrollend but can emit its last such event before
-	// the last wheel-driven scroll event. Wheel events are not generated by a
-	// native scrollbar-thumb drag, so this fallback closes that hole without
-	// reintroducing a timer that can fire while a held thumb is stationary.
+	// A wheel event is the one scroll source that proves the hand is not on
+	// the scrollbar thumb, so it alone may arm the settle timer — which both
+	// closes Firefox 140's early-scrollend hole (its last scrollend can
+	// precede the last wheel-driven scroll event) and guarantees no timer can
+	// fire while a held thumb sits stationary beyond one settle window of the
+	// last wheel input. See scrollSettleStep in vmath.js.
 	function handleWheel(e) {
 		if (e.ctrlKey || e.deltaY === 0) return; // browser zoom / horizontal gesture
 		// Upward wheel intent precedes the browser's scroll event. Record it now
@@ -440,7 +444,7 @@ export function VirtualList({
 			position.current.knownTop = scroller.current?.scrollTop || 0;
 			onPinnedRef.current?.(false);
 		}
-		armSettleFallback();
+		applySettle("wheel");
 	}
 
 	// After every commit: apply focus/prepend/header anchoring and restore a
@@ -459,7 +463,7 @@ export function VirtualList({
 			pendingPrepend.current = 0;
 			pendingLayoutAnchor.current = null;
 			tailNeedsRestore.current = false;
-			clearUserScroll();
+			applySettle("cancel");
 			centerRow(sc, position, geo, contentOrigin(sc, headerEl.current), focusIdx);
 			pendingFocus.current = false;
 			if (pendingFocusUnpin.current) {
