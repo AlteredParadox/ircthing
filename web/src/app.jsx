@@ -727,6 +727,11 @@ export function App() {
 		});
 		on("_close", () => {
 			setConnected(false);
+			// Whois intents die with the transport: the request they belong
+			// to died with its socket (its reply cannot arrive on the next
+			// connection), and a survivor would let one unsolicited whois
+			// push open a buffer or steal focus after the reconnect.
+			pendingWhois.current.clear();
 			// The WebSocket API can't distinguish a 401 handshake rejection
 			// from a network outage, and Socket retries forever. After a few
 			// closes with no successful open, re-probe auth: if the session is
@@ -1286,8 +1291,13 @@ export function App() {
 	}
 
 	function sendCommand(network, command, params) {
+		// Capture the socket before recording a whois intent: with no
+		// transport there is no request and no .catch to retire the entry,
+		// so it would linger for a future unsolicited push to ride.
+		const s = sock.current;
+		if (!s) return;
 		if (command === "WHOIS") rememberPendingWhois(network, params?.[0]);
-		sock.current?.request("command", { network, command, params })
+		s.request("command", { network, command, params })
 			.catch((e) => {
 				// The whois never went out (or errored): retire its intent so a
 				// later unsolicited whois push can't ride it to steal focus.

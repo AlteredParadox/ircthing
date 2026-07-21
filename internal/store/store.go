@@ -541,31 +541,53 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, o
 	if bufID == 0 {
 		return Message{}, false, nil // no such buffer and create is off
 	}
-	msg, err := s.insertLocked(ctx, bufID, r, m)
+	// Insert and archive settlement commit as one transaction: a message
+	// must never become durable with its buffer's archived flag unsettled,
+	// because a retry of the same msgid deduplicates before settlement and
+	// would leave the buffer hidden until unrelated traffic arrived.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Message{}, false, err
+	}
+	msg, err := s.insertTx(ctx, tx, bufID, m)
 	if err != nil || msg.ID == 0 {
 		// Nothing new was stored (error, or a duplicate msgid from overlapping
 		// backfill) — an already-known message must not un-archive either.
+		tx.Rollback()
 		return msg, false, err
 	}
-	stillArchived, err := s.applyArchiveLocked(ctx, bufID, opts.unarchive)
-	return msg, stillArchived, err
+	stillArchived, err := s.applyArchiveTx(ctx, tx, bufID, opts.unarchive)
+	if err != nil {
+		tx.Rollback()
+		return Message{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Message{}, false, err
+	}
+	// Hot ring only after commit: the ring must never hold a message the
+	// database rolled back.
+	s.ringBytes += int64(r.insert(msg))
+	s.touchRing(r)
+	s.evictRings(bufID)
+	return msg, stillArchived, nil
 }
 
-// applyArchiveLocked settles a just-appended message against the buffer's
-// archived flag (caller holds s.mu). Real conversation (unarchive true)
-// clears the flag so the buffer resurfaces in Buffers/RecentBuffers with its
-// full history; membership fan-out (unarchive false) leaves it hidden and
-// reports that, so the hub can persist the line without publishing an event
-// that would resurrect the buffer on clients. An unarchived buffer reports
-// false on both paths for free: the UPDATE matches no row, the SELECT reads 0.
-func (s *Store) applyArchiveLocked(ctx context.Context, bufID int64, unarchive bool) (bool, error) {
+// applyArchiveTx settles a just-appended message against the buffer's
+// archived flag, inside the append transaction (caller holds s.mu). Real
+// conversation (unarchive true) clears the flag so the buffer resurfaces in
+// Buffers/RecentBuffers with its full history; membership fan-out (unarchive
+// false) leaves it hidden and reports that, so the hub can persist the line
+// without publishing an event that would resurrect the buffer on clients. An
+// unarchived buffer reports false on both paths for free: the UPDATE matches
+// no row, the SELECT reads 0.
+func (s *Store) applyArchiveTx(ctx context.Context, tx *sql.Tx, bufID int64, unarchive bool) (bool, error) {
 	if unarchive {
-		_, err := s.db.ExecContext(ctx,
+		_, err := tx.ExecContext(ctx,
 			`UPDATE buffers SET archived = 0 WHERE id = ? AND archived = 1`, bufID)
 		return false, err
 	}
 	var archived int64
-	err := s.db.QueryRowContext(ctx,
+	err := tx.QueryRowContext(ctx,
 		`SELECT archived FROM buffers WHERE id = ?`, bufID).Scan(&archived)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil // buffer row gone: nothing left to resurrect
@@ -573,10 +595,11 @@ func (s *Store) applyArchiveLocked(ctx context.Context, bufID int64, unarchive b
 	return archived != 0, err
 }
 
-// insertLocked writes m into the buffer and hot ring (caller holds s.mu).
-// A dropped INSERT OR IGNORE (duplicate msgid) returns the zero Message.
-func (s *Store) insertLocked(ctx context.Context, bufID int64, r *ring, m Message) (Message, error) {
-	res, err := s.db.ExecContext(ctx,
+// insertTx writes m into the buffer inside the append transaction (caller
+// holds s.mu); the hot ring is the caller's job, after commit. A dropped
+// INSERT OR IGNORE (duplicate msgid) returns the zero Message.
+func (s *Store) insertTx(ctx context.Context, tx *sql.Tx, bufID int64, m Message) (Message, error) {
+	res, err := tx.ExecContext(ctx,
 		`INSERT OR IGNORE INTO messages (buffer_id, ts, msgid, sender, command, raw, text) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		bufID, m.Time.UnixMilli(), nullString(m.MsgID), m.Sender, m.Command, m.Raw, nullString(m.Text))
 	if err != nil {
@@ -589,9 +612,6 @@ func (s *Store) insertLocked(ctx context.Context, bufID int64, r *ring, m Messag
 	if err != nil {
 		return Message{}, err
 	}
-	s.ringBytes += int64(r.insert(m))
-	s.touchRing(r)
-	s.evictRings(bufID)
 	return m, nil
 }
 
@@ -1024,6 +1044,13 @@ func (s *Store) bufferID(ctx context.Context, network, target string, create boo
 		// authenticated user action (close_buffer purge:false), never by
 		// server traffic, so the server-forgeable population stays bounded
 		// at the cap while a user's archived buffers do not erode it.
+		// Un-archiving can transiently push the active count past the cap;
+		// accepted (2026-07-21): every archived row was admitted under this
+		// cap once and archiving is a deliberate authenticated action, so the
+		// total stays bounded by user intent. The alternatives — refusing an
+		// archive at some second quota, or leaving a live message hidden at
+		// resurface time — both punish the user to enforce a bound the
+		// server cannot abuse.
 		var count int
 		if err := s.db.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM buffers WHERE network_id = ? AND archived = 0`, netID).Scan(&count); err != nil {

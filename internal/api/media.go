@@ -330,7 +330,7 @@ func (s *Server) handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if ce := resp.Header.Get("Content-Encoding"); ce != "" && ce != "identity" {
+	if enc := nonIdentityEncoding(resp); enc != "" {
 		// We asked for identity; an encoded body would relay as mislabeled
 		// bytes (writeStreamHeaders forwards no Content-Encoding). Fail with a
 		// diagnosable 502 instead, no body bytes.
@@ -475,6 +475,25 @@ func (f *fetcher) stream(ctx context.Context, rawURL, rangeHdr string) (*http.Re
 		req.Header.Set("Range", rangeHdr)
 	}
 	return f.client.Do(req)
+}
+
+// nonIdentityEncoding returns the first Content-Encoding token that is not
+// "identity", checking every header value and comma-separated token — a
+// duplicate "identity" + "gzip" pair must not slip past a first-value
+// check — plus any Content-Encoding announced as a trailer (invalid HTTP,
+// and unseeable until after the body would already have been relayed).
+func nonIdentityEncoding(resp *http.Response) string {
+	for _, v := range resp.Header.Values("Content-Encoding") {
+		for _, tok := range strings.Split(v, ",") {
+			if t := strings.ToLower(strings.TrimSpace(tok)); t != "" && t != "identity" {
+				return t
+			}
+		}
+	}
+	if _, ok := resp.Trailer["Content-Encoding"]; ok {
+		return "trailer-announced"
+	}
+	return ""
 }
 
 // tagDialPhase wraps a dial func so its failures classify as dialPhaseError

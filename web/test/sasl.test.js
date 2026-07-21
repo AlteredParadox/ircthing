@@ -35,11 +35,11 @@ test("canonicalSASL strips fields the selected mechanism cannot use", () => {
 		// client cert is silently still presented on connect.
 		["PLAIN", { mechanism: "PLAIN", login: "alice", password: "hunter2" }],
 		["SCRAM-SHA-256", { mechanism: "SCRAM-SHA-256", login: "alice", password: "hunter2" }],
-		// PLAIN/SCRAM -> EXTERNAL: the password must not stay at rest; login
-		// is KEPT (it is the optional authzid, legal with EXTERNAL).
+		// PLAIN/SCRAM -> EXTERNAL: neither the password nor the login stays —
+		// login is the PLAIN/SCRAM authcid, and EXTERNAL's authzid is a
+		// separate config field this form does not edit.
 		["EXTERNAL", {
 			mechanism: "EXTERNAL",
-			login: "alice",
 			cert_file: "/etc/ssl/me.pem",
 			key_file: "/etc/ssl/me.key",
 		}],

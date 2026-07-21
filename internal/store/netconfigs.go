@@ -485,7 +485,7 @@ func (s *Store) DeleteBufferFolded(ctx context.Context, network, target string, 
 // Retention pruning still applies normally. There is no close tombstone and
 // no afterArchive hook: the straggler problem the tombstone solves for
 // deletes is handled by archived buffers swallowing membership fan-out
-// without publication (see applyArchiveLocked), and a tombstone here would
+// without publication (see applyArchiveTx), and a tombstone here would
 // wrongly DROP a live channel message that should instead resurface the
 // buffer. The hot ring and buffer-id cache are kept — the buffer stays live
 // for appends. The canonical spelling is returned even when no row exists

@@ -84,12 +84,17 @@ export class Socket {
 		// still deliver frames queued before the closing handshake completes;
 		// they belong to the retired auth/socket generation and must be inert.
 		if (this.closed) return;
-		if (env.v !== V) return;
-		// A parsed, version-matching envelope is the "delivered frame" proof of
-		// a real backend. It is deliberately signalled HERE, not in onmessage:
-		// a garbage frame (proxy error page, wrong upstream) must not reset
-		// reconnect backoff. A quiet-but-working link still stabilizes via the
-		// STABLE_MS timer.
+		// A well-formed, version-matching envelope is the "delivered frame"
+		// proof of a real backend. It is deliberately signalled HERE, not in
+		// onmessage: a garbage frame (proxy error page, wrong upstream) must
+		// not reset reconnect backoff — and JSON that parses but isn't our
+		// envelope shape (null, a bare {v:1}, a nonsense seq) is still
+		// garbage. A quiet-but-working link stabilizes via the STABLE_MS
+		// timer instead.
+		if (!env || typeof env !== "object" || env.v !== V) return;
+		if (typeof env.type !== "string" || !env.type) return;
+		if (env.seq != null && env.seq !== 0 &&
+			!(Number.isSafeInteger(env.seq) && env.seq > 0)) return;
 		this.markStable();
 		if (env.seq) {
 			const p = this.pending.get(env.seq);

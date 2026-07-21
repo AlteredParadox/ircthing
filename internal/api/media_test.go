@@ -670,25 +670,41 @@ func TestMediaStreamNoTransparentGzip(t *testing.T) {
 // Content-Encoding, so relaying would hand the media element mislabeled gzip
 // bytes.
 func TestMediaStreamRejectsEncodedResponse(t *testing.T) {
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "audio/mpeg")
-		w.Header().Set("Content-Encoding", "gzip")
-		io.WriteString(w, "\x1f\x8b not really gzip")
-	}))
-	defer origin.Close()
-
-	ts, srv := newTestServerWithRef(t)
-	permitStream(srv)
-	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
-	token := sealFor(t, srv, origin.URL+"/a.mp3")
-
-	resp := streamGet(t, ts, cookie, token, "")
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("encoded response relayed: status %d, want 502", resp.StatusCode)
+	cases := []struct {
+		name   string
+		encode func(http.Header)
+	}{
+		{"single gzip", func(h http.Header) { h.Set("Content-Encoding", "gzip") }},
+		// A first-value check (Header.Get) would pass this pair.
+		{"identity then gzip", func(h http.Header) {
+			h.Add("Content-Encoding", "identity")
+			h.Add("Content-Encoding", "gzip")
+		}},
+		{"comma list", func(h http.Header) { h.Set("Content-Encoding", "identity, GZIP") }},
 	}
-	if strings.Contains(string(body), "not really gzip") {
-		t.Fatalf("encoded body bytes leaked through the 502 path")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "audio/mpeg")
+				tc.encode(w.Header())
+				io.WriteString(w, "\x1f\x8b not really gzip")
+			}))
+			defer origin.Close()
+
+			ts, srv := newTestServerWithRef(t)
+			permitStream(srv)
+			cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+			token := sealFor(t, srv, origin.URL+"/a.mp3")
+
+			resp := streamGet(t, ts, cookie, token, "")
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Fatalf("encoded response relayed: status %d, want 502", resp.StatusCode)
+			}
+			if strings.Contains(string(body), "not really gzip") {
+				t.Fatalf("encoded body bytes leaked through the 502 path")
+			}
+		})
 	}
 }

@@ -25,9 +25,11 @@
 //     typed for EXTERNAL must not silently keep a client cert presented on
 //     connect. (This governs only the form's payload; a config file pairing
 //     a client cert with PLAIN — CertFP — remains supported.)
-//   - EXTERNAL: password is dropped (authentication is the TLS client
-//     cert); login is KEPT — it is the optional authzid, legal with
-//     EXTERNAL.
+//   - EXTERNAL: password AND login are dropped. Authentication is the TLS
+//     client cert, and login is the PLAIN/SCRAM authcid — EXTERNAL's
+//     optional authorization identity is the separate `authzid` config
+//     field (internal/irc/sasl.go newMech), which this form does not edit,
+//     so a kept login would just be inert stale state.
 //   - "auto" (stored as mechanism ""): the server resolves it to EXTERNAL
 //     when the password is empty, else SCRAM/PLAIN (internal/irc/sasl.go
 //     newMech), so every field is potentially applicable and all are kept.
@@ -40,6 +42,7 @@ export function canonicalSASL(sasl, choice) {
 	const clean = { ...sasl, mechanism: choice === "auto" ? "" : choice };
 	if (choice === "EXTERNAL") {
 		delete clean.password;
+		delete clean.login;
 	} else if (choice !== "auto") {
 		delete clean.cert_file;
 		delete clean.key_file;
