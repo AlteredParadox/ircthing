@@ -1321,8 +1321,11 @@ func (s *Store) canonicalLocked(ctx context.Context, network, target string, fol
 // (maxBuffersPerNetwork) PLUS the archived reservoir, which has no hard cap
 // and is bounded only by the user's own deliberate closes. ACCEPTED: s.mu is
 // released between calls, and a real user has tens of buffers (microseconds).
-// A hostile server that first opens thousands of buffers could turn this into
-// a throughput drag, but not a stall or exhaustion. If that ever matters, an
+// A hostile server that first opens thousands of buffers — or drives
+// NICK/QUIT floods against a user who has archived thousands — degrades
+// this into a per-line drag whose ceiling scales with that population; no
+// hard bound is guaranteed once the archived reservoir is large. If that
+// ever matters, an
 // ASCII-NOCASE indexed lookup would fast-path the common (special-char-free)
 // target and fall back to this scan only for names containing []\~{}|^.
 func (s *Store) FindBuffer(ctx context.Context, network, target string, fold func(string) string) (name string, ok bool, err error) {
