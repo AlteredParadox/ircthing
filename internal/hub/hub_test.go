@@ -339,15 +339,12 @@ func TestPersistTarget(t *testing.T) {
 	}
 }
 
-// replayTarget must file a REPLAYED private NOTICE in the SAME buffer live
-// noticeTarget would, so a reconnect chathistory replay does not duplicate it
-// (per-buffer msgid dedup would let both persist: a duplicate row + phantom
-// unread). Live now files a correspondent's notice under an open query with
-// that sender — and the query being backfilled IS open — so a notice whose
-// sender matches the batch target lands in the query, not "*". A sender that
-// differs (a rename since) still falls to "*", matching live (no open query
-// under the new nick). Channel notices and our own echoed notice keep the
-// batch target.
+// replayTarget must file a REPLAYED private NOTICE under the batch target,
+// exactly like PRIVMSG: a chathistory TARGET query replays only messages
+// belonging to that target's conversation, so every non-channel message in a
+// query batch belongs to that query — regardless of the sender prefix or our
+// CURRENT nick. Rerouting any of them to "*" duplicates the live copy
+// (per-buffer msgid dedup) as a misfiled lobby row + phantom unread.
 func TestReplayTargetNoticeRouting(t *testing.T) {
 	c := &fakeConn{nick: "AlteredParadox"}
 	cases := []struct {
@@ -357,14 +354,21 @@ func TestReplayTargetNoticeRouting(t *testing.T) {
 		want        string
 		ok          bool
 	}{
-		// The query we are backfilling is the sender's: file the notice there,
-		// mirroring live routing into the open query (services/opped bots).
+		// The query we are backfilling is the sender's: file the notice there.
 		{"incoming private notice -> the query", ":alice!u@h NOTICE AlteredParadox :ping", "alice", "alice", true},
 		{"incoming private notice, case-variant batch -> the query", ":Alice!u@h NOTICE AlteredParadox :ping", "alice", "alice", true},
 		// The correspondent renamed between the notice and the replay: the
-		// sender no longer matches the batch/query name, so it lands in "*"
-		// (matching live, which had no open query under the new nick).
-		{"incoming notice, sender renamed since -> server buffer", ":alice2!u@h NOTICE AlteredParadox :ping", "alice", "*", true},
+		// batch target still names the conversation being backfilled, so the
+		// notice stays in that query. (An earlier revision expected "*" here,
+		// keying on fold(sender)==fold(batch target) — but the server only
+		// replays messages belonging to the requested target's history, so a
+		// mismatched prefix never means "different conversation"; rerouting
+		// misfiled it and, msgid dedup being per-buffer, duplicated it.)
+		{"incoming notice, sender renamed since -> still the query", ":alice2!u@h NOTICE AlteredParadox :ping", "alice", "alice", true},
+		// Our own notice replayed under the OLD nick after a rename: still the
+		// batch target — replay routing is independent of the current nick
+		// (see persistBuffer's contract).
+		{"own notice under old nick after rename -> the query", ":OldNick!u@h NOTICE bob :psst", "bob", "bob", true},
 		{"our own echoed notice -> recipient query", ":AlteredParadox!u@h NOTICE alice :psst", "alice", "alice", true},
 		{"channel notice -> the channel", ":alice!u@h NOTICE #go :psst", "#go", "#go", true},
 		{"private message -> the query", ":alice!u@h PRIVMSG AlteredParadox :hi", "alice", "alice", true},
@@ -427,6 +431,74 @@ func TestNoticeRoutingWithOpenQuery(t *testing.T) {
 			t.Fatalf("routing: chat=%d (want 2), *=%d (want 1)", len(chatMsgs), len(starMsgs))
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// NOTICE analog of TestReplayPMRoutesByBatchTargetAfterNickChange: replayed
+// query NOTICEs must file under the batch target independently of our CURRENT
+// nick. Repro this pins: we sent "/notice bob psst" as AlteredParadox (echoed
+// live with msgid n1, stored in "bob"), the connection dropped, and reconnect
+// fell back to AlteredParadox_. Backfilling "bob" replays the notice under the
+// OLD nick; a current-nick own-check saw a foreign sender and rerouted it to
+// "*" — and msgid dedup being per-buffer, the live copy in "bob" could not
+// suppress that insert: a duplicate, misfiled lobby row + phantom unread.
+func TestReplayNoticeRoutesByBatchTargetAfterNickChange(t *testing.T) {
+	h := newTestHub(t)
+	// Already renamed: the replayed history is from when we were "AlteredParadox".
+	conn := &fakeConn{
+		ch: make(chan irc.Event, 16), name: "libera", nick: "AlteredParadox_",
+		caps: map[string]bool{"echo-message": true},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	// The live echo of our notice, stored in "bob" before the rename.
+	if _, err := h.store.Append(ctxb, "libera", "bob", store.Message{
+		Time:    time.Date(2026, 7, 15, 0, 0, 6, 0, time.UTC),
+		MsgID:   "n1",
+		Sender:  "AlteredParadox",
+		Command: "NOTICE",
+		Raw:     ":AlteredParadox!u@h NOTICE bob :psst",
+		Text:    "psst",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+	conn.ch <- ev(":srv BATCH +r1 chathistory bob")
+	// Our own notice under the OLD nick (must dedup against the live copy in
+	// "bob", not misfile into "*"), and bob's reply addressed to the OLD nick.
+	conn.ch <- ev("@batch=r1;msgid=n1;time=2026-07-15T00:00:06.000Z :AlteredParadox!u@h NOTICE bob :psst")
+	conn.ch <- ev("@batch=r1;msgid=n2;time=2026-07-15T00:00:07.000Z :bob!u@h NOTICE AlteredParadox :ack")
+	conn.ch <- ev(":srv BATCH -r1")
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		msgs, err := h.store.Latest(ctxb, "libera", "bob", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(msgs) >= 2 {
+			if len(msgs) != 2 {
+				t.Fatalf("own notice duplicated in bob: %d rows: %+v", len(msgs), msgs)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replayed notice history not filed under bob (got %d)", len(msgs))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Nothing leaked into the lobby or a phantom nick buffer.
+	for _, phantom := range []string{serverBufferTarget, "AlteredParadox", "AlteredParadox_"} {
+		if m, _ := h.store.Latest(ctxb, "libera", phantom, 10); len(m) != 0 {
+			t.Fatalf("notice history misfiled under %q: %+v", phantom, m)
+		}
 	}
 }
 

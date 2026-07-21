@@ -642,26 +642,17 @@ func replayTarget(m *ircv4.Message, batchTarget string, c Conn) (string, bool) {
 	if t == "" {
 		return "", false
 	}
-	// Mirror live NOTICE routing (noticeTarget): an incoming private NOTICE
-	// files under an OPEN query with the sender, else the network server
-	// buffer. During replay the query we are backfilling is the batch target
-	// t, and that it is being backfilled means it is open — so a notice whose
-	// SENDER is that correspondent stays in t (the query); anything else falls
-	// to "*". This keys on the sender (fold(prefix) == fold(t)), which agrees
-	// with the live path: when the correspondent renamed since (sender != t),
-	// live had no open query under the new nick and filed the notice in "*",
-	// so replay does too. Our own echoed notice (sender == our nick) has
-	// target == the correspondent (the batch target), so it stays in t.
-	if m.Command == "NOTICE" && !c.IsChannel(t) {
-		own := m.Prefix != nil && c.Nick() != "" && c.Fold(m.Prefix.Name) == c.Fold(c.Nick())
-		sender := ""
-		if m.Prefix != nil {
-			sender = m.Prefix.Name
-		}
-		if !own && c.Fold(sender) != c.Fold(t) {
-			return serverBufferTarget, true
-		}
-	}
+	// NOTICEs route by the batch target exactly like PRIVMSG — no re-derivation
+	// from the sender or our current nick. Per draft/chathistory, a TARGET
+	// query replays only messages belonging to that target's conversation, so
+	// every non-channel message in a query batch belongs to that query. Keying
+	// on the sender vs our CURRENT nick (as an earlier revision did, mirroring
+	// live noticeTarget) violated persistBuffer's nick-independence contract: a
+	// replay of our own notice after a /nick or collision-fallback rename saw
+	// fold(sender) != fold(current nick), rerouted to "*", and — msgid dedup
+	// being per-buffer — duplicated the live copy as a misfiled lobby row.
+	// Live routing is untouched; it never reaches here (persistBuffer only
+	// calls replayTarget inside a chathistory batch).
 	return t, true
 }
 
