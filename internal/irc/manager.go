@@ -376,10 +376,12 @@ func (m *Manager) Channel(name string) (topic string, members []Member, ok bool)
 	return m.roster.channel(name)
 }
 
-// ChannelPage is the transport-facing bounded roster snapshot. Channel stays
+// ChannelPage is the transport-facing bounded roster snapshot: up to limit
+// members whose folded key sorts strictly after the `after` cursor ("" =
+// first page; see roster.channelPage for the paging contract). Channel stays
 // available for internal callers/tests that explicitly need the full state.
-func (m *Manager) ChannelPage(name string, limit int) (topic string, members []Member, truncated, ok bool) {
-	return m.roster.channelPage(name, limit)
+func (m *Manager) ChannelPage(name string, limit int, after string) (topic string, members []Member, truncated, ok bool) {
+	return m.roster.channelPage(name, limit, after)
 }
 
 // EnsureNames requests the membership of a channel we have not fetched

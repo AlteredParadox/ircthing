@@ -1226,10 +1226,77 @@ func TestSessionGetChannelIsBoundedAndExplicitlyTruncated(t *testing.T) {
 	if !got.Joined || !got.Truncated || len(got.Members) == 0 || len(got.Members) >= maxChannelResponseMembers {
 		t.Fatalf("bounded channel = joined=%v members=%d truncated=%v", got.Joined, len(got.Members), got.Truncated)
 	}
+	// A byte-capped page yields a correspondingly earlier cursor: the folded
+	// key of the last member that fit, so the next page resumes there.
+	last := got.Members[len(got.Members)-1].Nick
+	if got.MembersAfter != conn.Fold(last) {
+		t.Fatalf("members_after = %q, want fold(%q)", got.MembersAfter, last)
+	}
+	s.Handle(ctx, request(t, "get_channel", 2, ChannelReq{Network: "libera", Buffer: "#large", After: got.MembersAfter}))
+	next := decode[ChannelData](t, recv(t, s, "channel"))
+	if len(next.Members) == 0 || conn.Fold(next.Members[0].Nick) <= got.MembersAfter {
+		t.Fatalf("cursor page did not advance: first=%v after=%q", next.Members, got.MembersAfter)
+	}
 	select {
 	case <-s.Done():
 		t.Fatal("valid bounded channel response evicted the session")
 	default:
+	}
+}
+
+// TestSessionGetChannelCursorPagesThroughFullRoster walks a channel larger
+// than the per-response member cap with the `after` cursor and checks the
+// union of pages is the complete roster, each member exactly once.
+func TestSessionGetChannelCursorPagesThroughFullRoster(t *testing.T) {
+	h := newTestHub(t)
+	members := make([]irc.Member, maxChannelResponseMembers*2+88)
+	for i := range members {
+		members[i] = irc.Member{Nick: fmt.Sprintf("nick%04d", i)}
+	}
+	conn := &fakeConn{
+		ch: make(chan irc.Event), name: "libera", nick: "me",
+		chans: map[string][]irc.Member{"#big": members},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	s := h.NewSession()
+	defer s.Close()
+
+	seen := map[string]bool{}
+	after := ""
+	for page, seq := 0, 1; ; page, seq = page+1, seq+1 {
+		if page > 10 {
+			t.Fatal("cursor walk did not terminate")
+		}
+		s.Handle(ctx, request(t, "get_channel", int64(seq), ChannelReq{Network: "libera", Buffer: "#big", After: after}))
+		got := decode[ChannelData](t, recv(t, s, "channel"))
+		if !got.Joined {
+			t.Fatalf("page %d: joined=false", page)
+		}
+		if len(got.Members) > maxChannelResponseMembers {
+			t.Fatalf("page %d: %d members exceeds the per-page cap", page, len(got.Members))
+		}
+		for _, m := range got.Members {
+			if seen[m.Nick] {
+				t.Fatalf("page %d: duplicate member %q across pages", page, m.Nick)
+			}
+			seen[m.Nick] = true
+		}
+		if !got.Truncated {
+			if got.MembersAfter != "" {
+				t.Fatalf("final page still carries a cursor %q", got.MembersAfter)
+			}
+			break
+		}
+		if got.MembersAfter == "" || got.MembersAfter <= after {
+			t.Fatalf("page %d: cursor %q did not advance past %q", page, got.MembersAfter, after)
+		}
+		after = got.MembersAfter
+	}
+	if len(seen) != len(members) {
+		t.Fatalf("walked %d members, want %d", len(seen), len(members))
 	}
 }
 

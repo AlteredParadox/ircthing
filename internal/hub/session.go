@@ -789,11 +789,13 @@ func (s *Session) handleGetChannel(ctx context.Context, env Envelope) {
 			members   []irc.Member
 			truncated bool
 			ok        bool
+			paged     bool // cursor-capable source: safe to hand out MembersAfter
 		)
 		if pager, supportsPage := conn.(interface {
-			ChannelPage(string, int) (string, []irc.Member, bool, bool)
+			ChannelPage(string, int, string) (string, []irc.Member, bool, bool)
 		}); supportsPage {
-			topic, members, truncated, ok = pager.ChannelPage(d.Buffer, maxChannelResponseMembers)
+			topic, members, truncated, ok = pager.ChannelPage(d.Buffer, maxChannelResponseMembers, d.After)
+			paged = true
 		} else {
 			// Test/alternate connections implement the original interface. Cap
 			// their snapshot immediately after the call; production Managers use
@@ -810,6 +812,15 @@ func (s *Session) handleGetChannel(ctx context.Context, env Envelope) {
 			data.Truncated = truncated
 			base, _ := json.Marshal(data)
 			used := len(base)
+			if paged {
+				// Reserve room for the members_after cursor appended below:
+				// a folded, clamped nick — ≤512 bytes (the irc package's
+				// maxRosterField) at worst all JSON-escaped to 6 bytes each —
+				// plus field syntax. Reserving up front means appending the
+				// cursor can never push the payload past the byte cap this
+				// loop enforces (~3 KB of headroom against a 512 KB cap).
+				used += 512*6 + len(`,"members_after":""`)
+			}
 			for _, m := range members {
 				md := MemberData{
 					Nick: m.Nick, Prefix: m.Prefix, Away: m.Away,
@@ -826,6 +837,18 @@ func (s *Session) handleGetChannel(ctx context.Context, env Envelope) {
 				}
 				used += extra
 				data.Members = append(data.Members, md)
+			}
+			// Next-page cursor: the folded key of the last member actually
+			// sent (Truncated covers both "roster has more" and the byte-cap
+			// break above). Stored nicks are already clamped, so Fold(nick)
+			// equals the roster's map key — and computing it from data.Members
+			// rather than the roster page means a byte-capped page yields the
+			// correspondingly earlier cursor. Zero members sent leaves no
+			// cursor; a cursor-aware client treats that as a degraded stop.
+			if paged && data.Truncated {
+				if n := len(data.Members); n > 0 {
+					data.MembersAfter = conn.Fold(data.Members[n-1].Nick)
+				}
 			}
 		}
 	}

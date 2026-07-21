@@ -233,6 +233,11 @@ type CommandData struct {
 type ChannelReq struct {
 	Network string `json:"network"`
 	Buffer  string `json:"buffer"`
+	// After is an optional paging cursor: the MembersAfter value of the
+	// previous page's response. Absent/empty requests the first page, so
+	// clients unaware of cursors get exactly the pre-cursor behavior
+	// (envelope forward-compat: unknown/absent field, old semantics).
+	After string `json:"after,omitempty"`
 }
 
 // MemberData is one channel occupant.
@@ -255,8 +260,15 @@ type ChannelData struct {
 	Joined  bool         `json:"joined"`
 	Topic   string       `json:"topic"`
 	Members []MemberData `json:"members"`
-	// Truncated reports that the roster snapshot was bounded for transport.
+	// Truncated reports that the roster snapshot was bounded for transport —
+	// for cursor-aware clients it means "more pages exist": request again
+	// with After = MembersAfter to continue.
 	Truncated bool `json:"truncated"`
+	// MembersAfter is the cursor for the next page, set when Truncated and
+	// the connection supports paging (the folded key of the last member in
+	// this response — so a byte-capped page simply yields an earlier
+	// cursor). Empty with Truncated set means no continuation is available.
+	MembersAfter string `json:"members_after,omitempty"`
 }
 
 // MembersChangedData is a server push hinting that channel state changed

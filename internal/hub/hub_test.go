@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -610,8 +611,16 @@ func (f *fakeConn) Channel(name string) (string, []irc.Member, bool) {
 	return f.topic, ms, ok
 }
 
-func (f *fakeConn) ChannelPage(name string, limit int) (string, []irc.Member, bool, bool) {
-	ms, ok := f.chans[name]
+// ChannelPage mirrors the production roster's paging contract: members in
+// folded-key order, strictly after the cursor, at most limit per call.
+func (f *fakeConn) ChannelPage(name string, limit int, after string) (string, []irc.Member, bool, bool) {
+	all, ok := f.chans[name]
+	ms := make([]irc.Member, len(all))
+	copy(ms, all)
+	sort.Slice(ms, func(i, j int) bool { return f.Fold(ms[i].Nick) < f.Fold(ms[j].Nick) })
+	for len(ms) > 0 && after != "" && f.Fold(ms[0].Nick) <= after {
+		ms = ms[1:]
+	}
 	truncated := len(ms) > limit
 	if truncated {
 		ms = ms[:limit]

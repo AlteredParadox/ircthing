@@ -23,6 +23,7 @@ import { applyPrefs, loadPrefs, MAX_PREFS_BYTES, normalizePrefs, prefsByteLength
 import { isIgnored, isMuted, loadIgnores, loadMutes, toggleIgnore, toggleMute } from "./local.js";
 import { editableNetwork, networkEditError } from "./networkedit.js";
 import { armPendingJoin, clearPendingJoin, notePendingJoinForward, takePendingJoin } from "./pending.js";
+import { fetchAllMembers } from "./memberlist.js";
 import { ContextMenu } from "./menu.jsx";
 import { Members } from "./members.jsx";
 import { ChannelPrompt, NetworkForm } from "./netform.jsx";
@@ -1054,6 +1055,13 @@ export function App() {
 
 	// Channel state (topic + members) for the active buffer. Debounced:
 	// members_changed hints arrive in bursts (NAMES floods, netsplits).
+	// Big channels page in via the get_channel `after` cursor:
+	// fetchAllMembers keeps requesting while the server reports more,
+	// pushing each accumulated page into chanInfo so the panel fills in
+	// live. It stops on its own at the roster cap or a non-advancing
+	// cursor (memberlist.js), and isStale abandons the walk when the
+	// active buffer or socket changes mid-page — the same staleness
+	// conditions the single-shot fetch guarded.
 	useEffect(() => {
 		const buf = activeKey ? buffers[activeKey] : null;
 		if (!buf || !connected || !isChannelName(buf.buffer, networks[buf.network]?.chantypes)) {
@@ -1068,14 +1076,33 @@ export function App() {
 		const key = buf.key;
 		let alive = true;
 		const t = setTimeout(() => {
-			s.request("get_channel", { network: buf.network, buffer: buf.buffer })
-				.then((d) => {
-					if (alive && sock.current === s && activeKeyRef.current === key &&
-						d?.network === buf.network && d?.buffer === buf.buffer) {
-						setChanInfo(d);
-					}
-				})
-				.catch(() => {});
+			fetchAllMembers({
+				request: (after) =>
+					s.request("get_channel", {
+						network: buf.network,
+						buffer: buf.buffer,
+						...(after ? { after } : {}),
+					}).then((d) => {
+						if (d?.network !== buf.network || d?.buffer !== buf.buffer) {
+							throw new Error("mismatched channel response");
+						}
+						return d;
+					}),
+				isStale: () => !alive || sock.current !== s || activeKeyRef.current !== key,
+				onPage: (st) => {
+					setChanInfo({
+						network: buf.network,
+						buffer: buf.buffer,
+						joined: st.meta.joined,
+						topic: st.meta.topic,
+						members: st.members,
+						// Only a walk that genuinely stopped early marks the
+						// list incomplete; while more pages are inbound the
+						// panel just shows what has arrived so far.
+						truncated: st.done && st.degraded,
+					});
+				},
+			});
 		}, 150);
 		return () => {
 			alive = false;

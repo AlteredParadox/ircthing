@@ -17,6 +17,7 @@
 package irc
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -89,7 +90,7 @@ func TestRosterChannelPageReturnsSortedBoundedPrefix(t *testing.T) {
 		":srv 353 AlteredParadox = #go :n4 n1 n3 AlteredParadox n0 n2",
 		":srv 366 AlteredParadox #go :end",
 	)
-	topic, got, truncated, ok := r.channelPage("#go", 3)
+	topic, got, truncated, ok := r.channelPage("#go", 3, "")
 	if !ok || topic != "" || !truncated {
 		t.Fatalf("page metadata = ok=%v topic=%q truncated=%v", ok, topic, truncated)
 	}
@@ -101,6 +102,149 @@ func TestRosterChannelPageReturnsSortedBoundedPrefix(t *testing.T) {
 		if got[i].Nick != want[i] {
 			t.Fatalf("member %d = %q, want %q", i, got[i].Nick, want[i])
 		}
+	}
+}
+
+// TestRosterChannelPageCursorWalk pages through a large channel with the
+// `after` cursor and checks the walk yields every member exactly once, in
+// folded-key order, across page-size boundaries (strictly-after: no
+// duplicate or skip at page joins).
+func TestRosterChannelPageCursorWalk(t *testing.T) {
+	r := testRoster()
+	feed(t, r, joinGo)
+	// 1,000 members via NAMES bursts (plus ourselves), under the roster bounds.
+	lines := []string{":srv 353 AlteredParadox = #go :AlteredParadox"}
+	for i := 0; i < 1000; i += 100 {
+		nicks := make([]string, 0, 100)
+		for j := i; j < i+100; j++ {
+			nicks = append(nicks, fmt.Sprintf("User%04d", j))
+		}
+		lines = append(lines, ":srv 353 AlteredParadox = #go :"+strings.Join(nicks, " "))
+	}
+	lines = append(lines, ":srv 366 AlteredParadox #go :end")
+	feed(t, r, lines...)
+
+	var walked []string
+	after := ""
+	for pages := 0; ; pages++ {
+		if pages > 100 {
+			t.Fatal("cursor walk did not terminate")
+		}
+		_, page, truncated, ok := r.channelPage("#go", 37, after)
+		if !ok {
+			t.Fatal("channel lost mid-walk")
+		}
+		for _, m := range page {
+			walked = append(walked, m.Nick)
+		}
+		if !truncated {
+			break
+		}
+		if len(page) == 0 {
+			t.Fatal("truncated page with no members")
+		}
+		after = r.isup.Fold(page[len(page)-1].Nick)
+	}
+	if len(walked) != 1001 { // 1,000 + ourselves
+		t.Fatalf("walked %d members, want 1001", len(walked))
+	}
+	seen := map[string]bool{}
+	for i, nick := range walked {
+		if seen[nick] {
+			t.Fatalf("duplicate member %q at position %d", nick, i)
+		}
+		seen[nick] = true
+		if i > 0 && r.isup.Fold(walked[i-1]) >= r.isup.Fold(nick) {
+			t.Fatalf("out of order at %d: %q then %q", i, walked[i-1], nick)
+		}
+	}
+	for j := 0; j < 1000; j++ {
+		if nick := fmt.Sprintf("User%04d", j); !seen[nick] {
+			t.Fatalf("member %q missing from walk", nick)
+		}
+	}
+}
+
+// A cursor that matches no stored key still means "strictly after": the walk
+// resumes at the next key without duplicating or skipping, and an empty
+// cursor is the first page.
+func TestRosterChannelPageCursorBoundaries(t *testing.T) {
+	r := testRoster()
+	feed(t, r,
+		joinGo,
+		":srv 353 AlteredParadox = #go :AlteredParadox n1 n3 n5",
+		":srv 366 AlteredParadox #go :end",
+	)
+	nicks := func(ms []Member) []string {
+		out := make([]string, len(ms))
+		for i, m := range ms {
+			out[i] = m.Nick
+		}
+		return out
+	}
+	// Empty cursor = first page (identical to the pre-cursor behavior).
+	_, first, _, _ := r.channelPage("#go", 2, "")
+	if want := []string{"alteredparadox", "n1"}; !reflect.DeepEqual(nicks(first), []string{"AlteredParadox", "n1"}) {
+		t.Fatalf("first page = %v, want AlteredParadox,n1 (fold order %v)", nicks(first), want)
+	}
+	// Between-keys cursor: "n2" is not a member; the page starts at n3.
+	_, page, truncated, _ := r.channelPage("#go", 10, "n2")
+	if !reflect.DeepEqual(nicks(page), []string{"n3", "n5"}) || truncated {
+		t.Fatalf("after n2 = %v truncated=%v, want [n3 n5] false", nicks(page), truncated)
+	}
+	// Cursor past every key: empty final page, not truncated.
+	_, page, truncated, _ = r.channelPage("#go", 10, "zzz")
+	if len(page) != 0 || truncated {
+		t.Fatalf("after zzz = %v truncated=%v, want empty false", nicks(page), truncated)
+	}
+}
+
+// Membership churn between pages must not panic, duplicate within a page, or
+// derail the cursor. Cross-page consistency under churn is best-effort by
+// design (see channelPage): a member joining behind the cursor is missed
+// until the next refresh — members_changed triggers that refetch.
+func TestRosterChannelPageCursorChurn(t *testing.T) {
+	r := testRoster()
+	feed(t, r,
+		joinGo,
+		":srv 353 AlteredParadox = #go :AlteredParadox n1 n2 n3 n4 n5 n6",
+		":srv 366 AlteredParadox #go :end",
+	)
+	_, page1, truncated, _ := r.channelPage("#go", 3, "")
+	if !truncated || len(page1) != 3 {
+		t.Fatalf("page1 = %d members truncated=%v", len(page1), truncated)
+	}
+	after := r.isup.Fold(page1[len(page1)-1].Nick) // "n2"
+	// Churn: a page-1 member and a not-yet-walked member leave; a new member
+	// joins behind the cursor (missed — acceptable) and one ahead of it.
+	feed(t, r,
+		":n1!u@h PART #go",
+		":n4!u@h QUIT :bye",
+		":a0!u@h JOIN #go", // behind the cursor: missed by this walk
+		":n45!u@h JOIN #go",
+	)
+	_, page2, _, ok := r.channelPage("#go", 10, after)
+	if !ok {
+		t.Fatal("channel lost after churn")
+	}
+	seen := map[string]bool{}
+	for _, m := range page2 {
+		if seen[m.Nick] {
+			t.Fatalf("duplicate %q within a page", m.Nick)
+		}
+		seen[m.Nick] = true
+		if key := r.isup.Fold(m.Nick); key <= after {
+			t.Fatalf("member %q at key %q not strictly after cursor %q", m.Nick, key, after)
+		}
+	}
+	want := []string{"n3", "n45", "n5", "n6"}
+	for _, nick := range want {
+		if !seen[nick] {
+			t.Fatalf("member %q missing after churn: page2 = %v", nick, page2)
+		}
+	}
+	if len(page2) != len(want) {
+		t.Fatalf("page2 has %d members, want %d (%v)", len(page2), len(want), page2)
 	}
 }
 

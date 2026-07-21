@@ -256,7 +256,24 @@ func (h *maxStringHeap) Pop() any {
 // every retained Member first. Roster state may legitimately be much larger
 // than one WebSocket response; callers get an explicit truncated bit rather
 // than an oversized frame that disconnects on every reconnect.
-func (r *roster) channelPage(name string, limit int) (topic string, members []Member, truncated, ok bool) {
+//
+// after is a paging cursor: only members whose folded key sorts strictly
+// after it are returned, in folded-key order, so a caller walks the full
+// roster one bounded page at a time (cursor = the folded key of the last
+// member of the previous page; "" means the first page). An unknown or
+// between-keys cursor is fine — "strictly after" needs no exact match.
+// truncated reports that more eligible members exist beyond this page.
+//
+// Each call materializes at most one page — never the full roster — so a
+// hostile 25k-member channel still costs O(members) key comparisons but
+// only O(limit) copies per request (same discipline as before the cursor).
+//
+// Consistency across pages is best-effort under live churn: the lock is
+// released between pages, so a member joining (or renaming) into a range
+// the walk already passed is missed until the next refresh, and one leaving
+// ahead of the walk is skipped. Within a single page the snapshot is
+// consistent; the members_changed push tells clients when to refetch.
+func (r *roster) channelPage(name string, limit int, after string) (topic string, members []Member, truncated, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := r.chans[r.foldKey(name)]
@@ -266,8 +283,13 @@ func (r *roster) channelPage(name string, limit int) (topic string, members []Me
 	if limit < 0 {
 		limit = 0
 	}
+	eligible := 0 // members past the cursor, kept or not — drives truncated
 	keys := make(maxStringHeap, 0, min(limit, len(st.members)))
 	for key := range st.members {
+		if after != "" && key <= after {
+			continue // strictly after the cursor: no duplicate at page joins
+		}
+		eligible++
 		if len(keys) < limit {
 			heap.Push(&keys, key)
 		} else if limit > 0 && key < keys[0] {
@@ -280,7 +302,7 @@ func (r *roster) channelPage(name string, limit int) (topic string, members []Me
 	for _, key := range keys {
 		members = append(members, st.members[key])
 	}
-	return st.topic, members, len(st.members) > len(members), true
+	return st.topic, members, eligible > len(members), true
 }
 
 // handle updates state from one server message. ourNick identifies which
