@@ -984,8 +984,13 @@ export function App() {
 				setConnected(false);
 			}
 			pendingJoins.current.clear();
+			// Intent bumps strand any in-flight request's .finally busy-ref
+			// reset (intent no longer matches), so reset the refs here too —
+			// same discipline as every other bump site.
 			netFormIntent.current++;
+			netFormBusyRef.current = false;
 			chanPromptIntent.current++;
+			chanPromptBusyRef.current = false;
 			topicIntent.current++;
 			s.close();
 		};
@@ -1487,7 +1492,13 @@ export function App() {
 	}
 
 	function editNetwork(network) {
+		// Bumping the intent invalidates any in-flight save/delete's .finally
+		// (it only resets the busy ref when the intent still matches), so every
+		// bump site must reset the ref itself or it latches true forever and
+		// save/delete silently no-op with enabled-looking buttons.
 		const intent = ++netFormIntent.current;
+		netFormBusyRef.current = false;
+		setNetFormBusy(false);
 		setCmdError("");
 		const s = sock.current;
 		if (!s) {
@@ -1532,9 +1543,12 @@ export function App() {
 
 	function deleteNetwork(name) {
 		const fromForm = netForm?.oldName === name;
-		const intent = fromForm ? netForm.intent : ++netFormIntent.current;
 		const s = sock.current;
+		// Busy guard BEFORE the intent bump: a double-click used to bump the
+		// intent first, which stranded the first request's .finally (intent
+		// mismatch) and latched netFormBusyRef true until the form closed.
 		if (!s || netFormBusyRef.current) return;
+		const intent = fromForm ? netForm.intent : ++netFormIntent.current;
 		netFormBusyRef.current = true;
 		setNetFormBusy(true);
 		s.request("delete_network", { network: name })
