@@ -381,10 +381,21 @@ function MediaCard({ url, net, kind }) {
 
 	// The virtualized list unmounts rows that scroll out of its render window.
 	// A removed <video> stops on its own, but a detached <audio> element can
-	// keep playing until it is garbage collected (engine-dependent) — pause
-	// deterministically on unmount instead of relying on GC timing.
+	// keep playing until it is garbage collected (engine-dependent), and even
+	// a paused element with src still set can keep its connection open and
+	// read-ahead buffering — holding one of the server's limited stream slots
+	// until the write deadline reaps it. Tear down deterministically on
+	// unmount instead: pause, drop src, and load() to abort the fetch and
+	// release the slot. (The other player-to-placeholder swaps — error
+	// fallback, expiry re-mint — happen only after the element's own onError,
+	// i.e. after its stream already died, so unmount is the only path that
+	// needs this.)
 	useEffect(() => () => {
-		if (elRef.current) elRef.current.pause();
+		const el = elRef.current;
+		if (!el) return;
+		el.pause();
+		el.removeAttribute("src");
+		el.load();
 	}, []);
 
 	const mint = async () => {

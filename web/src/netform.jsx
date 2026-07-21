@@ -16,6 +16,7 @@
 
 import { useState } from "preact/hooks";
 import { proxyCredsExposed } from "./irc.js";
+import { canonicalSASL } from "./sasl.js";
 
 // NetworkForm: add/edit a network (The Lounge-style form). `initial` is
 // the stored config object when editing (spread so any field this form does
@@ -57,16 +58,6 @@ function wireguardOut(wg) {
 	return clean;
 }
 
-// saslOut drops empty optional SASL fields so they don't clutter the stored
-// JSON.
-function saslOut(sasl) {
-	const clean = { ...sasl };
-	for (const k of ["mechanism", "login", "password", "cert_file", "key_file"]) {
-		if (!clean[k]) delete clean[k];
-	}
-	return clean;
-}
-
 function Field({ label, children }) {
 	return (
 		<label class="nf-field">
@@ -87,7 +78,7 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 	const [egress, setEgress] = useState(() => egressChoice(initial || {}));
 	const set = (patch) => setCfg((c) => ({ ...c, ...patch }));
 	const setWG = (patch) => setCfg((c) => ({ ...c, wireguard: { ...c.wireguard, ...patch } }));
-	const sasl = saslChoice(cfg);
+	const [sasl, setSasl] = useState(() => saslChoice(initial || {}));
 
 	// pickEgress switches egress mode. It does NOT clear the other block, so a
 	// typed proxy URL or WireGuard config survives toggling away and back; submit()
@@ -98,16 +89,13 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 		if (mode === "wireguard" && !cfg.wireguard) set({ wireguard: {} });
 	}
 
+	// pickSASL switches the SASL mechanism. Like pickEgress, it does NOT clear
+	// the other mechanism's fields (or the whole block on "none"), so a typed
+	// password or cert path survives toggling away and back; submit() is the
+	// single authority (via canonicalSASL) that keeps only the fields the
+	// selected mechanism can use.
 	function pickSASL(choice) {
-		if (choice === "none") set({ sasl: undefined });
-		else {
-			set({
-				sasl: {
-					...cfg.sasl,
-					mechanism: choice === "auto" ? "" : choice,
-				},
-			});
-		}
+		setSasl(choice);
 	}
 
 	function submit(e) {
@@ -127,7 +115,13 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 		}
 		if (!out.channels.length) delete out.channels;
 		if (!out.trusted_fingerprints.length) delete out.trusted_fingerprints;
-		if (out.sasl) out.sasl = saslOut(out.sasl);
+		// SASL follows the same rule as egress: the form keeps typed values
+		// across mechanism toggles, so submit is the SOLE authority on what gets
+		// stored — canonicalSASL keeps only the selected mechanism's fields
+		// (certs never ride along with PLAIN/SCRAM, no password at rest with
+		// EXTERNAL), drops the others.
+		const cleanSASL = canonicalSASL(out.sasl, sasl);
+		if (cleanSASL) out.sasl = cleanSASL;
 		else delete out.sasl;
 		onSave(out, oldName);
 	}
