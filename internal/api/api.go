@@ -785,9 +785,12 @@ func (s *Server) authed(r *http.Request) bool {
 // authenticated request and to revoke an already-open WebSocket after
 // logout or expiry. An expired token is deleted AND its live sockets and
 // streams are canceled (deleteTokenLocked) — note the expiry itself is
-// passive: teardown happens when the expiry is next OBSERVED, i.e. this
-// check on any authenticated request, or the prune ticker, whichever
-// comes first.
+// passive: teardown happens when the expiry is next OBSERVED. The observers
+// are this check on any authenticated request, each open WebSocket's
+// revalidation ticker (wsWritePump), and issueToken's pruning at login;
+// there is no global timer, so an expired token with none of those active
+// lingers (with its streams) until one occurs or the token is explicitly
+// revoked.
 func (s *Server) tokenValid(token string) bool {
 	var cancels []context.CancelFunc
 	s.mu.Lock()

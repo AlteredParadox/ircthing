@@ -291,7 +291,10 @@ func (s *Server) handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	// path: requireAuth checked the session ONCE, and every token-deletion
 	// path (logout, password rotation, lazy expiry, capacity eviction)
 	// funnels through deleteTokenLocked, which cancels registered streams
-	// alongside sockets — so a stream never outlives its session.
+	// alongside sockets — so every observed revocation or expiry tears the
+	// session's streams down. Expiry is lazy (see tokenValid): until some
+	// observer notices it, a stream on an expired-but-undeleted token keeps
+	// relaying.
 	// Registration re-validates the token under the registry lock; a
 	// revocation that landed since requireAuth already ran its cancel sweep,
 	// so registering blind would leave this stream relaying until the track

@@ -1316,9 +1316,10 @@ func (s *Store) canonicalLocked(ctx context.Context, network, target string, fol
 // This scans the network's buffer names and folds each in Go rather than
 // filtering in SQL: the store is deliberately casemapping-agnostic (fold is
 // a per-connection parameter, not stored), so the fold cannot live in an
-// index. The cost is O(buffers per network) per live QUIT/NICK — an ACCEPTED
-// bounded tradeoff: active buffers are capped at maxBuffersPerNetwork and
-// archived rows add only what the user has deliberately closed, s.mu is
+// index. The cost is O(buffers per network) per live QUIT/NICK, over ALL
+// rows including archived — so it is bounded by the active cap
+// (maxBuffersPerNetwork) PLUS the archived reservoir, which has no hard cap
+// and is bounded only by the user's own deliberate closes. ACCEPTED: s.mu is
 // released between calls, and a real user has tens of buffers (microseconds).
 // A hostile server that first opens thousands of buffers could turn this into
 // a throughput drag, but not a stall or exhaustion. If that ever matters, an
