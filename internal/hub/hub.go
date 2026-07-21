@@ -406,38 +406,9 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 	replay := historyReplay(ev, histBatches)
 	batch := histBatches[batchRef]
 	if replay {
-		// Track the batch's own newest message as the anchor for the
-		// next page: live traffic may already have stored rows newer
-		// than the gap, so the store's latest row would skip past it.
-		batch.count++
-		if t := messageTime(ev); !t.IsZero() {
-			batch.lastTS = t.UnixMilli()
-		}
-		// Clamp+detach: tag values are parser-detached but unbounded, so an
-		// oversized msgid retained across 256 open batches is real memory —
-		// and it would be interpolated into the next CHATHISTORY request,
-		// which the writer drops as over-length anyway.
-		batch.lastID = clampDetach(ev.Msg.Tags["msgid"])
-	} else {
-		// Every live-only numeric/control effect runs only AFTER replay
-		// classification. Replayed 470/MONITOR/WHOIS/MOTD numerics are history,
-		// not current connection state, and must neither mutate state nor emit
-		// ephemeral cards.
-		if h.handleControlNumeric(ctx, c, ev) {
-			return nil
-		}
-		if h.accumulateWhois(c, ev, whois) {
-			return nil
-		}
-		if ev.Msg.Command == "470" {
-			h.persistAutojoin(ctx, c, ev)
-		}
-		if info, ok := h.serverInfo(ev); ok {
-			info.Network = ev.Network
-			h.broadcast(envelope("server_info", 0, info))
-			return nil
-		}
-		h.liveHints(ctx, c, ev)
+		batch.noteReplayed(ev)
+	} else if h.liveControlConsumed(ctx, c, ev, whois) {
+		return nil
 	}
 	switch ev.Msg.Command {
 	case "TAGMSG": // ephemeral, never persisted
@@ -463,6 +434,47 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 func historyReplay(ev irc.Event, batches map[string]*histBatch) bool {
 	ref := clampBatchRef(ev.Msg.Tags["batch"])
 	return ref != "" && batches[ref] != nil
+}
+
+// noteReplayed records one replayed message's progress in its batch.
+// It tracks the batch's own newest message as the anchor for the next
+// page: live traffic may already have stored rows newer than the gap, so
+// the store's latest row would skip past it.
+func (b *histBatch) noteReplayed(ev irc.Event) {
+	b.count++
+	if t := messageTime(ev); !t.IsZero() {
+		b.lastTS = t.UnixMilli()
+	}
+	// Clamp+detach: tag values are parser-detached but unbounded, so an
+	// oversized msgid retained across 256 open batches is real memory —
+	// and it would be interpolated into the next CHATHISTORY request,
+	// which the writer drops as over-length anyway.
+	b.lastID = clampDetach(ev.Msg.Tags["msgid"])
+}
+
+// liveControlConsumed runs the side effects only LIVE (non-replayed)
+// messages have and reports whether the message was fully consumed by
+// them. Every live-only numeric/control effect runs only AFTER replay
+// classification (the caller's replay check). Replayed 470/MONITOR/WHOIS/
+// MOTD numerics are history, not current connection state, and must
+// neither mutate state nor emit ephemeral cards.
+func (h *Hub) liveControlConsumed(ctx context.Context, c Conn, ev irc.Event, whois map[string]*WhoisData) bool {
+	if h.handleControlNumeric(ctx, c, ev) {
+		return true
+	}
+	if h.accumulateWhois(c, ev, whois) {
+		return true
+	}
+	if ev.Msg.Command == "470" {
+		h.persistAutojoin(ctx, c, ev)
+	}
+	if info, ok := h.serverInfo(ev); ok {
+		info.Network = ev.Network
+		h.broadcast(envelope("server_info", 0, info))
+		return true
+	}
+	h.liveHints(ctx, c, ev)
+	return false
 }
 
 // liveHints handles the side effects only live (non-replayed) messages
@@ -681,17 +693,7 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 		h.bufferMutationMu.Lock()
 		defer h.bufferMutationMu.Unlock()
 	}
-	// queryOpen reports whether a NON-channel query buffer with the given nick
-	// is already open, so an incoming private NOTICE from a service or bot
-	// files under that conversation instead of the lobby (see noticeTarget).
-	// Evaluated lazily — only noticeTarget's addressed-to-us branch calls it,
-	// so channel traffic and PMs never pay for the buffer scan. A lookup error
-	// yields false (fall back to the lobby), never a misroute.
-	queryOpen := func(nick string) bool {
-		name, found, err := h.store.FindBuffer(ctx, ev.Network, nick, c.Fold)
-		return err == nil && found && !c.IsChannel(name)
-	}
-	target, ok := persistBuffer(ev, c, replay, batch, queryOpen)
+	target, ok := persistBuffer(ev, c, replay, batch, h.queryOpenFn(ctx, ev.Network, c))
 	if !ok {
 		return nil
 	}
@@ -729,23 +731,8 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	// check, so a straggler in flight when the user closes a buffer cannot
 	// resurrect it (the recentlyClosed check and the append used to be a
 	// check-then-act split across h.mu and store.mu — a two-lock TOCTOU).
-	// Archived-buffer (close_buffer purge:false) policy: real conversation
-	// (PRIVMSG/NOTICE/TOPIC/...) resurfaces a hidden buffer so its history
-	// returns on new activity; membership fan-out must not — the PART echo
-	// that races a purge:false close lands after the archive and would
-	// otherwise resurrect the buffer (the mirror of the deleted path's close
-	// tombstone). Our own LIVE JOIN is a deliberate rejoin and does resurface
-	// it — the same intent rule as the unmarkClosed above; a REPLAYED
-	// self-JOIN is backfill, not intent.
-	unarchive := true
-	switch ev.Msg.Command {
-	case "JOIN":
-		unarchive = own && !replay
-	case "PART", "QUIT", "NICK", "MODE":
-		unarchive = false
-	}
 	stored, stillArchived, err := h.store.AppendFoldedGuardedArchive(ctx, ev.Network, target, c.Fold,
-		h.graceGuard(ev, c, target, selfPart, replay), unarchive, storeMessage(ev))
+		h.graceGuard(ev, c, target, selfPart, replay), unarchivePolicy(ev.Msg.Command, own, replay), storeMessage(ev))
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -762,15 +749,56 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 		// hides. The line is in history for whenever the buffer resurfaces.
 		return nil
 	}
+	h.publishPersisted(stored, target, replay, batch)
+	return nil
+}
+
+// queryOpenFn builds the lazy queryOpen predicate persistBuffer needs: it
+// reports whether a NON-channel query buffer with the given nick is already
+// open, so an incoming private NOTICE from a service or bot files under that
+// conversation instead of the lobby (see noticeTarget). Evaluated lazily —
+// only noticeTarget's addressed-to-us branch calls it, so channel traffic and
+// PMs never pay for the buffer scan. A lookup error yields false (fall back
+// to the lobby), never a misroute.
+func (h *Hub) queryOpenFn(ctx context.Context, network string, c Conn) func(string) bool {
+	return func(nick string) bool {
+		name, found, err := h.store.FindBuffer(ctx, network, nick, c.Fold)
+		return err == nil && found && !c.IsChannel(name)
+	}
+}
+
+// unarchivePolicy decides whether persisting this event resurfaces an
+// archived (close_buffer purge:false) buffer: real conversation
+// (PRIVMSG/NOTICE/TOPIC/...) resurfaces a hidden buffer so its history
+// returns on new activity; membership fan-out must not — the PART echo
+// that races a purge:false close lands after the archive and would
+// otherwise resurrect the buffer (the mirror of the deleted path's close
+// tombstone). Our own LIVE JOIN is a deliberate rejoin and does resurface
+// it — the same intent rule as persistEvent's unmarkClosed; a REPLAYED
+// self-JOIN is backfill, not intent.
+func unarchivePolicy(command string, own, replay bool) bool {
+	switch command {
+	case "JOIN":
+		return own && !replay
+	case "PART", "QUIT", "NICK", "MODE":
+		return false
+	}
+	return true
+}
+
+// publishPersisted announces a freshly stored, non-archived event: live
+// events broadcast to every session; a replayed event rerouted to "*" (a
+// correspondent's private NOTICE) instead flags its batch — the batch-close
+// hint names only batch.target, so "*" needs the flag for its own
+// history_changed or the client's cached "*" list never refreshes.
+func (h *Hub) publishPersisted(stored store.Message, target string, replay bool, batch *histBatch) {
 	if !replay {
 		h.broadcast(envelope("event", 0, eventData(stored)))
-	} else if batch != nil && isServerBuffer(target) {
-		// A replayed event rerouted to "*" (a correspondent's private NOTICE):
-		// the batch-close hint names only batch.target, so flag "*" for its own
-		// history_changed or the client's cached "*" list never refreshes.
+		return
+	}
+	if batch != nil && isServerBuffer(target) {
 		batch.starTouched = true
 	}
-	return nil
 }
 
 // graceGuard returns the buffer-creation/close-grace predicate for one event.
@@ -1682,47 +1710,46 @@ func eventData(m store.Message) EventData {
 // msgid dedup makes the fan-out idempotent under overlapping backfill.
 func (h *Hub) persistMembership(ctx context.Context, c Conn, ev irc.Event, replay bool, batch *histBatch) {
 	for _, target := range h.membershipTargets(ctx, ev, replay, batch, c.Fold) {
-		if !replay {
-			h.bufferMutationMu.Lock()
-		}
-		// Canonicalize under the network casemapping (like persistEvent) so
-		// a QUIT/NICK for #FOO lands in the existing #foo buffer instead of
-		// splitting off a case-variant duplicate: the channel targets come
-		// from the roster's raw wire spelling, which can differ in case from
-		// the stored buffer.
-		//
-		// A just-closed buffer must not be resurrected by QUIT/NICK fan-out
-		// either (mirrors persistEvent's grace): the guard, applied
-		// atomically with buffer creation in the store, drops a straggler
-		// for a buffer closed concurrently. This is replay-agnostic to match
-		// persistEvent — a replayed (event-playback) QUIT/NICK for a buffer
-		// the user just closed must not re-create it either.
-		// QUIT/NICK are membership fan-out and never un-archive a
-		// close_buffer purge:false buffer (channel or query): the line is
-		// persisted into the hidden history but not published, mirroring
-		// persistEvent's archived-buffer policy.
-		stored, stillArchived, err := h.store.AppendFoldedGuardedArchive(ctx, ev.Network, target, c.Fold,
-			func(bool) bool { return h.recentlyClosed(ev.Network, c.Fold(target)) },
-			false, storeMessage(ev))
-		if err != nil {
-			log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
-			if !replay {
-				h.bufferMutationMu.Unlock()
-			}
-			continue
-		}
-		if stored.ID == 0 {
-			if !replay {
-				h.bufferMutationMu.Unlock()
-			}
-			continue // duplicate msgid: already stored and announced
-		}
-		if !replay && !stillArchived {
-			h.broadcast(envelope("event", 0, eventData(stored)))
-		}
-		if !replay {
-			h.bufferMutationMu.Unlock()
-		}
+		h.persistMembershipLine(ctx, c, ev, target, replay)
+	}
+}
+
+// persistMembershipLine stores one QUIT/NICK system line into one buffer
+// and, when live and unarchived, broadcasts it. Live writes hold
+// bufferMutationMu for the append + broadcast, like persistEvent.
+func (h *Hub) persistMembershipLine(ctx context.Context, c Conn, ev irc.Event, target string, replay bool) {
+	if !replay {
+		h.bufferMutationMu.Lock()
+		defer h.bufferMutationMu.Unlock()
+	}
+	// Canonicalize under the network casemapping (like persistEvent) so
+	// a QUIT/NICK for #FOO lands in the existing #foo buffer instead of
+	// splitting off a case-variant duplicate: the channel targets come
+	// from the roster's raw wire spelling, which can differ in case from
+	// the stored buffer.
+	//
+	// A just-closed buffer must not be resurrected by QUIT/NICK fan-out
+	// either (mirrors persistEvent's grace): the guard, applied
+	// atomically with buffer creation in the store, drops a straggler
+	// for a buffer closed concurrently. This is replay-agnostic to match
+	// persistEvent — a replayed (event-playback) QUIT/NICK for a buffer
+	// the user just closed must not re-create it either.
+	// QUIT/NICK are membership fan-out and never un-archive a
+	// close_buffer purge:false buffer (channel or query): the line is
+	// persisted into the hidden history but not published, mirroring
+	// persistEvent's archived-buffer policy.
+	stored, stillArchived, err := h.store.AppendFoldedGuardedArchive(ctx, ev.Network, target, c.Fold,
+		func(bool) bool { return h.recentlyClosed(ev.Network, c.Fold(target)) },
+		false, storeMessage(ev))
+	if err != nil {
+		log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
+		return
+	}
+	if stored.ID == 0 {
+		return // duplicate msgid: already stored and announced
+	}
+	if !replay && !stillArchived {
+		h.broadcast(envelope("event", 0, eventData(stored)))
 	}
 }
 

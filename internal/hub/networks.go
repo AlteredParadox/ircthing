@@ -289,74 +289,19 @@ func (s *Session) handleGetNetwork(ctx context.Context, env Envelope) {
 }
 
 func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
-	var d PutNetworkReq
-	if err := json.Unmarshal(env.Data, &d); err != nil || len(d.Config) == 0 {
-		s.push(errEnvelope(env.Seq, "bad_request", "put_network needs a config"))
-		return
-	}
-	nc, err := netconf.Parse(d.Config)
-	if err != nil {
-		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
-		return
-	}
-	// Full validation up front — the complete irc.Config checks
-	// (plaintext opt-in, SASL, fingerprints, proxy) plus client
-	// certificate loading — so an invalid edit is rejected while the
-	// existing definition and its connection are still untouched.
-	if err := ValidateNetwork(nc); err != nil {
-		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
+	nc, d, ok := s.parsePutNetwork(env)
+	if !ok {
 		return
 	}
 	name := nc.EffectiveName()
-	// Invalid legacy names are represented to clients only by an opaque
-	// synthetic recovery label. Never accept the raw spelling on the protocol:
-	// current write invariants could not restore it after a failed edit.
-	if d.OldName != "" && !validStoredNetworkName(d.OldName) {
-		s.push(errEnvelope(env.Seq, "bad_request", "old network name is invalid; remove it through its recovery entry"))
-		return
-	}
 
 	// Serialize start/stop against other network operations.
 	s.hub.netOps.Lock()
 	defer s.hub.netOps.Unlock()
 
-	prevName := d.OldName
-	if prevName == "" {
-		prevName = name
-	}
-	prevRow, prevFound, err := s.hub.store.NetworkConfig(ctx, prevName)
-	if err != nil {
-		s.push(errEnvelope(env.Seq, "internal", errLoadNetworks))
+	prev, renamed, ok := s.checkPutPreconditions(ctx, env, d, name)
+	if !ok {
 		return
-	}
-	renamed := d.OldName != "" && d.OldName != name
-	if d.OldName != "" && !prevFound {
-		s.push(errEnvelope(env.Seq, "bad_request", fmt.Sprintf("network %q not found", d.OldName)))
-		return
-	}
-	if d.OldName == "" || renamed {
-		_, targetFound, lerr := s.hub.store.NetworkConfig(ctx, name)
-		if lerr != nil {
-			s.push(errEnvelope(env.Seq, "internal", errLoadNetworks))
-			return
-		}
-		if targetFound {
-			s.push(errEnvelope(env.Seq, "bad_request", fmt.Sprintf("network %q already exists", name)))
-			return
-		}
-	}
-	if legacyNetworkRequiresRecreate(prevFound, prevRow, d.OldName != "") {
-		// ReplaceNetworkConfig deliberately rejects an old >64 KiB blob or an
-		// empty legacy value. A later StartNetwork failure could not roll either
-		// one back atomically, so keep the contract honest: malformed legacy rows
-		// are delete-and-recreate only.
-		s.push(errEnvelope(env.Seq, "bad_request", "stored network config is invalid or exceeds the safe limit; remove and recreate it"))
-		return
-	}
-	var prev *store.NetworkConfig
-	if prevFound && prevRow.Config != "" {
-		copy := prevRow
-		prev = &copy
 	}
 	canonical, err := json.Marshal(nc)
 	if err != nil {
@@ -377,6 +322,92 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcast(envelope("networks_changed", 0, nil))
+}
+
+// parsePutNetwork unmarshals and fully validates a put_network request
+// before any lock is taken, pushing the error reply itself when it fails.
+func (s *Session) parsePutNetwork(env Envelope) (*netconf.Network, PutNetworkReq, bool) {
+	var d PutNetworkReq
+	if err := json.Unmarshal(env.Data, &d); err != nil || len(d.Config) == 0 {
+		s.push(errEnvelope(env.Seq, "bad_request", "put_network needs a config"))
+		return nil, d, false
+	}
+	nc, err := netconf.Parse(d.Config)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
+		return nil, d, false
+	}
+	// Full validation up front — the complete irc.Config checks
+	// (plaintext opt-in, SASL, fingerprints, proxy) plus client
+	// certificate loading — so an invalid edit is rejected while the
+	// existing definition and its connection are still untouched.
+	if err := ValidateNetwork(nc); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
+		return nil, d, false
+	}
+	// Invalid legacy names are represented to clients only by an opaque
+	// synthetic recovery label. Never accept the raw spelling on the protocol:
+	// current write invariants could not restore it after a failed edit.
+	if d.OldName != "" && !validStoredNetworkName(d.OldName) {
+		s.push(errEnvelope(env.Seq, "bad_request", "old network name is invalid; remove it through its recovery entry"))
+		return nil, d, false
+	}
+	return nc, d, true
+}
+
+// checkPutPreconditions validates the stored state a put replaces — the
+// previous row exists (for an edit), the target name is free (for an add or
+// rename), and the previous row is replaceable — returning the previous
+// definition to roll back to (nil for an add) and whether this is a rename.
+// It pushes the error reply itself when a check fails. Caller holds netOps.
+func (s *Session) checkPutPreconditions(ctx context.Context, env Envelope, d PutNetworkReq, name string) (prev *store.NetworkConfig, renamed bool, ok bool) {
+	prevName := d.OldName
+	if prevName == "" {
+		prevName = name
+	}
+	prevRow, prevFound, err := s.hub.store.NetworkConfig(ctx, prevName)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", errLoadNetworks))
+		return nil, false, false
+	}
+	renamed = d.OldName != "" && d.OldName != name
+	if d.OldName != "" && !prevFound {
+		s.push(errEnvelope(env.Seq, "bad_request", fmt.Sprintf("network %q not found", d.OldName)))
+		return nil, false, false
+	}
+	if d.OldName == "" || renamed {
+		if !s.putNameAvailable(ctx, env, name) {
+			return nil, false, false
+		}
+	}
+	if legacyNetworkRequiresRecreate(prevFound, prevRow, d.OldName != "") {
+		// ReplaceNetworkConfig deliberately rejects an old >64 KiB blob or an
+		// empty legacy value. A later StartNetwork failure could not roll either
+		// one back atomically, so keep the contract honest: malformed legacy rows
+		// are delete-and-recreate only.
+		s.push(errEnvelope(env.Seq, "bad_request", "stored network config is invalid or exceeds the safe limit; remove and recreate it"))
+		return nil, false, false
+	}
+	if prevFound && prevRow.Config != "" {
+		copy := prevRow
+		prev = &copy
+	}
+	return prev, renamed, true
+}
+
+// putNameAvailable reports whether no stored network already uses the
+// target name, pushing the error reply when one does (or the lookup fails).
+func (s *Session) putNameAvailable(ctx context.Context, env Envelope, name string) bool {
+	_, targetFound, lerr := s.hub.store.NetworkConfig(ctx, name)
+	if lerr != nil {
+		s.push(errEnvelope(env.Seq, "internal", errLoadNetworks))
+		return false
+	}
+	if targetFound {
+		s.push(errEnvelope(env.Seq, "bad_request", fmt.Sprintf("network %q already exists", name)))
+		return false
+	}
+	return true
 }
 
 func legacyNetworkRequiresRecreate(found bool, row store.NetworkConfig, explicitEdit bool) bool {

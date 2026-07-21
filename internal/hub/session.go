@@ -487,24 +487,8 @@ func (s *Session) handleGetMonitors(ctx context.Context, env Envelope) {
 // and tells the connection to update its MONITOR list, which prompts the
 // server for the nick's current presence.
 func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
-	var d MonitorReq
-	if err := json.Unmarshal(env.Data, &d); err != nil {
-		s.push(errEnvelope(env.Seq, "bad_request", "malformed monitor data"))
-		return
-	}
-	if d.Network == "" || d.Nick == "" {
-		s.push(errEnvelope(env.Seq, "bad_request", "monitor needs a network and a nick"))
-		return
-	}
-	// ValidMonitorTarget also rejects NUL and excessive length — an invalid
-	// value must not be PERSISTED, or it would poison its ten-nick MONITOR
-	// chunk on every reconnect (the live send would reject it anyway). Gate
-	// ADDS only: a REMOVE of an invalid nick must still delete the row —
-	// rows persisted by older, laxer versions are filtered from IRC
-	// restoration but would otherwise be stuck visible forever, removable
-	// only by editing SQLite. The wire MONITOR - below is skipped for them.
-	if add && !irc.ValidMonitorTarget(d.Nick) {
-		s.push(errEnvelope(env.Seq, "bad_request", "monitor needs a network and a valid nick"))
+	d, ok := s.parseMonitorReq(env, add)
+	if !ok {
 		return
 	}
 	// Only a real (configured or connected) network may accrue monitors:
@@ -522,10 +506,7 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 		return
 	}
 	conn := s.hub.network(d.Network)
-	fold := asciiFold
-	if conn != nil {
-		fold = conn.Fold
-	}
+	fold := monitorFold(conn)
 
 	// The WHOLE mutation — store write AND the wire send — runs under monMu,
 	// the same lock startMonitor's restoration (snapshot + MONITOR C + list)
@@ -535,96 +516,18 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 	s.hub.monMu.Lock()
 	defer s.hub.monMu.Unlock()
 
-	var err error
 	nick := d.Nick // the spelling used for store/presence/wire (resolved for removes)
 	if add {
-		// Reject a casemapping-equivalent duplicate (Alice vs alice): SQLite
-		// uniqueness is byte-exact, but the server folds both to ONE monitor —
-		// presence keyed by fold would collapse them while the list renders
-		// both spellings, one stuck perpetually offline. Fold with the live
-		// connection's CASEMAPPING when connected, ASCII-only lowercase
-		// otherwise (covers the common conflict; rfc1459's []{}|~ extras need
-		// the server's mapping, and any residual pair is removable). Under
-		// monMu, two concurrent adds can't both pass and both persist.
-		existing, lerr := s.hub.store.Monitors(ctx, d.Network)
-		if lerr != nil {
-			// FAIL CLOSED: without the list we can enforce neither the
-			// duplicate check nor the cap, so don't blindly persist.
-			s.push(errEnvelope(env.Seq, "internal", "monitor list unavailable"))
+		if !s.addMonitorLocked(ctx, env, d, fold) {
 			return
 		}
-		// Reject a casemapping-equivalent duplicate (Alice vs alice) — but check
-		// existence BEFORE the cap so an already-monitored nick is an idempotent
-		// no-op even at capacity, not a spurious "list full". An EXACT-spelling
-		// duplicate is likewise a no-op.
-		for _, nk := range existing {
-			if nk == d.Nick {
-				s.push(envelope("ok", env.Seq, nil)) // already monitored, idempotent
-				return
-			}
-			if fold(nk) == fold(d.Nick) {
-				s.push(errEnvelope(env.Seq, "bad_request", "already monitored as "+nk))
-				return
-			}
-		}
-		// Cap the persisted list. A reconnect reconciles the WHOLE list as one
-		// atomic delta (up to a full remove+re-add), so an unbounded list could
-		// eventually exceed the send queue and become permanently unreconcilable
-		// on a server that advertises no limit. maxMonitorsPerNetwork keeps even
-		// a complete replacement well under the queue; far above any real list.
-		if len(existing) >= maxMonitorsPerNetwork {
-			s.push(errEnvelope(env.Seq, "bad_request", "monitor list is full"))
-			return
-		}
-		err = s.hub.store.AddMonitor(ctx, d.Network, d.Nick)
-	} else {
-		// Resolve the STORED spelling by fold before deleting: the store is
-		// byte-exact, so removing "alice" when the row says "Alice" would
-		// delete nothing — yet the wire MONITOR - (casemapped server-side)
-		// would still stop upstream monitoring, leaving a row (and cached
-		// presence) for a nick the server no longer watches. FAIL CLOSED on a
-		// read failure (as the add path does): without the list we can't
-		// resolve the stored spelling, so don't report success for a delete
-		// that may have removed nothing.
-		list, lerr := s.hub.store.Monitors(ctx, d.Network)
-		if lerr != nil {
-			s.push(errEnvelope(env.Seq, "internal", "monitor list unavailable"))
-			return
-		}
-		for _, nk := range list {
-			if nk == d.Nick || fold(nk) == fold(d.Nick) {
-				nick = nk
-				if nk == d.Nick {
-					break // exact match wins over a fold match
-				}
-			}
-		}
-		err = s.hub.store.RemoveMonitor(ctx, d.Network, nick)
-	}
-	if err != nil {
-		s.push(errEnvelope(env.Seq, "internal", "updating the monitor list failed"))
+	} else if resolved, removed := s.removeMonitorLocked(ctx, env, d, fold); !removed {
 		return
-	}
-	if !add {
-		// Drop the removed nick's cached presence: a stale entry would be
-		// served straight back by get_monitors if the nick is re-added
-		// before a fresh 730/731 arrives (or while disconnected).
-		s.hub.removePresence(d.Network, nick)
+	} else {
+		nick = resolved
 	}
 	if conn != nil {
-		// Reconcile the whole persisted list, not just this nick: it drives the
-		// exact delta atomically (so a full queue never records a half-sent
-		// list) and PROMOTES an overflow buddy into the slot a removal frees.
-		if desired, lerr := s.hub.store.Monitors(ctx, d.Network); lerr == nil {
-			if rerr := conn.ReconcileMonitored(desired); rerr != nil {
-				log.Printf("network %q: monitor reconcile: %v", d.Network, rerr)
-			}
-		} else {
-			// The mutation is persisted but couldn't be reconciled to the
-			// server this pass; log it (recovered on the next mutation or
-			// reconnect) rather than dropping it silently.
-			log.Printf("network %q: monitor reconcile skipped (list read failed): %v", d.Network, lerr)
-		}
+		s.reconcileMonitorsLocked(ctx, d.Network, conn)
 		if !add {
 			s.hub.broadcast(envelope("presence", 0, PresenceData{Network: d.Network, Nick: nick, Online: false}))
 		}
@@ -634,6 +537,146 @@ func (s *Session) handleMonitor(ctx context.Context, env Envelope, add bool) {
 	// optimistic state.
 	s.hub.broadcast(envelope("monitors_changed", 0, MonitorsChangedData{Network: d.Network}))
 	s.push(envelope("ok", env.Seq, nil))
+}
+
+// parseMonitorReq unmarshals and validates a monitor_add/monitor_remove
+// request, pushing the error reply itself when it fails.
+func (s *Session) parseMonitorReq(env Envelope, add bool) (MonitorReq, bool) {
+	var d MonitorReq
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", "malformed monitor data"))
+		return d, false
+	}
+	if d.Network == "" || d.Nick == "" {
+		s.push(errEnvelope(env.Seq, "bad_request", "monitor needs a network and a nick"))
+		return d, false
+	}
+	// ValidMonitorTarget also rejects NUL and excessive length — an invalid
+	// value must not be PERSISTED, or it would poison its ten-nick MONITOR
+	// chunk on every reconnect (the live send would reject it anyway). Gate
+	// ADDS only: a REMOVE of an invalid nick must still delete the row —
+	// rows persisted by older, laxer versions are filtered from IRC
+	// restoration but would otherwise be stuck visible forever, removable
+	// only by editing SQLite. The wire MONITOR - is skipped for them.
+	if add && !irc.ValidMonitorTarget(d.Nick) {
+		s.push(errEnvelope(env.Seq, "bad_request", "monitor needs a network and a valid nick"))
+		return d, false
+	}
+	return d, true
+}
+
+// monitorFold picks the casemapping for monitor-list comparisons: the live
+// connection's CASEMAPPING when connected, ASCII-only lowercase otherwise.
+func monitorFold(conn Conn) func(string) string {
+	if conn == nil {
+		return asciiFold
+	}
+	return conn.Fold
+}
+
+// addMonitorLocked persists one new monitored nick, pushing the reply
+// envelope itself on every failure (and on the idempotent already-monitored
+// no-op). It reports whether the list actually changed, so the caller knows
+// to reconcile and broadcast. Caller holds monMu and the lifecycle gate.
+func (s *Session) addMonitorLocked(ctx context.Context, env Envelope, d MonitorReq, fold func(string) string) bool {
+	// Reject a casemapping-equivalent duplicate (Alice vs alice): SQLite
+	// uniqueness is byte-exact, but the server folds both to ONE monitor —
+	// presence keyed by fold would collapse them while the list renders
+	// both spellings, one stuck perpetually offline. Fold with the live
+	// connection's CASEMAPPING when connected, ASCII-only lowercase
+	// otherwise (covers the common conflict; rfc1459's []{}|~ extras need
+	// the server's mapping, and any residual pair is removable). Under
+	// monMu, two concurrent adds can't both pass and both persist.
+	existing, lerr := s.hub.store.Monitors(ctx, d.Network)
+	if lerr != nil {
+		// FAIL CLOSED: without the list we can enforce neither the
+		// duplicate check nor the cap, so don't blindly persist.
+		s.push(errEnvelope(env.Seq, "internal", "monitor list unavailable"))
+		return false
+	}
+	// Reject a casemapping-equivalent duplicate (Alice vs alice) — but check
+	// existence BEFORE the cap so an already-monitored nick is an idempotent
+	// no-op even at capacity, not a spurious "list full". An EXACT-spelling
+	// duplicate is likewise a no-op.
+	for _, nk := range existing {
+		if nk == d.Nick {
+			s.push(envelope("ok", env.Seq, nil)) // already monitored, idempotent
+			return false
+		}
+		if fold(nk) == fold(d.Nick) {
+			s.push(errEnvelope(env.Seq, "bad_request", "already monitored as "+nk))
+			return false
+		}
+	}
+	// Cap the persisted list. A reconnect reconciles the WHOLE list as one
+	// atomic delta (up to a full remove+re-add), so an unbounded list could
+	// eventually exceed the send queue and become permanently unreconcilable
+	// on a server that advertises no limit. maxMonitorsPerNetwork keeps even
+	// a complete replacement well under the queue; far above any real list.
+	if len(existing) >= maxMonitorsPerNetwork {
+		s.push(errEnvelope(env.Seq, "bad_request", "monitor list is full"))
+		return false
+	}
+	if err := s.hub.store.AddMonitor(ctx, d.Network, d.Nick); err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "updating the monitor list failed"))
+		return false
+	}
+	return true
+}
+
+// removeMonitorLocked deletes one monitored nick, returning the STORED
+// spelling it removed and whether it succeeded; it pushes the error reply
+// itself on failure. Caller holds monMu and the lifecycle gate.
+func (s *Session) removeMonitorLocked(ctx context.Context, env Envelope, d MonitorReq, fold func(string) string) (string, bool) {
+	// Resolve the STORED spelling by fold before deleting: the store is
+	// byte-exact, so removing "alice" when the row says "Alice" would
+	// delete nothing — yet the wire MONITOR - (casemapped server-side)
+	// would still stop upstream monitoring, leaving a row (and cached
+	// presence) for a nick the server no longer watches. FAIL CLOSED on a
+	// read failure (as the add path does): without the list we can't
+	// resolve the stored spelling, so don't report success for a delete
+	// that may have removed nothing.
+	list, lerr := s.hub.store.Monitors(ctx, d.Network)
+	if lerr != nil {
+		s.push(errEnvelope(env.Seq, "internal", "monitor list unavailable"))
+		return "", false
+	}
+	nick := d.Nick
+	for _, nk := range list {
+		if nk == d.Nick || fold(nk) == fold(d.Nick) {
+			nick = nk
+			if nk == d.Nick {
+				break // exact match wins over a fold match
+			}
+		}
+	}
+	if err := s.hub.store.RemoveMonitor(ctx, d.Network, nick); err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "updating the monitor list failed"))
+		return "", false
+	}
+	// Drop the removed nick's cached presence: a stale entry would be
+	// served straight back by get_monitors if the nick is re-added
+	// before a fresh 730/731 arrives (or while disconnected).
+	s.hub.removePresence(d.Network, nick)
+	return nick, true
+}
+
+// reconcileMonitorsLocked pushes the authoritative persisted list to the
+// live connection. Reconcile the whole list, not just the mutated nick: it
+// drives the exact delta atomically (so a full queue never records a
+// half-sent list) and PROMOTES an overflow buddy into the slot a removal
+// frees. Caller holds monMu; conn is non-nil.
+func (s *Session) reconcileMonitorsLocked(ctx context.Context, network string, conn Conn) {
+	if desired, lerr := s.hub.store.Monitors(ctx, network); lerr == nil {
+		if rerr := conn.ReconcileMonitored(desired); rerr != nil {
+			log.Printf("network %q: monitor reconcile: %v", network, rerr)
+		}
+	} else {
+		// The mutation is persisted but couldn't be reconciled to the
+		// server this pass; log it (recovered on the next mutation or
+		// reconnect) rather than dropping it silently.
+		log.Printf("network %q: monitor reconcile skipped (list read failed): %v", network, lerr)
+	}
 }
 
 // MonitorsChangedData announces that a network's persisted monitor list
@@ -727,17 +770,9 @@ func (s *Session) handleCommand(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", "wrong number of parameters"))
 		return
 	}
-	for i, p := range d.Params {
-		if p == "" || strings.ContainsAny(p, "\r\n\x00") {
-			s.push(errEnvelope(env.Seq, "bad_request", "invalid parameter"))
-			return
-		}
-		// Only the final parameter may contain spaces or lead with ':'
-		// (it is sent as the trailing parameter).
-		if i < len(d.Params)-1 && (strings.Contains(p, " ") || strings.HasPrefix(p, ":")) {
-			s.push(errEnvelope(env.Seq, "bad_request", "invalid parameter"))
-			return
-		}
+	if !validCommandParams(d.Params) {
+		s.push(errEnvelope(env.Seq, "bad_request", "invalid parameter"))
+		return
 	}
 	conn, ok := s.conn(env.Seq, d.Network)
 	if !ok {
@@ -766,6 +801,22 @@ func (s *Session) handleCommand(ctx context.Context, env Envelope) {
 	s.push(envelope("ok", env.Seq, nil))
 }
 
+// validCommandParams reports whether every parameter is safe to place on
+// the wire: no empties, no CR/LF/NUL injection.
+func validCommandParams(params []string) bool {
+	for i, p := range params {
+		if p == "" || strings.ContainsAny(p, "\r\n\x00") {
+			return false
+		}
+		// Only the final parameter may contain spaces or lead with ':'
+		// (it is sent as the trailing parameter).
+		if i < len(params)-1 && (strings.Contains(p, " ") || strings.HasPrefix(p, ":")) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Session) handleGetChannel(ctx context.Context, env Envelope) {
 	var d ChannelReq
 	if err := json.Unmarshal(env.Data, &d); err != nil {
@@ -778,81 +829,96 @@ func (s *Session) handleGetChannel(ctx context.Context, env Envelope) {
 	case <-ctx.Done():
 		return
 	}
+	s.push(envelope("channel", env.Seq, s.buildChannelData(d)))
+}
+
+// buildChannelData assembles the get_channel response: topic, joined state,
+// and a byte-capped member page (with a next-page cursor when the roster
+// source supports paging).
+func (s *Session) buildChannelData(d ChannelReq) ChannelData {
 	data := ChannelData{Network: d.Network, Buffer: d.Buffer, Members: []MemberData{}}
-	if conn := s.hub.network(d.Network); conn != nil {
-		// Under no-implicit-names the roster is empty until we ask; this
-		// fetches lazily the first time a channel is viewed. The 366 reply
-		// raises members_changed and the client refetches.
-		conn.EnsureNames(d.Buffer)
-		var (
-			topic     string
-			members   []irc.Member
-			truncated bool
-			ok        bool
-			paged     bool // cursor-capable source: safe to hand out MembersAfter
-		)
-		if pager, supportsPage := conn.(interface {
-			ChannelPage(string, int, string) (string, []irc.Member, bool, bool)
-		}); supportsPage {
-			topic, members, truncated, ok = pager.ChannelPage(d.Buffer, maxChannelResponseMembers, d.After)
-			paged = true
-		} else {
-			// Test/alternate connections implement the original interface. Cap
-			// their snapshot immediately after the call; production Managers use
-			// ChannelPage and never copy the full hostile roster here.
-			topic, members, ok = conn.Channel(d.Buffer)
-			if len(members) > maxChannelResponseMembers {
-				members = members[:maxChannelResponseMembers]
-				truncated = true
-			}
-		}
-		if ok {
-			data.Joined = true
-			data.Topic = topic
-			data.Truncated = truncated
-			base, _ := json.Marshal(data)
-			used := len(base)
-			if paged {
-				// Reserve room for the members_after cursor appended below:
-				// a folded, clamped nick — ≤512 bytes (the irc package's
-				// maxRosterField) at worst all JSON-escaped to 6 bytes each —
-				// plus field syntax. Reserving up front means appending the
-				// cursor can never push the payload past the byte cap this
-				// loop enforces (~3 KB of headroom against a 512 KB cap).
-				used += 512*6 + len(`,"members_after":""`)
-			}
-			for _, m := range members {
-				md := MemberData{
-					Nick: m.Nick, Prefix: m.Prefix, Away: m.Away,
-					Account: m.Account, Bot: m.Bot, User: m.User, Host: m.Host,
-				}
-				encoded, _ := json.Marshal(md)
-				extra := len(encoded)
-				if len(data.Members) > 0 {
-					extra++
-				}
-				if used+extra > maxHistoryPayloadBytes {
-					data.Truncated = true
-					break
-				}
-				used += extra
-				data.Members = append(data.Members, md)
-			}
-			// Next-page cursor: the folded key of the last member actually
-			// sent (Truncated covers both "roster has more" and the byte-cap
-			// break above). Stored nicks are already clamped, so Fold(nick)
-			// equals the roster's map key — and computing it from data.Members
-			// rather than the roster page means a byte-capped page yields the
-			// correspondingly earlier cursor. Zero members sent leaves no
-			// cursor; a cursor-aware client treats that as a degraded stop.
-			if paged && data.Truncated {
-				if n := len(data.Members); n > 0 {
-					data.MembersAfter = conn.Fold(data.Members[n-1].Nick)
-				}
-			}
+	conn := s.hub.network(d.Network)
+	if conn == nil {
+		return data
+	}
+	// Under no-implicit-names the roster is empty until we ask; this
+	// fetches lazily the first time a channel is viewed. The 366 reply
+	// raises members_changed and the client refetches.
+	conn.EnsureNames(d.Buffer)
+	topic, members, truncated, paged, ok := channelRoster(conn, d.Buffer, d.After)
+	if !ok {
+		return data
+	}
+	data.Joined = true
+	data.Topic = topic
+	data.Truncated = truncated
+	fillChannelMembers(&data, members, paged)
+	// Next-page cursor: the folded key of the last member actually
+	// sent (Truncated covers both "roster has more" and the byte-cap
+	// break in fillChannelMembers). Stored nicks are already clamped, so
+	// Fold(nick) equals the roster's map key — and computing it from
+	// data.Members rather than the roster page means a byte-capped page
+	// yields the correspondingly earlier cursor. Zero members sent leaves no
+	// cursor; a cursor-aware client treats that as a degraded stop.
+	if paged && data.Truncated {
+		if n := len(data.Members); n > 0 {
+			data.MembersAfter = conn.Fold(data.Members[n-1].Nick)
 		}
 	}
-	s.push(envelope("channel", env.Seq, data))
+	return data
+}
+
+// channelRoster fetches one page of a channel's roster. paged reports a
+// cursor-capable source: safe to hand out MembersAfter.
+func channelRoster(conn Conn, buffer, after string) (topic string, members []irc.Member, truncated, paged, ok bool) {
+	if pager, supportsPage := conn.(interface {
+		ChannelPage(string, int, string) (string, []irc.Member, bool, bool)
+	}); supportsPage {
+		topic, members, truncated, ok = pager.ChannelPage(buffer, maxChannelResponseMembers, after)
+		return topic, members, truncated, true, ok
+	}
+	// Test/alternate connections implement the original interface. Cap
+	// their snapshot immediately after the call; production Managers use
+	// ChannelPage and never copy the full hostile roster here.
+	topic, members, ok = conn.Channel(buffer)
+	if len(members) > maxChannelResponseMembers {
+		members = members[:maxChannelResponseMembers]
+		truncated = true
+	}
+	return topic, members, truncated, false, ok
+}
+
+// fillChannelMembers appends members to the response under the encoded
+// payload cap, setting Truncated when the cap cuts the page short.
+func fillChannelMembers(data *ChannelData, members []irc.Member, paged bool) {
+	base, _ := json.Marshal(*data)
+	used := len(base)
+	if paged {
+		// Reserve room for the members_after cursor the caller appends:
+		// a folded, clamped nick — ≤512 bytes (the irc package's
+		// maxRosterField) at worst all JSON-escaped to 6 bytes each —
+		// plus field syntax. Reserving up front means appending the
+		// cursor can never push the payload past the byte cap this
+		// loop enforces (~3 KB of headroom against a 512 KB cap).
+		used += 512*6 + len(`,"members_after":""`)
+	}
+	for _, m := range members {
+		md := MemberData{
+			Nick: m.Nick, Prefix: m.Prefix, Away: m.Away,
+			Account: m.Account, Bot: m.Bot, User: m.User, Host: m.Host,
+		}
+		encoded, _ := json.Marshal(md)
+		extra := len(encoded)
+		if len(data.Members) > 0 {
+			extra++
+		}
+		if used+extra > maxHistoryPayloadBytes {
+			data.Truncated = true
+			break
+		}
+		used += extra
+		data.Members = append(data.Members, md)
+	}
 }
 
 func (s *Session) handleGetBuffers(ctx context.Context, env Envelope) {
@@ -873,18 +939,34 @@ func (s *Session) handleGetBuffers(ctx context.Context, env Envelope) {
 		Truncated: storeMore,
 	}
 	s.hub.mu.Lock()
-	names := make([]string, 0, len(s.hub.states))
-	for name := range s.hub.states {
+	names := s.hub.orderedNetworkNamesLocked(infos)
+	if len(names) > maxNetworkResponseRows {
+		names = names[:maxNetworkResponseRows]
+		data.Truncated = true
+	}
+	base, _ := json.Marshal(data)
+	used := len(base)
+	includedNetworks, used := s.hub.fillBufferNetworksLocked(&data, names, used)
+	s.hub.mu.Unlock()
+	fillBufferRows(&data, infos, includedNetworks, used)
+	s.push(envelope("buffers", env.Seq, data))
+}
+
+// orderedNetworkNamesLocked lists the network names for a buffers response.
+// Prefer networks represented by the recent buffer page, then fill with
+// the remaining configured/running names (alphabetically). This avoids
+// spending the buffer row budget on networks that an alphabetical network
+// cap would omit. Caller holds h.mu.
+func (h *Hub) orderedNetworkNamesLocked(infos []store.BufferInfo) []string {
+	names := make([]string, 0, len(h.states))
+	for name := range h.states {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	// Prefer networks represented by the recent buffer page, then fill with
-	// the remaining configured/running names. This avoids spending the buffer
-	// row budget on networks that an alphabetical network cap would omit.
 	ordered := make([]string, 0, len(names))
 	seenNames := make(map[string]struct{}, len(names))
 	for _, b := range infos {
-		if _, exists := s.hub.states[b.Network]; !exists {
+		if _, exists := h.states[b.Network]; !exists {
 			continue
 		}
 		if _, seen := seenNames[b.Network]; seen {
@@ -900,17 +982,17 @@ func (s *Session) handleGetBuffers(ctx context.Context, env Envelope) {
 		seenNames[name] = struct{}{}
 		ordered = append(ordered, name)
 	}
-	names = ordered
-	if len(names) > maxNetworkResponseRows {
-		names = names[:maxNetworkResponseRows]
-		data.Truncated = true
-	}
+	return ordered
+}
+
+// fillBufferNetworksLocked appends per-network info rows under the encoded
+// payload cap, returning the set of networks actually included and the
+// updated byte tally. Caller holds h.mu.
+func (h *Hub) fillBufferNetworksLocked(data *BuffersData, names []string, used int) (map[string]struct{}, int) {
 	includedNetworks := make(map[string]struct{}, len(names))
-	base, _ := json.Marshal(data)
-	used := len(base)
 	for _, name := range names {
-		info := NetworkInfo{Name: name, State: s.hub.states[name]}
-		if c := s.hub.networks[name]; c != nil {
+		info := NetworkInfo{Name: name, State: h.states[name]}
+		if c := h.networks[name]; c != nil {
 			info.Nick = c.Nick()
 			info.ChanTypes = c.ChanTypes()
 		}
@@ -927,7 +1009,12 @@ func (s *Session) handleGetBuffers(ctx context.Context, env Envelope) {
 		data.Networks = append(data.Networks, info)
 		includedNetworks[name] = struct{}{}
 	}
-	s.hub.mu.Unlock()
+	return includedNetworks, used
+}
+
+// fillBufferRows appends buffer rows (for included networks only) under the
+// same encoded payload cap the network rows already consumed from.
+func fillBufferRows(data *BuffersData, infos []store.BufferInfo, includedNetworks map[string]struct{}, used int) {
 	for _, b := range infos {
 		if _, ok := includedNetworks[b.Network]; !ok {
 			data.Truncated = true
@@ -949,7 +1036,6 @@ func (s *Session) handleGetBuffers(ctx context.Context, env Envelope) {
 		used += extra
 		data.Buffers = append(data.Buffers, info)
 	}
-	s.push(envelope("buffers", env.Seq, data))
 }
 
 func (s *Session) handleGetHistory(ctx context.Context, env Envelope) {
@@ -1045,80 +1131,124 @@ func boundedHistoryPage(network, buffer string, msgs []store.Message, limit int,
 			msgs = msgs[:limit]
 		}
 	}
-	events := make([]EventData, len(msgs))
-	costs := make([]int, len(msgs))
-	base, _ := json.Marshal(page) // includes the empty [] and false (longer than true)
-	used := len(base)
-	for i, m := range msgs {
-		events[i] = eventData(m)
-		b, _ := json.Marshal(events[i])
-		costs[i] = len(b)
-	}
-	add := func(i int) bool {
-		extra := costs[i]
-		if len(page.Messages) > 0 {
-			extra++ // comma
-		}
-		if used+extra > maxHistoryPayloadBytes {
-			return false
-		}
-		used += extra
-		page.Messages = append(page.Messages, events[i])
-		return true
-	}
+	b := newHistoryPageBuilder(&page, msgs)
 	switch direction {
 	case historyBackward:
-		// Select newest-to-oldest, then restore chronological order.
-		for i := len(events) - 1; i >= 0; i-- {
-			if !add(i) {
-				break
-			}
-		}
-		for i, j := 0, len(page.Messages)-1; i < j; i, j = i+1, j-1 {
-			page.Messages[i], page.Messages[j] = page.Messages[j], page.Messages[i]
-		}
+		b.selectBackward()
 	case historyAround:
-		pivot := 0
-		if around != nil {
-			for i, ev := range events {
-				if ev.Time > around.TS || ev.Time == around.TS && ev.ID >= around.ID {
-					pivot = i
-					break
-				}
-			}
-		}
-		selected := make([]bool, len(events))
-		for left, right := pivot, pivot+1; left >= 0 || right < len(events); {
-			if left >= 0 {
-				if !add(left) {
-					break
-				}
-				selected[left] = true
-				left--
-			}
-			if right < len(events) {
-				if !add(right) {
-					break
-				}
-				selected[right] = true
-				right++
-			}
-		}
-		page.Messages = page.Messages[:0]
-		for i, ok := range selected {
-			if ok {
-				page.Messages = append(page.Messages, events[i])
-			}
-		}
+		b.selectAround(around)
 	default:
-		for i := range events {
-			if !add(i) {
-				break
-			}
+		b.selectForward()
+	}
+	page.HasMore = countMore || len(page.Messages) < len(msgs)
+	return page
+}
+
+// historyPageBuilder fills one history page from pre-encoded events while
+// enforcing the encoded payload cap.
+type historyPageBuilder struct {
+	page   *HistoryData
+	events []EventData
+	costs  []int // encoded size of each event
+	used   int   // encoded bytes admitted so far
+}
+
+func newHistoryPageBuilder(page *HistoryData, msgs []store.Message) *historyPageBuilder {
+	b := &historyPageBuilder{
+		page:   page,
+		events: make([]EventData, len(msgs)),
+		costs:  make([]int, len(msgs)),
+	}
+	base, _ := json.Marshal(*page) // includes the empty [] and false (longer than true)
+	b.used = len(base)
+	for i, m := range msgs {
+		b.events[i] = eventData(m)
+		enc, _ := json.Marshal(b.events[i])
+		b.costs[i] = len(enc)
+	}
+	return b
+}
+
+// add appends event i to the page unless it would exceed the payload cap.
+func (b *historyPageBuilder) add(i int) bool {
+	extra := b.costs[i]
+	if len(b.page.Messages) > 0 {
+		extra++ // comma
+	}
+	if b.used+extra > maxHistoryPayloadBytes {
+		return false
+	}
+	b.used += extra
+	b.page.Messages = append(b.page.Messages, b.events[i])
+	return true
+}
+
+// selectBackward selects newest-to-oldest, then restores chronological order.
+func (b *historyPageBuilder) selectBackward() {
+	for i := len(b.events) - 1; i >= 0; i-- {
+		if !b.add(i) {
+			break
 		}
 	}
-	page.HasMore = countMore || len(page.Messages) < len(events)
-	return page
+	for i, j := 0, len(b.page.Messages)-1; i < j; i, j = i+1, j-1 {
+		b.page.Messages[i], b.page.Messages[j] = b.page.Messages[j], b.page.Messages[i]
+	}
+}
+
+func (b *historyPageBuilder) selectForward() {
+	for i := range b.events {
+		if !b.add(i) {
+			break
+		}
+	}
+}
+
+// selectAround expands outward from the anchor, then restores chronological
+// order.
+func (b *historyPageBuilder) selectAround(around *Cursor) {
+	selected := b.expandAround(b.aroundPivot(around))
+	b.page.Messages = b.page.Messages[:0]
+	for i, ok := range selected {
+		if ok {
+			b.page.Messages = append(b.page.Messages, b.events[i])
+		}
+	}
+}
+
+// aroundPivot locates the first event at or after the anchor cursor.
+func (b *historyPageBuilder) aroundPivot(around *Cursor) int {
+	if around == nil {
+		return 0
+	}
+	for i, ev := range b.events {
+		if ev.Time > around.TS || ev.Time == around.TS && ev.ID >= around.ID {
+			return i
+		}
+	}
+	return 0
+}
+
+// expandAround alternately admits events on either side of the pivot until
+// the cap or both ends are reached, returning which indices were selected.
+func (b *historyPageBuilder) expandAround(pivot int) []bool {
+	selected := make([]bool, len(b.events))
+	for left, right := pivot, pivot+1; left >= 0 || right < len(b.events); {
+		if left >= 0 {
+			if !b.add(left) {
+				break
+			}
+			selected[left] = true
+			left--
+		}
+		if right < len(b.events) {
+			if !b.add(right) {
+				break
+			}
+			selected[right] = true
+			right++
+		}
+	}
+	return selected
 }
 
 func (s *Session) handleSearch(ctx context.Context, env Envelope) {
