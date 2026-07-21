@@ -95,17 +95,17 @@ func TestMediaTargetIDRedactsOnRandomFailure(t *testing.T) {
 }
 
 func TestMediaLogDoesNotExposeTargetOrUpstreamText(t *testing.T) {
-	oldDebug := mediaDebug
+	oldDebug, oldURLs := mediaDebug, mediaDebugURLs
 	oldWriter := log.Writer()
 	oldFlags := log.Flags()
 	oldPrefix := log.Prefix()
 	t.Cleanup(func() {
-		mediaDebug = oldDebug
+		mediaDebug, mediaDebugURLs = oldDebug, oldURLs
 		log.SetOutput(oldWriter)
 		log.SetFlags(oldFlags)
 		log.SetPrefix(oldPrefix)
 	})
-	mediaDebug = true
+	mediaDebug, mediaDebugURLs = true, false
 	var out bytes.Buffer
 	log.SetOutput(&out)
 	log.SetFlags(0)
@@ -123,6 +123,80 @@ func TestMediaLogDoesNotExposeTargetOrUpstreamText(t *testing.T) {
 	}
 	if !strings.Contains(got, "id="+mediaTargetID(target)) || !strings.Contains(got, "event=fetch_error") {
 		t.Fatalf("media debug log lacks safe correlation fields: %q", got)
+	}
+}
+
+func TestMediaDebugFlags(t *testing.T) {
+	cases := []struct {
+		debugEnv, urlsEnv string
+		debug, urls       bool
+	}{
+		{"", "", false, false},
+		{"0", "", false, false},
+		{"1", "", true, false},
+		{"1", "0", true, false}, // _URLS needs its own explicit true
+		{"", "1", true, true},   // _URLS alone implies debug logging on
+		{"0", "1", true, true},  // even against an explicit _MEDIA=0
+		{"1", "1", true, true},
+	}
+	for _, c := range cases {
+		debug, urls := mediaDebugFlags(c.debugEnv, c.urlsEnv)
+		if debug != c.debug || urls != c.urls {
+			t.Errorf("mediaDebugFlags(%q, %q) = (%t, %t), want (%t, %t)",
+				c.debugEnv, c.urlsEnv, debug, urls, c.debug, c.urls)
+		}
+	}
+}
+
+func TestMediaLogURLRequiresExplicitOptIn(t *testing.T) {
+	oldDebug, oldURLs := mediaDebug, mediaDebugURLs
+	oldWriter := log.Writer()
+	oldFlags := log.Flags()
+	oldPrefix := log.Prefix()
+	t.Cleanup(func() {
+		mediaDebug, mediaDebugURLs = oldDebug, oldURLs
+		log.SetOutput(oldWriter)
+		log.SetFlags(oldFlags)
+		log.SetPrefix(oldPrefix)
+	})
+	var out bytes.Buffer
+	log.SetOutput(&out)
+	log.SetFlags(0)
+	log.SetPrefix("")
+
+	target := "https://example.test/private?sig=hunter2"
+
+	// Plain debug: the ID, never the URL.
+	mediaDebug, mediaDebugURLs = true, false
+	logMedia("preview", target, time.Now(), mediaLogResult{event: "ok", class: "card"})
+	if got := out.String(); strings.Contains(got, "example.test") || strings.Contains(got, "hunter2") || strings.Contains(got, "url=") {
+		t.Fatalf("without IRCTHING_DEBUG_MEDIA_URLS the log carried the URL: %q", got)
+	}
+
+	// Explicit unsafe opt-in: URL alongside the same ID.
+	out.Reset()
+	mediaDebugURLs = true
+	logMedia("preview", target, time.Now(), mediaLogResult{event: "ok", class: "card"})
+	got := out.String()
+	if !strings.Contains(got, fmt.Sprintf("url=%q", target)) {
+		t.Fatalf("with IRCTHING_DEBUG_MEDIA_URLS the log lacks the URL: %q", got)
+	}
+	if !strings.Contains(got, "id="+mediaTargetID(target)) {
+		t.Fatalf("URL mode dropped the correlation ID: %q", got)
+	}
+}
+
+func TestMediaDebugURLsWarning(t *testing.T) {
+	old := mediaDebugURLs
+	t.Cleanup(func() { mediaDebugURLs = old })
+
+	mediaDebugURLs = false
+	if w := MediaDebugURLsWarning(); w != "" {
+		t.Fatalf("warning present with _URLS off: %q", w)
+	}
+	mediaDebugURLs = true
+	if w := MediaDebugURLsWarning(); !strings.Contains(w, "IRCTHING_DEBUG_MEDIA_URLS") {
+		t.Fatalf("warning missing or unnamed env var: %q", w)
 	}
 }
 

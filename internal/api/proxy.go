@@ -17,11 +17,13 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -64,7 +66,35 @@ const proxyUserAgent = "ircthing-media-proxy/1.0 (+https://github.com/ircthing)"
 // Targets are represented only by a short one-way correlation ID, and neither
 // URL components, page metadata, nor upstream-controlled error strings reach
 // the log.
-var mediaDebug = debugFlagValue(os.Getenv("IRCTHING_DEBUG_MEDIA"))
+//
+// mediaDebugURLs (IRCTHING_DEBUG_MEDIA_URLS) is the EXPLICITLY-UNSAFE step up:
+// media debug log lines additionally carry the full target URL, for when the
+// ID correlation is not enough. Setting it implies mediaDebug — the log lines
+// it decorates must exist. main.go logs a startup warning while it is active,
+// because target URLs (which may carry userinfo or signed parameters) then
+// reach persistent logs.
+var mediaDebug, mediaDebugURLs = mediaDebugFlags(
+	os.Getenv("IRCTHING_DEBUG_MEDIA"), os.Getenv("IRCTHING_DEBUG_MEDIA_URLS"))
+
+// mediaDebugFlags resolves the two media-debug env values: urls requires its
+// own explicit true value, and debug is on when either is — _URLS without
+// _MEDIA still turns the logging on.
+func mediaDebugFlags(debugEnv, urlsEnv string) (debug, urls bool) {
+	urls = debugFlagValue(urlsEnv)
+	return urls || debugFlagValue(debugEnv), urls
+}
+
+// MediaDebugURLsWarning returns a startup warning when IRCTHING_DEBUG_MEDIA_URLS
+// is active, "" otherwise. Logged by main alongside the config warnings: unlike
+// plain IRCTHING_DEBUG_MEDIA (anonymized IDs only), this mode defeats the
+// keep-URLs-out-of-logs design on purpose, and the operator should see that
+// prominently, once, at startup — not discover it in a shipped journal later.
+func MediaDebugURLsWarning() string {
+	if !mediaDebugURLs {
+		return ""
+	}
+	return "IRCTHING_DEBUG_MEDIA_URLS is set: media debug log lines include full target URLs — sensitive URLs (signed parameters, userinfo) WILL be written to persistent logs; unset it when done debugging"
+}
 
 const (
 	mediaTargetIDKeySize  = 32
@@ -128,13 +158,56 @@ type mediaLogResult struct {
 // logMedia records one media-fetch outcome when mediaDebug is on. Every field
 // is locally generated and structurally typed, so a future call site cannot
 // accidentally feed a target URL, title, content type, or raw upstream error
-// into the log.
+// into the log — with ONE deliberate exception: under mediaDebugURLs the
+// target itself is appended (%q-quoted, so a hostile URL cannot forge extra
+// log lines), which is exactly the unsafe behavior that env var opts into.
 func logMedia(kind, target string, start time.Time, result mediaLogResult) {
-	if mediaDebug {
-		log.Printf("media[%s] id=%s event=%s class=%s retryable=%t http=%d bytes=%d output_bytes=%d cap_bytes=%d blank=%t unpreviewable=%t duration_ms=%d",
-			kind, mediaTargetID(target), result.event, result.class, result.retryable,
-			result.httpStatus, result.bytes, result.outputBytes, result.capBytes,
-			result.blank, result.unpreviewable, time.Since(start).Milliseconds())
+	if !mediaDebug {
+		return
+	}
+	urlField := ""
+	if mediaDebugURLs {
+		urlField = fmt.Sprintf(" url=%q", target)
+	}
+	log.Printf("media[%s] id=%s%s event=%s class=%s retryable=%t http=%d bytes=%d output_bytes=%d cap_bytes=%d blank=%t unpreviewable=%t duration_ms=%d",
+		kind, mediaTargetID(target), urlField, result.event, result.class, result.retryable,
+		result.httpStatus, result.bytes, result.outputBytes, result.capBytes,
+		result.blank, result.unpreviewable, time.Since(start).Milliseconds())
+}
+
+// mediaIDHeader carries the anonymized per-fetch correlation ID on media-plane
+// responses (POST /api/preview, POST /api/thumb) while media debug logging is
+// active. The browser's devtools show the target URL in the request body and
+// this header in the response, and the server log shows the same ID — so the
+// operator can correlate the two without URLs ever entering persistent logs.
+// Never emitted when mediaDebug is off: production responses stay clean.
+const mediaIDHeader = "X-Ircthing-Media-ID"
+
+// withMediaID wraps a media endpoint handler so its response carries
+// mediaIDHeader when media debug logging is on. This is the shared choke point
+// for both media endpoints (wrapped at registration in api.go): the target
+// travels in the POST body, so the body is read here — one byte past
+// mediaRequest's 4096 cap, so an oversized body still overflows the handler's
+// MaxBytesReader — and replayed to the wrapped handler unchanged. The ID is
+// the same keyed digest logMedia uses (mediaTargetID), so header and log
+// lines correlate by construction. Decode errors are left for the handler to
+// report; the header is simply omitted.
+func withMediaID(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !mediaDebug {
+			next(w, r)
+			return
+		}
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 4096+1))
+		r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var req struct {
+			URL string `json:"url"`
+		}
+		if json.Unmarshal(body, &req) == nil && req.URL != "" {
+			w.Header().Set(mediaIDHeader, mediaTargetID(req.URL))
+		}
+		next(w, r)
 	}
 }
 

@@ -142,6 +142,53 @@ func mediaPost(t *testing.T, ts *httptest.Server, cookie *http.Cookie, path, tar
 	return resp
 }
 
+// The media endpoints stamp the anonymized per-fetch correlation ID
+// (X-Ircthing-Media-ID) on their responses while IRCTHING_DEBUG_MEDIA is
+// active — the same keyed digest the media debug log lines carry — and stay
+// header-clean when it is off.
+func TestMediaIDHeaderTracksDebugFlag(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<head><meta property="og:title" content="t"></head>`))
+	}))
+	defer origin.Close()
+
+	ts, srvObj := newTestServerWithRef(t)
+	permit(srvObj)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	oldDebug := mediaDebug
+	t.Cleanup(func() { mediaDebug = oldDebug })
+
+	// Debug off: production responses carry no correlation header.
+	mediaDebug = false
+	resp := mediaPost(t, ts, cookie, "/api/preview", origin.URL, testNet)
+	resp.Body.Close()
+	if got := resp.Header.Get(mediaIDHeader); got != "" {
+		t.Fatalf("debug off, %s = %q, want absent", mediaIDHeader, got)
+	}
+
+	// Debug on: the header is the exact ID the log lines use for this target.
+	mediaDebug = true
+	resp = mediaPost(t, ts, cookie, "/api/preview", origin.URL, testNet)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("preview status = %d", resp.StatusCode)
+	}
+	if got, want := resp.Header.Get(mediaIDHeader), mediaTargetID(origin.URL); got != want {
+		t.Fatalf("preview %s = %q, want %q", mediaIDHeader, got, want)
+	}
+
+	// /api/thumb goes through the same choke point (withMediaID at
+	// registration), and the header is present even on a failed request —
+	// correlation matters most on failures. An HTML origin 415s here.
+	resp = mediaPost(t, ts, cookie, "/api/thumb", origin.URL, testNet)
+	resp.Body.Close()
+	if got, want := resp.Header.Get(mediaIDHeader), mediaTargetID(origin.URL); got != want {
+		t.Fatalf("thumb %s = %q, want %q (status %d)", mediaIDHeader, got, want, resp.StatusCode)
+	}
+}
+
 func TestClientConfigPreviewsEnabled(t *testing.T) {
 	ts, _ := newTestServer(t)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))

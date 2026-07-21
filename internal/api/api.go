@@ -278,9 +278,11 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 	// runtime when previews are disabled, so the switch is editable live.
 	// POST, not GET: the target URL travels in the request body so it never
 	// reaches a reverse-proxy access log's query string (may carry userinfo /
-	// signed params). sameSiteOnly still guards them.
-	s.mux.HandleFunc("POST /api/preview", s.sameSiteOnly(s.requireAuth(s.handlePreview)))
-	s.mux.HandleFunc("POST /api/thumb", s.sameSiteOnly(s.requireAuth(s.handleThumb)))
+	// signed params). sameSiteOnly still guards them. withMediaID is the shared
+	// debug choke point: under IRCTHING_DEBUG_MEDIA it stamps the anonymized
+	// per-fetch correlation ID on both endpoints' responses (see proxy.go).
+	s.mux.HandleFunc("POST /api/preview", s.sameSiteOnly(s.requireAuth(withMediaID(s.handlePreview))))
+	s.mux.HandleFunc("POST /api/thumb", s.sameSiteOnly(s.requireAuth(withMediaID(s.handleThumb))))
 	// AGPL §13 requires OFFERING THE SOURCE to every network user. These three
 	// are deliberately UNauthenticated so anyone using a deployment can reach
 	// them: /license and /third-party-licenses serve the embedded license TEXTS;

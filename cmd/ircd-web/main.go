@@ -123,6 +123,9 @@ func run(cfg *config) error {
 	if w := cfg.cookieConfigWarning(); w != "" {
 		log.Print("config: " + w)
 	}
+	if w := api.MediaDebugURLsWarning(); w != "" {
+		log.Print("env: " + w)
+	}
 
 	h := hub.New(st)
 
