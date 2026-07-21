@@ -16,7 +16,16 @@
 
 import { useEffect, useRef, useState } from "preact/hooks";
 import { pressable } from "./a11y.js";
-import { bufKey, fmtTime, renderable, stripFormatting } from "./irc.js";
+import {
+	bufKey,
+	dropPurgedRows,
+	emptySearchPurge,
+	fmtTime,
+	recordBufferClosed,
+	recordNetworkRemoved,
+	renderable,
+	stripFormatting,
+} from "./irc.js";
 
 // tombstoneResults re-marks search rows that were redacted while the buffer
 // was unloaded — a snapshot taken before the destructive scrub could otherwise
@@ -56,6 +65,13 @@ export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep, redacte
 	const [state, setState] = useState("idle"); // idle | loading | done
 	const inputRef = useRef(null);
 	const seq = useRef(0);
+	// Buffers purged (destructive close / network removal) while the panel is
+	// open. Both the displayed rows and any response still in flight are
+	// filtered against it — a delayed response could otherwise install rows
+	// for a just-purged buffer. Deliberately NOT a seq bump: bumping would
+	// strand the panel "loading" and discard unrelated rows.
+	const purged = useRef(null);
+	if (!purged.current) purged.current = emptySearchPurge();
 
 	useEffect(() => {
 		inputRef.current?.focus();
@@ -74,8 +90,25 @@ export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep, redacte
 		const s = sock.current;
 		if (!s) return undefined;
 		const onRedact = (d) => setResults((rs) => tombstoneMatching(rs, d));
+		// Purges are one-way while the panel is open: accumulate, then drop
+		// matching rows already on screen (archive closes record nothing and
+		// the setter stays a no-op).
+		const onClosed = (d) => {
+			recordBufferClosed(purged.current, d);
+			setResults((rs) => dropPurgedRows(rs, purged.current));
+		};
+		const onNetworkRemoved = (d) => {
+			recordNetworkRemoved(purged.current, d);
+			setResults((rs) => dropPurgedRows(rs, purged.current));
+		};
 		s.on("redact", onRedact);
-		return () => s.off("redact", onRedact);
+		s.on("buffer_closed", onClosed);
+		s.on("network_removed", onNetworkRemoved);
+		return () => {
+			s.off("redact", onRedact);
+			s.off("buffer_closed", onClosed);
+			s.off("network_removed", onNetworkRemoved);
+		};
 	}, []);
 
 	useEffect(() => {
@@ -99,8 +132,10 @@ export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep, redacte
 				.then((data) => {
 					if (mine !== seq.current) return; // a newer query superseded us
 					// Apply known tombstones to the freshly-installed rows: a row
-					// snapshotted before its redaction scrub must not display content.
-					setResults(tombstoneResults(data.messages || [], redactedIds));
+					// snapshotted before its redaction scrub must not display
+					// content. Then drop rows for buffers purged since the panel
+					// opened — this response may have been snapshotted pre-purge.
+					setResults(dropPurgedRows(tombstoneResults(data.messages || [], redactedIds), purged.current));
 					setHasMore(data.has_more === true);
 					setState("done");
 				})

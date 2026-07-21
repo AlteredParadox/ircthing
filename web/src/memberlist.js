@@ -38,7 +38,13 @@ export function initialPaging() {
 //     buggy/hostile server — stop rather than loop forever;
 //   - the MAX_MEMBERS accumulation cap.
 export function applyMemberPage(st, d) {
-	const page = Array.isArray(d?.members) ? d.members : [];
+	const full = Array.isArray(d?.members) ? d.members : [];
+	// Slice each page to the remaining capacity BEFORE concatenation: the
+	// cap check below runs post-concat, so without this the final list could
+	// exceed MAX_MEMBERS by up to a page — and a single hostile oversized
+	// page by any amount.
+	const room = Math.max(0, MAX_MEMBERS - st.members.length);
+	const page = full.length > room ? full.slice(0, room) : full;
 	const next = {
 		members: st.members.concat(page),
 		after: st.after,
@@ -48,6 +54,13 @@ export function applyMemberPage(st, d) {
 		done: false,
 		degraded: false,
 	};
+	if (page.length < full.length) {
+		// Members were dropped by the cap slice: the walk ends here and the
+		// list is genuinely incomplete, whatever the page claims.
+		next.done = true;
+		next.degraded = true;
+		return next;
+	}
 	if (d?.truncated !== true) {
 		next.done = true; // complete: the server has no more members
 		return next;
@@ -76,7 +89,9 @@ export function applyMemberPage(st, d) {
 // abandons the walk (returning null) when the active buffer or socket
 // changed underneath it; onPage(state) fires per page so the UI can show
 // members as they accumulate. Resolves the final state, or null when
-// abandoned or a request failed.
+// abandoned. A failed request ends the walk with what has accumulated,
+// delivered through onPage as done+degraded so the caller's "incomplete"
+// warning shows instead of a silently-partial list.
 export async function fetchAllMembers({ request, isStale, onPage }) {
 	let st = initialPaging();
 	for (;;) {
@@ -84,7 +99,17 @@ export async function fetchAllMembers({ request, isStale, onPage }) {
 		try {
 			d = await request(st.after);
 		} catch {
-			return null;
+			if (isStale()) return null;
+			st = {
+				...st,
+				// The very first page may have failed; onPage consumers read
+				// meta unconditionally, so fill the neutral default.
+				meta: st.meta || { joined: false, topic: "" },
+				done: true,
+				degraded: true,
+			};
+			onPage(st);
+			return st;
 		}
 		if (isStale()) return null;
 		st = applyMemberPage(st, d);

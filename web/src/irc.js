@@ -1018,6 +1018,42 @@ export function applyTombstones(list, tombstones) {
 	);
 }
 
+// Purge accumulator for the search overlay: buffers destructively closed and
+// networks removed while the panel was open. An open result set (and any
+// in-flight response) is an independent snapshot that a fresh query would no
+// longer return, so it must be filtered against this set — purged content
+// must not stay readable through the search panel. Archived closes are NOT
+// recorded: archived buffers deliberately stay searchable.
+export function emptySearchPurge() {
+	return { buffers: new Set(), networks: new Set() };
+}
+
+// recordBufferClosed folds a buffer_closed push into the accumulator. The
+// server resolves `purge` to a boolean; an ABSENT field means an old server
+// that doesn't say — treated as purge, the safe direction (over-hiding beats
+// displaying purged content). Only an explicit purge:false (archive) keeps
+// the buffer's rows.
+export function recordBufferClosed(p, d) {
+	if (!d || d.purge === false) return;
+	p.buffers.add(bufKey(d.network, d.buffer));
+}
+
+// recordNetworkRemoved purges every row of the removed network.
+export function recordNetworkRemoved(p, d) {
+	if (d?.network != null) p.networks.add(d.network);
+}
+
+// dropPurgedRows filters search rows against the accumulator. Returns the
+// input array unchanged when nothing is dropped, so a state setter around it
+// stays a no-op.
+export function dropPurgedRows(rows, p) {
+	if (!p || (p.buffers.size === 0 && p.networks.size === 0)) return rows;
+	const kept = rows.filter(
+		(ev) => !p.networks.has(ev.network) && !p.buffers.has(bufKey(ev.network, ev.buffer)),
+	);
+	return kept.length === rows.length ? rows : kept;
+}
+
 // uuid returns a random id. crypto.randomUUID is secure-context-only
 // (HTTPS/localhost) — unavailable over plain HTTP at a LAN address, the
 // "open from my phone" case — so fall back to getRandomValues, which is

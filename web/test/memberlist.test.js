@@ -101,6 +101,44 @@ test("applyMemberPage stops degraded at the accumulation cap", () => {
 	is(st.members.length, MAX_MEMBERS);
 });
 
+test("applyMemberPage slices an incoming page to the remaining capacity", () => {
+	// One member of room left: a 3-member page is sliced to exactly the cap,
+	// never past it, and the drop marks the walk degraded.
+	let st = initialPaging();
+	st.members = nicks(MAX_MEMBERS - 1);
+	st = applyMemberPage(st, page(nicks(3, MAX_MEMBERS - 1), true, "zzz"));
+	is(st.members.length, MAX_MEMBERS);
+	is(st.done, true);
+	is(st.degraded, true);
+});
+
+test("applyMemberPage bounds a single hostile oversized page", () => {
+	const st = applyMemberPage(initialPaging(), page(nicks(MAX_MEMBERS + 5000), true, "zzz"));
+	is(st.members.length, MAX_MEMBERS);
+	is(st.done, true);
+	is(st.degraded, true);
+});
+
+test("applyMemberPage marks a sliced FINAL page degraded despite truncated:false", () => {
+	// The server's last page overflows the cap: members were dropped, so the
+	// list is incomplete even though the server considers the walk finished.
+	let st = initialPaging();
+	st.members = nicks(MAX_MEMBERS - 2);
+	st = applyMemberPage(st, page(nicks(5, MAX_MEMBERS - 2), false));
+	is(st.members.length, MAX_MEMBERS);
+	is(st.done, true);
+	is(st.degraded, true);
+});
+
+test("applyMemberPage keeps an exactly-fitting final page non-degraded", () => {
+	let st = initialPaging();
+	st.members = nicks(MAX_MEMBERS - 2);
+	st = applyMemberPage(st, page(nicks(2, MAX_MEMBERS - 2), false));
+	is(st.members.length, MAX_MEMBERS);
+	is(st.done, true);
+	is(st.degraded, false);
+});
+
 test("fetchAllMembers walks pages and reports each accumulation step", async () => {
 	const pages = {
 		"": page(nicks(2), true, "n00001"),
@@ -139,12 +177,47 @@ test("fetchAllMembers abandons a stale walk without reporting further pages", as
 	eq(seen, []); // nothing applied after staleness
 });
 
-test("fetchAllMembers resolves null on request failure", async () => {
+test("fetchAllMembers surfaces a mid-walk failure as a final degraded state", async () => {
+	const pages = { "": page(nicks(2), true, "n00001") };
+	const seen = [];
+	const st = await fetchAllMembers({
+		request: (after) =>
+			after in pages ? Promise.resolve(pages[after]) : Promise.reject(new Error("boom")),
+		isStale: () => false,
+		onPage: (s) => seen.push({ n: s.members.length, done: s.done, degraded: s.degraded }),
+	});
+	// The partial list is kept, but the walk ends flagged incomplete so the
+	// warning UI shows — a silent partial list was the bug.
+	eq(seen, [
+		{ n: 2, done: false, degraded: false },
+		{ n: 2, done: true, degraded: true },
+	]);
+	is(st.done, true);
+	is(st.degraded, true);
+	is(st.members.length, 2);
+});
+
+test("fetchAllMembers surfaces a first-page failure with neutral meta", async () => {
+	const seen = [];
 	const st = await fetchAllMembers({
 		request: () => Promise.reject(new Error("boom")),
 		isStale: () => false,
+		onPage: (s) => seen.push(s),
+	});
+	is(seen.length, 1);
+	is(st.done, true);
+	is(st.degraded, true);
+	is(st.members.length, 0);
+	// onPage consumers read meta unconditionally; a failed walk still fills it.
+	eq(st.meta, { joined: false, topic: "" });
+});
+
+test("fetchAllMembers stays silent when a failure lands on a stale walk", async () => {
+	const st = await fetchAllMembers({
+		request: () => Promise.reject(new Error("boom")),
+		isStale: () => true, // buffer switched before the rejection landed
 		onPage: () => {
-			throw new Error("onPage after failure");
+			throw new Error("onPage on a stale walk");
 		},
 	});
 	is(st, null);

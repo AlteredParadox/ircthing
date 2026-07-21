@@ -85,6 +85,12 @@ export class Socket {
 		// they belong to the retired auth/socket generation and must be inert.
 		if (this.closed) return;
 		if (env.v !== V) return;
+		// A parsed, version-matching envelope is the "delivered frame" proof of
+		// a real backend. It is deliberately signalled HERE, not in onmessage:
+		// a garbage frame (proxy error page, wrong upstream) must not reset
+		// reconnect backoff. A quiet-but-working link still stabilizes via the
+		// STABLE_MS timer.
+		this.markStable();
 		if (env.seq) {
 			const p = this.pending.get(env.seq);
 			if (!p) return;
@@ -114,10 +120,9 @@ export class Socket {
 		};
 		ws.onmessage = (e) => {
 			if (this.closed || this.ws !== ws) return;
-			// Any server frame proves the connection is real, not an
-			// accept-then-drop; don't make a quiet-but-working link wait out
-			// the timer.
-			this.markStable();
+			// Stability (backoff reset) is signalled by dispatch() once the
+			// frame parses as a version-matching envelope — an unparseable
+			// frame is not proof of a live backend.
 			let env;
 			try {
 				env = JSON.parse(e.data);

@@ -82,6 +82,17 @@ export function Members({ info, theme, ignoredNicks, onNick }) {
 	const [viewH, setViewH] = useState(600);
 	const [heights, setHeights] = useState({ row: 30, head: 24 });
 
+	// The panel is mounted unkeyed, so a buffer switch reuses this instance:
+	// without a reset the previous channel's filter text and scroll offset
+	// would silently apply to the new roster. Reset in an effect rather than
+	// keying the component, which would tear down the measured row heights
+	// and the ResizeObserver for no reason.
+	useEffect(() => {
+		setFilter("");
+		if (listRef.current) listRef.current.scrollTop = 0;
+		setScrollTop(0);
+	}, [info?.network, info?.buffer]);
+
 	// Track the scroller's viewport height (the panel resizes with the
 	// window / layout changes).
 	useEffect(() => {

@@ -393,6 +393,10 @@ export function App() {
 	// a ref (not state) so socket handlers read the live set without a stale
 	// closure; survives buffer eviction so a late history/search page for a
 	// closed-then-reopened buffer still can't restore redacted content.
+	// Lifecycle decision: entries are deliberately NOT dropped on buffer close
+	// or network removal — that survival is the ref's whole purpose (a purged
+	// buffer recreated under the same name must still tombstone), and the
+	// rememberRedaction bounds (128 buffers x 400 ids) already cap growth.
 	const redactedIds = useRef(new Map());
 	// Nicks we ran /whois on, keyed network+"\n"+lowercased-nick, so ONLY a
 	// client-initiated whois opens and selects a query buffer. An unsolicited
@@ -848,7 +852,6 @@ export function App() {
 			// Invalidate any in-flight initial loads for the removed buffers.
 			for (const g of gone) {
 				historyGen.current[g.key] = (historyGen.current[g.key] || 0) + 1;
-				redactedIds.current.delete(g.key); // drop tombstones for gone buffers
 			}
 			setMsgs((m) => {
 				let next = m;
@@ -990,6 +993,9 @@ export function App() {
 				setConnected(false);
 			}
 			pendingJoins.current.clear();
+			// Same for whois intents: a stale entry surviving a reconnect would
+			// let one unsolicited future whois push open a buffer/steal focus.
+			pendingWhois.current.clear();
 			// Intent bumps strand any in-flight request's .finally busy-ref
 			// reset (intent no longer matches), so reset the refs here too —
 			// same discipline as every other bump site.
@@ -1282,7 +1288,14 @@ export function App() {
 	function sendCommand(network, command, params) {
 		if (command === "WHOIS") rememberPendingWhois(network, params?.[0]);
 		sock.current?.request("command", { network, command, params })
-			.catch((e) => setCmdError(e.message || "failed"));
+			.catch((e) => {
+				// The whois never went out (or errored): retire its intent so a
+				// later unsolicited whois push can't ride it to steal focus.
+				if (command === "WHOIS" && params?.[0]) {
+					pendingWhois.current.delete(network + "\n" + foldNick(params[0]));
+				}
+				setCmdError(e.message || "failed");
+			});
 	}
 
 	// forgetBuffer is the LOCAL half of a close (either mode): drop the
@@ -1302,7 +1315,6 @@ export function App() {
 		// Invalidate any in-flight initial get_history so it can't reinstall a
 		// phantom msgs entry for the buffer we're closing.
 		historyGen.current[key] = (historyGen.current[key] || 0) + 1;
-		redactedIds.current.delete(key);
 		setMsgs((m) => dropBufferMsgs(m, key));
 		setTypers((all) => {
 			if (!all.has(key)) return all;

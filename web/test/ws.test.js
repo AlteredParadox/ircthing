@@ -173,6 +173,37 @@ test("first server frame marks the connection stable and resets backoff", () => 
 	});
 });
 
+// The stability signal moved from raw frame delivery into dispatch(): only a
+// parsed, version-matching envelope proves a real backend. A proxy error page
+// or wrong upstream babbling at us must not reset backoff.
+test("a garbage (unparseable) frame does not reset backoff or mark stable", () => {
+	withFakeWS((made) => {
+		const s = new Socket("ws://x");
+		let stables = 0;
+		s.on("_stable", () => stables++);
+		try {
+			s.backoff = 8000;
+			s.connect();
+			made[0].onopen();
+			made[0].onmessage({ data: "<html>502 Bad Gateway</html>" });
+			is(s.backoff, 8000);
+			is(stables, 0);
+			is(s.stable, false);
+			// A wrong-version envelope parses but fails the version check —
+			// equally not proof of OUR backend.
+			made[0].onmessage({ data: JSON.stringify({ v: 999, seq: 0, type: "event", data: {} }) });
+			is(s.backoff, 8000);
+			is(stables, 0);
+			// The first valid envelope on the same transport still stabilizes.
+			made[0].onmessage({ data: JSON.stringify({ v: 1, seq: 0, type: "event", data: {} }) });
+			is(s.backoff, 1000);
+			is(stables, 1);
+		} finally {
+			s.close();
+		}
+	});
+});
+
 test("a connection that stays open goes stable on the timer without traffic", (t) => {
 	t.mock.timers.enable({ apis: ["setTimeout"] });
 	withFakeWS((made) => {
