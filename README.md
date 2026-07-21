@@ -12,6 +12,11 @@ database it creates. The binary is ~16 MB; the web bundle inside it is
 ~53 KB gzipped; a working setup with 5 networks and 10k messages of hot
 scrollback runs in ~32 MB of RSS.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/main_dark.png">
+  <img src="docs/screenshots/main_light.png" alt="ircthing: channel view with an image thumbnail and an inline audio player, member list on the right">
+</picture>
+
 ## Features
 
 - **Bouncer core**: persistent connections with reconnect
@@ -56,6 +61,8 @@ scrollback runs in ~32 MB of RSS.
   message font — plus a raw custom-CSS override. Usable at 360 px wide;
   installable as a PWA.
 
+<img src="docs/screenshots/settings_preview.png" width="380" align="right" alt="Settings: theme, accent, density, sidebar width, message font, join/part display, timestamps">
+
 ### Keyboard
 
 | Keys | Action |
@@ -68,6 +75,8 @@ scrollback runs in ~32 MB of RSS.
 | `Shift+Enter` | newline (sent as `draft/multiline` where supported) |
 | `Ctrl+B` / `Ctrl+I` / `Ctrl+U` | bold / italic / underline (mIRC codes); `Alt+F` opens the full style + color panel |
 | `↑` / `↓` | recall previously sent messages (from the draft's first/last line); `↓` while typing clears the box |
+
+<br clear="all">
 
 ## Quick start
 
