@@ -325,7 +325,8 @@ func clip(s string, max int) string {
 // no pure-Go decoder in our dependency set, so they are deliberately absent.
 // image/webp is claimed even though LOSSLESS (VP8L) bodies are refused at the
 // decode gate (see webpUsesVP8L): the content type doesn't distinguish them, and
-// a blank card for lossless WebP is the accepted cost of that restriction.
+// a refused VP8L body 415s WITH the unpreviewable header — a real image we
+// decline to decode — so the client shows an "open original" card, not a blank.
 func isImageType(contentType string) bool {
 	ct, _, _ := strings.Cut(contentType, ";")
 	switch strings.TrimSpace(strings.ToLower(ct)) {

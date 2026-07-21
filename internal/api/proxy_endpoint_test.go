@@ -163,6 +163,93 @@ func TestThumbRejectsNonImage(t *testing.T) {
 	}
 }
 
+// A hostile origin can pass the content-type gate on its DECLARED type alone
+// (DetectContentType of junk says text/plain, but `image/png` in the header
+// suffices) while serving bytes no decoder recognizes. That must 415 WITHOUT
+// the unpreviewable hint: the header buys a permanent "open original" card in
+// the client, and junk-behind-an-image-CT must stay blank like any non-image
+// rather than letting the origin guarantee its link a prominent card.
+func TestThumbJunkBodyWithImageTypeNotUnpreviewable(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write([]byte("this is not a png, or any image at all"))
+	}))
+	defer origin.Close()
+
+	ts, srvObj := newTestServerWithRef(t)
+	permit(srvObj)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	resp := mediaPost(t, ts, cookie, "/api/thumb", origin.URL, testNet)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d, want 415", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Thumb-Unpreviewable"); got != "" {
+		t.Fatalf("X-Thumb-Unpreviewable = %q, want empty for an undecodable body", got)
+	}
+}
+
+// A real image whose declared AREA exceeds the decode budget (dimensions
+// individually under maxImageDim, so it passes the dimension cap and is
+// rejected by the byte-product math) is a genuine image we refuse: 415 WITH
+// the unpreviewable hint so the client offers the original.
+func TestThumbOverAreaBudgetUnpreviewable(t *testing.T) {
+	// A valid 1x1 RGBA PNG patched to declare 20000 x 20000 (400 MP x 4 B/px
+	// = 1.6 GB modeled decode, far over maxDecodeBytes; 20000 < maxImageDim).
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	b := buf.Bytes()
+	binary.BigEndian.PutUint32(b[16:], 20000) // IHDR width
+	binary.BigEndian.PutUint32(b[20:], 20000) // IHDR height
+	binary.BigEndian.PutUint32(b[29:], crc32.ChecksumIEEE(b[12:29]))
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(b)
+	}))
+	defer origin.Close()
+
+	ts, srvObj := newTestServerWithRef(t)
+	permit(srvObj)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	resp := mediaPost(t, ts, cookie, "/api/thumb", origin.URL, testNet)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d, want 415 (rejected before decode)", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Thumb-Unpreviewable"); got != "too-large" {
+		t.Fatalf("X-Thumb-Unpreviewable = %q, want %q", got, "too-large")
+	}
+}
+
+// A lossless (VP8L) WebP is a real image the decode gate deliberately refuses
+// (see webpUsesVP8L): 415 WITH the unpreviewable hint — the "open original"
+// card is the better outcome for a genuine image, not a blank.
+func TestThumbVP8LUnpreviewable(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/webp")
+		w.Write(minimalVP8LWebP)
+	}))
+	defer origin.Close()
+
+	ts, srvObj := newTestServerWithRef(t)
+	permit(srvObj)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	resp := mediaPost(t, ts, cookie, "/api/thumb", origin.URL, testNet)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("status = %d, want 415", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Thumb-Unpreviewable"); got != "too-large" {
+		t.Fatalf("X-Thumb-Unpreviewable = %q, want %q", got, "too-large")
+	}
+}
+
 // A PNG declaring huge dimensions is rejected at the header check, not
 // decoded. 100000^2 is accepted by Go's DecodeConfig (its own overflow
 // guard only trips much higher) but far exceeds the decode budget; the

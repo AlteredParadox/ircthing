@@ -32,12 +32,22 @@ import (
 )
 
 // thumbUnpreviewableHeader flags an error response where we DID fetch a real
-// image but decline to inline it: too many megapixels for the decode-memory
-// budget, a re-encode that overran the serving cap, or a body over the 10 MiB
-// fetch cap. The client renders a small "open original" fallback card instead
-// of a blank (matching how The Lounge handles un-inlineable images) — this is
-// distinct from a dead link or a non-image, which stay blank. The value is a
-// short reason ("too-large") the client may surface.
+// image but decline to inline it. The client renders a small, PERMANENT
+// "open original" fallback card instead of a blank (matching how The Lounge
+// handles un-inlineable images) and never retries, so the header must only
+// appear when the target really is an image. The three failure shapes at the
+// decode gate, and their outcomes:
+//   - real image over budget — body over the 10 MiB fetch cap, declared
+//     area/bit depth over the decode-memory budget, or a re-encode over the
+//     serving cap: header SET ("too-large") → fallback card;
+//   - lossless (VP8L) WebP — a real image we deliberately refuse to decode
+//     (see webpUsesVP8L): header SET → fallback card, the better outcome for
+//     a genuine image;
+//   - undecodable body — an image content type over bytes image.DecodeConfig
+//     rejects (junk, or a format we ship no decoder for): header ABSENT →
+//     the client stays blank, same as a dead link or a non-image, so a
+//     hostile origin can't buy a persistent card with junk bytes.
+// The value is a short reason ("too-large") the client may surface.
 const thumbUnpreviewableHeader = "X-Thumb-Unpreviewable"
 
 // Image thumbnails: fetch an image through the proxy, downscale it
@@ -203,8 +213,9 @@ func jpegDecodesToRGBA(b []byte) bool {
 // huffman.go:46) — independent of DecodeConfig's dimensions and far past
 // the deploy unit's MemoryMax. VP8L color transforms and compressed alpha
 // exceed the model too, less dramatically. Until the decoder bounds its
-// Huffman groups upstream, lossless WebP is refused (415, blank card);
-// plain lossy VP8 — the dominant CDN form — still thumbnails.
+// Huffman groups upstream, lossless WebP is refused (415 with the
+// unpreviewable header — the client offers the original); plain lossy
+// VP8 — the dominant CDN form — still thumbnails.
 //
 // RIFF layout (the caller already validated the header via DecodeConfig):
 // "RIFF" len "WEBP", then chunks of fourCC + LE32 length + payload + pad.
@@ -230,25 +241,43 @@ func webpUsesVP8L(body []byte) bool {
 	return false
 }
 
+// decodeVerdict classifies a fetched body at the thumbnail decode gate. The
+// distinction matters because only decodeRefused earns the unpreviewable
+// header (see thumbUnpreviewableHeader): a refused body is a REAL image the
+// client should offer via an "open original" card, while an undecodable body
+// is not an image as far as we can tell and must stay blank.
+type decodeVerdict int
+
+const (
+	decodeOK       decodeVerdict = iota
+	decodeNotImage               // image.DecodeConfig failed: no decoder recognizes the body
+	decodeRefused                // real image (header parsed) we decline to decode: over budget, or VP8L
+)
+
 // decodableFormat validates that body is an image we are willing to fully
-// decode within maxDecodeBytes, returning its format. ok is false when the
-// header is unreadable, the dimensions are out of range, or the modeled
-// decode would exceed the memory cap. Bounding decoded BYTES (not just
-// pixels) matters: a 16-bit-depth image decodes to 8 bytes/pixel
-// (RGBA64/NRGBA64/Gray16), double the assumed 4, so a pixel-only cap would
-// let it use twice the intended memory.
-func decodableFormat(body []byte) (format string, ok bool) {
+// decode within maxDecodeBytes, returning its format and a verdict:
+// decodeNotImage when the header is unreadable by every registered decoder,
+// decodeRefused when the header parsed but the dimensions are out of range,
+// the modeled decode would exceed the memory cap, or the body is lossless
+// (VP8L) WebP. Bounding decoded BYTES (not just pixels) matters: a
+// 16-bit-depth image decodes to 8 bytes/pixel (RGBA64/NRGBA64/Gray16),
+// double the assumed 4, so a pixel-only cap would let it use twice the
+// intended memory.
+func decodableFormat(body []byte) (format string, verdict decodeVerdict) {
 	cfg, format, err := image.DecodeConfig(bytes.NewReader(body))
+	if err != nil {
+		return "", decodeNotImage
+	}
 	// The dimension caps are checked FIRST (short-circuit) so the byte
 	// product below can never overflow int64.
-	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 ||
+	if cfg.Width <= 0 || cfg.Height <= 0 ||
 		cfg.Width > maxImageDim || cfg.Height > maxImageDim {
-		return "", false
+		return "", decodeRefused
 	}
 	// Lossless (VP8L) WebP escapes the per-pixel decode model entirely —
 	// see webpUsesVP8L — so it is refused before any decode.
 	if format == "webp" && webpUsesVP8L(body) {
-		return "", false
+		return "", decodeRefused
 	}
 	// Per-pixel decode cost is the output bitmap PLUS, for a progressive
 	// JPEG, the decoder's full up-front DCT coefficient allocation: image/jpeg
@@ -265,9 +294,9 @@ func decodableFormat(body []byte) (format string, ok bool) {
 		h = (h + 15) &^ 15
 	}
 	if w*h*perPixel > maxDecodeBytes {
-		return "", false
+		return "", decodeRefused
 	}
-	return format, true
+	return format, decodeOK
 }
 
 // decodePerPixel estimates the per-pixel cost of decoding, charging EVERY buffer
@@ -400,7 +429,16 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// Reject oversized decodes from the cheap header read, before
 	// committing to a full decode. (The concrete format no longer drives the
 	// re-encode — encodeThumb keys on actual opacity — so only the gate matters.)
-	if _, ok := decodableFormat(body); !ok {
+	switch _, verdict := decodableFormat(body); verdict {
+	case decodeNotImage:
+		// The type gate above passes on the DECLARED content type alone, so an
+		// image content type over junk bytes lands here. Not a real image as
+		// far as we can tell: no unpreviewable hint — the client stays blank
+		// rather than rendering a permanent "open original" card for junk.
+		logMedia("thumb", target, start, mediaLogResult{event: "reject", class: "undecodable", bytes: len(body), httpStatus: 415})
+		http.Error(w, "not an image", http.StatusUnsupportedMediaType)
+		return
+	case decodeRefused:
 		// Real image, but its declared pixel area (or a lossless-WebP bitstream)
 		// exceeds the decode-memory budget — offer the original instead of a blank.
 		w.Header().Set(thumbUnpreviewableHeader, "too-large")

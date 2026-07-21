@@ -238,9 +238,9 @@ var uncompressedAlphaWebP = func() []byte {
 }()
 
 func TestWebPLossyDecodes(t *testing.T) {
-	format, ok := decodableFormat(lossyWebP)
-	if !ok || format != "webp" {
-		t.Fatalf("decodableFormat = (%q, %v), want (webp, true)", format, ok)
+	format, verdict := decodableFormat(lossyWebP)
+	if verdict != decodeOK || format != "webp" {
+		t.Fatalf("decodableFormat = (%q, %v), want (webp, decodeOK)", format, verdict)
 	}
 	// isImageType must agree the content type is decodable, and reject the
 	// formats we have no decoder for (avif, x-icon) so they don't route to a
@@ -289,8 +289,11 @@ func TestWebPVP8LRejected(t *testing.T) {
 		{"lossless VP8L", minimalVP8LWebP},
 		{"compressed ALPH", lossyAlphaWebP},
 	} {
-		if format, ok := decodableFormat(tc.body); ok {
-			t.Errorf("%s: decodableFormat = (%q, true), want rejected", tc.name, format)
+		// decodeRefused, not decodeNotImage: a VP8L body is a REAL image we
+		// decline to decode, so it must earn the unpreviewable header (the
+		// client offers the original instead of blanking).
+		if format, verdict := decodableFormat(tc.body); verdict != decodeRefused {
+			t.Errorf("%s: decodableFormat = (%q, %v), want decodeRefused", tc.name, format, verdict)
 		}
 	}
 }
@@ -299,9 +302,9 @@ func TestWebPVP8LRejected(t *testing.T) {
 // to a non-opaque NYCbCrA; the thumbnail must select PNG or the transparency
 // renders dark/black through JPEG.
 func TestWebPAlphaKeepsPNG(t *testing.T) {
-	format, ok := decodableFormat(uncompressedAlphaWebP)
-	if !ok || format != "webp" {
-		t.Fatalf("decodableFormat = (%q, %v), want (webp, true)", format, ok)
+	format, verdict := decodableFormat(uncompressedAlphaWebP)
+	if verdict != decodeOK || format != "webp" {
+		t.Fatalf("decodableFormat = (%q, %v), want (webp, decodeOK)", format, verdict)
 	}
 	src, _, err := image.Decode(bytes.NewReader(uncompressedAlphaWebP))
 	if err != nil {
