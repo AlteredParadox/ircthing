@@ -587,6 +587,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
+// msgTooManyAttempts is the rate-limit refusal body shared by login and
+// change-password (both gate on the same login buckets). Clients match on
+// this exact text; keep it stable.
+const msgTooManyAttempts = "too many attempts, retry later"
+
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Username string `json:"username"`
@@ -602,14 +607,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	source := s.loginSourceKey(r)
 	if wait := s.login.retryAfter(source, time.Now()); wait > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds()+1)))
-		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
+		http.Error(w, msgTooManyAttempts, http.StatusTooManyRequests)
 		return
 	}
 	// The global bucket is charged after the per-source check so a source
 	// already in backoff cannot drain tokens from everyone else.
 	if wait := s.login.globalAllow(time.Now()); wait > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds()+1)))
-		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
+		http.Error(w, msgTooManyAttempts, http.StatusTooManyRequests)
 		return
 	}
 	// Snapshot the credential generation BEFORE the (slow) bcrypt verify; if a
@@ -793,13 +798,20 @@ func (s *Server) tokenValid(token string) bool {
 // and the handler must refuse the socket.
 func (s *Server) registerWSCancel(token string, cancel context.CancelFunc, conn *websocket.Conn) (unregister func(), ok bool) {
 	if token == "" {
-		return func() {}, false
+		return func() {
+			// Intentionally empty: registration was refused, so there is
+			// nothing to unregister — a no-op lets the caller defer the
+			// unregister unconditionally.
+		}, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	expiry, live := s.tokens[token]
 	if !live || time.Now().After(expiry) {
-		return func() {}, false
+		return func() {
+			// Intentionally empty: no cancel func was recorded for this
+			// dead/expired token, so the unregister has nothing to undo.
+		}, false
 	}
 	id := s.wsNextID
 	s.wsNextID++

@@ -47,8 +47,15 @@ import (
 //     rejects (junk, or a format we ship no decoder for): header ABSENT →
 //     the client stays blank, same as a dead link or a non-image, so a
 //     hostile origin can't buy a persistent card with junk bytes.
+//
 // The value is a short reason ("too-large") the client may surface.
-const thumbUnpreviewableHeader = "X-Thumb-Unpreviewable"
+const (
+	thumbUnpreviewableHeader = "X-Thumb-Unpreviewable"
+	// thumbUnpreviewableTooLarge is the one reason value currently emitted,
+	// covering every over-budget shape above. Clients match on this exact
+	// text; keep it stable.
+	thumbUnpreviewableTooLarge = "too-large"
+)
 
 // Image thumbnails: fetch an image through the proxy, downscale it
 // server-side, and serve a small re-encoded version so the browser never
@@ -394,30 +401,10 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
 		return
 	}
-	// Classify the fetch error: TRANSIENT (WireGuard tunnel still warming up,
-	// upstream 5xx) → 503 so the client retries; PERMANENT (bad/blocked URL, body
-	// over the 10 MiB cap, upstream 4xx) → 502 so it caches the failure instead of
-	// re-downloading up to ~10 MiB per retry to the same end. Fail closed either
-	// way: no direct fetch.
 	start := time.Now()
 	ct, _, body, err := f.get(r.Context(), target)
 	if err != nil {
-		// A body over the 10 MiB fetch cap is a real image we simply won't
-		// download in full — flag it unpreviewable so the client offers the
-		// original rather than blanking. (Still 502: permanent, don't retry.)
-		if errors.Is(err, errTooLarge) {
-			w.Header().Set(thumbUnpreviewableHeader, "too-large")
-			logMedia("thumb", target, start, mediaLogResult{event: "fetch_error", class: "too_large", httpStatus: 502, unpreviewable: true})
-			http.Error(w, "image too large", http.StatusBadGateway)
-			return
-		}
-		if fetchErrorRetryable(err) {
-			logMedia("thumb", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), retryable: true, httpStatus: 503})
-			http.Error(w, "thumbnail fetch failed", http.StatusServiceUnavailable)
-		} else {
-			logMedia("thumb", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), httpStatus: 502})
-			http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
-		}
+		thumbFetchFailed(w, target, start, err)
 		return
 	}
 	if !isImageType(ct) && !isImageType(http.DetectContentType(body)) {
@@ -441,7 +428,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	case decodeRefused:
 		// Real image, but its declared pixel area (or a lossless-WebP bitstream)
 		// exceeds the decode-memory budget — offer the original instead of a blank.
-		w.Header().Set(thumbUnpreviewableHeader, "too-large")
+		w.Header().Set(thumbUnpreviewableHeader, thumbUnpreviewableTooLarge)
 		logMedia("thumb", target, start, mediaLogResult{event: "reject", class: "decode_budget", bytes: len(body), httpStatus: 415, unpreviewable: true})
 		http.Error(w, "unsupported image", http.StatusUnsupportedMediaType)
 		return
@@ -468,7 +455,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// thumbnail, exactly as it does for any thumb failure — which keeps browser
 	// blob residency at count × maxThumbCacheEntry.
 	if len(res.data) > maxThumbCacheEntry {
-		w.Header().Set(thumbUnpreviewableHeader, "too-large")
+		w.Header().Set(thumbUnpreviewableHeader, thumbUnpreviewableTooLarge)
 		logMedia("thumb", target, start, mediaLogResult{event: "reject", class: "encoded_size", bytes: len(res.data), capBytes: maxThumbCacheEntry, httpStatus: 413, unpreviewable: true})
 		http.Error(w, "thumbnail too large", http.StatusRequestEntityTooLarge)
 		return
@@ -476,6 +463,30 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	logMedia("thumb", target, start, mediaLogResult{event: "ok", class: "thumbnail", bytes: len(body), outputBytes: len(res.data)})
 	s.thumbCache.put(ck, res)
 	writeThumb(w, res)
+}
+
+// thumbFetchFailed classifies a failed thumbnail fetch: TRANSIENT (WireGuard
+// tunnel still warming up, upstream 5xx) → 503 so the client retries;
+// PERMANENT (bad/blocked URL, body over the 10 MiB cap, upstream 4xx) → 502
+// so it caches the failure instead of re-downloading up to ~10 MiB per retry
+// to the same end. Fail closed either way: no direct fetch.
+func thumbFetchFailed(w http.ResponseWriter, target string, start time.Time, err error) {
+	// A body over the 10 MiB fetch cap is a real image we simply won't
+	// download in full — flag it unpreviewable so the client offers the
+	// original rather than blanking. (Still 502: permanent, don't retry.)
+	if errors.Is(err, errTooLarge) {
+		w.Header().Set(thumbUnpreviewableHeader, thumbUnpreviewableTooLarge)
+		logMedia("thumb", target, start, mediaLogResult{event: "fetch_error", class: "too_large", httpStatus: 502, unpreviewable: true})
+		http.Error(w, "image too large", http.StatusBadGateway)
+		return
+	}
+	if fetchErrorRetryable(err) {
+		logMedia("thumb", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), retryable: true, httpStatus: 503})
+		http.Error(w, "thumbnail fetch failed", http.StatusServiceUnavailable)
+	} else {
+		logMedia("thumb", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), httpStatus: 502})
+		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
+	}
 }
 
 func writeThumb(w http.ResponseWriter, t thumbResult) {

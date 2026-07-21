@@ -353,6 +353,19 @@ func (e *upstreamStatusError) Error() string {
 // Everything else — dial/timeout errors (a WireGuard tunnel still warming up),
 // TLS handshake I/O errors, truncated reads, and 5xx/408/429 upstream — is
 // transient.
+// retryableUpstreamStatus reports whether a non-200 upstream status is a
+// transient hiccup worth a client retry, as opposed to a permanent "no".
+func retryableUpstreamStatus(code int) bool {
+	switch code {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, // 408, 429
+		http.StatusInternalServerError, http.StatusBadGateway, // 500, 502
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout: // 503, 504
+		return true
+	default:
+		return false // 4xx and other permanent statuses
+	}
+}
+
 func fetchErrorRetryable(err error) bool {
 	if err == nil {
 		return false
@@ -392,14 +405,7 @@ func fetchErrorRetryable(err error) bool {
 	}
 	var se *upstreamStatusError
 	if errors.As(err, &se) {
-		switch se.code {
-		case http.StatusRequestTimeout, http.StatusTooManyRequests, // 408, 429
-			http.StatusInternalServerError, http.StatusBadGateway, // 500, 502
-			http.StatusServiceUnavailable, http.StatusGatewayTimeout: // 503, 504
-			return true
-		default:
-			return false // 4xx and other permanent statuses
-		}
+		return retryableUpstreamStatus(se.code)
 	}
 	// Explicitly TRANSIENT classes, whatever phase they surface in:
 	//   - dialPhaseError: TCP/proxy/tunnel dial failures — a WireGuard tunnel

@@ -217,9 +217,6 @@ func run(cfg *config) error {
 	return runErr
 }
 
-// startNetworks seeds the network_configs table from the config file on
-// first run, then starts every stored definition. A bad stored row is
-// skipped with a log line, not fatal.
 // seedNetworks validates the config-file definitions and imports them on
 // first run (empty database). Seeds get the same full validation as web
 // edits (TLS/SASL/proxy/certificate checks) BEFORE anything is
@@ -244,24 +241,81 @@ func seedNetworks(ctx context.Context, st *store.Store, fileNetworks []netconf.N
 	return nil
 }
 
-func startNetworks(ctx context.Context, st *store.Store, h *hub.Hub, fileNetworks []netconf.Network) error {
+// seedNetworksIfFirstRun runs the config-file seeding decision: an empty
+// network_configs table imports the file's networks[]; a populated table
+// ignores the file list (the database wins — networks are managed from the
+// web UI).
+func seedNetworksIfFirstRun(ctx context.Context, st *store.Store, fileNetworks []netconf.Network) error {
 	count, err := st.NetworkConfigCount(ctx)
 	if err != nil {
 		return err
 	}
-	if count == 0 && len(fileNetworks) > 0 {
-		if err = seedNetworks(ctx, st, fileNetworks); err != nil {
-			return err
-		}
-	} else if len(fileNetworks) > 0 {
-		log.Printf("networks: %d definitions in database; config file networks[] is ignored (manage networks in the web UI)", count)
+	if len(fileNetworks) == 0 {
+		return nil
+	}
+	if count == 0 {
+		return seedNetworks(ctx, st, fileNetworks)
+	}
+	log.Printf("networks: %d definitions in database; config file networks[] is ignored (manage networks in the web UI)", count)
+	return nil
+}
+
+// networkRowStarter starts stored network definitions one row at a time,
+// carrying the runtime-cap counters across pages.
+type networkRowStarter struct {
+	h             *hub.Hub
+	tracked       int // valid-name rows seen, counted toward the runtime cap
+	legacySkipped int // valid-name rows beyond the cap, not started
+}
+
+// startRow handles one stored definition. A bad row is skipped with a log
+// line, not fatal.
+func (ns *networkRowStarter) startRow(row store.NetworkConfig) {
+	if row.InvalidName {
+		// Registered before (and not counted toward) the runtime cap: an
+		// invalid-name row never starts a network, and get_networks
+		// synthesizes a recovery entry for every such row it pages — each
+		// one must map to a deletable rowid here, or the advertised
+		// delete affordance dead-ends on itself.
+		label := ns.h.NoteInvalidNetwork(row.PageID)
+		log.Printf("networks: %s represents row %d whose stored name violates current safety bounds; delete and recreate it", label, row.PageID)
+		return
+	}
+	if ns.tracked >= store.MaxNetworkConfigs {
+		// Keep paging — invalid-name rows on later pages must still
+		// register above — but start nothing further.
+		ns.legacySkipped++
+		return
+	}
+	ns.tracked++
+	if row.Oversized {
+		log.Printf("networks: skipping row %d: stored definition exceeds the %d-byte safety limit", row.PageID, store.MaxNetworkConfigBytes)
+		ns.h.NoteStoppedNetwork(row.Name)
+		return
+	}
+	nc, err := netconf.Parse([]byte(row.Config))
+	if err != nil {
+		log.Printf("networks: skipping %q: %v", row.Name, err)
+		ns.h.NoteStoppedNetwork(row.Name)
+		return
+	}
+	if err := ns.h.StartNetwork(nc); err != nil {
+		log.Printf("networks: starting %q: %v", row.Name, err)
+		ns.h.NoteStoppedNetwork(row.Name)
+	}
+}
+
+// startNetworks seeds the network_configs table from the config file on
+// first run, then starts every stored definition.
+func startNetworks(ctx context.Context, st *store.Store, h *hub.Hub, fileNetworks []netconf.Network) error {
+	if err := seedNetworksIfFirstRun(ctx, st, fileNetworks); err != nil {
+		return err
 	}
 	// Iterate bounded pages. A legacy definition grown beyond the current
 	// ingress cap is surfaced to the UI as a stopped network for deletion or
 	// recreation, but its blob is never materialized here.
 	var after int64
-	tracked := 0
-	legacySkipped := 0
+	starter := networkRowStarter{h: h}
 	for {
 		rows, more, err := st.NetworkConfigsPage(ctx, after, 16)
 		if err != nil {
@@ -275,45 +329,14 @@ func startNetworks(ctx context.Context, st *store.Store, h *hub.Hub, fileNetwork
 		}
 		for _, row := range rows {
 			after = row.PageID
-			if row.InvalidName {
-				// Registered before (and not counted toward) the runtime cap: an
-				// invalid-name row never starts a network, and get_networks
-				// synthesizes a recovery entry for every such row it pages — each
-				// one must map to a deletable rowid here, or the advertised
-				// delete affordance dead-ends on itself.
-				label := h.NoteInvalidNetwork(row.PageID)
-				log.Printf("networks: %s represents row %d whose stored name violates current safety bounds; delete and recreate it", label, row.PageID)
-				continue
-			}
-			if tracked >= store.MaxNetworkConfigs {
-				// Keep paging — invalid-name rows on later pages must still
-				// register above — but start nothing further.
-				legacySkipped++
-				continue
-			}
-			tracked++
-			if row.Oversized {
-				log.Printf("networks: skipping row %d: stored definition exceeds the %d-byte safety limit", row.PageID, store.MaxNetworkConfigBytes)
-				h.NoteStoppedNetwork(row.Name)
-				continue
-			}
-			nc, err := netconf.Parse([]byte(row.Config))
-			if err != nil {
-				log.Printf("networks: skipping %q: %v", row.Name, err)
-				h.NoteStoppedNetwork(row.Name)
-				continue
-			}
-			if err := h.StartNetwork(nc); err != nil {
-				log.Printf("networks: starting %q: %v", row.Name, err)
-				h.NoteStoppedNetwork(row.Name)
-			}
+			starter.startRow(row)
 		}
 		if !more {
 			break
 		}
 	}
-	if legacySkipped > 0 {
-		log.Printf("networks: %d legacy definitions exceed the %d-network runtime cap and were not started; remove visible rows and restart to recover the remainder", legacySkipped, store.MaxNetworkConfigs)
+	if starter.legacySkipped > 0 {
+		log.Printf("networks: %d legacy definitions exceed the %d-network runtime cap and were not started; remove visible rows and restart to recover the remainder", starter.legacySkipped, store.MaxNetworkConfigs)
 	}
 	return nil
 }

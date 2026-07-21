@@ -79,6 +79,18 @@ const streamSlots = 2
 // costs the same memory as a jingle.
 const streamCopyBufBytes = 32 * 1024
 
+// Header names used on both sides of the stream relay (canonical form, as
+// http.Header stores them).
+const (
+	headerContentType  = "Content-Type"
+	headerContentRange = "Content-Range"
+)
+
+// msgStreamUnavailable is the 502 body for permanent stream refusals:
+// unresolvable egress, non-retryable fetch failure, unforwardable origin
+// status. Clients match on this exact text; keep it stable.
+const msgStreamUnavailable = "stream unavailable"
+
 // streamIdleTimeout bounds PROGRESS, not total duration: a long track is
 // legitimate (no total deadline), but a hung origin (no bytes readable) or a
 // stalled client (no bytes writable) must not pin one of the two stream slots
@@ -185,7 +197,7 @@ func (s *Server) handleMediaToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(headerContentType, "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(struct {
 		Token string `json:"token"`
@@ -265,7 +277,7 @@ func (s *Server) handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	// proxy) — fail closed, never a direct fetch.
 	f := s.streamFetcherForNetwork(r.Context(), tok.Net)
 	if f == nil {
-		http.Error(w, "stream unavailable", http.StatusBadGateway)
+		http.Error(w, msgStreamUnavailable, http.StatusBadGateway)
 		return
 	}
 
@@ -280,38 +292,16 @@ func (s *Server) handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	resp, err := f.stream(ctx, tok.URL, forwardRangeHeader(r))
 	if err != nil {
-		if fetchErrorRetryable(err) {
-			logMedia("stream", tok.URL, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), retryable: true, httpStatus: 503})
-			http.Error(w, "stream fetch failed", http.StatusServiceUnavailable)
-		} else {
-			logMedia("stream", tok.URL, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), httpStatus: 502})
-			http.Error(w, "stream unavailable", http.StatusBadGateway)
-		}
+		streamFetchFailed(w, tok.URL, start, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	// Only the three statuses a media element understands are forwarded.
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusPartialContent:
-		// fall through to the type gate and body copy
-	case http.StatusRequestedRangeNotSatisfiable:
-		// 416 carries no media body worth forwarding (origins put error HTML
-		// there); forward the status and Content-Range so the element can
-		// re-request sanely.
-		if cr := resp.Header.Get("Content-Range"); cr != "" {
-			w.Header().Set("Content-Range", cr)
-		}
-		logMedia("stream", tok.URL, start, mediaLogResult{event: "ok", class: "range_unsatisfiable", httpStatus: 416})
-		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
-		return
-	default:
-		logMedia("stream", tok.URL, start, mediaLogResult{event: "reject", class: mediaErrorClass(&upstreamStatusError{resp.StatusCode}), httpStatus: 502})
-		http.Error(w, "stream unavailable", http.StatusBadGateway)
+	if !forwardStreamStatus(w, resp, tok.URL, start) {
 		return
 	}
 
-	ct := resp.Header.Get("Content-Type")
+	ct := resp.Header.Get(headerContentType)
 	if !streamableType(ct) {
 		// Refused type: 502, NO body bytes — text/html and friends must never
 		// relay through here.
@@ -320,11 +310,53 @@ func (s *Server) handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Forward ONLY the entity headers a player needs. Never Set-Cookie or
-	// anything else origin-controlled.
+	writeStreamHeaders(w, resp, ct)
+	relayStreamBody(w, resp, watchdog, tok.URL, start)
+}
+
+// streamFetchFailed answers a failed origin fetch: transient failures map to
+// 503 so the client retries, permanent ones to 502 so it caches the failure.
+func streamFetchFailed(w http.ResponseWriter, url string, start time.Time, err error) {
+	if fetchErrorRetryable(err) {
+		logMedia("stream", url, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), retryable: true, httpStatus: 503})
+		http.Error(w, "stream fetch failed", http.StatusServiceUnavailable)
+	} else {
+		logMedia("stream", url, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), httpStatus: 502})
+		http.Error(w, msgStreamUnavailable, http.StatusBadGateway)
+	}
+}
+
+// forwardStreamStatus vets the origin's status line. Only the three statuses
+// a media element understands are forwarded; it returns true when the caller
+// should proceed to the type gate and body copy (200/206), false when the
+// response has been fully answered here (416 or a refused status).
+func forwardStreamStatus(w http.ResponseWriter, resp *http.Response, url string, start time.Time) bool {
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusPartialContent:
+		return true
+	case http.StatusRequestedRangeNotSatisfiable:
+		// 416 carries no media body worth forwarding (origins put error HTML
+		// there); forward the status and Content-Range so the element can
+		// re-request sanely.
+		if cr := resp.Header.Get(headerContentRange); cr != "" {
+			w.Header().Set(headerContentRange, cr)
+		}
+		logMedia("stream", url, start, mediaLogResult{event: "ok", class: "range_unsatisfiable", httpStatus: 416})
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		return false
+	default:
+		logMedia("stream", url, start, mediaLogResult{event: "reject", class: mediaErrorClass(&upstreamStatusError{resp.StatusCode}), httpStatus: 502})
+		http.Error(w, msgStreamUnavailable, http.StatusBadGateway)
+		return false
+	}
+}
+
+// writeStreamHeaders forwards ONLY the entity headers a player needs. Never
+// Set-Cookie or anything else origin-controlled.
+func writeStreamHeaders(w http.ResponseWriter, resp *http.Response, ct string) {
 	h := w.Header()
-	h.Set("Content-Type", ct)
-	for _, k := range []string{"Content-Length", "Content-Range", "Accept-Ranges"} {
+	h.Set(headerContentType, ct)
+	for _, k := range []string{"Content-Length", headerContentRange, "Accept-Ranges"} {
 		if v := resp.Header.Get(k); v != "" {
 			h.Set(k, v)
 		}
@@ -335,14 +367,16 @@ func (s *Server) handleMediaStream(w http.ResponseWriter, r *http.Request) {
 	// expire here, so don't create a client one.
 	h.Set("Cache-Control", "private, no-store")
 	w.WriteHeader(resp.StatusCode)
+}
 
-	// Fixed-buffer relay: at no point does the body accumulate. Each origin
-	// read re-arms the idle watchdog (progress, not total time); each client
-	// write gets its own deadline so a stalled browser can't pin the slot
-	// either.
+// relayStreamBody is the fixed-buffer relay: at no point does the body
+// accumulate. Each origin read re-arms the idle watchdog (progress, not total
+// time); each client write gets its own deadline so a stalled browser can't
+// pin the slot either.
+func relayStreamBody(w http.ResponseWriter, resp *http.Response, watchdog *time.Timer, url string, start time.Time) {
 	rc := http.NewResponseController(w)
 	// On exit, grant the server's FINAL buffered flush (which happens after
-	// this handler returns) its own idle budget: the last in-loop write
+	// the stream handler returns) its own idle budget: the last in-loop write
 	// deadline may already be in the past by then, and an expired deadline
 	// would abort the connection mid-tail — the client saw truncated streams
 	// exactly this way in tests.
@@ -355,7 +389,7 @@ func (s *Server) handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		if n > 0 {
 			_ = rc.SetWriteDeadline(time.Now().Add(streamIdleTimeout))
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				logMedia("stream", tok.URL, start, mediaLogResult{event: "client_gone", class: "network_io", outputBytes: copied})
+				logMedia("stream", url, start, mediaLogResult{event: "client_gone", class: "network_io", outputBytes: copied})
 				return
 			}
 			copied += n
@@ -368,7 +402,7 @@ func (s *Server) handleMediaStream(w http.ResponseWriter, r *http.Request) {
 			if !errors.Is(rerr, io.EOF) {
 				cls = mediaErrorClass(rerr)
 			}
-			logMedia("stream", tok.URL, start, mediaLogResult{event: "ok", class: cls, httpStatus: resp.StatusCode, outputBytes: copied})
+			logMedia("stream", url, start, mediaLogResult{event: "ok", class: cls, httpStatus: resp.StatusCode, outputBytes: copied})
 			return
 		}
 	}

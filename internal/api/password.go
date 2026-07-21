@@ -75,11 +75,11 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	// bucket, which this endpoint previously skipped.
 	source := s.loginSourceKey(r)
 	if wait := s.login.retryAfter(source, time.Now()); wait > 0 {
-		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
+		http.Error(w, msgTooManyAttempts, http.StatusTooManyRequests)
 		return
 	}
 	if wait := s.login.globalAllow(time.Now()); wait > 0 {
-		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
+		http.Error(w, msgTooManyAttempts, http.StatusTooManyRequests)
 		return
 	}
 	// Serialize the whole verify→store→revoke: two concurrent rotations must
@@ -98,7 +98,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	// serializing it through the lock would otherwise let every queued
 	// request burn a bcrypt verify with no further gate.
 	if wait := s.login.retryAfter(source, time.Now()); wait > 0 {
-		http.Error(w, "too many attempts, retry later", http.StatusTooManyRequests)
+		http.Error(w, msgTooManyAttempts, http.StatusTooManyRequests)
 		return
 	}
 	// Recheck auth too: a logout/rotation that landed while this request
