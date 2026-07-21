@@ -402,7 +402,7 @@ func (s *Store) Close() error {
 // and the zero Message (ID 0) is returned — callers use that to skip
 // broadcasting.
 func (s *Store) Append(ctx context.Context, network, target string, m Message) (Message, error) {
-	msg, _, err := s.append(ctx, network, target, m, true, nil, nil, true)
+	msg, _, err := s.append(ctx, network, target, m, appendOpts{create: true, unarchive: true})
 	return msg, err
 }
 
@@ -412,7 +412,7 @@ func (s *Store) Append(ctx context.Context, network, target string, m Message) (
 // close_buffer delete and the PART echo race, and both orders must end
 // with the buffer gone.
 func (s *Store) AppendExisting(ctx context.Context, network, target string, m Message) (Message, error) {
-	msg, _, err := s.append(ctx, network, target, m, false, nil, nil, true)
+	msg, _, err := s.append(ctx, network, target, m, appendOpts{unarchive: true})
 	return msg, err
 }
 
@@ -425,13 +425,13 @@ func (s *Store) AppendExisting(ctx context.Context, network, target string, m Me
 // straggler appended to a buffer not yet deleted (so it cannot broadcast a
 // live event that resurrects the buffer on clients).
 func (s *Store) AppendGuarded(ctx context.Context, network, target string, guardCreate func(exists bool) bool, m Message) (Message, error) {
-	msg, _, err := s.append(ctx, network, target, m, true, nil, guardCreate, true)
+	msg, _, err := s.append(ctx, network, target, m, appendOpts{create: true, guardCreate: guardCreate, unarchive: true})
 	return msg, err
 }
 
 // AppendFoldedGuarded is AppendFolded plus the AppendGuarded append guard.
 func (s *Store) AppendFoldedGuarded(ctx context.Context, network, target string, fold func(string) string, guardCreate func(exists bool) bool, m Message) (Message, error) {
-	msg, _, err := s.append(ctx, network, target, m, true, fold, guardCreate, true)
+	msg, _, err := s.append(ctx, network, target, m, appendOpts{create: true, fold: fold, guardCreate: guardCreate, unarchive: true})
 	return msg, err
 }
 
@@ -445,7 +445,7 @@ func (s *Store) AppendFoldedGuarded(ctx context.Context, network, target string,
 // echo racing a purge:false close) cannot resurrect the buffer on clients.
 // The flag/report and the insert happen under one hold of the store lock.
 func (s *Store) AppendFoldedGuardedArchive(ctx context.Context, network, target string, fold func(string) string, guardCreate func(exists bool) bool, unarchive bool, m Message) (Message, bool, error) {
-	return s.append(ctx, network, target, m, true, fold, guardCreate, unarchive)
+	return s.append(ctx, network, target, m, appendOpts{create: true, fold: fold, guardCreate: guardCreate, unarchive: unarchive})
 }
 
 // AppendFolded resolves target to its canonical stored spelling under
@@ -454,7 +454,7 @@ func (s *Store) AppendFoldedGuardedArchive(ctx context.Context, network, target 
 // IRC event run on independent goroutines) cannot each decide no buffer
 // exists and create separate rows. m.Target is set to the resolved name.
 func (s *Store) AppendFolded(ctx context.Context, network, target string, fold func(string) string, m Message) (Message, error) {
-	msg, _, err := s.append(ctx, network, target, m, true, fold, nil, true)
+	msg, _, err := s.append(ctx, network, target, m, appendOpts{create: true, fold: fold, unarchive: true})
 	return msg, err
 }
 
@@ -483,7 +483,18 @@ func (s *Store) appendVetoed(ctx context.Context, network, target string, guard 
 	return guard(id != 0), nil
 }
 
-func (s *Store) append(ctx context.Context, network, target string, m Message, create bool, fold func(string) string, guardCreate func(exists bool) bool, unarchive bool) (Message, bool, error) {
+// appendOpts carries append's per-call-site policy: how the target resolves,
+// whether a missing buffer may be created, whether a guard may veto the write,
+// and how the archived flag settles. See the exported Append* wrappers for
+// what each combination means.
+type appendOpts struct {
+	create      bool                   // create the buffer when absent
+	fold        func(string) string    // canonical-spelling resolver; nil uses target as-is
+	guardCreate func(exists bool) bool // atomic veto under s.mu; nil disables the guard
+	unarchive   bool                   // real conversation clears the archived flag
+}
+
+func (s *Store) append(ctx context.Context, network, target string, m Message, opts appendOpts) (Message, bool, error) {
 	if network == "" || target == "" {
 		return Message{}, false, errors.New("store: network and target must be non-empty")
 	}
@@ -510,12 +521,12 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if fold != nil {
-		target, _ = s.canonicalLocked(ctx, network, target, fold)
+	if opts.fold != nil {
+		target, _ = s.canonicalLocked(ctx, network, target, opts.fold)
 	}
 	m.Network, m.Target = network, target
-	if guardCreate != nil {
-		blocked, err := s.appendVetoed(ctx, network, target, guardCreate)
+	if opts.guardCreate != nil {
+		blocked, err := s.appendVetoed(ctx, network, target, opts.guardCreate)
 		if err != nil {
 			return Message{}, false, err
 		}
@@ -523,7 +534,7 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 			return Message{}, false, nil
 		}
 	}
-	bufID, r, err := s.bufferAndRing(ctx, network, target, create)
+	bufID, r, err := s.bufferAndRing(ctx, network, target, opts.create)
 	if err != nil {
 		return Message{}, false, err
 	}
@@ -536,7 +547,7 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 		// backfill) — an already-known message must not un-archive either.
 		return msg, false, err
 	}
-	stillArchived, err := s.applyArchiveLocked(ctx, bufID, unarchive)
+	stillArchived, err := s.applyArchiveLocked(ctx, bufID, opts.unarchive)
 	return msg, stillArchived, err
 }
 

@@ -58,6 +58,16 @@ const (
 	MaxNetworkConfigBytes = 64 << 10
 )
 
+// errInvalidNetworkName is returned for every name rejected by
+// validateNetworkName; the reasons are deliberately not distinguished.
+var errInvalidNetworkName = errors.New("store: invalid network name")
+
+// errNetworkLimitReached reports that MaxNetworkConfigs stored definitions
+// already exist.
+func errNetworkLimitReached() error {
+	return fmt.Errorf("store: network limit reached (%d)", MaxNetworkConfigs)
+}
+
 // ValidateNetworkConfigRecord is the final persistence-boundary guard shared
 // by UI puts, config-file seeds, and incremental autojoin updates.
 func ValidateNetworkConfigRecord(name, config string) error {
@@ -82,11 +92,11 @@ func ValidateNetworkConfigRecord(name, config string) error {
 // persistence layer).
 func validateNetworkName(name string) error {
 	if name == "" || strings.HasPrefix(name, ReservedRecoveryNetworkPrefix) || len(name) > MaxNetworkNameBytes || !utf8.ValidString(name) {
-		return fmt.Errorf("store: invalid network name")
+		return errInvalidNetworkName
 	}
 	for _, r := range name {
 		if unicode.IsControl(r) {
-			return fmt.Errorf("store: invalid network name")
+			return errInvalidNetworkName
 		}
 	}
 	// Keep this fixed ECMAScript Object.prototype set aligned with netconf's
@@ -97,7 +107,7 @@ func validateNetworkName(name string) error {
 		"hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable",
 		"toLocaleString", "toString", "valueOf",
 		"__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__":
-		return fmt.Errorf("store: invalid network name")
+		return errInvalidNetworkName
 	}
 	return nil
 }
@@ -163,20 +173,7 @@ func (s *Store) NetworkConfigsPage(ctx context.Context, after int64, limit int) 
 		if err := rows.Scan(&nc.PageID, &name, &nameSize, &config, &size); err != nil {
 			return nil, false, err
 		}
-		if name.Valid && validateNetworkName(name.String) == nil {
-			nc.Name = name.String
-		} else {
-			nc.InvalidName = true
-		}
-		if nc.InvalidName {
-			// Recovery of an invalid-name row is delete-only by opaque PageID. Do
-			// not expose its definition to callers that cannot safely address it.
-			nc.Config = ""
-		} else if config.Valid {
-			nc.Config = config.String
-		} else {
-			nc.Oversized = size > MaxNetworkConfigBytes
-		}
+		fillNetworkConfigPageRow(&nc, name, config, size)
 		out = append(out, nc)
 	}
 	if err := rows.Err(); err != nil {
@@ -187,6 +184,26 @@ func (s *Store) NetworkConfigsPage(ctx context.Context, after int64, limit int) 
 		out = out[:limit]
 	}
 	return out, hasMore, nil
+}
+
+// fillNetworkConfigPageRow populates one NetworkConfigsPage row from its
+// size-guarded columns: name/config are NULL when the stored value exceeds
+// its cap (see the query in NetworkConfigsPage).
+func fillNetworkConfigPageRow(nc *NetworkConfig, name, config sql.NullString, size int64) {
+	if name.Valid && validateNetworkName(name.String) == nil {
+		nc.Name = name.String
+	} else {
+		nc.InvalidName = true
+	}
+	if nc.InvalidName {
+		// Recovery of an invalid-name row is delete-only by opaque PageID. Do
+		// not expose its definition to callers that cannot safely address it.
+		nc.Config = ""
+	} else if config.Valid {
+		nc.Config = config.String
+	} else {
+		nc.Oversized = size > MaxNetworkConfigBytes
+	}
 }
 
 // NetworkConfig returns one stored definition by name (ok=false when
@@ -243,7 +260,7 @@ func (s *Store) PutNetworkConfig(ctx context.Context, name, config string) error
 			return err
 		}
 		if count >= MaxNetworkConfigs {
-			return fmt.Errorf("store: network limit reached (%d)", MaxNetworkConfigs)
+			return errNetworkLimitReached()
 		}
 	}
 
@@ -273,6 +290,33 @@ func (s *Store) ReplaceNetworkConfig(ctx context.Context, oldName, name, config 
 	}
 	defer tx.Rollback()
 	renamed := oldName != "" && oldName != name
+	if err := checkReplaceNetworkLimit(ctx, tx, renamed, oldName, name); err != nil {
+		return err
+	}
+	if renamed {
+		if err := moveNetworkHistory(ctx, tx, oldName, name); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO network_configs (name, config) VALUES (?, ?)
+		ON CONFLICT (name) DO UPDATE SET config = excluded.config`,
+		name, config); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if renamed {
+		s.dropNetworkCachesLocked(oldName)
+	}
+	return nil
+}
+
+// checkReplaceNetworkLimit enforces MaxNetworkConfigs inside
+// ReplaceNetworkConfig's transaction: the store may only grow (the upsert
+// target is a new name that no retired old name offsets) while under the cap.
+func checkReplaceNetworkLimit(ctx context.Context, tx *sql.Tx, renamed bool, oldName, name string) error {
 	var count, oldExists, targetExists int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM network_configs`).Scan(&count); err != nil {
 		return err
@@ -293,40 +337,31 @@ func (s *Store) ReplaceNetworkConfig(ctx context.Context, oldName, name, config 
 		projected++
 	}
 	if projected > count && count >= MaxNetworkConfigs {
-		return fmt.Errorf("store: network limit reached (%d)", MaxNetworkConfigs)
-	}
-	if renamed {
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE networks SET name = ? WHERE user_id = ? AND name = ?`,
-			name, defaultUserID, oldName); err != nil {
-			// A unique-constraint hit means the new name already has
-			// stored history; surface something actionable.
-			var taken string
-			if row := tx.QueryRowContext(ctx,
-				`SELECT name FROM networks WHERE user_id = ? AND name = ?`,
-				defaultUserID, name); row.Scan(&taken) == nil {
-				return fmt.Errorf("network %q already has stored history", name)
-			}
-			return err
-		}
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM network_configs WHERE name = ?`, oldName); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO network_configs (name, config) VALUES (?, ?)
-		ON CONFLICT (name) DO UPDATE SET config = excluded.config`,
-		name, config); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	if renamed {
-		s.dropNetworkCachesLocked(oldName)
+		return errNetworkLimitReached()
 	}
 	return nil
+}
+
+// moveNetworkHistory retires oldName inside ReplaceNetworkConfig's
+// transaction: the networks row (and everything cascading from it) moves to
+// the new name and the old definition row goes.
+func moveNetworkHistory(ctx context.Context, tx *sql.Tx, oldName, name string) error {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE networks SET name = ? WHERE user_id = ? AND name = ?`,
+		name, defaultUserID, oldName); err != nil {
+		// A unique-constraint hit means the new name already has
+		// stored history; surface something actionable.
+		var taken string
+		if row := tx.QueryRowContext(ctx,
+			`SELECT name FROM networks WHERE user_id = ? AND name = ?`,
+			defaultUserID, name); row.Scan(&taken) == nil {
+			return fmt.Errorf("network %q already has stored history", name)
+		}
+		return err
+	}
+	_, err := tx.ExecContext(ctx,
+		`DELETE FROM network_configs WHERE name = ?`, oldName)
+	return err
 }
 
 // DeleteNetwork removes a network entirely — its definition row and its
@@ -530,7 +565,7 @@ func (s *Store) dropNetworkCachesLocked(network string) {
 // table makes every later run ignore the config file.
 func (s *Store) SeedNetworkConfigs(ctx context.Context, configs []NetworkConfig) (bool, error) {
 	if len(configs) > MaxNetworkConfigs {
-		return false, fmt.Errorf("store: network limit reached (%d)", MaxNetworkConfigs)
+		return false, errNetworkLimitReached()
 	}
 	for _, nc := range configs {
 		if err := ValidateNetworkConfigRecord(nc.Name, nc.Config); err != nil {

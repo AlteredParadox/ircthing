@@ -480,18 +480,11 @@ func httpConnect(conn net.Conn, user *url.Userinfo, target string) error {
 		return err
 	}
 
-	var head strings.Builder
-	buf := make([]byte, 1)
-	for !strings.HasSuffix(head.String(), "\r\n\r\n") {
-		if head.Len() > 8192 {
-			return fmt.Errorf("%w: oversized HTTP CONNECT response", ErrProxyProtocol)
-		}
-		if _, err := io.ReadFull(conn, buf); err != nil {
-			return fmt.Errorf("http proxy response: %w", err)
-		}
-		head.WriteByte(buf[0])
+	head, err := readHTTPConnectHead(conn)
+	if err != nil {
+		return err
 	}
-	status, _, _ := strings.Cut(head.String(), "\r\n")
+	status, _, _ := strings.Cut(head, "\r\n")
 	f := strings.Fields(status)
 	// Strict status line: "HTTP/x.y NNN ...". A malformed version or a
 	// non-3-digit status is a protocol error (not an HTTP proxy) — permanent.
@@ -516,6 +509,25 @@ func httpConnect(conn net.Conn, user *url.Userinfo, target string) error {
 		// retrying repeats the same answer.
 		return fmt.Errorf("%w: CONNECT %d", ErrProxyRejected, code)
 	}
+}
+
+// readHTTPConnectHead reads the CONNECT response byte-by-byte up to (and
+// including) the blank line so nothing past the headers is consumed — the
+// tunneled stream must start exactly where the proxy left off. The size cap
+// bounds a proxy that never sends the terminator.
+func readHTTPConnectHead(conn net.Conn) (string, error) {
+	var head strings.Builder
+	buf := make([]byte, 1)
+	for !strings.HasSuffix(head.String(), "\r\n\r\n") {
+		if head.Len() > 8192 {
+			return "", fmt.Errorf("%w: oversized HTTP CONNECT response", ErrProxyProtocol)
+		}
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			return "", fmt.Errorf("http proxy response: %w", err)
+		}
+		head.WriteByte(buf[0])
+	}
+	return head.String(), nil
 }
 
 // validHTTPVersion reports whether tok is "HTTP/<digit>.<digit>".

@@ -763,18 +763,25 @@ func (r *roster) applyChannelMode(st *channelState, params []string) {
 			if letters++; letters > maxModeLettersPerLine {
 				return // hostile/degenerate modestring — see the constant
 			}
-			switch cls.chanModeType(c) {
-			case 'P': // status mode
-				r.applyStatusMode(st, takeArg(), string(cls.symbolForMode(c)), adding)
-			case 'A', 'B': // always take an argument
-				takeArg()
-			case 'C': // argument only when setting
-				if adding {
-					takeArg()
-				}
-				// 'D' and unknown: no argument
-			}
+			r.applyModeLetter(st, &cls, c, adding, takeArg)
 		}
+	}
+}
+
+// applyModeLetter handles one channel mode letter: a status (PREFIX) mode
+// updates the named member's prefixes; other classes only consume their
+// argument (if any) to keep the pairing aligned. Caller holds r.mu.
+func (r *roster) applyModeLetter(st *channelState, cls *modeClassifier, c byte, adding bool, takeArg func() string) {
+	switch cls.chanModeType(c) {
+	case 'P': // status mode
+		r.applyStatusMode(st, takeArg(), string(cls.symbolForMode(c)), adding)
+	case 'A', 'B': // always take an argument
+		takeArg()
+	case 'C': // argument only when setting
+		if adding {
+			takeArg()
+		}
+		// 'D' and unknown: no argument
 	}
 }
 

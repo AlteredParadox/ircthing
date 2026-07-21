@@ -114,37 +114,9 @@ func (s *Store) stsValueLocked(ctx context.Context, host string) (string, bool, 
 		return "", false, nil
 	}
 
-	// Every matching row — including a canonical one — must be readable. A
-	// corrupt alias might be the real active policy; ignoring it would fail open.
-	// Legacy revisions were independently generated under each raw key and are
-	// therefore not comparable. Security state wins: any unexpired policy beats
-	// an expired/disabled one, then the furthest expiry wins.
-	var chosen stsRecord
-	var maxRevision uint64
-	chosenActive := false
-	chosenUntil := int64(0)
-	now := time.Now()
-	for i, a := range aliases {
-		_, until, _, revision, _, ok, err := decodeSTSPolicy(canonicalSTSHost(host), a.value, true)
-		if err != nil {
-			return "", false, err
-		}
-		var rec stsRecord
-		_ = json.Unmarshal([]byte(a.value), &rec) // decodeSTSPolicy proved JSON
-		if revision > maxRevision {
-			maxRevision = revision
-		}
-		active := ok && now.Before(until)
-		candidateUntil := int64(0)
-		if ok {
-			candidateUntil = until.UnixMilli()
-		}
-		if i == 0 || (active && !chosenActive) ||
-			(active == chosenActive && candidateUntil > chosenUntil) {
-			chosen = rec
-			chosenActive = active
-			chosenUntil = candidateUntil
-		}
+	chosen, maxRevision, err := strongestSTSAlias(host, aliases)
+	if err != nil {
+		return "", false, err
 	}
 	// A single already-canonical row needs no rewrite (and must not bump its
 	// generation on every read). The full scan above still checked for corrupt
@@ -165,30 +137,49 @@ func (s *Store) stsValueLocked(ctx context.Context, host string) (string, bool, 
 	if err != nil {
 		return "", false, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", false, err
-	}
-	if _, err = tx.ExecContext(ctx,
-		`INSERT INTO settings (key, value) VALUES (?, ?)
-		 ON CONFLICT (key) DO UPDATE SET value = excluded.value`, key, string(b)); err == nil {
-		for _, a := range aliases {
-			if a.key != key {
-				_, err = tx.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, a.key)
-				if err != nil {
-					break
-				}
-			}
-		}
-	}
-	if err != nil {
-		_ = tx.Rollback()
-		return "", false, err
-	}
-	if err := tx.Commit(); err != nil {
+	// writeSTSRecordLocked upserts the canonical key and deletes every
+	// noncanonical alias in the same transaction — exactly the atomic rewrite
+	// migration needs (aliases is nonempty here, so it always takes that path).
+	if err := s.writeSTSRecordLocked(ctx, host, chosen, aliases); err != nil {
 		return "", false, err
 	}
 	return string(b), true, nil
+}
+
+// strongestSTSAlias picks which equivalent-spelling record migrates to the
+// canonical key, plus the highest revision seen across all of them. Every
+// matching row — including a canonical one — must be readable. A corrupt
+// alias might be the real active policy; ignoring it would fail open. Legacy
+// revisions were independently generated under each raw key and are therefore
+// not comparable. Security state wins: any unexpired policy beats an
+// expired/disabled one, then the furthest expiry wins.
+func strongestSTSAlias(host string, aliases []stsAlias) (chosen stsRecord, maxRevision uint64, err error) {
+	chosenActive := false
+	chosenUntil := int64(0)
+	now := time.Now()
+	for i, a := range aliases {
+		_, until, _, revision, _, ok, err := decodeSTSPolicy(canonicalSTSHost(host), a.value, true)
+		if err != nil {
+			return stsRecord{}, 0, err
+		}
+		var rec stsRecord
+		_ = json.Unmarshal([]byte(a.value), &rec) // decodeSTSPolicy proved JSON
+		if revision > maxRevision {
+			maxRevision = revision
+		}
+		active := ok && now.Before(until)
+		candidateUntil := int64(0)
+		if ok {
+			candidateUntil = until.UnixMilli()
+		}
+		if i == 0 || (active && !chosenActive) ||
+			(active == chosenActive && candidateUntil > chosenUntil) {
+			chosen = rec
+			chosenActive = active
+			chosenUntil = candidateUntil
+		}
+	}
+	return chosen, maxRevision, nil
 }
 
 func ptrInt64(v int64) *int64 { return &v }
@@ -310,6 +301,63 @@ func (s *Store) writeSTSRecordLocked(ctx context.Context, host string, rec stsRe
 	return tx.Commit()
 }
 
+// stsReadErrorRepairable reports whether a policy-read failure may be repaired
+// by the mutation in flight: only an unconditional Set/Clear (no CAS
+// expectation) is authoritative enough, and only semantic corruption or an
+// exhausted (tampered) counter qualifies — a database I/O failure never does.
+func stsReadErrorRepairable(expected *uint64, err error) bool {
+	return expected == nil && (errors.Is(err, errCorruptSTSPolicy) || errors.Is(err, errSTSGenerationExhausted))
+}
+
+// freshSTSGenerationPair mints an independent opaque revision and policy epoch
+// (see freshSTSGeneration). If entropy is unavailable, repair fails closed.
+func freshSTSGenerationPair() (revision, epoch uint64, err error) {
+	revision, err = freshSTSGeneration()
+	if err != nil {
+		return 0, 0, err
+	}
+	epoch, err = freshSTSGeneration()
+	if err != nil {
+		return 0, 0, err
+	}
+	return revision, epoch, nil
+}
+
+// prepareSTSRepairLocked gathers what an authoritative Set/Clear needs to
+// replace an unreadable record: every equivalent spelling for atomic deletion,
+// and a starting record with opaque generations rather than zero (ABA
+// protection). Caller holds s.mu.
+func (s *Store) prepareSTSRepairLocked(ctx context.Context, host string) (current stsRecord, repairAliases []stsAlias, err error) {
+	repairAliases, err = s.stsAliasesLocked(ctx, host)
+	if err != nil {
+		return stsRecord{}, nil, err
+	}
+	freshRevision, freshEpoch, err := freshSTSGenerationPair()
+	if err != nil {
+		return stsRecord{}, nil, err
+	}
+	return stsRecord{Revision: freshRevision, PolicyEpoch: freshEpoch}, repairAliases, nil
+}
+
+// remintExhaustedSTSGenerations handles a record that decodes cleanly but
+// carries a counter at MaxUint64 — exhaustion-tampered (see
+// errSTSGenerationExhausted): incrementing it in makeRecord would fail every
+// future Set/Clear, wedging the network on whatever the record pins. An
+// authoritative mutation re-mints both generations, exactly as for an
+// undecodable record. A CAS reschedule (expected != nil) is skipped here and
+// keeps failing closed inside makeRecord, so healthy optimistic concurrency is
+// untouched.
+func remintExhaustedSTSGenerations(expected *uint64, current *stsRecord) error {
+	if expected == nil && (current.Revision == math.MaxUint64 || current.PolicyEpoch == math.MaxUint64) {
+		freshRevision, freshEpoch, err := freshSTSGenerationPair()
+		if err != nil {
+			return err
+		}
+		current.Revision, current.PolicyEpoch = freshRevision, freshEpoch
+	}
+	return nil
+}
+
 // updateSTS serializes read-modify-write with every other store operation.
 // Disabled policies are tombstones rather than deleted rows, preventing an
 // ABA where a stale generation-zero manager resurrects a cleared policy. An
@@ -324,26 +372,16 @@ func (s *Store) updateSTS(ctx context.Context, host string, expected *uint64, ma
 	var repairAliases []stsAlias
 	var current stsRecord
 	if err != nil {
-		if expected != nil || !(errors.Is(err, errCorruptSTSPolicy) || errors.Is(err, errSTSGenerationExhausted)) {
+		if !stsReadErrorRepairable(expected, err) {
 			return 0, 0, false, err
 		}
 		// The semantic record is unreadable — or legacy-alias migration hit an
 		// exhausted (tampered) counter — but a fresh Set/Clear can safely
-		// replace it. Gather every equivalent spelling for atomic deletion, then
-		// start from an opaque generation rather than zero (ABA protection).
-		repairAliases, err = s.stsAliasesLocked(ctx, host)
+		// replace it.
+		current, repairAliases, err = s.prepareSTSRepairLocked(ctx, host)
 		if err != nil {
 			return 0, 0, false, err
 		}
-		freshRevision, err := freshSTSGeneration()
-		if err != nil {
-			return 0, 0, false, err
-		}
-		freshEpoch, err := freshSTSGeneration()
-		if err != nil {
-			return 0, 0, false, err
-		}
-		current = stsRecord{Revision: freshRevision, PolicyEpoch: freshEpoch}
 		present = len(repairAliases) > 0
 	} else if present {
 		// stsValueLocked already validated this JSON (and migrated aliases).
@@ -354,24 +392,8 @@ func (s *Store) updateSTS(ctx context.Context, host string, expected *uint64, ma
 	if expected != nil && current.Revision != *expected {
 		return current.Revision, current.PolicyEpoch, false, nil
 	}
-	// A record that decodes cleanly but carries a counter at MaxUint64 is
-	// exhaustion-tampered (see errSTSGenerationExhausted): incrementing it in
-	// makeRecord would fail every future Set/Clear, wedging the network on
-	// whatever the record pins. An authoritative mutation re-mints both
-	// generations, exactly as for an undecodable record. A CAS reschedule
-	// (expected != nil) is skipped here and keeps failing closed inside
-	// makeRecord, so healthy optimistic concurrency is untouched.
-	if expected == nil && (current.Revision == math.MaxUint64 || current.PolicyEpoch == math.MaxUint64) {
-		freshRevision, err := freshSTSGeneration()
-		if err != nil {
-			return 0, 0, false, err
-		}
-		freshEpoch, err := freshSTSGeneration()
-		if err != nil {
-			return 0, 0, false, err
-		}
-		current.Revision = freshRevision
-		current.PolicyEpoch = freshEpoch
+	if err := remintExhaustedSTSGenerations(expected, &current); err != nil {
+		return 0, 0, false, err
 	}
 	next, apply, err := makeRecord(current.Revision, current, present)
 	if err != nil || !apply {

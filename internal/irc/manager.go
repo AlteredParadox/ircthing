@@ -1081,30 +1081,8 @@ func (m *Manager) loadSTS(ctx context.Context) error {
 	now := time.Now()
 	storeActive := ok && now.Before(until)
 	localActive := m.stsPort > 0 && (m.stsUntil.IsZero() || now.Before(m.stsUntil))
-	if m.stsDirty {
-		// Only a changed POLICY epoch is an explicit hostname-wide update. The
-		// record revision also changes when another manager merely reschedules the
-		// OLD policy's expiry; treating that as authoritative would discard a
-		// newer verified policy after its full write failed, creating a live STS
-		// downgrade window.
-		newerShared := m.stsDirtyBaseEpochKnown && policyEpoch != m.stsDirtyBaseEpoch
-		if !newerShared && localActive {
-			// A failed FULL write is the only verified copy of its port/duration,
-			// so retain it until a semantic policy update supersedes it. A failed
-			// expiry-only write can merge with the same stored policy and keep the
-			// later expiry.
-			if m.stsDirtyFull || !storeActive || m.stsUntil.After(until) {
-				m.stsRevision, m.stsRevisionKnown = revision, true
-				m.stsPolicyEpoch, m.stsPolicyEpochKnown = policyEpoch, true
-				m.stsDirtyBaseEpoch, m.stsDirtyBaseEpochKnown = policyEpoch, true
-				return nil
-			}
-		}
-		// A newer shared policy epoch, an expired local policy, or an equal/
-		// stronger stored policy resolves the dirty state in favor of the store.
-		m.stsDirty = false
-		m.stsDirtyFull = false
-		m.stsDirtyBaseEpochKnown = false
+	if m.stsDirty && m.resolveSTSDirtyLocked(revision, policyEpoch, storeActive, localActive, until) {
+		return nil
 	}
 	m.stsRevision, m.stsRevisionKnown = revision, true
 	m.stsPolicyEpoch, m.stsPolicyEpochKnown = policyEpoch, true
@@ -1120,6 +1098,38 @@ func (m *Manager) loadSTS(ctx context.Context) error {
 		m.stsPort, m.stsUntil, m.stsLastDur = 0, time.Time{}, 0
 	}
 	return nil
+}
+
+// resolveSTSDirtyLocked settles a dirty (failed-write) local policy against
+// the freshly loaded store state. It returns true when the local policy must
+// be RETAINED — the caller adopts the store's counters and keeps everything
+// else — and false when the store wins, clearing the dirty flags. Caller
+// holds m.stsMu.
+func (m *Manager) resolveSTSDirtyLocked(revision, policyEpoch uint64, storeActive, localActive bool, until time.Time) (retained bool) {
+	// Only a changed POLICY epoch is an explicit hostname-wide update. The
+	// record revision also changes when another manager merely reschedules the
+	// OLD policy's expiry; treating that as authoritative would discard a
+	// newer verified policy after its full write failed, creating a live STS
+	// downgrade window.
+	newerShared := m.stsDirtyBaseEpochKnown && policyEpoch != m.stsDirtyBaseEpoch
+	if !newerShared && localActive {
+		// A failed FULL write is the only verified copy of its port/duration,
+		// so retain it until a semantic policy update supersedes it. A failed
+		// expiry-only write can merge with the same stored policy and keep the
+		// later expiry.
+		if m.stsDirtyFull || !storeActive || m.stsUntil.After(until) {
+			m.stsRevision, m.stsRevisionKnown = revision, true
+			m.stsPolicyEpoch, m.stsPolicyEpochKnown = policyEpoch, true
+			m.stsDirtyBaseEpoch, m.stsDirtyBaseEpochKnown = policyEpoch, true
+			return true
+		}
+	}
+	// A newer shared policy epoch, an expired local policy, or an equal/
+	// stronger stored policy resolves the dirty state in favor of the store.
+	m.stsDirty = false
+	m.stsDirtyFull = false
+	m.stsDirtyBaseEpochKnown = false
+	return false
 }
 
 // effectiveAddr resolves where and how to connect: the configured
