@@ -23,6 +23,7 @@ test("highlightText: nick mention", () => {
 	is(highlightText("category AlteredParadoxx", "AlteredParadox", [], "libera"), false, "no partial-word mention");
 	is(highlightText("nothing here", "AlteredParadox", [], "libera"), false);
 	is(highlightText("ALTEREDPARADOX shouted", "AlteredParadox", [], "libera"), true, "case-insensitive");
+	is(highlightText("dan{m}: the deploy broke", "dan[m]", [], "libera"), true, "rfc1459 fold reaches highlight");
 });
 
 test("highlightText: global keyword rules", () => {

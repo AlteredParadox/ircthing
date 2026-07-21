@@ -352,6 +352,14 @@ test("mentionsMe", () => {
 		{ text: "ping AlteredParadox[]", nick: "AlteredParadox[]", want: true },
 		{ text: "nothing here", nick: "AlteredParadox", want: false },
 		{ text: "anything", nick: "", want: false },
+		// rfc1459 casemapping fold (RFC 2812 §2.2): {}|^ ≡ []\~ for nick identity.
+		{ text: "dan{m}: the deploy broke", nick: "dan[m]", want: true },
+		{ text: "dan[m]: ping", nick: "dan{m}", want: true },
+		{ text: "DAN{M} around?", nick: "dan[m]", want: true }, // fold + ASCII case together
+		{ text: "hey d|n^", nick: String.raw`d\n~`, want: true }, // \→| and ~→^
+		{ text: "dan(m) hi", nick: "dan[m]", want: false }, // ( is not rfc1459-equivalent to [
+		{ text: "xdan{m} nope", nick: "dan[m]", want: false }, // folded {}  are nick chars, not boundaries
+		{ text: "dan{m}x nope", nick: "dan[m]", want: false },
 	];
 	for (const c of cases) is(mentionsMe(c.text, c.nick), c.want, `${c.text} / ${c.nick}`);
 });

@@ -232,8 +232,19 @@ const NICK_CHARS = String.raw`A-Za-z0-9_\-\[\]\\` + "`^{}|";
 export function mentionsMe(text, nick) {
 	if (!nick) return false;
 	text = stripFormatting(text); // a colour code between chars must not hide a mention
-	const esc = nick.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
-	return new RegExp(`(^|[^${NICK_CHARS}])${esc}($|[^${NICK_CHARS}])`, "i").test(text);
+	// Fold BOTH sides with the rfc1459 casemapping (RFC 2812 §2.2: {}|^ ≡ []\~)
+	// before matching: on a CASEMAPPING=rfc1459 network "dan{m}: hi" addresses
+	// dan[m], and missing that ping is worse than the false-positive highlight
+	// this can produce on a strict-ascii network — the same loose-superset
+	// tradeoff foldNick already makes for whois/pending keys (we don't know the
+	// network's CASEMAPPING here either). foldNick is a 1:1 character mapping,
+	// so lengths and boundary positions in the folded text line up with the
+	// original; only the boolean result is used by callers anyway. The folded
+	// text contains {}|^ where the original had []\~ — NICK_CHARS lists both
+	// sets, so those stay nick characters, not word boundaries. The "i" flag
+	// stays for ASCII case (foldNick lowercases, so it is belt-and-braces).
+	const esc = foldNick(nick).replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+	return new RegExp(`(^|[^${NICK_CHARS}])${esc}($|[^${NICK_CHARS}])`, "i").test(foldNick(text));
 }
 
 // linkify splits text into { link: bool, text } segments. The character class
