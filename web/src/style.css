@@ -1045,6 +1045,87 @@ input::placeholder {
 	cursor: default;
 }
 
+/* mIRC-formatting popover: the "A" toggle in the compose row plus a small
+   panel anchored above it (style toggles, 4x4 colour grid, reset). */
+.fmt-anchor {
+	position: relative;
+	display: flex;
+	align-self: flex-start;
+}
+
+.fmt-toggle {
+	width: 28px;
+	height: 28px;
+}
+
+.fmt-panel {
+	position: absolute;
+	bottom: calc(100% + 10px);
+	right: 0;
+	z-index: 4;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	padding: 8px;
+	background: var(--elev);
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+}
+
+.fmt-styles {
+	display: flex;
+	gap: 4px;
+}
+
+.fmt-style {
+	width: 26px;
+	height: 26px;
+	font-size: 0.9286rem;
+	color: var(--text);
+}
+
+.fmt-style-b { font-weight: 700; }
+.fmt-style-i { font-style: italic; }
+.fmt-style-u { text-decoration: underline; }
+.fmt-style-s { text-decoration: line-through; }
+.fmt-style-m { font-family: var(--mono-font); }
+
+.fmt-colors {
+	display: grid;
+	grid-template-columns: repeat(4, 26px);
+	gap: 4px;
+	justify-content: center;
+}
+
+.fmt-swatch {
+	width: 26px;
+	height: 26px;
+	padding: 0;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	cursor: pointer;
+}
+
+.fmt-swatch:hover {
+	border-color: var(--accent-line);
+}
+
+.fmt-reset {
+	padding: 4px 8px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	background: var(--panel-2);
+	color: var(--text-dim);
+	font-family: var(--ui-font);
+	font-size: 0.8214rem;
+	cursor: pointer;
+}
+
+.fmt-reset:hover {
+	background: var(--hover-2);
+}
+
 .empty-state {
 	flex: 1;
 	display: flex;

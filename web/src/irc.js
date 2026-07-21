@@ -276,8 +276,9 @@ export function linkify(text) {
 // out-of-range mean "default", handled as null). These are FIXED hex values —
 // the only server-controlled input to formatting is the numeric index, clamped
 // into this table, so there is no way to inject an arbitrary colour string.
+// Exported for the composer's format-panel colour swatches (indices 0-15).
 // prettier-ignore
-const IRC_PALETTE = [
+export const IRC_PALETTE = [
 	"#ffffff", "#000000", "#00007f", "#009300", "#ff0000", "#7f0000", "#9c009c", "#fc7f00",
 	"#ffff00", "#00fc00", "#009393", "#00ffff", "#0000fc", "#ff00ff", "#7f7f7f", "#d2d2d2",
 	"#470000", "#472100", "#474700", "#324700", "#004700", "#00472c", "#004747", "#002747",

@@ -18,6 +18,9 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Completer } from "./complete.js";
 import { isEditable, modalScrimOpen } from "./dom.js";
 import { menuTrigger } from "./menu.jsx";
+import { applyFormat, BOLD, ITALIC, UNDERLINE } from "./format.js";
+import { FormatPanel } from "./formatpanel.jsx";
+import { InputHistory, isFirstLine, isLastLine } from "./inputhistory.js";
 import { applyStatusMode, firstURL, fmtTime, highlightNicks, linkify, nickColor, nickSet, parseFormatting, renderable, SERVER_BUFFER, stripFormatting, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
@@ -276,6 +279,12 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 	const loadingOlder = useRef(false);
 	// Tab cycles candidates; fresh state per buffer.
 	const completer = useMemo(() => new Completer(), [buf?.key]);
+	// Up/Down recall of sent messages. One instance for the session (the
+	// module keeps per-buffer state internally, so switching buffers keeps
+	// each buffer's history); in-memory only, gone on reload.
+	const inputHistory = useMemo(() => new InputHistory(), []);
+	// The mIRC-formatting popover (format button / Alt+F).
+	const [fmtOpen, setFmtOpen] = useState(false);
 	const list = msgs?.list || [];
 	const last = list[list.length - 1];
 	// Max server-stamped time, excluding browser-clock-stamped local info
@@ -432,6 +441,10 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 		// whitespace (e.g. "hi " from a mobile keyboard) still clears.
 		Promise.resolve(onSend(text, key))
 			.then(() => {
+				// Record in Up/Down history only once the send is ACCEPTED —
+				// same rule as clearing — so a rejected line isn't recallable
+				// as if it had been sent. Commands count as entries too.
+				inputHistory.push(key, text);
 				setDrafts((old) => {
 					if (old.get(key) !== raw) return old;
 					const next = new Map(old);
@@ -440,6 +453,20 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 				});
 			})
 			.catch(() => {});
+	}
+
+	// applyFmt inserts a formatting toggle at the composer's current
+	// selection (wrapping it if non-empty) and restores focus + the computed
+	// selection. Shared by the Ctrl+B/I/U shortcuts and the format panel.
+	function applyFmt(code) {
+		const ta = taRef.current;
+		if (!ta || ta.disabled) return;
+		const r = applyFormat(ta.value, ta.selectionStart, ta.selectionEnd, code);
+		draftChanged(r.text);
+		requestAnimationFrame(() => {
+			ta.focus();
+			ta.setSelectionRange(r.selStart, r.selEnd);
+		});
 	}
 
 	const header = msgs?.loaded
@@ -503,6 +530,51 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 							// half-composed draft. Mirrors the type-anywhere
 							// handler's isComposing check above.
 							if (e.isComposing || e.keyCode === 229) return;
+							// Ctrl/Cmd+B/I/U insert mIRC formatting toggles.
+							// Strikethrough/monospace/colours live in the format
+							// panel only (no conflict-free chords; Ctrl+S stays
+							// the browser's). Ctrl+K is NOT handled here — it
+							// must fall through to the global channel-switcher
+							// shortcut.
+							if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
+								const k = e.key.toLowerCase();
+								const code = k === "b" ? BOLD : k === "i" ? ITALIC : k === "u" ? UNDERLINE : null;
+								if (code) {
+									e.preventDefault(); // Ctrl+U is view-source etc.
+									applyFmt(code);
+									return;
+								}
+								// Any other Ctrl/Cmd chord falls through
+								// (Ctrl+Enter must still reach the send branch).
+							}
+							// Alt+F toggles the format panel (free in-app: the
+							// global shortcuts only use Alt+arrows; browsers'
+							// Alt+F menus honour preventDefault).
+							if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "f") {
+								e.preventDefault();
+								setFmtOpen((o) => !o);
+								return;
+							}
+							// Plain Up/Down recall sent-message history — but
+							// only from the FIRST line (Up) / LAST line (Down)
+							// with no selection, so arrows inside a multiline
+							// draft keep their native line movement. A null from
+							// navigate also falls through to the native caret
+							// move. Down while typing a fresh draft clears the
+							// composer (and past the newest entry it clears too
+							// — Down at the bottom always ends empty).
+							if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+								const ta = e.currentTarget;
+								if (ta.selectionStart !== ta.selectionEnd) return;
+								const dir = e.key === "ArrowDown" ? 1 : -1;
+								if (dir < 0 ? !isFirstLine(ta.value, ta.selectionStart) : !isLastLine(ta.value, ta.selectionEnd)) return;
+								const r = inputHistory.navigate(activeDraftKey, dir, ta.value);
+								if (!r) return;
+								e.preventDefault();
+								draftChanged(r.text);
+								requestAnimationFrame(() => ta.setSelectionRange(r.text.length, r.text.length));
+								return;
+							}
 							// Tab completes commands/emoji/nicks and cycles on
 							// repeat; Shift+Tab cycles backwards.
 							if (e.key === "Tab") {
@@ -525,6 +597,12 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 						}}
 						placeholder={connected ? `Message ${buf?.buffer || ""}` : "disconnected — reconnecting…"}
 						disabled={!connected}
+					/>
+					<FormatPanel
+						open={fmtOpen}
+						onToggle={() => setFmtOpen((o) => !o)}
+						onClose={() => setFmtOpen(false)}
+						onApply={applyFmt}
 					/>
 					<button class="btn-accent" type="submit" disabled={!connected}>Send</button>
 				</form>
