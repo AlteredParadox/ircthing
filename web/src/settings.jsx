@@ -614,7 +614,8 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 							over that proxy (no IP leak), one in a direct network goes direct.
 							Off by default: an auto-fetched preview is a tracking beacon — whoever
 							posts a link can tell when you open the buffer. Leave off for zero
-							outbound fetches. Applies immediately.
+							outbound fetches. Applies immediately to new fetches; audio or video
+							already playing keeps streaming until you stop it.
 						</div>
 						{previewsOn !== null && (
 							<div class="pref-row">

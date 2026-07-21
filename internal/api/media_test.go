@@ -660,4 +660,35 @@ func TestMediaStreamNoTransparentGzip(t *testing.T) {
 	if strings.Contains(acceptEnc, "gzip") {
 		t.Fatalf("stream request solicited gzip (Accept-Encoding = %q)", acceptEnc)
 	}
+	if acceptEnc != "identity" {
+		t.Fatalf("stream request Accept-Encoding = %q, want identity", acceptEnc)
+	}
+}
+
+// An origin that ignores Accept-Encoding: identity and sends an encoded body
+// anyway must get a 502 with no body relayed: writeStreamHeaders forwards no
+// Content-Encoding, so relaying would hand the media element mislabeled gzip
+// bytes.
+func TestMediaStreamRejectsEncodedResponse(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.Header().Set("Content-Encoding", "gzip")
+		io.WriteString(w, "\x1f\x8b not really gzip")
+	}))
+	defer origin.Close()
+
+	ts, srv := newTestServerWithRef(t)
+	permitStream(srv)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	token := sealFor(t, srv, origin.URL+"/a.mp3")
+
+	resp := streamGet(t, ts, cookie, token, "")
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("encoded response relayed: status %d, want 502", resp.StatusCode)
+	}
+	if strings.Contains(string(body), "not really gzip") {
+		t.Fatalf("encoded body bytes leaked through the 502 path")
+	}
 }

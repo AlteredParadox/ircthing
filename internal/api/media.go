@@ -330,6 +330,15 @@ func (s *Server) handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if ce := resp.Header.Get("Content-Encoding"); ce != "" && ce != "identity" {
+		// We asked for identity; an encoded body would relay as mislabeled
+		// bytes (writeStreamHeaders forwards no Content-Encoding). Fail with a
+		// diagnosable 502 instead, no body bytes.
+		logMedia("stream", tok.URL, start, mediaLogResult{event: "reject", class: "encoded", httpStatus: 502})
+		http.Error(w, msgStreamUnavailable, http.StatusBadGateway)
+		return
+	}
+
 	writeStreamHeaders(w, resp, ct)
 	relayStreamBody(w, resp, watchdog, tok.URL, start)
 }
@@ -456,6 +465,12 @@ func (f *fetcher) stream(ctx context.Context, rawURL, rangeHdr string) (*http.Re
 	}
 	req.Header.Set("User-Agent", proxyUserAgent)
 	req.Header.Set("Accept", "*/*")
+	// Identity is requested explicitly (DisableCompression already stops the
+	// transport from soliciting gzip, but that is advisory to the origin);
+	// handleMediaStream rejects a response that sets a non-identity
+	// Content-Encoding anyway, since relaying encoded bytes under an a/v
+	// Content-Type would hand the element mislabeled garbage.
+	req.Header.Set("Accept-Encoding", "identity")
 	if rangeHdr != "" {
 		req.Header.Set("Range", rangeHdr)
 	}
