@@ -8,8 +8,8 @@ you run one process, it stays on IRC, and every browser you log in from
 picks up exactly where you left off.
 
 No CGO, no runtime dependencies beyond the config file and the SQLite
-database it creates. The binary is ~15 MB; the web bundle inside it is
-~42 KB gzipped; a working setup with 5 networks and 10k messages of hot
+database it creates. The binary is ~16 MB; the web bundle inside it is
+~53 KB gzipped; a working setup with 5 networks and 10k messages of hot
 scrollback runs in ~32 MB of RSS.
 
 ## Features
@@ -39,10 +39,16 @@ scrollback runs in ~32 MB of RSS.
   own hostname). Link previews for a WireGuard network are fetched through
   that same tunnel and fail closed if it's down.
 - **Web UI**: virtualized message list (smooth at 50k+ messages),
-  full-text search (FTS5), link previews and image thumbnails through a
-  server-side proxy, desktop notifications with per-network highlight
-  rules, a MONITOR buddy list with live presence, typing indicators,
-  and multiline composing.
+  full-text search (FTS5), link previews, image thumbnails, and inline
+  audio/video players — all through a server-side proxy, and nothing
+  streams until you press play — a complete member list even on huge
+  channels (cursor-paged from the server, windowed rendering), desktop
+  notifications with per-network highlight rules, a MONITOR buddy list
+  with live presence, typing indicators, and multiline composing with
+  mIRC formatting and per-buffer input history. Closing a channel or PM
+  keeps its history by default (the buffer returns, intact, on new
+  activity or a rejoin); a settings toggle makes closing delete
+  instead, behind a confirmation.
 - **Multi-device**: read markers, unread counts, and appearance
   preferences sync through the server; `draft/read-marker` bridges read
   state to other bouncer clients.
@@ -60,6 +66,8 @@ scrollback runs in ~32 MB of RSS.
 | `Alt+Shift+↑` / `Alt+Shift+↓` | previous / next unread buffer |
 | `Tab` / `Shift+Tab` | complete nicks, `/commands`, `:emoji:` — repeat to cycle |
 | `Shift+Enter` | newline (sent as `draft/multiline` where supported) |
+| `Ctrl+B` / `Ctrl+I` / `Ctrl+U` | bold / italic / underline (mIRC codes); `Alt+F` opens the full style + color panel |
+| `↑` / `↓` | recall previously sent messages (from the draft's first/last line); `↓` while typing clears the box |
 
 ## Quick start
 
@@ -126,7 +134,7 @@ Per network (`networks[]` seed / edit form):
 | `wireguard` | Egress this network through an in-process userspace WireGuard tunnel (no TUN device, no root) instead of a proxy — its Noise handshake authenticates without the cleartext exposure `proxy` auth has. Object with `private_key`, `peer_public_key`, `endpoint` (`host:port`; a hostname is resolved locally, pre-tunnel), `address` (this client's address inside the tunnel), `dns` (in-tunnel resolver, `ip` or `ip:port`, default `:53`), and optional `preshared_key` / `mtu` (default 1420). Keys are standard WireGuard base64 (as `wg genkey` / Mullvad print them). Target DNS resolves through the tunnel (no local leak). Link previews/thumbnails for links seen in a WireGuard network are fetched **through the same tunnel** (in-tunnel DNS, tunnel egress), so they inherit the network's IP — and fail closed (no preview) whenever the tunnel is down rather than ever fetching directly. Configurable in the web UI under **Egress → WireGuard tunnel**. Mutually exclusive with `proxy`. Endpoint resolution **prefers IPv4**: a dual-record (`A`+`AAAA`) endpoint whose IPv4 is unreachable fails to connect (it does not fall back to the `AAAA`, and never to direct egress — it fails closed, no leak). Pin the working family with an IP-literal `endpoint` if that bites. |
 | `nick`, `username`, `realname` | Identity. `username`/`realname` default to the nick. |
 | `pass` | Server password (`PASS`), rarely needed. |
-| `sasl` | `mechanism` `""` picks automatically (EXTERNAL without a password, else SCRAM-SHA-256 when offered, else PLAIN). `cert_file`/`key_file` supply the client certificate for EXTERNAL. SCRAM-SHA-256 does **not** apply SASLprep normalization to either the **login (account name) or the password** (RFC 5802 §2.2), so use ASCII (or already-normalized) values for both — a non-ASCII login or password may not match a server that normalizes it. |
+| `sasl` | `mechanism` `""` picks automatically (EXTERNAL without a password, else SCRAM-SHA-256 when offered, else PLAIN). `cert_file`/`key_file` supply the client certificate for EXTERNAL; they may also be paired with PLAIN/SCRAM — the certificate is still presented during TLS, which is exactly what services CertFP (`CERT ADD`) needs while account auth stays password-based. SCRAM-SHA-256 does **not** apply SASLprep normalization to either the **login (account name) or the password** (RFC 5802 §2.2), so use ASCII (or already-normalized) values for both — a non-ASCII login or password may not match a server that normalizes it. |
 | `channels` | Joined after every registration, so they come back on reconnect. The UI keeps this in sync: joining via the network menu adds to it, the *Leave channel* action removes. Note: because this client is the sole IRC connection, a **server- or services-forced** membership change (a `+f` channel forward, `SVSJOIN`/`SVSPART`) is treated as your intent and persisted here — so a forced join is rejoined after restart and a forced part is dropped. This is deliberate (it makes redirects survive restarts); it only matters against a compromised server or MITM on a plaintext connection, which can already force membership live. |
 
 ### Preview fetches & the proxy SSRF caveat
@@ -242,6 +250,13 @@ make irctest      # irctest's client suite drives our CAP/SASL/TLS/STS handshake
 make memcheck     # RSS scenario under GOMEMLIMIT=64MiB, asserted ≤ 72 MB
 make build-debug  # unstripped, race-enabled binary for delve
 ```
+
+Media-plane debugging: `IRCTHING_DEBUG_MEDIA=1` logs every
+preview/thumbnail/stream fetch phase under an anonymized per-URL id and
+returns the same id to the browser in an `X-Ircthing-Media-ID` response
+header, so devtools and the server log correlate without URLs ever
+entering persistent logs. `IRCTHING_DEBUG_MEDIA_URLS=1` (implies the
+former) additionally logs the target URLs, with a loud startup warning.
 
 Architecture, protocol scope, budgets, and working rules live in
 [CLAUDE.md](CLAUDE.md). The short version: `internal/irc` speaks IRC
