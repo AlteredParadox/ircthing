@@ -61,8 +61,6 @@ scrollback runs in ~32 MB of RSS.
   message font — plus a raw custom-CSS override. Usable at 360 px wide;
   installable as a PWA.
 
-<img src="docs/screenshots/settings_preview.png" width="380" align="right" alt="Settings: theme, accent, density, sidebar width, message font, join/part display, timestamps">
-
 ### Keyboard
 
 | Keys | Action |
@@ -76,7 +74,12 @@ scrollback runs in ~32 MB of RSS.
 | `Ctrl+B` / `Ctrl+I` / `Ctrl+U` | bold / italic / underline (mIRC codes); `Alt+F` opens the full style + color panel |
 | `↑` / `↓` | recall previously sent messages (from the draft's first/last line); `↓` while typing clears the box |
 
-<br clear="all">
+### Appearance
+
+Theme, accent, text size, density, sidebar width, message font, and
+join/part display are all live-editable:
+
+<img src="docs/screenshots/settings_preview.png" width="380" alt="Settings: theme, accent, density, sidebar width, message font, join/part display, timestamps">
 
 ## Quick start
 
