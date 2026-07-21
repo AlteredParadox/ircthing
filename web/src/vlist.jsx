@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { anchorId, Geometry, prependedCount } from "./vmath.js";
 
 // computeWindow picks the [start, end) row slice to render this frame: the
@@ -200,6 +200,45 @@ export function VirtualList({
 		};
 	}
 
+	// Scrollbar-thumb drags break prepend anchoring: while the thumb is
+	// held, the browser re-derives scrollTop from the thumb's position on
+	// EVERY mouse move, so a prepend that grows scrollHeight mid-drag
+	// clobbers the anchored scrollTop and teleports the content
+	// proportionally — and near the top each teleport lands under
+	// nearTopPx and re-fires onNearTop, cascading page loads until the
+	// view sits at the beginning of the loaded window. Content anchoring
+	// and a user-held thumb are inherently incompatible (the thumb under
+	// the cursor wins), so hold onNearTop while the gutter is being
+	// dragged and run it once on release. Chromium dispatches pointer
+	// events for scrollbar interactions (target = the scroller, offsetX
+	// past clientWidth); Firefox never delivers them, so there this is a
+	// no-op and behavior is unchanged.
+	const barDrag = useRef(false);
+	const onNearTopRef = useRef(onNearTop);
+	onNearTopRef.current = onNearTop;
+	function gutterDown(e) {
+		const sc = scroller.current;
+		if (sc && e.target === sc && e.offsetX >= sc.clientWidth) barDrag.current = true;
+	}
+	useEffect(() => {
+		const release = () => {
+			if (!barDrag.current) return;
+			barDrag.current = false;
+			const sc = scroller.current;
+			// The drag may have parked the view in the near-top zone with
+			// loads suppressed; retrigger once so paging resumes.
+			if (sc && sc.scrollTop < nearTopPx) onNearTopRef.current?.();
+		};
+		window.addEventListener("pointerup", release);
+		window.addEventListener("pointercancel", release);
+		window.addEventListener("blur", release);
+		return () => {
+			window.removeEventListener("pointerup", release);
+			window.removeEventListener("pointercancel", release);
+			window.removeEventListener("blur", release);
+		};
+	}, []);
+
 	const scrollScheduled = useRef(false);
 	function handleScroll() {
 		const sc = scroller.current;
@@ -209,7 +248,7 @@ export function VirtualList({
 			pinned.current = nowPinned;
 			onPinned?.(nowPinned);
 		}
-		if (sc.scrollTop < nearTopPx) onNearTop?.();
+		if (sc.scrollTop < nearTopPx && !barDrag.current) onNearTop?.();
 		// One re-render per frame, however many scroll events arrive.
 		if (scrollScheduled.current) return;
 		scrollScheduled.current = true;
@@ -262,7 +301,7 @@ export function VirtualList({
 	});
 
 	return (
-		<div class="msgs scroll" ref={scroller} onScroll={handleScroll}>
+		<div class="msgs scroll" ref={scroller} onScroll={handleScroll} onPointerDown={gutterDown}>
 			<div ref={headerEl}>{header}</div>
 			<div style={{ height: topPad }} />
 			{items.slice(start, end).map((item, j) => (
