@@ -107,6 +107,11 @@ export const DEFAULTS = {
 	// Prefix a sender's nick with its channel mode symbol (@ op, + voice) in
 	// the message list, The Lounge style. Off = bare nicks.
 	nickPrefixes: false,
+	// Closing a channel or DM erases its stored history (close_buffer
+	// purge:true, behind a confirmation). Off (the default): closing only
+	// removes the buffer from the sidebar, no confirmation — it returns with
+	// its scrollback on new activity.
+	purgeOnClose: false,
 	css: "",
 };
 
@@ -133,6 +138,7 @@ export function normalizePrefs(raw) {
 		titleUnread: typeof p.titleUnread === "boolean" ? p.titleUnread : DEFAULTS.titleUnread,
 		titleChannel: typeof p.titleChannel === "boolean" ? p.titleChannel : DEFAULTS.titleChannel,
 		nickPrefixes: typeof p.nickPrefixes === "boolean" ? p.nickPrefixes : DEFAULTS.nickPrefixes,
+		purgeOnClose: typeof p.purgeOnClose === "boolean" ? p.purgeOnClose : DEFAULTS.purgeOnClose,
 		css: typeof p.css === "string" ? p.css : DEFAULTS.css,
 	});
 }

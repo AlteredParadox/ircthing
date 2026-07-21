@@ -729,8 +729,23 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	// check, so a straggler in flight when the user closes a buffer cannot
 	// resurrect it (the recentlyClosed check and the append used to be a
 	// check-then-act split across h.mu and store.mu — a two-lock TOCTOU).
-	stored, err := h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
-		h.graceGuard(ev, c, target, selfPart, replay), storeMessage(ev))
+	// Archived-buffer (close_buffer purge:false) policy: real conversation
+	// (PRIVMSG/NOTICE/TOPIC/...) resurfaces a hidden buffer so its history
+	// returns on new activity; membership fan-out must not — the PART echo
+	// that races a purge:false close lands after the archive and would
+	// otherwise resurrect the buffer (the mirror of the deleted path's close
+	// tombstone). Our own LIVE JOIN is a deliberate rejoin and does resurface
+	// it — the same intent rule as the unmarkClosed above; a REPLAYED
+	// self-JOIN is backfill, not intent.
+	unarchive := true
+	switch ev.Msg.Command {
+	case "JOIN":
+		unarchive = own && !replay
+	case "PART", "QUIT", "NICK", "MODE":
+		unarchive = false
+	}
+	stored, stillArchived, err := h.store.AppendFoldedGuardedArchive(ctx, ev.Network, target, c.Fold,
+		h.graceGuard(ev, c, target, selfPart, replay), unarchive, storeMessage(ev))
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -740,6 +755,12 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 	}
 	if stored.ID == 0 {
 		return nil // duplicate msgid: already stored and announced
+	}
+	if stillArchived {
+		// Persisted into a buffer that stays archived: publish nothing — an
+		// event or history hint would re-grow a sidebar row that get_buffers
+		// hides. The line is in history for whenever the buffer resurfaces.
+		return nil
 	}
 	if !replay {
 		h.broadcast(envelope("event", 0, eventData(stored)))
@@ -1676,9 +1697,13 @@ func (h *Hub) persistMembership(ctx context.Context, c Conn, ev irc.Event, repla
 		// for a buffer closed concurrently. This is replay-agnostic to match
 		// persistEvent — a replayed (event-playback) QUIT/NICK for a buffer
 		// the user just closed must not re-create it either.
-		stored, err := h.store.AppendFoldedGuarded(ctx, ev.Network, target, c.Fold,
+		// QUIT/NICK are membership fan-out and never un-archive a
+		// close_buffer purge:false buffer (channel or query): the line is
+		// persisted into the hidden history but not published, mirroring
+		// persistEvent's archived-buffer policy.
+		stored, stillArchived, err := h.store.AppendFoldedGuardedArchive(ctx, ev.Network, target, c.Fold,
 			func(bool) bool { return h.recentlyClosed(ev.Network, c.Fold(target)) },
-			storeMessage(ev))
+			false, storeMessage(ev))
 		if err != nil {
 			log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
 			if !replay {
@@ -1692,8 +1717,10 @@ func (h *Hub) persistMembership(ctx context.Context, c Conn, ev irc.Event, repla
 			}
 			continue // duplicate msgid: already stored and announced
 		}
-		if !replay {
+		if !replay && !stillArchived {
 			h.broadcast(envelope("event", 0, eventData(stored)))
+		}
+		if !replay {
 			h.bufferMutationMu.Unlock()
 		}
 	}

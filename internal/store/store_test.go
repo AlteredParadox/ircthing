@@ -18,10 +18,12 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -565,14 +567,14 @@ func TestMigrationsIdempotentAndRecorded(t *testing.T) {
 	if err := s2.db.QueryRow(`SELECT count(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 11 {
-		t.Fatalf("schema_migrations rows = %d, want 11", n)
+	if n != 12 {
+		t.Fatalf("schema_migrations rows = %d, want 12", n)
 	}
 	var name string
-	if err := s2.db.QueryRow(`SELECT name FROM schema_migrations WHERE version = 11`).Scan(&name); err != nil {
+	if err := s2.db.QueryRow(`SELECT name FROM schema_migrations WHERE version = 12`).Scan(&name); err != nil {
 		t.Fatal(err)
 	}
-	if name != "0011_fts_recreate.sql" {
+	if name != "0012_archived_buffers.sql" {
 		t.Fatalf("recorded name = %q", name)
 	}
 	// WAL mode actually took effect.
@@ -725,5 +727,204 @@ func TestOpenSecuresLiteralPathWithSpecialChars(t *testing.T) {
 		if fi.Mode().Perm() != 0o600 {
 			t.Fatalf("literal file %q mode = %o, want 0600", path, fi.Mode().Perm())
 		}
+	}
+}
+
+// ---- archived buffers (close_buffer purge:false) ----
+
+// archivedFlag reads the raw archived column for a buffer row.
+func archivedFlag(t *testing.T, s *Store, network, target string) int {
+	t.Helper()
+	var v int
+	err := s.db.QueryRow(`
+		SELECT b.archived FROM buffers b
+		JOIN networks n ON n.id = b.network_id
+		WHERE n.name = ? AND b.name = ?`, network, target).Scan(&v)
+	if err != nil {
+		t.Fatalf("archived flag for %s/%s: %v", network, target, err)
+	}
+	return v
+}
+
+// Archiving hides the buffer from Buffers/RecentBuffers but keeps its
+// message rows and read marker, resolving the name under fold like a
+// delete would.
+func TestArchiveBufferHidesAndKeepsHistory(t *testing.T) {
+	s, _ := openTest(t, 10)
+	seed(t, s, "net", "#chan", 3)
+	if err := s.SetReadMarker(ctx, "net", "#chan", time.UnixMilli(2000)); err != nil {
+		t.Fatal(err)
+	}
+
+	canonical, err := s.ArchiveBufferFolded(ctx, "net", "#CHAN", strings.ToLower)
+	if err != nil {
+		t.Fatalf("ArchiveBufferFolded: %v", err)
+	}
+	if canonical != "#chan" {
+		t.Fatalf("canonical = %q, want #chan", canonical)
+	}
+	if got := archivedFlag(t, s, "net", "#chan"); got != 1 {
+		t.Fatalf("archived = %d, want 1", got)
+	}
+
+	if infos, err := s.Buffers(ctx); err != nil || len(infos) != 0 {
+		t.Fatalf("Buffers after archive = %v, %v; want empty", infos, err)
+	}
+	if infos, more, err := s.RecentBuffers(ctx, 10); err != nil || more || len(infos) != 0 {
+		t.Fatalf("RecentBuffers after archive = %v, %v, %v; want empty", infos, more, err)
+	}
+	if msgs, err := s.Latest(ctx, "net", "#chan", 10); err != nil || len(msgs) != 3 {
+		t.Fatalf("Latest after archive = %d msgs, %v; want 3 intact", len(msgs), err)
+	}
+	if marker, err := s.ReadMarker(ctx, "net", "#chan"); err != nil || marker.UnixMilli() != 2000 {
+		t.Fatalf("ReadMarker after archive = %v, %v; want 2000", marker, err)
+	}
+}
+
+// Archiving a name with no stored row (a purely client-side buffer) is a
+// no-op that still reports the canonical spelling.
+func TestArchiveBufferMissingRowIsNoop(t *testing.T) {
+	s, _ := openTest(t, 10)
+	canonical, err := s.ArchiveBufferFolded(ctx, "net", "#ghost", strings.ToLower)
+	if err != nil || canonical != "#ghost" {
+		t.Fatalf("ArchiveBufferFolded = %q, %v", canonical, err)
+	}
+}
+
+// A membership line (unarchive=false — the racing PART echo) appended to an
+// archived buffer is persisted but reports stillArchived, and the buffer
+// stays hidden.
+func TestArchivedBufferMembershipAppendStaysHidden(t *testing.T) {
+	s, _ := openTest(t, 10)
+	seed(t, s, "net", "#chan", 1)
+	if _, err := s.ArchiveBufferFolded(ctx, "net", "#chan", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	m, stillArchived, err := s.AppendFoldedGuardedArchive(ctx, "net", "#chan", nil, nil, false, Message{
+		Time: time.UnixMilli(5000), Sender: "me", Command: "PART", Raw: ":me PART #chan",
+	})
+	if err != nil || m.ID == 0 {
+		t.Fatalf("append = %+v, %v; want stored", m, err)
+	}
+	if !stillArchived {
+		t.Fatal("membership append reported un-archived")
+	}
+	if infos, err := s.Buffers(ctx); err != nil || len(infos) != 0 {
+		t.Fatalf("Buffers = %v, %v; want still hidden", infos, err)
+	}
+	if msgs, err := s.Latest(ctx, "net", "#chan", 10); err != nil || len(msgs) != 2 {
+		t.Fatalf("Latest = %d msgs, %v; want 2 (seed + PART kept in history)", len(msgs), err)
+	}
+}
+
+// A conversation line (unarchive=true) clears the flag: the buffer
+// resurfaces in Buffers with its prior history plus the new message.
+func TestArchivedBufferContentAppendResurfaces(t *testing.T) {
+	s, _ := openTest(t, 10)
+	seed(t, s, "net", "#chan", 2)
+	if _, err := s.ArchiveBufferFolded(ctx, "net", "#chan", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	m, stillArchived, err := s.AppendFoldedGuardedArchive(ctx, "net", "#Chan", strings.ToLower, nil, true, Message{
+		Time: time.UnixMilli(9000), Sender: "bob", Command: "PRIVMSG", Raw: "new activity",
+	})
+	if err != nil || m.ID == 0 {
+		t.Fatalf("append = %+v, %v; want stored", m, err)
+	}
+	if stillArchived {
+		t.Fatal("content append left the buffer archived")
+	}
+	if got := archivedFlag(t, s, "net", "#chan"); got != 0 {
+		t.Fatalf("archived = %d, want 0", got)
+	}
+	infos, err := s.Buffers(ctx)
+	if err != nil || len(infos) != 1 || infos[0].Target != "#chan" {
+		t.Fatalf("Buffers = %v, %v; want resurfaced #chan", infos, err)
+	}
+	if msgs, err := s.Latest(ctx, "net", "#chan", 10); err != nil || len(msgs) != 3 {
+		t.Fatalf("Latest = %d msgs, %v; want prior 2 + new 1", len(msgs), err)
+	}
+}
+
+// A duplicate-msgid append (overlapping chathistory backfill) stores
+// nothing and must not un-archive: only genuinely new conversation
+// resurfaces a buffer.
+func TestArchivedBufferDuplicateMsgidDoesNotUnarchive(t *testing.T) {
+	s, _ := openTest(t, 10)
+	if _, err := s.Append(ctx, "net", "#chan", Message{
+		Time: time.UnixMilli(1000), Sender: "alice", Command: "PRIVMSG", Raw: "hi", MsgID: "m1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ArchiveBufferFolded(ctx, "net", "#chan", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	m, stillArchived, err := s.AppendFoldedGuardedArchive(ctx, "net", "#chan", nil, nil, true, Message{
+		Time: time.UnixMilli(1000), Sender: "alice", Command: "PRIVMSG", Raw: "hi", MsgID: "m1",
+	})
+	if err != nil || m.ID != 0 {
+		t.Fatalf("duplicate append = %+v, %v; want dropped", m, err)
+	}
+	if stillArchived {
+		t.Fatal("dropped append must report false (nothing was stored)")
+	}
+	if got := archivedFlag(t, s, "net", "#chan"); got != 1 {
+		t.Fatalf("archived = %d, want still 1", got)
+	}
+}
+
+// Migration 0012 applies to a database created before it existed: pre-0012
+// buffer rows gain archived=0 and stay visible.
+func TestArchivedMigrationAppliesToExistingDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", "file:"+encodeDBPath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+		version    INTEGER PRIMARY KEY,
+		name       TEXT NOT NULL,
+		applied_at TEXT NOT NULL
+	) STRICT`); err != nil {
+		t.Fatal(err)
+	}
+	// Build the pre-0012 schema by applying only the older migrations.
+	names, _, err := knownMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		v, err := migrationVersion(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v >= 12 {
+			continue
+		}
+		if err := applyMigration(db, name, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO networks (user_id, name) VALUES (1, 'net')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO buffers (network_id, name)
+		SELECT id, '#old' FROM networks WHERE name = 'net'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s := reopen(t, path, 10) // applies 0012 to the existing database
+	if got := archivedFlag(t, s, "net", "#old"); got != 0 {
+		t.Fatalf("pre-existing buffer archived = %d, want default 0", got)
+	}
+	infos, err := s.Buffers(ctx)
+	if err != nil || len(infos) != 1 || infos[0].Target != "#old" {
+		t.Fatalf("Buffers = %v, %v; want the pre-existing buffer visible", infos, err)
 	}
 }

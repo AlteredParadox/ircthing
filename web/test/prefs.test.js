@@ -33,7 +33,8 @@ test("normalizePrefs: keeps valid values", () => {
 		theme: "light", accent: "rose", textSize: "xl",
 		density: "compact", sidebarWidth: "wide", msgFont: "mono", statusMsgs: "collapse",
 		statusHost: true, clock: "12", seconds: true, ampm: false, nickSep: ":", highlightNames: false,
-		sendTyping: false, titleUnread: false, titleChannel: true, nickPrefixes: true, css: "a { color: red }",
+		sendTyping: false, titleUnread: false, titleChannel: true, nickPrefixes: true, purgeOnClose: true,
+		css: "a { color: red }",
 	};
 	eq(normalizePrefs(full), full);
 });
@@ -47,12 +48,20 @@ test("normalizePrefs: clamps timestamp/separator prefs", () => {
 });
 
 test("normalizePrefs: non-boolean toggles fall back to defaults", () => {
-	const p = normalizePrefs({ statusHost: "yes", sendTyping: 0, titleUnread: null, titleChannel: "x", nickPrefixes: 1 });
+	const p = normalizePrefs({ statusHost: "yes", sendTyping: 0, titleUnread: null, titleChannel: "x", nickPrefixes: 1, purgeOnClose: "on" });
 	is(p.statusHost, DEFAULTS.statusHost);
 	is(p.sendTyping, DEFAULTS.sendTyping);
 	is(p.titleUnread, DEFAULTS.titleUnread);
 	is(p.titleChannel, DEFAULTS.titleChannel);
 	is(p.nickPrefixes, DEFAULTS.nickPrefixes);
+	is(p.purgeOnClose, DEFAULTS.purgeOnClose);
+});
+
+test("purgeOnClose: defaults off (closing keeps history) and round-trips", () => {
+	is(DEFAULTS.purgeOnClose, false);
+	is(normalizePrefs({}).purgeOnClose, false);
+	is(normalizePrefs({ purgeOnClose: true }).purgeOnClose, true);
+	is(normalizePrefs({ purgeOnClose: false }).purgeOnClose, false);
 });
 
 test("normalizePrefs: clamps unknown values field by field", () => {

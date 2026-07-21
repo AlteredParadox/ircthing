@@ -597,9 +597,12 @@ func (s *Session) handleJoinChannel(ctx context.Context, env Envelope, join bool
 	s.hub.broadcast(envelope("networks_changed", 0, nil))
 }
 
-// handleCloseBuffer deletes a buffer's stored history so it stays
-// closed (the sidebar is store-driven; without this a closed buffer
-// resurrects on the next refresh). Leaving a channel via the UI sends
+// handleCloseBuffer removes a buffer from every device's sidebar (the
+// sidebar is store-driven; without a store change a closed buffer
+// resurrects on the next refresh). With purge missing or true it deletes
+// the stored history outright; with purge:false it archives the buffer —
+// history kept, hidden from get_buffers, resurfacing with its scrollback
+// on real new conversation. Leaving a channel via the UI sends
 // part_channel first, then this.
 func (s *Session) handleCloseBuffer(ctx context.Context, env Envelope) {
 	var d BufferRef
@@ -620,21 +623,36 @@ func (s *Session) handleCloseBuffer(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "unknown_network", "unknown network"))
 		return
 	}
-	// Resolve/delete and install the close tombstone under the store lock, the
-	// same ordering used by guarded appends. No append can land in a gap
-	// between those operations.
+	// purge defaults to true: an older client's bare close_buffer keeps its
+	// destructive delete semantics unchanged.
+	purge := d.Purge == nil || *d.Purge
+	d.Purge = nil // ok/buffer_closed payloads keep their pre-purge wire shape
+	// Resolve/mutate (and for purge, install the close tombstone) under the
+	// store lock, the same ordering used by guarded appends. No append can
+	// land in a gap between those operations.
 	fold := asciiFold
 	if c := s.hub.network(d.Network); c != nil {
 		fold = c.Fold
 	}
-	// Delete+tombstone+publication is one observable mutation. Live append
+	// Mutation+tombstone+publication is one observable mutation. Live append
 	// paths hold the same mutex through their event publication, preventing an
 	// older append from resurfacing the buffer after buffer_closed.
 	s.hub.bufferMutationMu.Lock()
 	defer s.hub.bufferMutationMu.Unlock()
-	canonical, err := s.hub.store.DeleteBufferFolded(ctx, d.Network, d.Buffer, fold, func(name string) {
-		s.hub.markClosed(d.Network, fold(name), time.Now().UnixMilli())
-	})
+	var canonical string
+	if purge {
+		canonical, err = s.hub.store.DeleteBufferFolded(ctx, d.Network, d.Buffer, fold, func(name string) {
+			s.hub.markClosed(d.Network, fold(name), time.Now().UnixMilli())
+		})
+	} else {
+		// Archive: history kept, no close tombstone. The straggler problem the
+		// tombstone solves for deletes (our PART echo racing this request) is
+		// handled by archived buffers swallowing membership fan-out without
+		// publication (persistEvent's stillArchived check); a tombstone here
+		// would instead DROP a live channel message that should resurface the
+		// buffer with its history.
+		canonical, err = s.hub.store.ArchiveBufferFolded(ctx, d.Network, d.Buffer, fold)
+	}
 	if err != nil {
 		s.push(errEnvelope(env.Seq, "internal", "closing buffer failed"))
 		return

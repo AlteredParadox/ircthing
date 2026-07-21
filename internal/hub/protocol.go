@@ -418,8 +418,13 @@ type ChannelRef struct {
 }
 
 // BufferRef names a buffer ("close_buffer" request, "buffer_closed"
-// push).
+// push). Purge applies to close_buffer only: missing or true deletes the
+// buffer's stored history (the original, destructive behavior — older
+// clients keep it); false archives instead — hidden from get_buffers with
+// history intact, resurfacing on new conversation. The handler clears the
+// field before echoing, so ok/buffer_closed payloads never carry it.
 type BufferRef struct {
 	Network string `json:"network"`
 	Buffer  string `json:"buffer"`
+	Purge   *bool  `json:"purge,omitempty"`
 }

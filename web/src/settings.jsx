@@ -663,6 +663,24 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 					</section>
 
 					<section class="settings-section">
+						<div class="settings-label">Closing conversations</div>
+						<div class="pref-row">
+							<span class="pref-name">Delete history when closing a conversation</span>
+							<Seg
+								value={prefs.purgeOnClose ? "on" : "off"}
+								options={["off", "on"]}
+								labels={["Off", "On"]}
+								onPick={(v) => onPrefs({ ...prefs, purgeOnClose: v === "on" })}
+							/>
+						</div>
+						<div class="settings-note">
+							Off: closing a channel or DM only removes it from the sidebar — it comes
+							back with its full scrollback on new activity. On: closing permanently
+							erases its stored history (asks for confirmation first).
+						</div>
+					</section>
+
+					<section class="settings-section">
 						<div class="settings-label">Session</div>
 						<div class="settings-note">
 							How long a login stays valid before you have to sign in again. Applies

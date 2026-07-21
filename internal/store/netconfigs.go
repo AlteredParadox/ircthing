@@ -443,6 +443,35 @@ func (s *Store) DeleteBufferFolded(ctx context.Context, network, target string, 
 	return canonical, nil
 }
 
+// ArchiveBufferFolded is DeleteBufferFolded's non-destructive sibling
+// (close_buffer purge:false): it resolves target the same way, under the
+// same store lock, and marks the row archived — hidden from
+// Buffers/RecentBuffers with messages, read marker, and FTS rows intact.
+// Retention pruning still applies normally. There is no close tombstone and
+// no afterArchive hook: the straggler problem the tombstone solves for
+// deletes is handled by archived buffers swallowing membership fan-out
+// without publication (see applyArchiveLocked), and a tombstone here would
+// wrongly DROP a live channel message that should instead resurface the
+// buffer. The hot ring and buffer-id cache are kept — the buffer stays live
+// for appends. The canonical spelling is returned even when no row exists
+// (archiving a purely client-side buffer is a no-op).
+func (s *Store) ArchiveBufferFolded(ctx context.Context, network, target string, fold func(string) string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	canonical, err := s.canonicalBufferLocked(ctx, network, target, fold)
+	if err != nil {
+		return "", err
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE buffers SET archived = 1 WHERE name = ? AND network_id =
+			(SELECT id FROM networks WHERE user_id = ? AND name = ?)`,
+		canonical, defaultUserID, network); err != nil {
+		return "", err
+	}
+	return canonical, nil
+}
+
 func (s *Store) canonicalBufferLocked(ctx context.Context, network, target string, fold func(string) string) (string, error) {
 	if fold == nil {
 		return target, nil

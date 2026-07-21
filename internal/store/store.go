@@ -402,7 +402,8 @@ func (s *Store) Close() error {
 // and the zero Message (ID 0) is returned — callers use that to skip
 // broadcasting.
 func (s *Store) Append(ctx context.Context, network, target string, m Message) (Message, error) {
-	return s.append(ctx, network, target, m, true, nil, nil)
+	msg, _, err := s.append(ctx, network, target, m, true, nil, nil, true)
+	return msg, err
 }
 
 // AppendExisting is Append minus buffer creation: the message is
@@ -411,7 +412,8 @@ func (s *Store) Append(ctx context.Context, network, target string, m Message) (
 // close_buffer delete and the PART echo race, and both orders must end
 // with the buffer gone.
 func (s *Store) AppendExisting(ctx context.Context, network, target string, m Message) (Message, error) {
-	return s.append(ctx, network, target, m, false, nil, nil)
+	msg, _, err := s.append(ctx, network, target, m, false, nil, nil, true)
+	return msg, err
 }
 
 // AppendGuarded is Append with an atomic guard consulted UNDER the store
@@ -423,12 +425,27 @@ func (s *Store) AppendExisting(ctx context.Context, network, target string, m Me
 // straggler appended to a buffer not yet deleted (so it cannot broadcast a
 // live event that resurrects the buffer on clients).
 func (s *Store) AppendGuarded(ctx context.Context, network, target string, guardCreate func(exists bool) bool, m Message) (Message, error) {
-	return s.append(ctx, network, target, m, true, nil, guardCreate)
+	msg, _, err := s.append(ctx, network, target, m, true, nil, guardCreate, true)
+	return msg, err
 }
 
 // AppendFoldedGuarded is AppendFolded plus the AppendGuarded append guard.
 func (s *Store) AppendFoldedGuarded(ctx context.Context, network, target string, fold func(string) string, guardCreate func(exists bool) bool, m Message) (Message, error) {
-	return s.append(ctx, network, target, m, true, fold, guardCreate)
+	msg, _, err := s.append(ctx, network, target, m, true, fold, guardCreate, true)
+	return msg, err
+}
+
+// AppendFoldedGuardedArchive is AppendFoldedGuarded plus explicit control
+// over an archived (close_buffer purge:false) buffer. unarchive says whether
+// this message is real conversation: true clears the buffer's archived flag
+// so it resurfaces in Buffers/RecentBuffers; false (membership fan-out —
+// JOIN/PART/QUIT/NICK/MODE) leaves the flag alone. The second result reports
+// whether the buffer is STILL archived after a successful append — the hub
+// then persists the line without publishing it, so a straggler (the PART
+// echo racing a purge:false close) cannot resurrect the buffer on clients.
+// The flag/report and the insert happen under one hold of the store lock.
+func (s *Store) AppendFoldedGuardedArchive(ctx context.Context, network, target string, fold func(string) string, guardCreate func(exists bool) bool, unarchive bool, m Message) (Message, bool, error) {
+	return s.append(ctx, network, target, m, true, fold, guardCreate, unarchive)
 }
 
 // AppendFolded resolves target to its canonical stored spelling under
@@ -437,7 +454,8 @@ func (s *Store) AppendFoldedGuarded(ctx context.Context, network, target string,
 // IRC event run on independent goroutines) cannot each decide no buffer
 // exists and create separate rows. m.Target is set to the resolved name.
 func (s *Store) AppendFolded(ctx context.Context, network, target string, fold func(string) string, m Message) (Message, error) {
-	return s.append(ctx, network, target, m, true, fold, nil)
+	msg, _, err := s.append(ctx, network, target, m, true, fold, nil, true)
+	return msg, err
 }
 
 // nullString maps "" to a SQL NULL (an empty text/msgid must not be
@@ -465,9 +483,9 @@ func (s *Store) appendVetoed(ctx context.Context, network, target string, guard 
 	return guard(id != 0), nil
 }
 
-func (s *Store) append(ctx context.Context, network, target string, m Message, create bool, fold func(string) string, guardCreate func(exists bool) bool) (Message, error) {
+func (s *Store) append(ctx context.Context, network, target string, m Message, create bool, fold func(string) string, guardCreate func(exists bool) bool, unarchive bool) (Message, bool, error) {
 	if network == "" || target == "" {
-		return Message{}, errors.New("store: network and target must be non-empty")
+		return Message{}, false, errors.New("store: network and target must be non-empty")
 	}
 	if m.Time.IsZero() {
 		m.Time = time.Now()
@@ -499,20 +517,49 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, c
 	if guardCreate != nil {
 		blocked, err := s.appendVetoed(ctx, network, target, guardCreate)
 		if err != nil {
-			return Message{}, err
+			return Message{}, false, err
 		}
 		if blocked {
-			return Message{}, nil
+			return Message{}, false, nil
 		}
 	}
 	bufID, r, err := s.bufferAndRing(ctx, network, target, create)
 	if err != nil {
-		return Message{}, err
+		return Message{}, false, err
 	}
 	if bufID == 0 {
-		return Message{}, nil // no such buffer and create is off
+		return Message{}, false, nil // no such buffer and create is off
 	}
-	return s.insertLocked(ctx, bufID, r, m)
+	msg, err := s.insertLocked(ctx, bufID, r, m)
+	if err != nil || msg.ID == 0 {
+		// Nothing new was stored (error, or a duplicate msgid from overlapping
+		// backfill) — an already-known message must not un-archive either.
+		return msg, false, err
+	}
+	stillArchived, err := s.applyArchiveLocked(ctx, bufID, unarchive)
+	return msg, stillArchived, err
+}
+
+// applyArchiveLocked settles a just-appended message against the buffer's
+// archived flag (caller holds s.mu). Real conversation (unarchive true)
+// clears the flag so the buffer resurfaces in Buffers/RecentBuffers with its
+// full history; membership fan-out (unarchive false) leaves it hidden and
+// reports that, so the hub can persist the line without publishing an event
+// that would resurrect the buffer on clients. An unarchived buffer reports
+// false on both paths for free: the UPDATE matches no row, the SELECT reads 0.
+func (s *Store) applyArchiveLocked(ctx context.Context, bufID int64, unarchive bool) (bool, error) {
+	if unarchive {
+		_, err := s.db.ExecContext(ctx,
+			`UPDATE buffers SET archived = 0 WHERE id = ? AND archived = 1`, bufID)
+		return false, err
+	}
+	var archived int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT archived FROM buffers WHERE id = ?`, bufID).Scan(&archived)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil // buffer row gone: nothing left to resurrect
+	}
+	return archived != 0, err
 }
 
 // insertLocked writes m into the buffer and hot ring (caller holds s.mu).
@@ -858,7 +905,8 @@ type BufferInfo struct {
 }
 
 // Buffers lists every buffer with its activity and read state, ordered by
-// network then target.
+// network then target. Archived buffers (close_buffer purge:false) are
+// excluded — hidden until real conversation clears the flag.
 func (s *Store) Buffers(ctx context.Context) ([]BufferInfo, error) {
 	// The unread count must match what the client counts as unread live, or the
 	// two disagree the moment a client fetches buffers (the badge jumps). The
@@ -876,6 +924,7 @@ func (s *Store) Buffers(ctx context.Context) ([]BufferInfo, error) {
 				AND ts > COALESCE((SELECT ts FROM read_markers WHERE buffer_id = b.id), 0))
 		FROM buffers b
 		JOIN networks n ON n.id = b.network_id
+		WHERE b.archived = 0
 		ORDER BY n.name, b.name`)
 	if err != nil {
 		return nil, err
@@ -910,7 +959,7 @@ func (s *Store) RecentBuffers(ctx context.Context, limit int) ([]BufferInfo, boo
 				AND ts > COALESCE((SELECT ts FROM read_markers WHERE buffer_id = b.id), 0))
 		FROM buffers b
 		JOIN networks n ON n.id = b.network_id
-		WHERE n.user_id = ?
+		WHERE n.user_id = ? AND b.archived = 0
 		ORDER BY last_ts DESC, n.name, b.name
 		LIMIT ?`, defaultUserID, limit+1)
 	if err != nil {

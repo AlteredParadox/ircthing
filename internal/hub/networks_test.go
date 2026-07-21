@@ -1221,3 +1221,195 @@ func TestPersistOwnSkipsUnknownNetwork(t *testing.T) {
 		t.Fatalf("persistOwn created a buffer for an unknown network: %+v", bufs)
 	}
 }
+
+// ---- close_buffer purge:false (archive) ----
+
+func boolPtr(b bool) *bool { return &b }
+
+// expectNoEvent drains the session queue for a moment and fails on any
+// "event" push — the envelope that would grow a sidebar row on clients.
+// Roster hints (members_changed) are tolerated: the client only uses them
+// to refresh the ACTIVE buffer's member list, never to create a buffer.
+func expectNoEvent(t *testing.T, s *Session) {
+	t.Helper()
+	timeout := time.After(100 * time.Millisecond)
+	for {
+		select {
+		case queued := <-s.Outbound():
+			var env Envelope
+			_ = json.Unmarshal(queued.Data, &env)
+			queued.Release()
+			if env.Type == "event" {
+				t.Fatalf("unexpected event push: %s", env.Data)
+			}
+		case <-timeout:
+			return
+		}
+	}
+}
+
+// archiveTestSetup runs a hub with one fake network, seeds #foo with one
+// PRIVMSG, and archives it via close_buffer purge:false, returning the
+// session with its ok/buffer_closed already consumed.
+func archiveTestSetup(t *testing.T) (*Hub, *fakeConn, *Session, func(string, ...string) irc.Event) {
+	t.Helper()
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	ev := func(line string, affected ...string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+			Msg: ircv4.MustParseMessage(line), Affected: affected}
+	}
+	conn.ch <- ev(":alice!u@h PRIVMSG #foo :first")
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#foo", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed message never persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	s := h.NewSession()
+	t.Cleanup(s.Close)
+	s.Handle(ctxb, request(t, "close_buffer", 1,
+		BufferRef{Network: "libera", Buffer: "#FOO", Purge: boolPtr(false)}))
+	env := recv(t, s, "ok", "event") // a racing seed event may arrive
+	if ref := decode[BufferRef](t, env); ref.Buffer != "#foo" || ref.Network != "libera" {
+		t.Fatalf("ok payload = %+v, want canonical libera/#foo", ref)
+	}
+	recv(t, s, "buffer_closed", "event")
+	return h, conn, s, ev
+}
+
+// close_buffer purge:false archives: the ok response is canonicalized,
+// buffer_closed is broadcast (asserted in archiveTestSetup), history stays
+// intact, and the buffer is absent from a fresh get_buffers.
+func TestCloseBufferArchiveKeepsHistory(t *testing.T) {
+	h, _, s, _ := archiveTestSetup(t)
+	ctxb := context.Background()
+
+	if msgs, err := h.store.Latest(ctxb, "libera", "#foo", 5); err != nil || len(msgs) != 1 {
+		t.Fatalf("history after archive = %d msgs, %v; want 1 intact", len(msgs), err)
+	}
+	s.Handle(ctxb, request(t, "get_buffers", 2, nil))
+	data := decode[BuffersData](t, recv(t, s, "buffers"))
+	if len(data.Buffers) != 0 {
+		t.Fatalf("get_buffers after archive = %+v, want empty", data.Buffers)
+	}
+}
+
+// An explicit purge:true keeps the original destructive behavior (the
+// missing-purge case is covered by the pre-existing close_buffer tests).
+func TestCloseBufferPurgeTrueStillDeletes(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+		Msg: ircv4.MustParseMessage(":alice!u@h PRIVMSG #foo :first")}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if b, _ := h.store.Latest(ctxb, "libera", "#foo", 5); len(b) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed message never persisted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	s := h.NewSession()
+	defer s.Close()
+	s.Handle(ctxb, request(t, "close_buffer", 1,
+		BufferRef{Network: "libera", Buffer: "#foo", Purge: boolPtr(true)}))
+	recv(t, s, "ok", "event")
+	recv(t, s, "buffer_closed", "event")
+	if msgs, _ := h.store.Latest(ctxb, "libera", "#foo", 5); len(msgs) != 0 {
+		t.Fatalf("purge:true left %d history rows", len(msgs))
+	}
+}
+
+// The PART echo that races a purge:false close lands after the archive: it
+// is persisted into the hidden buffer but publishes no event and does not
+// resurface the buffer — the archive path's equivalent of the delete path's
+// close tombstone.
+func TestArchivedPartEchoStaysHidden(t *testing.T) {
+	h, conn, s, ev := archiveTestSetup(t)
+	ctxb := context.Background()
+
+	conn.ch <- ev(":AlteredParadox!u@h PART #foo")
+	time.Sleep(200 * time.Millisecond)
+	expectNoEvent(t, s) // no event broadcast may resurrect the buffer on clients
+	if bufs, _ := h.store.Buffers(ctxb); len(bufs) != 0 {
+		t.Fatalf("PART echo resurfaced the archived buffer: %+v", bufs)
+	}
+	if msgs, _ := h.store.Latest(ctxb, "libera", "#foo", 5); len(msgs) != 2 {
+		t.Fatalf("history = %d msgs, want seed + PART kept", len(msgs))
+	}
+}
+
+// Foreign membership fan-out (someone else's JOIN, a QUIT touching the
+// channel) must not resurface an archived buffer either.
+func TestArchivedForeignMembershipStaysHidden(t *testing.T) {
+	h, conn, s, ev := archiveTestSetup(t)
+	ctxb := context.Background()
+
+	conn.ch <- ev(":bob!u@h JOIN #foo")
+	conn.ch <- ev(":bob!u@h QUIT :bye", "#foo")
+	time.Sleep(200 * time.Millisecond)
+	expectNoEvent(t, s)
+	if bufs, _ := h.store.Buffers(ctxb); len(bufs) != 0 {
+		t.Fatalf("foreign membership resurfaced the archived buffer: %+v", bufs)
+	}
+}
+
+// Real conversation resurfaces an archived buffer: the event is broadcast
+// live and a fresh get_buffers lists the buffer again with its prior
+// history plus the new message.
+func TestArchivedBufferResurfacesOnContent(t *testing.T) {
+	h, conn, s, ev := archiveTestSetup(t)
+	ctxb := context.Background()
+
+	conn.ch <- ev(":bob!u@h PRIVMSG #foo :are you there?")
+	got := decode[EventData](t, recv(t, s, "event"))
+	if got.Buffer != "#foo" || got.Command != "PRIVMSG" {
+		t.Fatalf("resurfacing event = %+v, want PRIVMSG to #foo", got)
+	}
+	s.Handle(ctxb, request(t, "get_buffers", 2, nil))
+	data := decode[BuffersData](t, recv(t, s, "buffers"))
+	if len(data.Buffers) != 1 || data.Buffers[0].Buffer != "#foo" {
+		t.Fatalf("get_buffers after content = %+v, want [#foo]", data.Buffers)
+	}
+	if msgs, _ := h.store.Latest(ctxb, "libera", "#foo", 5); len(msgs) != 2 {
+		t.Fatalf("history = %d msgs, want prior 1 + new 1", len(msgs))
+	}
+}
+
+// Our own LIVE JOIN of an archived channel is a deliberate rejoin and
+// resurfaces it (a REPLAYED self-JOIN must not — see
+// TestReplayedSelfJoinDoesNotResurrectClosedChannel for the deleted-path
+// twin of that rule).
+func TestArchivedBufferResurfacesOnOwnLiveJoin(t *testing.T) {
+	h, conn, s, ev := archiveTestSetup(t)
+	ctxb := context.Background()
+
+	conn.ch <- ev(":AlteredParadox!u@h JOIN #foo")
+	got := decode[EventData](t, recv(t, s, "event", "members_changed"))
+	if got.Buffer != "#foo" || got.Command != "JOIN" {
+		t.Fatalf("resurfacing event = %+v, want own JOIN of #foo", got)
+	}
+	if bufs, _ := h.store.Buffers(ctxb); len(bufs) != 1 || bufs[0].Target != "#foo" {
+		t.Fatalf("Buffers after own live JOIN = %+v, want [#foo]", bufs)
+	}
+}

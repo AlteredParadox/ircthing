@@ -1284,10 +1284,12 @@ export function App() {
 			.catch((e) => setCmdError(e.message || "failed"));
 	}
 
-	// closeBuffer removes a buffer everywhere (leave/close): the stored
-	// history goes too — the sidebar is store-driven, so a buffer that
-	// stays in the store resurrects on the next refresh. Other devices
-	// drop it via the buffer_closed push.
+	// forgetBuffer is the LOCAL half of a close (either mode): drop the
+	// buffer's sidebar row, cached messages, and typing state. The server
+	// side (closeBuffer) deletes or archives the stored copy — the sidebar
+	// is store-driven, so a buffer left untouched in the store would
+	// resurrect on the next refresh. Other devices drop it via the
+	// buffer_closed push.
 	function forgetBuffer(network, buffer) {
 		const key = bufKey(network, buffer);
 		setBuffers((b) => {
@@ -1319,11 +1321,16 @@ export function App() {
 		}
 	}
 
-	async function closeBuffer(network, buffer) {
+	// closeBuffer removes a buffer from every device's sidebar. purge:true
+	// deletes its stored history (the destructive close, behind a confirm);
+	// purge:false archives it server-side — history kept, and the buffer
+	// returns with its scrollback on new activity. Local cleanup
+	// (forgetBuffer) is identical in both modes.
+	async function closeBuffer(network, buffer, purge) {
 		const s = sock.current;
 		if (!s) throw new Error("not connected");
 		try {
-			const d = await s.request("close_buffer", { network, buffer });
+			const d = await s.request("close_buffer", { network, buffer, purge });
 			// New servers return the canonical spelling they actually removed;
 			// fall back for compatibility with an older nil `ok` response.
 			forgetBuffer(d?.network || network, d?.buffer || buffer);
@@ -1413,6 +1420,30 @@ export function App() {
 		const muted = isMuted(mutesRef.current, key);
 		const chan = isChannelName(buffer, networksRef.current[network]?.chantypes);
 		const ig = !chan && isIgnored(ignoresRef.current, network, buffer);
+		// The purgeOnClose pref (default off) decides what closing means:
+		// off archives (history kept server-side, no confirmation); on is the
+		// destructive delete behind confirmDestructiveClose. Local cleanup is
+		// the same either way (closeBuffer -> forgetBuffer).
+		const purgeClose = prefsRef.current.purgeOnClose === true;
+		const doClose = async (leave, purge) => {
+			if (!leave) {
+				await closeBuffer(network, buffer, purge).catch(() => {});
+				return;
+			}
+			const s = sock.current;
+			if (!s) {
+				setCmdError("not connected");
+				return;
+			}
+			try {
+				// part_channel also removes the channel from autojoin. The stored
+				// history is touched only after both operations are acknowledged.
+				await s.request("part_channel", { network, channel: buffer });
+				await closeBuffer(network, buffer, purge);
+			} catch (e) {
+				setCmdError(e.message || "leaving channel failed");
+			}
+		};
 		const confirmDestructiveClose = (leave) => setMenu({
 			x, y, title: buffer,
 			items: [{
@@ -1420,25 +1451,7 @@ export function App() {
 					? "Really leave? This erases its scrollback"
 					: "Really close? This erases its scrollback",
 				danger: true,
-				onClick: async () => {
-					if (!leave) {
-						await closeBuffer(network, buffer).catch(() => {});
-						return;
-					}
-					const s = sock.current;
-					if (!s) {
-						setCmdError("not connected");
-						return;
-					}
-					try {
-						// part_channel also removes the channel from autojoin. History
-						// is deleted only after both operations are acknowledged.
-						await s.request("part_channel", { network, channel: buffer });
-						await closeBuffer(network, buffer);
-					} catch (e) {
-						setCmdError(e.message || "leaving channel failed");
-					}
-				},
+				onClick: () => doClose(leave, true),
 			}],
 		});
 		const items = [
@@ -1457,10 +1470,15 @@ export function App() {
 			},
 			chan
 				? {
-					label: "Leave channel…", danger: true,
-					onClick: () => confirmDestructiveClose(true),
+					label: purgeClose ? "Leave channel…" : "Leave channel",
+					danger: purgeClose,
+					onClick: () => (purgeClose ? confirmDestructiveClose(true) : doClose(true, false)),
 				}
-				: { label: "Close…", danger: true, onClick: () => confirmDestructiveClose(false) },
+				: {
+					label: purgeClose ? "Close…" : "Close",
+					danger: purgeClose,
+					onClick: () => (purgeClose ? confirmDestructiveClose(false) : doClose(false, false)),
+				},
 		];
 		setMenu({ x, y, title: buffer, items });
 	}
