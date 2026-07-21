@@ -43,9 +43,11 @@ type NetworkConfig struct {
 const (
 	ReservedRecoveryNetworkPrefix = "__ircthing_invalid_row_"
 	// MaxNetworkNameBytes keeps identifiers cheap in every state/event envelope
-	// and log context. IRC network names are local labels, not server-provided
-	// protocol fields; 128 bytes is deliberately generous.
-	MaxNetworkNameBytes = 128
+	// and log context. It must cover every legal EffectiveName fallback: an
+	// unnamed network is keyed by its addr, and proxydial.ValidHostPort accepts
+	// a 255-byte host plus ":65535" (~262 bytes). 300 covers that with room to
+	// spare. Mirrored by internal/netconf's maxNetworkNameBytes.
+	MaxNetworkNameBytes = 300
 	// MaxNetworkConfigs bounds reconnect goroutines and every process-wide
 	// network map. Existing over-cap databases may still edit/delete rows, but
 	// no ingress can grow them further.
@@ -68,12 +70,22 @@ func ValidateNetworkConfigRecord(name, config string) error {
 	return nil
 }
 
+// validateNetworkName rejects only what is unsafe to carry through envelopes,
+// logs, and the frontend's plain-object maps: empty or oversized names,
+// invalid UTF-8, control characters (NUL/CR/LF/tab injection), the reserved
+// recovery prefix, and the JS Object.prototype set below. Spaces and other
+// printable Unicode are deliberately legal — legacy databases hold names like
+// "Libera Chat", and rejecting them here would strand those rows behind the
+// destructive delete-only recovery path. Keep in sync with internal/netconf's
+// validNetworkName (the packages intentionally do not import each other:
+// store stays free of internal deps, and netconf must not pull in the
+// persistence layer).
 func validateNetworkName(name string) error {
 	if name == "" || strings.HasPrefix(name, ReservedRecoveryNetworkPrefix) || len(name) > MaxNetworkNameBytes || !utf8.ValidString(name) {
 		return fmt.Errorf("store: invalid network name")
 	}
 	for _, r := range name {
-		if unicode.IsSpace(r) || unicode.IsControl(r) {
+		if unicode.IsControl(r) {
 			return fmt.Errorf("store: invalid network name")
 		}
 	}

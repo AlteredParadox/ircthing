@@ -280,7 +280,9 @@ func TestRawInvalidLegacyNetworkMutationsAreRejected(t *testing.T) {
 	ctx := context.Background()
 	cfg := json.RawMessage(`{"name":"replacement","addr":"127.0.0.1:1","allow_plaintext":true,"nick":"AlteredParadox"}`)
 
-	for i, name := range []string{"bad name", store.ReservedRecoveryNetworkPrefix + "7", strings.Repeat("n", store.MaxNetworkNameBytes+1)} {
+	// Spaced names are deliberately absent here: they are ordinary legal
+	// names since the rule was relaxed to grandfather legacy databases.
+	for i, name := range []string{"bad\x1bname", store.ReservedRecoveryNetworkPrefix + "7", strings.Repeat("n", store.MaxNetworkNameBytes+1)} {
 		s.Handle(ctx, request(t, "put_network", int64(i*2+1), PutNetworkReq{OldName: name, Config: cfg}))
 		if got := decode[ErrorData](t, recv(t, s, "error")); got.Code != "bad_request" {
 			t.Fatalf("put with raw legacy name %q: code=%q", name, got.Code)
@@ -289,6 +291,34 @@ func TestRawInvalidLegacyNetworkMutationsAreRejected(t *testing.T) {
 		if got := decode[ErrorData](t, recv(t, s, "error")); got.Code != "bad_request" {
 			t.Fatalf("delete with raw legacy name %q: code=%q", name, got.Code)
 		}
+	}
+}
+
+// A printable spaced name ("Libera Chat") is an ordinary name: creatable,
+// editable under its own name, and deletable through the normal paths.
+// Legacy databases hold such names; they must never be forced through the
+// destructive delete-only recovery path.
+func TestPutNetworkAcceptsSpacedName(t *testing.T) {
+	h := newTestHub(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	h.UseRoot(ctx, &wg)
+	defer wg.Wait() // after cancel: reap the manager goroutines
+	defer cancel()
+	s := h.NewSession()
+	defer s.Close()
+	ctxb := context.Background()
+
+	cfg := json.RawMessage(`{"name":"Libera Chat","addr":"127.0.0.1:1","allow_plaintext":true,"nick":"AlteredParadox"}`)
+	s.Handle(ctxb, request(t, "put_network", 1, PutNetworkReq{Config: cfg}))
+	recv(t, s, "ok", "networks_changed", "state")
+	edited := json.RawMessage(`{"name":"Libera Chat","addr":"127.0.0.1:2","allow_plaintext":true,"nick":"AlteredParadox"}`)
+	s.Handle(ctxb, request(t, "put_network", 2, PutNetworkReq{OldName: "Libera Chat", Config: edited}))
+	recv(t, s, "ok", "networks_changed", "state", "network_removed")
+	s.Handle(ctxb, request(t, "delete_network", 3, NetworkRef{Network: "Libera Chat"}))
+	recv(t, s, "ok", "networks_changed", "state", "network_removed")
+	if count, err := h.store.NetworkConfigCount(ctxb); err != nil || count != 0 {
+		t.Fatalf("count after delete = %d err=%v, want 0", count, err)
 	}
 }
 

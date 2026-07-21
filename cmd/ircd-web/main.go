@@ -259,7 +259,6 @@ func startNetworks(ctx context.Context, st *store.Store, h *hub.Hub, fileNetwork
 	var after int64
 	tracked := 0
 	legacySkipped := 0
-loadPages:
 	for {
 		rows, more, err := st.NetworkConfigsPage(ctx, after, 16)
 		if err != nil {
@@ -273,18 +272,23 @@ loadPages:
 		}
 		for _, row := range rows {
 			after = row.PageID
-			if tracked >= store.MaxNetworkConfigs {
-				if count > tracked {
-					legacySkipped = count - tracked
-				}
-				break loadPages
-			}
-			tracked++
 			if row.InvalidName {
+				// Registered before (and not counted toward) the runtime cap: an
+				// invalid-name row never starts a network, and get_networks
+				// synthesizes a recovery entry for every such row it pages — each
+				// one must map to a deletable rowid here, or the advertised
+				// delete affordance dead-ends on itself.
 				label := h.NoteInvalidNetwork(row.PageID)
 				log.Printf("networks: %s represents row %d whose stored name violates current safety bounds; delete and recreate it", label, row.PageID)
 				continue
 			}
+			if tracked >= store.MaxNetworkConfigs {
+				// Keep paging — invalid-name rows on later pages must still
+				// register above — but start nothing further.
+				legacySkipped++
+				continue
+			}
+			tracked++
 			if row.Oversized {
 				log.Printf("networks: skipping row %d: stored definition exceeds the %d-byte safety limit", row.PageID, store.MaxNetworkConfigBytes)
 				h.NoteStoppedNetwork(row.Name)

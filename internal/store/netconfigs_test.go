@@ -77,8 +77,8 @@ func TestNetworkConfigBoundsAndPaging(t *testing.T) {
 	if err := s.PutNetworkConfig(ctx, strings.Repeat("n", MaxNetworkNameBytes+1), `{}`); err == nil {
 		t.Fatal("oversized network name was accepted")
 	}
-	if err := s.PutNetworkConfig(ctx, "bad name", `{}`); err == nil {
-		t.Fatal("whitespace-bearing network name was accepted")
+	if err := s.PutNetworkConfig(ctx, "bad\x1bname", `{}`); err == nil {
+		t.Fatal("control-bearing network name was accepted")
 	}
 	if err := s.PutNetworkConfig(ctx, "__proto__", `{}`); err == nil {
 		t.Fatal("prototype-colliding network name was accepted")
@@ -145,6 +145,57 @@ func TestNetworkConfigBoundsAndPaging(t *testing.T) {
 	}
 	if !found || !foundNUL || !foundPrototype {
 		t.Fatalf("legacy recovery rows: regular=%v nul=%v prototype=%v", found, foundNUL, foundPrototype)
+	}
+}
+
+// The name rule rejects only what is unsafe (control characters, invalid
+// UTF-8, reserved names, oversized): printable Unicode including interior
+// spaces is legal, because legacy databases hold names like "Libera Chat"
+// and rejecting them would strand those rows behind the destructive
+// delete-only recovery path.
+func TestValidateNetworkName(t *testing.T) {
+	valid := []string{
+		"libera",
+		"Libera Chat", // interior space: pre-hardening databases hold such names
+		"Libera  Chat (backup)",
+		"ネット ワーク", // printable non-ASCII with a space
+		strings.Repeat("n", MaxNetworkNameBytes), // exactly at the cap
+	}
+	for _, name := range valid {
+		if err := validateNetworkName(name); err != nil {
+			t.Errorf("validateNetworkName(%q) = %v, want nil", name, err)
+		}
+	}
+	invalid := []string{
+		"",
+		strings.Repeat("n", MaxNetworkNameBytes+1),
+		"bad\x00name",
+		"bad\rname",
+		"bad\nname",
+		"bad\tname",
+		"bad\x1bname",
+		"\xff\xfe", // not UTF-8
+		ReservedRecoveryNetworkPrefix + "1__",
+		"__proto__",
+		"toString",
+	}
+	for _, name := range invalid {
+		if err := validateNetworkName(name); err == nil {
+			t.Errorf("validateNetworkName(%q) = nil, want error", name)
+		}
+	}
+
+	// A spaced legacy-style name round-trips through the store as an
+	// ordinary, addressable row — never as an invalid-name recovery entry.
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+	if err := s.PutNetworkConfig(ctx, "Libera Chat", `{"addr":"a:1"}`); err != nil {
+		t.Fatalf("spaced name rejected at ingress: %v", err)
+	}
+	rows, _, err := s.NetworkConfigsPage(ctx, 0, 10)
+	if err != nil || len(rows) != 1 || rows[0].InvalidName || rows[0].Name != "Libera Chat" {
+		t.Fatalf("spaced-name page = %#v err=%v", rows, err)
 	}
 }
 

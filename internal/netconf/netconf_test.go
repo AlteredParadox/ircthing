@@ -46,7 +46,13 @@ func TestParse(t *testing.T) {
 		// Empty mechanism + no password auto-selects EXTERNAL, so it needs a keypair too.
 		{"auto-EXTERNAL without keypair", `{"addr": "a:1", "nick": "me", "sasl": {}}`, "cert_file and key_file"},
 		{"reserved network name", `{"name": "__proto__", "addr": "a:1", "nick": "me"}`, "reserved"},
-		{"network name whitespace", `{"name": "bad name", "addr": "a:1", "nick": "me"}`, "whitespace"},
+		// Interior spaces are legal: legacy configs/databases hold names
+		// like "Libera Chat" and must keep working.
+		{"network name with spaces", `{"name": "My Network", "addr": "a:1", "nick": "me"}`, ""},
+		// An unnamed network is keyed by its addr; when that fallback hits
+		// the name rule, the error must blame the missing name, not a
+		// "name" field the user never set.
+		{"reserved-prefix addr fallback", `{"addr": "__ircthing_invalid_row_1:6667", "nick": "me"}`, "no name and its addr"},
 		{"network name control", `{"name": "bad\u001bname", "addr": "a:1", "nick": "me"}`, "control"},
 	}
 	for _, tc := range cases {
@@ -56,8 +62,11 @@ func TestParse(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Parse: %v", err)
 				}
-				if n.EffectiveName() != n.Addr {
+				if n.Name == "" && n.EffectiveName() != n.Addr {
 					t.Fatalf("EffectiveName = %q, want addr", n.EffectiveName())
+				}
+				if n.Name != "" && n.EffectiveName() != n.Name {
+					t.Fatalf("EffectiveName = %q, want name", n.EffectiveName())
 				}
 				return
 			}
@@ -69,5 +78,18 @@ func TestParse(t *testing.T) {
 	long := &Network{Name: strings.Repeat("n", maxNetworkNameBytes+1), Addr: "a:1", Nick: "me"}
 	if err := long.Validate(); err == nil || !strings.Contains(err.Error(), "at most") {
 		t.Fatalf("long network name validation = %v", err)
+	}
+	// An unnamed network whose addr is a long-but-legal hostname must
+	// validate: the name cap is sized to cover every addr ValidHostPort
+	// accepts, so the fallback can never fail on length alone.
+	unnamed := &Network{Addr: strings.Repeat("h", 130) + ":6667", Nick: "me"}
+	if err := unnamed.Validate(); err != nil {
+		t.Fatalf("unnamed network with 130-byte host = %v, want valid", err)
+	}
+	// A >300-byte addr never reaches the name fallback — ValidHostPort caps
+	// hosts at 255 bytes and rejects it first, blaming the addr.
+	huge := &Network{Addr: strings.Repeat("h", 301) + ":6667", Nick: "me"}
+	if err := huge.Validate(); err == nil || !strings.Contains(err.Error(), "addr") {
+		t.Fatalf("oversized addr = %v, want addr error", err)
 	}
 }

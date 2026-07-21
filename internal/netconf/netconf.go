@@ -114,7 +114,10 @@ func (n *Network) EffectiveName() string {
 const (
 	maxChannels         = 4096
 	maxChannelLen       = 200
-	maxNetworkNameBytes = 128 // mirrored by store.MaxNetworkNameBytes
+	// maxNetworkNameBytes is mirrored by store.MaxNetworkNameBytes: sized so
+	// any addr proxydial.ValidHostPort accepts (255-byte host + ":65535",
+	// ~262 bytes) can serve as the EffectiveName fallback.
+	maxNetworkNameBytes = 300
 )
 
 func (n *Network) Validate() error {
@@ -146,16 +149,13 @@ func (n *Network) validateIdentity() error {
 		return errors.New("nick is required")
 	}
 	name := n.EffectiveName()
-	if len(name) > maxNetworkNameBytes || !utf8.ValidString(name) {
-		return fmt.Errorf("network name must be valid UTF-8 and at most %d bytes", maxNetworkNameBytes)
-	}
-	for _, r := range name {
-		if unicode.IsSpace(r) || unicode.IsControl(r) {
-			return errors.New("network name must not contain whitespace or control characters")
+	if err := validNetworkName(name); err != nil {
+		if n.Name == "" {
+			// The failing value is the addr standing in for a missing name
+			// (EffectiveName fallback) — blame the right field.
+			return fmt.Errorf("network has no name and its addr %q is not usable as one (%v); set a short \"name\"", n.Addr, err)
 		}
-	}
-	if strings.HasPrefix(name, "__ircthing_invalid_row_") {
-		return fmt.Errorf("network name %q is reserved", name)
+		return err
 	}
 	// Egress is either a proxy or a WireGuard tunnel, never both. The full
 	// WireGuard validation is deferred to wgdial.Validate via IRCConfig/NewManager;
@@ -163,6 +163,29 @@ func (n *Network) validateIdentity() error {
 	// the combo directly, independent of that funnel (defense in depth).
 	if n.Proxy != "" && n.WireGuard != nil {
 		return errors.New("proxy and wireguard are mutually exclusive")
+	}
+	return nil
+}
+
+// validNetworkName rejects only what is unsafe in a network identifier:
+// oversized names, invalid UTF-8, control characters (NUL/CR/LF/tab
+// injection), the reserved recovery prefix, and the JS Object.prototype set
+// below. Spaces and other printable Unicode are deliberately legal — legacy
+// configs and databases hold names like "Libera Chat". Keep in sync with
+// internal/store's validateNetworkName (the packages intentionally do not
+// import each other: store stays free of internal deps, and netconf must not
+// pull in the persistence layer).
+func validNetworkName(name string) error {
+	if len(name) > maxNetworkNameBytes || !utf8.ValidString(name) {
+		return fmt.Errorf("network name must be valid UTF-8 and at most %d bytes", maxNetworkNameBytes)
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return errors.New("network name must not contain control characters")
+		}
+	}
+	if strings.HasPrefix(name, "__ircthing_invalid_row_") {
+		return fmt.Errorf("network name %q is reserved", name)
 	}
 	// The frontend keys several plain JS objects by the network name (ignores,
 	// monitors, per-network maps). A name that collides with an Object.prototype
