@@ -76,18 +76,23 @@ func (s *Store) stsAliasesLocked(ctx context.Context, host string) ([]stsAlias, 
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	var aliases []stsAlias
 	for rows.Next() {
 		var a stsAlias
 		if err := rows.Scan(&a.key, &a.value); err != nil {
-			rows.Close()
 			return nil, err
 		}
 		if canonicalSTSHost(strings.TrimPrefix(a.key, "sts:")) == canonicalSTSHost(host) {
 			aliases = append(aliases, a)
 		}
 	}
-	if err := rows.Close(); err != nil {
+	// A mid-iteration failure (driver error, context cancellation) makes Next
+	// return false with the rows already auto-closed and Close returning nil;
+	// only Err reports it. Without this check a truncated — possibly empty —
+	// alias list would be returned as success, read upstream as "no policy
+	// stored", permitting exactly the plaintext downgrade this file prevents.
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	return aliases, nil
@@ -236,9 +241,19 @@ func (s *Store) STSPolicy(ctx context.Context, host string) (port int, until tim
 // (×1e6) stays well within int64. Mirrors the parse-time clamp in internal/irc.
 const maxSTSDurationMs = int64(100*365*24*60*60) * 1000
 
+// errSTSGenerationExhausted marks a revision/policy-epoch counter that cannot
+// be incremented. Healthy counters never get near MaxUint64 (freshSTSGeneration
+// yields values below 2^63 and each mutation adds one), so this shape only
+// arises from a tampered or corrupted record — the same threat model as
+// errCorruptSTSPolicy, and it gets the same treatment: reads and CAS
+// reschedules fail closed; an authoritative Set/Clear repairs by minting fresh
+// generations. Failing forever instead would leave the tampered policy
+// enforced AND unclearable — a permanently wedged network.
+var errSTSGenerationExhausted = errors.New("sts: policy revision exhausted")
+
 func nextSTSRevision(current uint64) (uint64, error) {
 	if current == math.MaxUint64 {
-		return 0, errors.New("sts: policy revision exhausted")
+		return 0, errSTSGenerationExhausted
 	}
 	return current + 1, nil
 }
@@ -299,7 +314,8 @@ func (s *Store) writeSTSRecordLocked(ctx context.Context, host string, rec stsRe
 // Disabled policies are tombstones rather than deleted rows, preventing an
 // ABA where a stale generation-zero manager resurrects a cleared policy. An
 // unconditional Set/Clear is authoritative because it came from a verified
-// TLS connection, so it may replace corrupt rows; a CAS reschedule never may.
+// TLS connection, so it may replace corrupt or exhaustion-tampered rows; a
+// CAS reschedule never may.
 func (s *Store) updateSTS(ctx context.Context, host string, expected *uint64, makeRecord func(uint64, stsRecord, bool) (stsRecord, bool, error)) (revision, policyEpoch uint64, applied bool, err error) {
 	host = canonicalSTSHost(host)
 	s.mu.Lock()
@@ -308,10 +324,11 @@ func (s *Store) updateSTS(ctx context.Context, host string, expected *uint64, ma
 	var repairAliases []stsAlias
 	var current stsRecord
 	if err != nil {
-		if expected != nil || !errors.Is(err, errCorruptSTSPolicy) {
+		if expected != nil || !(errors.Is(err, errCorruptSTSPolicy) || errors.Is(err, errSTSGenerationExhausted)) {
 			return 0, 0, false, err
 		}
-		// The semantic record is unreadable, but a fresh Set/Clear can safely
+		// The semantic record is unreadable — or legacy-alias migration hit an
+		// exhausted (tampered) counter — but a fresh Set/Clear can safely
 		// replace it. Gather every equivalent spelling for atomic deletion, then
 		// start from an opaque generation rather than zero (ABA protection).
 		repairAliases, err = s.stsAliasesLocked(ctx, host)
@@ -336,6 +353,25 @@ func (s *Store) updateSTS(ctx context.Context, host string, expected *uint64, ma
 	}
 	if expected != nil && current.Revision != *expected {
 		return current.Revision, current.PolicyEpoch, false, nil
+	}
+	// A record that decodes cleanly but carries a counter at MaxUint64 is
+	// exhaustion-tampered (see errSTSGenerationExhausted): incrementing it in
+	// makeRecord would fail every future Set/Clear, wedging the network on
+	// whatever the record pins. An authoritative mutation re-mints both
+	// generations, exactly as for an undecodable record. A CAS reschedule
+	// (expected != nil) is skipped here and keeps failing closed inside
+	// makeRecord, so healthy optimistic concurrency is untouched.
+	if expected == nil && (current.Revision == math.MaxUint64 || current.PolicyEpoch == math.MaxUint64) {
+		freshRevision, err := freshSTSGeneration()
+		if err != nil {
+			return 0, 0, false, err
+		}
+		freshEpoch, err := freshSTSGeneration()
+		if err != nil {
+			return 0, 0, false, err
+		}
+		current.Revision = freshRevision
+		current.PolicyEpoch = freshEpoch
 	}
 	next, apply, err := makeRecord(current.Revision, current, present)
 	if err != nil || !apply {
