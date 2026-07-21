@@ -495,6 +495,14 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 						value={draft}
 						onInput={(e) => draftChanged(e.currentTarget.value)}
 						onKeyDown={(e) => {
+							// Per UI Events, the keystroke that commits an IME
+							// conversion candidate fires keydown with key=="Enter"
+							// and isComposing==true (keyCode 229 in Chromium)
+							// BEFORE compositionend. Without this guard that Enter
+							// would preventDefault the commit and send the
+							// half-composed draft. Mirrors the type-anywhere
+							// handler's isComposing check above.
+							if (e.isComposing || e.keyCode === 229) return;
 							// Tab completes commands/emoji/nicks and cycles on
 							// repeat; Shift+Tab cycles backwards.
 							if (e.key === "Tab") {
