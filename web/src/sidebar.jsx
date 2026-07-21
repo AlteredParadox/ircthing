@@ -26,7 +26,7 @@ function stateDot(state) {
 	return "offline";
 }
 
-export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSet, onSelect, onSettings, onBufferMenu, onNetworkMenu, onAddNetwork, onAddMonitor, onRemoveMonitor }) {
+export function Sidebar({ networks, buffers, activeKey, monitors, truncated, theme, mutedSet, onSelect, onSettings, onBufferMenu, onNetworkMenu, onAddNetwork, onAddMonitor, onRemoveMonitor }) {
 	// One shared flag: a long-press that opened a menu suppresses the tap
 	// that follows it. pressTimer holds the pending hold timer across
 	// re-renders (see longPress) so a mid-hold re-render can't orphan it.
@@ -58,6 +58,11 @@ export function Sidebar({ networks, buffers, activeKey, monitors, theme, mutedSe
 				<div class="side-meta">{sections.length} net{sections.length === 1 ? "" : "s"}</div>
 				<button class="monitor-addbtn" title="Add network" onClick={onAddNetwork}>+</button>
 			</div>
+			{truncated && (
+				<div class="data-warning" role="status" title="The server response reached its safety limit.">
+					Buffer list incomplete — server limit reached
+				</div>
+			)}
 			<div class="side-list scroll">
 				{sections.map((sec) => (
 					<div class="net-group" key={sec.name}>

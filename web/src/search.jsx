@@ -52,6 +52,7 @@ function tombstoneMatching(rs, d) {
 export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep, redactedIds }) {
 	const [query, setQuery] = useState("");
 	const [results, setResults] = useState([]);
+	const [hasMore, setHasMore] = useState(false);
 	const [state, setState] = useState("idle"); // idle | loading | done
 	const inputRef = useRef(null);
 	const seq = useRef(0);
@@ -85,10 +86,12 @@ export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep, redacte
 			// its `mine === seq.current` guard and repopulate the cleared panel.
 			++seq.current;
 			setResults([]);
+			setHasMore(false);
 			setState("idle");
 			return;
 		}
 		setState("loading");
+		setHasMore(false);
 		const mine = ++seq.current;
 		const t = setTimeout(() => {
 			sock.current
@@ -98,6 +101,7 @@ export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep, redacte
 					// Apply known tombstones to the freshly-installed rows: a row
 					// snapshotted before its redaction scrub must not display content.
 					setResults(tombstoneResults(data.messages || [], redactedIds));
+					setHasMore(data.has_more === true);
 					setState("done");
 				})
 				.catch(() => mine === seq.current && setState("done"));
@@ -141,6 +145,9 @@ export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep, redacte
 							</div>
 						);
 					})}
+					{state === "done" && hasMore && (
+						<div class="search-note">more matches exist — refine your search</div>
+					)}
 				</div>
 			</div>
 		</div>

@@ -547,13 +547,16 @@ export function parseInput(input, buffer, chantypes) {
 	const cmd = (sp === -1 ? body : body.slice(0, sp)).toLowerCase();
 	if (!cmd) return err("usage: /<command>");
 	const rest = sp === -1 ? "" : body.slice(sp + 1).trim();
-	const parse = CMD_PARSERS[cmd];
+	// The command name is untrusted composer input. Never walk Object.prototype:
+	// `/constructor` used to select the inherited constructor function, while
+	// `/__proto__` selected an object and then threw when invoked.
+	const parse = Object.prototype.hasOwnProperty.call(CMD_PARSERS, cmd) ? CMD_PARSERS[cmd] : null;
 	return parse ? parse(rest, buffer, chantypes, err) : err("unknown command /" + cmd);
 }
 
 // One parser per command, uniform (rest, buffer, chantypes, err)
 // signature; the table doubles as the COMMANDS completion source.
-const CMD_PARSERS = {
+const CMD_PARSERS = Object.assign(Object.create(null), {
 	me: (rest, _buffer, _ct, err) =>
 		rest ? { type: "text", text: "\x01ACTION " + rest + "\x01" } : err("usage: /me <action>"),
 	msg: parseMsgCmd,
@@ -580,7 +583,7 @@ const CMD_PARSERS = {
 	mode: parseModeCmd,
 	kick: parseKickCmd,
 	invite: parseInviteCmd,
-};
+});
 
 // COMMANDS lists every slash command parseInput understands, for
 // composer tab-completion — derived from the parser table so the two
@@ -755,6 +758,66 @@ export function typingExpired(state, at, now) {
 	return now - at > (state === "paused" ? 30000 : 6000);
 }
 
+// Browser-side typing state is deliberately much smaller than the message
+// working set. A server controls typing pushes, so both dimensions need hard
+// caps even though legitimate channels rarely have more than a handful of
+// simultaneous typers. Maps also avoid special property names such as
+// "__proto__" changing the representation itself.
+export const MAX_TYPING_BUFFERS = 128;
+export const MAX_TYPERS_PER_BUFFER = 64;
+
+export function clearTypingNick(all, key, nick) {
+	const cur = all.get(key);
+	if (!cur?.has(nick)) return all;
+	const next = new Map(all);
+	const nicks = new Map(cur);
+	nicks.delete(nick);
+	if (nicks.size) next.set(key, nicks);
+	else next.delete(key);
+	return next;
+}
+
+// updateTypingState applies one already-authorized push. Callers pass
+// knownBuffer=false for unknown/closed buffers so a hostile server cannot
+// create state for arbitrary names. A stray "done" is always a no-op.
+export function updateTypingState(all, key, d, knownBuffer, now = Date.now()) {
+	if (!knownBuffer || !key || !d?.nick) return all;
+	const cur = all.get(key);
+	if (d.state === "done") return clearTypingNick(all, key, d.nick);
+	if (d.state !== "active" && d.state !== "paused") return all;
+	if (!cur && all.size >= MAX_TYPING_BUFFERS) return all;
+	if (!cur?.has(d.nick) && (cur?.size || 0) >= MAX_TYPERS_PER_BUFFER) return all;
+	const next = new Map(all);
+	const nicks = new Map(cur || []);
+	nicks.set(d.nick, { state: d.state, at: now });
+	next.set(key, nicks);
+	return next;
+}
+
+export function expireTypingState(all, now = Date.now()) {
+	let next = all;
+	for (const [key, cur] of all) {
+		let nicks = cur;
+		for (const [nick, v] of cur) {
+			if (!typingExpired(v.state, v.at, now)) continue;
+			if (next === all) next = new Map(all);
+			if (nicks === cur) nicks = new Map(cur);
+			nicks.delete(nick);
+		}
+		if (nicks === cur) continue;
+		if (nicks.size) next.set(key, nicks);
+		else next.delete(key);
+	}
+	return next;
+}
+
+// New servers explicitly say whether another byte-bounded history page is
+// available. Retain the old full-page heuristic for rolling upgrades.
+export function historyHasMore(page, limit) {
+	if (typeof page?.has_more === "boolean") return page.has_more;
+	return (page?.messages?.length || 0) >= limit;
+}
+
 // firstURL returns the first http(s) link in text, or "".
 export function firstURL(text) {
 	for (const seg of linkify(text)) {
@@ -802,7 +865,7 @@ export function bufKey(network, buffer) {
 // buffer the server has intentionally dropped (e.g. closed on another
 // device while this client was offline); it must not be resurrected. Pure,
 // so it can be unit tested.
-export function mergeServerBuffers(dataBuffers, prev, nets) {
+export function mergeServerBuffers(dataBuffers, prev, nets, truncated = false) {
 	const bufs = {};
 	for (const b of dataBuffers || []) {
 		const key = bufKey(b.network, b.buffer);
@@ -816,7 +879,7 @@ export function mergeServerBuffers(dataBuffers, prev, nets) {
 		};
 	}
 	for (const key of Object.keys(prev)) {
-		if (!bufs[key] && prev[key].ephemeral && prev[key].network in nets) bufs[key] = prev[key];
+		if (!bufs[key] && (prev[key].ephemeral || truncated) && prev[key].network in nets) bufs[key] = prev[key];
 	}
 	return bufs;
 }

@@ -16,7 +16,10 @@
 
 import { deepStrictEqual as eq, strictEqual as is } from "node:assert";
 import { test } from "node:test";
-import { ACCENT_RGB, ACCENTS, DEFAULTS, normalizePrefs, resolveTheme } from "../src/prefs.js";
+import {
+	ACCENT_RGB, ACCENTS, DEFAULTS, MAX_PREFS_BYTES,
+	clampPrefsToBudget, normalizePrefs, prefsByteLength, resolveTheme,
+} from "../src/prefs.js";
 
 test("normalizePrefs: defaults for missing/garbage input", () => {
 	eq(normalizePrefs(null), DEFAULTS);
@@ -69,4 +72,13 @@ test("resolveTheme", () => {
 
 test("every accent has a swatch color", () => {
 	for (const a of ACCENTS) is(typeof ACCENT_RGB[a], "string", a);
+});
+
+test("custom CSS is clamped by serialized UTF-8 bytes", () => {
+	const p = normalizePrefs({ css: "😀\\\"\n".repeat(30000) });
+	is(prefsByteLength(p) <= MAX_PREFS_BYTES, true);
+	is(p.css.length > 0, true);
+	is(p.css.endsWith("\ud83d"), false, "does not split a surrogate pair");
+	const again = clampPrefsToBudget(p);
+	eq(again, p, "already-valid prefs are unchanged");
 });

@@ -284,6 +284,7 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 							<button
 								type="button"
 								class={"nf-danger" + (confirmDel ? " confirm" : "")}
+								disabled={busy}
 								onClick={() => (confirmDel ? onDelete(oldName) : setConfirmDel(true))}
 							>
 								{confirmDel ? "Really remove? This erases its scrollback" : "Remove network"}
@@ -304,12 +305,12 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 // input is NOT prefilled with "#": pasting "#chan" after a prefilled
 // "#" silently made "##chan" — a different (and valid) channel. A
 // missing chantype prefix is added on submit instead.
-export function ChannelPrompt({ network, chantypes, error, onJoin, onClose }) {
+export function ChannelPrompt({ network, chantypes, error, busy, onJoin, onClose }) {
 	const [name, setName] = useState("");
 	function submit(e) {
 		e.preventDefault();
 		let n = name.trim();
-		if (!n) return;
+		if (!n || busy) return;
 		if (!(chantypes || "#").includes(n[0])) n = "#" + n;
 		if (n.length > 1) onJoin(network, n);
 	}
@@ -330,11 +331,12 @@ export function ChannelPrompt({ network, chantypes, error, onJoin, onClose }) {
 						onInput={(e) => setName(e.currentTarget.value)}
 						placeholder="#channel"
 						autofocus
+						disabled={busy}
 					/>
 					{error && <div class="cmd-error">{error}</div>}
 					<div class="nf-actions">
 						<div class="nf-spacer" />
-						<button type="submit" class="btn-accent" disabled={!name.trim()}>Join</button>
+						<button type="submit" class="btn-accent" disabled={!name.trim() || busy}>{busy ? "Joining…" : "Join"}</button>
 					</div>
 				</div>
 			</form>

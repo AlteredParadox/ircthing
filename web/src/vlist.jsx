@@ -15,7 +15,16 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import { useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
-import { anchorId, computeWindow, Geometry, pinnedAfterScroll, prependedCount } from "./vmath.js";
+import {
+	anchorId,
+	captureViewportAnchor,
+	computeWindow,
+	Geometry,
+	hasNonAppendIdentityChange,
+	pinnedAfterScroll,
+	prependedCount,
+	restoreViewportAnchor,
+} from "./vmath.js";
 
 const SCROLL_SETTLE_MS = 160;
 
@@ -108,6 +117,7 @@ export function VirtualList({
 	onNearTop,
 	onPinned,
 	focusId,
+	layoutKey,
 	overscan = 600,
 	nearTopPx = 400,
 }) {
@@ -127,15 +137,56 @@ export function VirtualList({
 	const rowEls = useRef(new Map()); // id -> element
 	const position = useRef({ knownTop: 0, internalTop: null, owned: false });
 	const prevItems = useRef(null);
+	const prevLayoutKey = useRef(layoutKey);
+	const pendingLayoutAnchor = useRef(null);
 	const tailNeedsRestore = useRef(true);
 	const onPinnedRef = useRef(onPinned);
 	onPinnedRef.current = onPinned;
+	const el = scroller.current;
+	const origin = el ? contentOrigin(el, headerEl.current) : 0;
+	const actualViewTop = el ? Math.max(0, el.scrollTop - origin) : 0;
+
+	// A layout-affecting preference can change every row without changing its
+	// item identity. Capture the current row before dropping measurements, then
+	// render around its new estimated offset in this same commit. Doing this
+	// during render (the layoutKey prop caused the render) avoids one frame whose
+	// spacers still use stale font/density/CSS heights.
+	if (prevLayoutKey.current !== layoutKey) {
+		if (!pinned.current && el) {
+			pendingLayoutAnchor.current = captureViewportAnchor(geo, geo.items, actualViewTop);
+		}
+		geo.clearMeasured();
+		prevLayoutKey.current = layoutKey;
+		if (pinned.current) tailNeedsRestore.current = true;
+	}
+
+	let forceIndexRebuild = false;
 	if (prevItems.current !== items) {
+		// Same-id rows can change their rendered body (redaction, collapsed-run
+		// membership, preview data). A filter/collapse rewrite can instead remove
+		// rows while every survivor keeps the same object identity, so detect that
+		// from the stable-id sequence too. Ordinary tail appends remain unanchored.
+		const oldItems = geo.items;
+		const contentAnchor = !pinned.current && el
+			? captureViewportAnchor(geo, oldItems, actualViewTop)
+			: null;
+		const structuralChange = hasNonAppendIdentityChange(oldItems, items);
+		forceIndexRebuild = structuralChange;
+		const tailAppend = !structuralChange && items.length > oldItems.length;
+		// Collapse mode rebuilds synthetic row objects when the source list grows,
+		// even when their stable ids/content did not change. Keep those useful
+		// measurements on a pure tail append; visible real changes are still
+		// corrected by ResizeObserver.
+		const changedRows = tailAppend ? 0 : geo.invalidateChanged(items);
+		if ((structuralChange || (changedRows > 0 && !tailAppend)) &&
+			contentAnchor && !pendingLayoutAnchor.current) {
+			pendingLayoutAnchor.current = contentAnchor;
+		}
 		prevItems.current = items;
 		tailNeedsRestore.current = true;
 	}
 
-	geo.setItems(items);
+	geo.setItems(items, forceIndexRebuild);
 
 	// A new focus target (a search jump) unpins and requests a scroll-to
 	// once the item is present. Set synchronously so the window below
@@ -161,9 +212,10 @@ export function VirtualList({
 	prevFirstId.current = items.length ? anchorId(items[0]) : null;
 
 	// Current window from the last known scroll position.
-	const el = scroller.current;
-	const origin = el ? contentOrigin(el, headerEl.current) : 0;
-	const viewTop = el ? el.scrollTop - origin : 0;
+	const anchorTop = !pinned.current
+		? restoreViewportAnchor(geo, pendingLayoutAnchor.current)
+		: null;
+	const viewTop = anchorTop ?? actualViewTop;
 	const viewH = el ? el.clientHeight : 800;
 	const { start, end } = computeWindow(geo, items.length, {
 		viewTop, viewH, overscan,
@@ -229,7 +281,16 @@ export function VirtualList({
 			const widthChanged = nextWidth !== lastWidth;
 			lastWidth = nextWidth;
 			lastHeight = nextHeight;
-			if (widthChanged) geo.clearMeasured();
+			if (widthChanged) {
+				if (!pinned.current) {
+					pendingLayoutAnchor.current = captureViewportAnchor(
+						geo,
+						geo.items,
+						Math.max(0, sc.scrollTop - contentOrigin(sc, headerEl.current)),
+					);
+				}
+				geo.clearMeasured();
+			}
 			if (pinned.current) {
 				tailNeedsRestore.current = true;
 				if (canRestoreTail(
@@ -396,6 +457,7 @@ export function VirtualList({
 			// detected in the same commit — otherwise it fires on the next commit
 			// and scrolls the view off the focused row.
 			pendingPrepend.current = 0;
+			pendingLayoutAnchor.current = null;
 			tailNeedsRestore.current = false;
 			clearUserScroll();
 			centerRow(sc, position, geo, contentOrigin(sc, headerEl.current), focusIdx);
@@ -405,6 +467,22 @@ export function VirtualList({
 				onPinnedRef.current?.(false);
 			}
 			if (!pinned.current && sc.scrollHeight - sc.clientHeight < 40) {
+				pinned.current = true;
+				onPinnedRef.current?.(true);
+			}
+			return;
+		}
+		if (!pinned.current && pendingLayoutAnchor.current) {
+			// The window above was deliberately rendered around this id using
+			// the new estimates. Place it at the same intra-row pixel before paint;
+			// ResizeObserver then compensates as the rendered neighborhood acquires
+			// real heights.
+			const top = restoreViewportAnchor(geo, pendingLayoutAnchor.current);
+			pendingLayoutAnchor.current = null;
+			pendingPrepend.current = 0; // the stable-id anchor subsumes prepend math
+			tailNeedsRestore.current = false;
+			if (top !== null) writeScroll(sc, position, contentOrigin(sc, headerEl.current) + top);
+			if (sc.scrollHeight - sc.clientHeight < 40) {
 				pinned.current = true;
 				onPinnedRef.current?.(true);
 			}

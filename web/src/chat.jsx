@@ -256,8 +256,7 @@ function estimate(ev) {
 // Chat renders the active buffer: virtualized scrollback plus composer.
 // completionNicks feeds tab-completion (channel roster, or the query
 // counterpart).
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, statusHost, timeFmt, nickSep, previews, highlightNames, userhosts, nickPrefixes, memberPrefixes, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
-	const [draft, setDraft] = useState("");
+export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, statusHost, timeFmt, nickSep, previews, highlightNames, userhosts, nickPrefixes, memberPrefixes, layoutKey, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
 	// Lookup for in-body nick highlighting (Settings toggle): channel roster
 	// minus our own nick. Null when off, so the row renderer skips the scan.
 	const nickHi = useMemo(
@@ -267,7 +266,11 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 	// Per-buffer drafts: keep half-typed text with its own buffer so a
 	// switch swaps the composer contents instead of carrying text into —
 	// and letting Enter send it to — the wrong channel.
-	const drafts = useRef({});
+	const [drafts, setDrafts] = useState(() => new Map());
+	const activeDraftKey = buf?.key;
+	const activeDraftKeyRef = useRef(activeDraftKey);
+	activeDraftKeyRef.current = activeDraftKey;
+	const draft = drafts.get(activeDraftKey) || "";
 	const pinned = useRef(true);
 	const loadingOlder = useRef(false);
 	// Tab cycles candidates; fresh state per buffer.
@@ -287,8 +290,6 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 	// applyStatusMode): a run stays open across growth at either end.
 	const [expanded, setExpanded] = useState(() => new Set());
 	useEffect(() => setExpanded(new Set()), [buf?.key]);
-	// Swap in this buffer's saved draft (empty if none).
-	useEffect(() => setDraft(drafts.current[buf?.key] || ""), [buf?.key]);
 	const toggleRun = (run) => setExpanded((old) => {
 		const next = new Set(old);
 		const open = run.find((e) => next.has(e.id));
@@ -330,10 +331,19 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 	const taRef = useRef(null);
 	useEffect(() => {
 		if (!composerApi) return;
-		composerApi.current = {
-			prefill: (text) => {
-				setDraft(text);
+		const api = {
+			// The caller must name the destination. An async topic fetch for A
+			// must never place its text into whichever buffer happens to be active
+			// when it resolves.
+			prefill: (key, text) => {
+				if (!key) return;
+				setDrafts((old) => {
+					const next = new Map(old);
+					next.set(key, text);
+					return next;
+				});
 				requestAnimationFrame(() => {
+					if (activeDraftKeyRef.current !== key) return;
 					const el = taRef.current;
 					if (el) {
 						el.focus();
@@ -342,11 +352,21 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 				});
 			},
 		};
+		composerApi.current = api;
+		return () => {
+			if (composerApi.current === api) composerApi.current = null;
+		};
 	}, [composerApi]);
 
 	function draftChanged(text) {
-		setDraft(text);
-		drafts.current[buf?.key] = text;
+		const key = activeDraftKey;
+		if (!key) return;
+		setDrafts((old) => {
+			const next = new Map(old);
+			if (text) next.set(key, text);
+			else next.delete(key);
+			return next;
+		});
 		typing.input(text);
 		clearTimeout(pauseTimer.current);
 		pauseTimer.current = setTimeout(() => typing.pause(text), 5000);
@@ -398,7 +418,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 
 	function submit(e) {
 		e.preventDefault();
-		const raw = draft; // untrimmed snapshot — draft state / drafts.current are untrimmed
+		const raw = draft; // untrimmed keyed-draft snapshot
 		const text = raw.trim();
 		if (!text || !connected) return;
 		const key = buf?.key;
@@ -411,10 +431,14 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 		// equality against the UNTRIMMED snapshot so text the user kept typing
 		// while waiting isn't clobbered — and so a draft with surrounding
 		// whitespace (e.g. "hi " from a mobile keyboard) still clears.
-		Promise.resolve(onSend(text))
+		Promise.resolve(onSend(text, key))
 			.then(() => {
-				if (drafts.current[key] === raw) delete drafts.current[key];
-				if (buf?.key === key) setDraft((d) => (d === raw ? "" : d));
+				setDrafts((old) => {
+					if (old.get(key) !== raw) return old;
+					const next = new Map(old);
+					next.delete(key);
+					return next;
+				});
 			})
 			.catch(() => {});
 	}
@@ -431,6 +455,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 				estimate={estimate}
 				header={header}
 				focusId={focusId}
+				layoutKey={layoutKey}
 				onNearTop={nearTop}
 				onPinned={(p) => {
 					pinned.current = p;

@@ -41,6 +41,7 @@ for (let i = 0; i < 50000; i++) initial.push(mkMsg(10 + ((i * 37) % 240)));
 
 function App() {
 	const [items, setItems] = useState(initial);
+	const [layoutKey, setLayoutKey] = useState("default");
 	window.__h = {
 		itemCount: () => items.length,
 		domRows: () => document.querySelectorAll("[data-vid]").length,
@@ -48,10 +49,14 @@ function App() {
 			setItems((it) => [...it, ...Array.from({ length: n }, () => mkMsg(60))]),
 		prepend: (n) =>
 			setItems((it) => [...Array.from({ length: n }, () => mkMsg(60)), ...it]),
+		filterEvery: (n) => setItems((it) => it.filter((_, i) => i % n !== 0)),
+		invalidateLayout: () => setLayoutKey((k) => k + "!"),
+		changeItem: (id, len) => setItems((it) => it.map((m) => m.id === id ? { ...m, raw: mkMsg(len).raw } : m)),
 	};
 	return (
 		<VirtualList
 			items={items}
+			layoutKey={layoutKey}
 			estimate={(m) => estimateMsgHeight(m.raw)}
 			header={<div class="top-note">top of harness</div>}
 			onNearTop={() => {

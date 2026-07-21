@@ -46,6 +46,14 @@ export class Socket {
 		for (const fn of this.handlers.get(type) || []) fn(data);
 	}
 
+	rejectPending(message = "disconnected") {
+		for (const [, p] of this.pending) {
+			clearTimeout(p.timer);
+			p.reject(new Error(message));
+		}
+		this.pending.clear();
+	}
+
 	// dispatch routes one decoded envelope. A seq-tagged envelope is a
 	// request reply, never a push: settle it if still pending, otherwise it
 	// arrived after the request timed out — drop it rather than emit() it,
@@ -53,6 +61,10 @@ export class Socket {
 	// the prefs push) would clobber unsynced local state. Seq-less
 	// envelopes (seq 0/absent) are server pushes.
 	dispatch(env) {
+		// close() is synchronous from the app's point of view. A browser may
+		// still deliver frames queued before the closing handshake completes;
+		// they belong to the retired auth/socket generation and must be inert.
+		if (this.closed) return;
 		if (env.v !== V) return;
 		if (env.seq) {
 			const p = this.pending.get(env.seq);
@@ -68,12 +80,15 @@ export class Socket {
 
 	connect() {
 		if (this.closed) return; // don't revive a socket closed during backoff
-		this.ws = new WebSocket(this.url);
-		this.ws.onopen = () => {
+		const ws = new WebSocket(this.url);
+		this.ws = ws;
+		ws.onopen = () => {
+			if (this.closed || this.ws !== ws) return;
 			this.backoff = 1000;
 			this.emit("_open");
 		};
-		this.ws.onmessage = (e) => {
+		ws.onmessage = (e) => {
+			if (this.closed || this.ws !== ws) return;
 			let env;
 			try {
 				env = JSON.parse(e.data);
@@ -82,14 +97,15 @@ export class Socket {
 			}
 			this.dispatch(env);
 		};
-		this.ws.onclose = () => {
-			this.emit("_close");
-			for (const [, p] of this.pending) {
-				clearTimeout(p.timer);
-				p.reject(new Error("disconnected"));
-			}
-			this.pending.clear();
+		ws.onclose = () => {
+			// connect() can replace a transport before an older browser close
+			// callback is delivered. That retired callback must not reject the new
+			// transport's requests or schedule a second reconnect loop.
+			if (this.ws !== ws) return;
+			this.ws = null;
+			this.rejectPending();
 			if (this.closed) return;
+			this.emit("_close");
 			// Jitter from crypto — quality is irrelevant for reconnect
 			// spacing, but it keeps security linters quiet without a config
 			// exception.
@@ -101,7 +117,7 @@ export class Socket {
 
 	request(type, data, timeoutMs = 10000) {
 		return new Promise((resolve, reject) => {
-			if (this.ws?.readyState !== WebSocket.OPEN) {
+			if (this.closed || this.ws?.readyState !== WebSocket.OPEN) {
 				reject(new Error("not connected"));
 				return;
 			}
@@ -119,17 +135,21 @@ export class Socket {
 	// Silently dropped while disconnected — fine for ephemeral state
 	// like typing.
 	notify(type, data) {
-		if (this.ws?.readyState === WebSocket.OPEN) {
+		if (!this.closed && this.ws?.readyState === WebSocket.OPEN) {
 			this.ws.send(JSON.stringify({ v: V, type, data }));
 		}
 	}
 
 	close() {
+		if (this.closed) return;
 		this.closed = true;
 		// Cancel any reconnect scheduled by a prior onclose — otherwise it
 		// fires after close() and revives a zombie socket that double-
 		// processes every push once the app reconnects.
 		clearTimeout(this.reconnectTimer);
+		// Settle callers NOW. Waiting for the browser's asynchronous close event
+		// leaves old request continuations alive across a rapid logout/re-login.
+		this.rejectPending();
 		this.ws?.close();
 	}
 }

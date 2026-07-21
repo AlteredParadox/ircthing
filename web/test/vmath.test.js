@@ -18,11 +18,14 @@ import { deepStrictEqual as eq, strictEqual as is } from "node:assert";
 import { test } from "node:test";
 import {
 	computeWindow,
+	captureViewportAnchor,
 	estimateMsgHeight,
 	findIndex,
 	Geometry,
+	hasNonAppendIdentityChange,
 	pinnedAfterScroll,
 	prependedCount,
+	restoreViewportAnchor,
 } from "../src/vmath.js";
 
 const items = (n, from = 0) =>
@@ -175,6 +178,117 @@ test("clearMeasured falls back to estimates", () => {
 	is(g.total(), 60);
 });
 
+test("layout invalidation restores the same row and intra-row offset", () => {
+	const list = items(5);
+	const g = geo(list);
+	for (let i = 0; i < list.length; i++) g.measure(list[i].id, 40 + i * 10);
+	const anchor = captureViewportAnchor(g, list, g.offsetOf(3) + 17);
+	is(anchor.id, 3);
+	is(anchor.member, 3);
+	is(anchor.intra, 17);
+	g.clearMeasured();
+	is(restoreViewportAnchor(g, anchor), g.offsetOf(3) + 17);
+});
+
+test("viewport anchor survives a presence row collapsing into a run", () => {
+	const shown = [{ id: 40 }, { id: 41 }, { id: 42 }, { id: 50 }];
+	const g = geo(shown);
+	const anchor = captureViewportAnchor(g, shown, g.offsetOf(1) + 5);
+	const collapsed = [
+		{ id: "clp-42", collapse: shown.slice(0, 3) },
+		shown[3],
+	];
+	g.setItems(collapsed);
+	is(restoreViewportAnchor(g, anchor), 5, "containing collapsed row becomes the anchor");
+});
+
+test("an expanded collapse summary restores to the summary, not its last child", () => {
+	const run = [{ id: 40 }, { id: 41 }, { id: 42 }];
+	const expanded = [
+		{ id: "clp-42", collapse: run, expanded: true },
+		...run,
+		{ id: 50 },
+	];
+	const g = geo(expanded);
+	const anchor = captureViewportAnchor(g, expanded, 7);
+	is(anchor.id, "clp-42");
+	is(anchor.member, 42);
+	g.clearMeasured();
+	is(restoreViewportAnchor(g, anchor), 7,
+		"the exact synthetic row wins over the real child carrying member id 42");
+});
+
+test("a removed viewport row falls forward to its nearest surviving neighbor", () => {
+	const list = items(8);
+	const g = geo(list);
+	for (const item of list) g.measure(item.id, 40);
+	const anchor = captureViewportAnchor(g, list, g.offsetOf(3) + 9);
+	const filtered = [list[0], list[1], list[4], list[5], list[6], list[7]];
+	g.setItems(filtered, true);
+	is(restoreViewportAnchor(g, anchor), g.offsetOf(2) + 9,
+		"row 4, the next survivor, replaces removed row 3 at the anchor");
+});
+
+test("viewport fallback crosses a long run of removed rows", () => {
+	const list = items(24);
+	const g = geo(list);
+	for (const item of list) g.measure(item.id, 40);
+	const anchor = captureViewportAnchor(g, list, g.offsetOf(10) + 11);
+	const filtered = [list[0], ...list.slice(18)];
+	g.setItems(filtered, true);
+	is(restoreViewportAnchor(g, anchor), g.offsetOf(1) + 11,
+		"the next survivor wins even when more than a small neighbor window was removed");
+});
+
+test("non-append identity changes distinguish filters from live tail appends", () => {
+	const list = items(5);
+	is(hasNonAppendIdentityChange(list, [...list, { id: 5 }]), false,
+		"ordinary tail append does not request a viewport anchor");
+	is(hasNonAppendIdentityChange(list, list.slice()), false,
+		"a fresh array with the same stable identities is not structural");
+	is(hasNonAppendIdentityChange(list, [list[0], list[2], list[3], list[4]]), true,
+		"filtering a row is structural even when all survivors are the same objects");
+	is(hasNonAppendIdentityChange(list, list.slice(1)), true, "head trim is structural");
+});
+
+test("a stable visible row restores after unchanged rows above it are filtered", () => {
+	const list = items(6);
+	const g = geo(list);
+	for (const item of list) g.measure(item.id, 40);
+	const anchor = captureViewportAnchor(g, list, g.offsetOf(4) + 9);
+	const filtered = [list[0], list[2], list[4], list[5]];
+	is(hasNonAppendIdentityChange(list, filtered), true);
+	g.setItems(filtered);
+	is(restoreViewportAnchor(g, anchor), g.offsetOf(2) + 9,
+		"the same row stays at the same intra-row viewport position");
+});
+
+test("non-append identity changes recognize collapse/show rewrites", () => {
+	const shown = [{ id: 40 }, { id: 41 }, { id: 42 }, { id: 50 }];
+	const collapsed = [
+		{ id: "clp-42", collapse: shown.slice(0, 3) },
+		shown[3],
+	];
+	is(hasNonAppendIdentityChange(shown, collapsed), true);
+	is(hasNonAppendIdentityChange(collapsed, shown), true);
+	is(hasNonAppendIdentityChange(collapsed, [...collapsed, { id: 60 }]), false,
+		"a tail append after an unchanged collapsed run stays on the append path");
+});
+
+test("same-id content changes invalidate only their cached measurement", () => {
+	const list = items(3);
+	const g = geo(list);
+	g.measure(0, 60);
+	g.measure(1, 70);
+	g.measure(2, 80);
+	const changed = [list[0], { ...list[1], raw: "redacted" }, list[2]];
+	is(g.invalidateChanged(changed), 1);
+	g.setItems(changed);
+	is(g.heightAt(0), 60);
+	is(g.heightAt(1), 30, "changed row falls back to estimate");
+	is(g.heightAt(2), 80);
+});
+
 test("prependedCount", () => {
 	is(prependedCount(null, items(3)), 0, "fresh load");
 	is(prependedCount(0, items(3)), 0, "unchanged head");
@@ -211,4 +325,14 @@ test("Geometry: measured is pruned for removed rows (no unbounded growth)", () =
 	g.setItems(list.slice(7));
 	is(g.measured.size, 3, "measurements for trimmed rows dropped");
 	is(g.measured.get(list[9].id), 39, "survivor keeps its measured height");
+});
+
+test("Geometry: a same-length structural rewrite forces index rebuild", () => {
+	const g = new Geometry(() => 20);
+	const list = items(5);
+	g.setItems(list);
+	const rewritten = [list[0], list[2], list[1], list[3], list[4]];
+	g.setItems(rewritten, true);
+	is(g.indexOf(list[2].id), 1);
+	is(g.indexOf(list[1].id), 2);
 });

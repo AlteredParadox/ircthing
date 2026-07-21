@@ -68,3 +68,70 @@ test("dispatch ignores a wrong protocol version", () => {
 	s.dispatch({ v: 999, seq: 0, type: "event", data: {} });
 	is(pushed, 0);
 });
+
+test("close synchronously rejects and clears every pending request", () => {
+	const s = new Socket("ws://x");
+	let rejected;
+	s.pending.set(9, {
+		resolve: () => {},
+		reject: (e) => (rejected = e),
+		timer: setTimeout(() => {}, 10000),
+	});
+	s.close();
+	is(rejected.message, "disconnected");
+	is(s.pending.size, 0);
+});
+
+test("a closed socket suppresses queued replies and pushes", () => {
+	const s = new Socket("ws://x");
+	let pushed = 0;
+	let resolved = false;
+	s.on("event", () => pushed++);
+	s.pending.set(4, {
+		resolve: () => (resolved = true),
+		reject: () => {},
+		timer: setTimeout(() => {}, 10000),
+	});
+	s.close();
+	s.dispatch({ v: 1, seq: 0, type: "event", data: {} });
+	s.dispatch({ v: 1, seq: 4, type: "ok", data: {} });
+	is(pushed, 0);
+	is(resolved, false);
+});
+
+test("a superseded transport close cannot tear down the current transport", () => {
+	const previous = globalThis.WebSocket;
+	const made = [];
+	class FakeWebSocket {
+		static OPEN = 1;
+		constructor() {
+			this.readyState = FakeWebSocket.OPEN;
+			made.push(this);
+		}
+		close() {}
+	}
+	globalThis.WebSocket = FakeWebSocket;
+	try {
+		const s = new Socket("ws://x");
+		let closes = 0;
+		let rejected = false;
+		s.on("_close", () => closes++);
+		s.connect();
+		const old = made[0];
+		s.connect();
+		const current = made[1];
+		s.pending.set(11, {
+			resolve: () => {},
+			reject: () => (rejected = true),
+			timer: setTimeout(() => {}, 10000),
+		});
+		old.onclose();
+		is(s.ws, current);
+		is(rejected, false);
+		is(s.pending.has(11), true);
+		is(closes, 0);
+		s.close();
+	} finally {
+		globalThis.WebSocket = previous;
+	}
+});

@@ -20,8 +20,15 @@ import {
 	bufKey, firstURL, fmtTime, hostOf, linkify, looksLikeImageURL,
 	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash, applyStatusMode, mergeById, mergeServerBuffers,
 	applyTombstones, rememberRedaction, nickSet, highlightNicks, proxyCredsExposed, foldNick,
-	parseFormatting, stripFormatting,
+	parseFormatting, stripFormatting, historyHasMore,
 } from "../src/irc.js";
+
+test("historyHasMore prefers explicit byte-bounded continuation metadata", () => {
+	is(historyHasMore({ messages: [1], has_more: true }, 100), true);
+	is(historyHasMore({ messages: Array(100), has_more: false }, 100), false);
+	is(historyHasMore({ messages: Array(100) }, 100), true, "legacy full page");
+	is(historyHasMore({ messages: Array(99) }, 100), false, "legacy short page");
+});
 
 test("parseFormatting: plain text is one unstyled run", () => {
 	const runs = parseFormatting("hello world");
@@ -208,6 +215,11 @@ test("mergeServerBuffers", () => {
 	is(out[bufKey("libera", "#closed")], undefined);
 	// An ephemeral buffer on a no-longer-known network is dropped too.
 	is(out[bufKey("dead", "#x")], undefined);
+	// In a truncated snapshot absence is not authoritative; keep known rows on
+	// surviving networks until a buffer_closed push explicitly removes them.
+	const partial = mergeServerBuffers(data, prev, nets, true);
+	is(!!partial[bufKey("libera", "#closed")], true);
+	is(partial[bufKey("dead", "#x")], undefined);
 });
 
 test("parseLine", () => {

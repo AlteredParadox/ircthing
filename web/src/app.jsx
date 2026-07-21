@@ -16,11 +16,13 @@
 
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
-import { applyTombstones, bufferOrder, bufKey, foldNick, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, rememberRedaction, renderable, SERVER_BUFFER, stripFormatting, toHash, typingExpired } from "./irc.js";
+import { applyTombstones, bufferOrder, bufKey, clearTypingNick, expireTypingState, foldNick, historyHasMore, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, rememberRedaction, renderable, SERVER_BUFFER, stripFormatting, toHash, updateTypingState } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
 import { Login } from "./login.jsx";
-import { applyPrefs, loadPrefs, normalizePrefs, resolveTheme, savePrefs } from "./prefs.js";
+import { applyPrefs, loadPrefs, MAX_PREFS_BYTES, normalizePrefs, prefsByteLength, resolveTheme, savePrefs } from "./prefs.js";
 import { isIgnored, isMuted, loadIgnores, loadMutes, toggleIgnore, toggleMute } from "./local.js";
+import { editableNetwork, networkEditError } from "./networkedit.js";
+import { armPendingJoin, clearPendingJoin, notePendingJoinForward, takePendingJoin } from "./pending.js";
 import { ContextMenu } from "./menu.jsx";
 import { Members } from "./members.jsx";
 import { ChannelPrompt, NetworkForm } from "./netform.jsx";
@@ -217,22 +219,6 @@ function appendInfoLine(m, key, ev, tight) {
 	return { ...m, [key]: { ...cur, list, bytes, reachedTop } };
 }
 
-// clearTyperFor drops one nick's typing state (they just spoke).
-function clearTyperFor(t, key, sender) {
-	if (!t[key]?.[sender]) return t;
-	const cur = { ...t[key] };
-	delete cur[sender];
-	return { ...t, [key]: cur };
-}
-
-// setTypingState records a typing push; "done" clears it.
-function setTypingState(t, key, d) {
-	const cur = { ...t[key] };
-	if (d.state === "done") delete cur[d.nick];
-	else cur[d.nick] = { state: d.state, at: Date.now() };
-	return { ...t, [key]: cur };
-}
-
 // bumpBufferActivity advances a buffer's last-activity/unread/mention
 // state for a live event (creating the buffer on first traffic).
 function bumpBufferActivity(b, key, ev, countUnread, highlight) {
@@ -317,7 +303,7 @@ function mergeHistoryPage(m, key, page, tombstones) {
 	// page can exceed MAX_BUFFER_BYTES, and although a live append re-trims, a
 	// quiet buffer would sit oversized until then. This is a tail load, so
 	// front-trimming (oldest) is correct; reachedTop clears if anything dropped.
-	const t = trimBuffer(merged, listBytes(merged), pageMsgs.length < PAGE);
+	const t = trimBuffer(merged, listBytes(merged), !historyHasMore(page, PAGE));
 	return {
 		...m,
 		[key]: {
@@ -341,20 +327,38 @@ export function App() {
 	const [connected, setConnected] = useState(false);
 	const [networks, setNetworks] = useState({});
 	const [buffers, setBuffers] = useState({});
+	const [buffersTruncated, setBuffersTruncated] = useState(false);
 	// Network management: the add/edit form ({ initial, oldName } | null)
 	// and the join-channel prompt ({ network } | null), with the last
 	// server error for each.
 	const [netForm, setNetForm] = useState(null);
 	const [netFormError, setNetFormError] = useState("");
 	const [netFormBusy, setNetFormBusy] = useState(false);
+	const netFormBusyRef = useRef(false);
 	const [chanPrompt, setChanPrompt] = useState(null);
 	const [chanPromptError, setChanPromptError] = useState("");
+	const [chanPromptBusy, setChanPromptBusy] = useState(false);
+	const chanPromptBusyRef = useRef(false);
+	// Every async modal/prefill operation captures an intent id and Socket
+	// object. Closing/reopening a modal, superseding an action, or crossing an
+	// auth/socket boundary makes its late callbacks inert.
+	const netFormIntent = useRef(0);
+	const chanPromptIntent = useRef(0);
+	const topicIntent = useRef(0);
 	const [msgs, setMsgs] = useState({});
 	const [activeKey, setActiveKey] = useState(() => {
 		const h = parseHash(location.hash);
 		return h ? bufKey(h.network, h.buffer) : null;
 	});
+	// Explicit navigation and async actions that intend to navigate share one
+	// generation. A reply/JOIN may move focus only while its generation is still
+	// current, so a later click or command always wins over a delayed callback.
+	const navigationIntent = useRef(0);
 	const [prefs, setPrefs] = useState(loadPrefs);
+	const [prefsError, setPrefsError] = useState("");
+	// Last blob the server actually confirmed. Permanent set_prefs rejection
+	// rolls the UI back here instead of leaving it showing unsaved state.
+	const prefsConfirmed = useRef(prefs);
 	const [sysDark, setSysDark] = useState(
 		() => globalThis.matchMedia("(prefers-color-scheme: dark)").matches,
 	);
@@ -395,9 +399,11 @@ export function App() {
 	const pendingWhois = useRef(new Set());
 	const notifier = useRef();
 	if (!notifier.current) notifier.current = new Notifier();
-	// typers: bufKey -> { nick: { state, at } }; ephemeral, never stored.
-	const [typers, setTypers] = useState({});
+	// typers: Map<bufKey, Map<nick, {state, at}>>; ephemeral, capped and
+	// prototype-safe because every name originates at an IRC server.
+	const [typers, setTypers] = useState(() => new Map());
 	const sock = useRef(null);
+	const socketGen = useRef(0);
 	// Buffers with a get_history request in flight — at most one per
 	// buffer, so a live event arriving mid-load cannot fire a second,
 	// window-slid request that corrupts ordering.
@@ -431,19 +437,53 @@ export function App() {
 	// server (e.g. changed while the socket was down). Used on reconnect
 	// to re-push rather than adopt the server's stale copy.
 	const prefsDirty = useRef(false);
-	function updatePrefs(next) {
+	function persistPrefs(next, attempt = 0) {
+		if (prefsRef.current !== next) return;
+		const s = sock.current;
+		if (!s) {
+			setPrefsError("Preferences are waiting to sync after reconnect.");
+			return;
+		}
+		s.request("set_prefs", { prefs: next })
+			.then(() => {
+				if (sock.current !== s) return;
+				prefsConfirmed.current = next;
+				if (prefsRef.current === next) {
+					prefsDirty.current = false;
+					setPrefsError("");
+				}
+			})
+			.catch((e) => {
+				if (sock.current !== s || prefsRef.current !== next) return;
+				if (e?.code === "bad_request") {
+					prefsDirty.current = false;
+					setPrefs(prefsConfirmed.current);
+					setPrefsError(e.message || "Preferences were rejected and rolled back.");
+					return;
+				}
+				// A disconnect/store failure is transient. Retry a few times while
+				// this remains the newest edit; if the socket stays down, the dirty
+				// value is retried by adoptPrefs on reconnect.
+				setPrefsError("Preferences are waiting to sync after reconnect.");
+				if (attempt < 3) {
+					prefsPush.current = setTimeout(() => persistPrefs(next, attempt + 1), 500 * 2 ** attempt);
+				}
+			});
+	}
+
+	function updatePrefs(rawNext) {
+		const next = normalizePrefs(rawNext);
 		setPrefs(next);
 		prefsDirty.current = true;
+		setPrefsError(
+			prefsByteLength(rawNext) > MAX_PREFS_BYTES
+				? "Preferences are limited to 64 KiB; custom CSS was truncated."
+				: "",
+		);
 		// Debounced: the custom-CSS textarea changes on every keystroke.
 		clearTimeout(prefsPush.current);
 		prefsPush.current = setTimeout(() => {
-			sock.current?.request("set_prefs", { prefs: next })
-				// Only clear the dirty flag if no newer edit landed while this
-				// request was in flight (prefs still === the pushed snapshot);
-				// otherwise the queued newer edit would look synced and a
-				// reconnect would adopt the server's now-stale copy over it.
-				.then(() => { if (prefsRef.current === next) prefsDirty.current = false; })
-				.catch(() => {});
+			persistPrefs(next);
 		}, 400);
 	}
 
@@ -478,6 +518,18 @@ export function App() {
 		// session's cookie, and a delayed previews callback must not re-pin
 		// the state just reset above.
 		resetSettingsSession();
+		clearTimeout(prefsPush.current);
+		setBuffersTruncated(false);
+		setNetForm(null);
+		netFormBusyRef.current = false;
+		setNetFormBusy(false);
+		setChanPrompt(null);
+		chanPromptBusyRef.current = false;
+		setChanPromptBusy(false);
+		setSettingsOpen(false);
+		setSearchOpen(false);
+		setSwitcherOpen(false);
+		setMenu(null);
 	}, [phase]);
 
 	// Server switches (whether link/media previews are enabled). Fetched
@@ -501,7 +553,10 @@ export function App() {
 	useEffect(() => {
 		const onHash = () => {
 			const h = parseHash(location.hash);
-			if (h) setActiveKey(bufKey(h.network, h.buffer));
+			if (h) {
+				navigationIntent.current++;
+				setActiveKey(bufKey(h.network, h.buffer));
+			}
 		};
 		globalThis.addEventListener("hashchange", onHash);
 		return () => globalThis.removeEventListener("hashchange", onHash);
@@ -529,31 +584,43 @@ export function App() {
 		return () => globalThis.removeEventListener("keydown", onKey);
 	}, []);
 
-	// Socket helpers, at component scope so handler nesting stays
-	// shallow. All of them read sock.current, which the effect below
-	// sets before any handler can fire.
+	// Socket helpers, at component scope so handler nesting stays shallow.
+	// Async responses are accepted only from the socket that issued them.
 
 	// loadMonitors fetches one network's MONITOR buddy list with presence.
 	function loadMonitors(name) {
-		sock.current.request("get_monitors", { network: name })
-			.then((md) => setMonitors((all) => ({ ...all, [name]: md.monitors || [] })))
+		const s = sock.current;
+		if (!s) return;
+		s.request("get_monitors", { network: name })
+			.then((md) => {
+				if (sock.current !== s) return;
+				setMonitors((all) => ({ ...all, [name]: md.monitors || [] }));
+			})
 			.catch(() => {});
 	}
 
 	// applyBuffers installs a get_buffers response: network states and
 	// the sidebar buffer list (the mention flag is client-side; keep it).
 	function applyBuffers(data) {
-		const nets = {};
-		for (const n of data.networks || []) {
+		const truncated = data?.truncated === true;
+		setBuffersTruncated(truncated);
+		// An incomplete network snapshot cannot authoritatively delete names that
+		// were outside the response cap. Preserve them until network_removed.
+		const nets = truncated ? { ...networksRef.current } : {};
+		const responseNetworks = data.networks || [];
+		for (const n of responseNetworks) {
 			nets[n.name] = { state: n.state, nick: n.nick, chantypes: n.chantypes || "#&" };
 		}
 		setNetworks(nets);
-		for (const name of Object.keys(nets)) loadMonitors(name);
+		// A truncated snapshot preserves omitted old network rows, but refetching
+		// every preserved name turns one bounded response into an unbounded burst.
+		// Refresh only the networks the server actually included this time.
+		for (const { name } of responseNetworks) loadMonitors(name);
 
-		// mergeServerBuffers preserves client-only ephemeral buffers but never
-		// resurrects a real server buffer the server intentionally dropped
-		// (e.g. closed on another device while we were offline).
-		const bufs = mergeServerBuffers(data.buffers, buffersRef.current, nets);
+		// A complete snapshot drops server buffers absent from the authoritative
+		// list. A safety-truncated snapshot cannot distinguish omitted from closed,
+		// so retain known rows; live buffer_closed events still remove them.
+		const bufs = mergeServerBuffers(data.buffers, buffersRef.current, nets, truncated);
 		setBuffers(bufs);
 
 		// If the active buffer was one the server dropped, don't leave the
@@ -571,7 +638,13 @@ export function App() {
 	}
 
 	function refreshBuffers() {
-		sock.current.request("get_buffers", null).then(applyBuffers).catch(() => {});
+		const s = sock.current;
+		if (!s) return;
+		s.request("get_buffers", null)
+			.then((data) => {
+				if (sock.current === s) applyBuffers(data);
+			})
+			.catch(() => {});
 	}
 
 	// adoptPrefs applies the server's prefs; a server with none stored
@@ -585,28 +658,49 @@ export function App() {
 		// newer edit would look synced and the next reconnect would adopt the
 		// server's now-stale copy over it.
 		if (prefsDirty.current) {
+			// Preserve the actual rollback point before trying the unsynced local
+			// edit. This matters on the first connection, where the localStorage
+			// value has never itself been server-confirmed.
+			if (d.prefs) prefsConfirmed.current = normalizePrefs(d.prefs);
 			const pushed = prefsRef.current;
-			sock.current?.request("set_prefs", { prefs: pushed })
-				.then(() => { if (prefsRef.current === pushed) prefsDirty.current = false; })
-				.catch(() => {});
+			persistPrefs(pushed);
 			return;
 		}
-		if (d.prefs) setPrefs(normalizePrefs(d.prefs));
-		else sock.current.request("set_prefs", { prefs: prefsRef.current }).catch(() => {});
+		if (d.prefs) {
+			const adopted = normalizePrefs(d.prefs);
+			prefsConfirmed.current = adopted;
+			setPrefs(adopted);
+			setPrefsError("");
+		} else {
+			const seeded = prefsRef.current;
+			prefsDirty.current = true;
+			persistPrefs(seeded);
+		}
 	}
 
 	// Socket lifecycle, once authed.
 	useEffect(() => {
 		if (phase !== "app") return;
 		const s = new Socket(wsURL());
+		const gen = ++socketGen.current;
 		sock.current = s;
+		setConnected(false);
+		const live = () => sock.current === s && socketGen.current === gen;
+		// Every push handler is generation-guarded in one place. Socket.close also
+		// suppresses queued frames, but this protects callbacks already dispatched
+		// into the microtask queue before teardown.
+		const on = (type, fn) => s.on(type, (data) => {
+			if (live()) fn(data);
+		});
 
 		const wsFailures = { n: 0 };
-		s.on("_open", async () => {
+		on("_open", async () => {
 			wsFailures.n = 0;
 			failedHistory.current.clear(); // fresh connection: let loads retry
 			setConnected(true);
-			s.request("get_prefs", null).then(adoptPrefs).catch(() => {});
+			s.request("get_prefs", null)
+				.then((d) => { if (live()) adoptPrefs(d); })
+				.catch(() => {});
 			// Drop cached pages up front so every open buffer refetches a
 			// fresh tail covering the offline window. This must NOT hang off
 			// get_buffers succeeding: if that request rejects (error envelope
@@ -615,12 +709,13 @@ export function App() {
 			// live events resume appending to it.
 			setMsgs({});
 			try {
-				applyBuffers(await s.request("get_buffers", null));
+				const data = await s.request("get_buffers", null);
+				if (live()) applyBuffers(data);
 			} catch {
 				/* sidebar refresh will retry; scrollback already reset above */
 			}
 		});
-		s.on("_close", () => {
+		on("_close", () => {
 			setConnected(false);
 			// The WebSocket API can't distinguish a 401 handshake rejection
 			// from a network outage, and Socket retries forever. After a few
@@ -631,7 +726,7 @@ export function App() {
 			if (++wsFailures.n >= 3) {
 				fetch("/api/ws")
 					.then((r) => {
-						if (r.status === 401) {
+						if (live() && r.status === 401) {
 							wsFailures.n = 0;
 							setPhase("login");
 						}
@@ -644,7 +739,7 @@ export function App() {
 		// pages (the active buffer refetches automatically) and refresh
 		// sidebar counts, debounced across a burst of backfills.
 		let bufRefresh;
-		s.on("history_changed", (d) => {
+		on("history_changed", (d) => {
 			const key = bufKey(d.network, d.buffer);
 			historyGen.current[key] = (historyGen.current[key] || 0) + 1;
 			// This buffer is being told to refetch — a failed-load marker from
@@ -659,7 +754,7 @@ export function App() {
 			bufRefresh = setTimeout(refreshBuffers, 300);
 		});
 
-		s.on("state", (d) => {
+		on("state", (d) => {
 			setNetworks((n) => ({ ...n, [d.network]: { ...n[d.network], state: d.state } }));
 			// A (re)registered network's ISUPPORT (chantypes, nick) lands
 			// just after 001; refresh the buffer list once it settles.
@@ -669,24 +764,22 @@ export function App() {
 			}
 		});
 
-		s.on("event", (ev) => {
+		on("event", (ev) => {
 			const key = bufKey(ev.network, ev.buffer);
 			const keep = key === activeKeyRef.current || loadingHistory.current.has(key);
 			setMsgs((m) => appendEventMsgs(m, key, ev, keep));
 			// A message from someone clears their typing indicator.
-			setTypers((t) => clearTyperFor(t, key, ev.sender));
+			setTypers((t) => clearTypingNick(t, key, ev.sender));
 			const r = renderable(ev);
 			const isMsg = r.kind !== "system";
 			const nick = networksRef.current[ev.network]?.nick;
 			const mine = nick && ev.sender === nick;
-			// A UI-initiated join selects the channel we actually ended up
-			// in — which may differ from the requested one (channel
-			// forwarding, numeric 470) — so selection follows our own JOIN
-			// instead of assuming the requested name.
-			const pj = pendingJoin.current;
-			if (pj && mine && ev.command === "JOIN" && ev.network === pj.network && Date.now() - pj.ts < 15000) {
-				pendingJoin.current = null;
-				select(ev.network, ev.buffer);
+			// A UI-initiated join selects the channel we actually ended up in,
+			// target-correlated so an asynchronously rejected earlier JOIN cannot
+			// consume this event. A 470 adds the forwarded name as an alias below.
+			if (mine && ev.command === "JOIN") {
+				const token = takePendingJoin(pendingJoins.current, ev.network, ev.buffer);
+				if (token) selectForNavigation(token.intent, ev.network, ev.buffer);
 			}
 			// Highlight = a mention/keyword in a channel, or any message in
 			// a query (PM) buffer. PMs always alert. The synthetic server
@@ -721,36 +814,20 @@ export function App() {
 				const where = isChan ? `${ev.sender} in ${ev.buffer}` : ev.sender;
 				// The Notification API renders plain text, so strip mIRC codes.
 				notifier.current.show(where, stripFormatting(r.text), key, () => {
-					location.hash = toHash(ev.network, ev.buffer);
-					setActiveKey(key);
+					select(ev.network, ev.buffer);
 				});
 			}
 		});
 
 		// Another device closed a buffer; drop it here too.
-		s.on("buffer_closed", (d) => {
-			const key = bufKey(d.network, d.buffer);
-			if (!buffersRef.current[key]) return;
-			setBuffers((b) => {
-				const next = { ...b };
-				delete next[key];
-				return next;
-			});
-			// Invalidate any in-flight initial get_history for this buffer, so
-			// its resolve doesn't reinstall a phantom msgs entry after teardown.
-			historyGen.current[key] = (historyGen.current[key] || 0) + 1;
-			redactedIds.current.delete(key); // its scrollback is gone; drop tombstones
-			setMsgs((m) => dropBufferMsgs(m, key));
-			if (activeKeyRef.current === key) {
-				setActiveKey(null);
-				location.hash = "";
-			}
+		on("buffer_closed", (d) => {
+			forgetBuffer(d.network, d.buffer);
 		});
 
 		// A network was deleted or renamed away: drop its buffers and
 		// state. New/renamed networks introduce themselves via "state"
 		// pushes and the buffer refresh.
-		s.on("network_removed", (d) => {
+		on("network_removed", (d) => {
 			setNetworks((n) => {
 				const next = { ...n };
 				delete next[d.network];
@@ -772,6 +849,15 @@ export function App() {
 				for (const g of gone) next = dropBufferMsgs(next, g.key);
 				return next;
 			});
+			setTypers((all) => {
+				let next = all;
+				for (const g of gone) {
+					if (!next.has(g.key)) continue;
+					if (next === all) next = new Map(all);
+					next.delete(g.key);
+				}
+				return next;
+			});
 			if (gone.some((g) => g.key === activeKeyRef.current)) {
 				setActiveKey(null);
 				location.hash = "";
@@ -782,16 +868,30 @@ export function App() {
 		// over an unsynced local edit still in the debounce window, or its
 		// pending set_prefs would clobber this device's change server-side
 		// (mirrors adoptPrefs's dirty guard).
-		s.on("prefs", (d) => {
+		on("prefs", (d) => {
 			if (prefsDirty.current) return;
-			if (d.prefs) setPrefs(normalizePrefs(d.prefs));
+			if (d.prefs) {
+				const adopted = normalizePrefs(d.prefs);
+				prefsConfirmed.current = adopted;
+				setPrefs(adopted);
+				setPrefsError("");
+			}
 		});
 
 		// Ephemeral server replies (/list, error numerics): shown as
 		// system lines in the active buffer, never persisted — a history
 		// refetch drops them.
 		let infoSeq = 0;
-		s.on("server_info", (d) => {
+		on("server_info", (d) => {
+			// ERR_LINKCHANNEL (470) is formatted as "<original> <target> ...".
+			// Correlate only when BOTH leading words are channel names and the
+			// original matches an outstanding token; other error numerics remain
+			// ordinary informational text.
+			const words = String(d.text || "").trim().split(/\s+/);
+			const chantypes = networksRef.current[d.network]?.chantypes;
+			if (isChannelName(words[0], chantypes) && isChannelName(words[1], chantypes)) {
+				notePendingJoinForward(pendingJoins.current, d.network, words[0], words[1]);
+			}
 			// Server info (MOTD, connect numerics) lands in the network's own
 			// server buffer, not whatever buffer happens to be active.
 			const key = bufKey(d.network, SERVER_BUFFER);
@@ -810,7 +910,7 @@ export function App() {
 		// A WHOIS card lands in the target's query buffer; jump there, so
 		// /whois does not clutter the channel (The Lounge style).
 		let whoisSeq = 0;
-		s.on("whois", (d) => {
+		on("whois", (d) => {
 			// Only a whois WE asked for opens/selects a buffer. Drop an
 			// unsolicited server-pushed card so a hostile server can't spawn a
 			// buffer per nick or repeatedly steal focus (browser-memory + UX DoS).
@@ -827,20 +927,23 @@ export function App() {
 			if (activeKeyRef.current !== key) select(d.network, d.nick);
 		});
 
-		s.on("presence", (d) => setMonitors((all) => applyPresenceUpdate(all, d)));
+		on("presence", (d) => setMonitors((all) => applyPresenceUpdate(all, d)));
 		// Another tab/device changed the buddy list: refetch the authoritative
 		// list instead of drifting on this tab's local state.
-		s.on("monitors_changed", (d) => d?.network && loadMonitors(d.network));
+		on("monitors_changed", (d) => d?.network && loadMonitors(d.network));
 
-		s.on("redact", (d) => {
+		on("redact", (d) => {
 			const key = bufKey(d.network, d.buffer);
 			rememberRedaction(redactedIds.current, key, d.msgid, d.reason);
 			setMsgs((m) => applyRedaction(m, key, d));
 		});
 
-		s.on("typing", (d) => setTypers((t) => setTypingState(t, bufKey(d.network, d.buffer), d)));
+		on("typing", (d) => {
+			const key = bufKey(d.network, d.buffer);
+			setTypers((t) => updateTypingState(t, key, d, !!buffersRef.current[key]));
+		});
 
-		s.on("members_changed", (d) => {
+		on("members_changed", (d) => {
 			const buf = buffersRef.current[activeKeyRef.current];
 			if (
 				buf && d.network === buf.network &&
@@ -850,7 +953,7 @@ export function App() {
 			}
 		});
 
-		s.on("read_marker", (d) => {
+		on("read_marker", (d) => {
 			const key = bufKey(d.network, d.buffer);
 			const cur = buffersRef.current[key];
 			setBuffers((b) => applyMarkerState(b, key, d.time));
@@ -867,7 +970,19 @@ export function App() {
 		});
 
 		s.connect();
-		return () => s.close();
+		return () => {
+			clearTimeout(bufRefresh);
+			if (live()) {
+				socketGen.current++;
+				sock.current = null;
+				setConnected(false);
+			}
+			pendingJoins.current.clear();
+			netFormIntent.current++;
+			chanPromptIntent.current++;
+			topicIntent.current++;
+			s.close();
+		};
 	}, [phase]);
 
 	// Refs mirror state so long-lived socket handlers read current values
@@ -907,21 +1022,7 @@ export function App() {
 	// Expire stale typing states (6s active / 30s paused per spec).
 	useEffect(() => {
 		const t = setInterval(() => {
-			setTypers((all) => {
-				const now = Date.now();
-				let changed = false;
-				const next = {};
-				for (const [key, nicks] of Object.entries(all)) {
-					const keep = {};
-					for (const [nick, v] of Object.entries(nicks)) {
-						if (typingExpired(v.state, v.at, now)) changed = true;
-						else keep[nick] = v;
-					}
-					if (Object.keys(keep).length) next[key] = keep;
-					else if (Object.keys(nicks).length) changed = true;
-				}
-				return changed ? next : all;
-			});
+			setTypers((all) => expireTypingState(all));
 		}, 1000);
 		return () => clearInterval(t);
 	}, []);
@@ -943,12 +1044,20 @@ export function App() {
 			setChanInfo(null);
 			return;
 		}
+		const s = sock.current;
+		if (!s) {
+			setChanInfo(null);
+			return;
+		}
+		const key = buf.key;
 		let alive = true;
 		const t = setTimeout(() => {
-			sock.current
-				.request("get_channel", { network: buf.network, buffer: buf.buffer })
+			s.request("get_channel", { network: buf.network, buffer: buf.buffer })
 				.then((d) => {
-					if (alive) setChanInfo(d);
+					if (alive && sock.current === s && activeKeyRef.current === key &&
+						d?.network === buf.network && d?.buffer === buf.buffer) {
+						setChanInfo(d);
+					}
 				})
 				.catch(() => {});
 		}, 150);
@@ -956,7 +1065,11 @@ export function App() {
 			alive = false;
 			clearTimeout(t);
 		};
-	}, [activeKey, connected, chanTick]);
+	}, [
+		activeKey, connected, chanTick,
+		buffers[activeKey]?.network, buffers[activeKey]?.buffer,
+		networks[buffers[activeKey]?.network]?.chantypes,
+	]);
 
 	// Visiting a buffer clears any prior load failure so it retries once (runs
 	// before the load effect below, so the retry fires this same commit).
@@ -1074,7 +1187,7 @@ export function App() {
 	}
 	stepRef.current = stepBuffer;
 
-	function select(network, buffer) {
+	function navigate(network, buffer) {
 		const key = bufKey(network, buffer);
 		// A buffer may not exist yet (/join, /msg to a fresh target):
 		// create a placeholder so the view renders while events arrive.
@@ -1097,6 +1210,21 @@ export function App() {
 		if (globalThis.innerWidth < 760) setSideOpen(false);
 	}
 
+	function select(network, buffer) {
+		navigationIntent.current++;
+		navigate(network, buffer);
+	}
+
+	function beginNavigation() {
+		return ++navigationIntent.current;
+	}
+
+	function selectForNavigation(intent, network, buffer) {
+		if (navigationIntent.current !== intent) return false;
+		navigate(network, buffer);
+		return true;
+	}
+
 	// rememberPendingWhois records a nick we asked about so its whois reply is
 	// treated as client-initiated (opens/selects a buffer). Soft-capped so a
 	// stream of never-answered requests can't grow it.
@@ -1117,10 +1245,10 @@ export function App() {
 	// history goes too — the sidebar is store-driven, so a buffer that
 	// stays in the store resurrects on the next refresh. Other devices
 	// drop it via the buffer_closed push.
-	function closeBuffer(network, buffer) {
-		sock.current?.request("close_buffer", { network, buffer }).catch(() => {});
+	function forgetBuffer(network, buffer) {
 		const key = bufKey(network, buffer);
 		setBuffers((b) => {
+			if (!b[key]) return b;
 			const next = { ...b };
 			delete next[key];
 			return next;
@@ -1128,29 +1256,61 @@ export function App() {
 		// Invalidate any in-flight initial get_history so it can't reinstall a
 		// phantom msgs entry for the buffer we're closing.
 		historyGen.current[key] = (historyGen.current[key] || 0) + 1;
+		redactedIds.current.delete(key);
 		setMsgs((m) => dropBufferMsgs(m, key));
-		if (activeKeyRef.current !== key) return;
-		const rest = Object.values(buffersRef.current)
-			.filter((b) => b.key !== key)
-			.sort((a, b) => (a.network + a.buffer).localeCompare(b.network + b.buffer));
-		if (rest.length) select(rest[0].network, rest[0].buffer);
-		else {
-			setActiveKey(null);
-			location.hash = "";
+		setTypers((all) => {
+			if (!all.has(key)) return all;
+			const next = new Map(all);
+			next.delete(key);
+			return next;
+		});
+		if (activeKeyRef.current === key) {
+			const rest = Object.values(buffersRef.current)
+				.filter((b) => b.key !== key)
+				.sort((a, b) => (a.network + a.buffer).localeCompare(b.network + b.buffer));
+			if (rest.length) select(rest[0].network, rest[0].buffer);
+			else {
+				setActiveKey(null);
+				location.hash = "";
+			}
 		}
 	}
 
-	// editTopic selects the channel and prefills the composer with its
-	// current topic for editing (sent as /topic). The topic is fetched for
-	// the target directly: chanInfo tracks only the (previously) active
-	// buffer, and activeKeyRef still holds the old key synchronously after
-	// select(). Resolving asynchronously also lands the prefill after the
-	// buffer-switch draft reset, so it is not clobbered.
+	async function closeBuffer(network, buffer) {
+		const s = sock.current;
+		if (!s) throw new Error("not connected");
+		try {
+			const d = await s.request("close_buffer", { network, buffer });
+			// New servers return the canonical spelling they actually removed;
+			// fall back for compatibility with an older nil `ok` response.
+			forgetBuffer(d?.network || network, d?.buffer || buffer);
+			setCmdError("");
+			return d;
+		} catch (e) {
+			setCmdError(e.message || "closing buffer failed");
+			throw e;
+		}
+	}
+
+	// editTopic selects the channel and prefills that channel's keyed draft.
+	// The intent/socket guards discard a superseded request or one that crossed
+	// an auth boundary; switching elsewhere merely leaves the draft in its
+	// intended channel instead of writing into the newly active composer.
 	function editTopic(network, buffer) {
+		const key = bufKey(network, buffer);
+		const intent = ++topicIntent.current;
+		const s = sock.current;
 		select(network, buffer);
-		sock.current?.request("get_channel", { network, buffer })
-			.then((d) => composerApi.current?.prefill(`/topic ${d?.topic || ""}`))
-			.catch(() => composerApi.current?.prefill("/topic "));
+		if (!s) return;
+		s.request("get_channel", { network, buffer })
+			.then((d) => {
+				if (topicIntent.current !== intent || sock.current !== s) return;
+				composerApi.current?.prefill(key, `/topic ${d?.topic || ""}`);
+			})
+			.catch(() => {
+				if (topicIntent.current !== intent || sock.current !== s) return;
+				composerApi.current?.prefill(key, "/topic ");
+			});
 	}
 
 	// openUserMenu: the right-click menu for a nick (member list, message).
@@ -1174,7 +1334,7 @@ export function App() {
 	// Halfop (%) can kick and manage voice; @ and above also op and ban.
 	function modItems(network, nick) {
 		const buf = activeBuf;
-		const members = chanInfo?.members;
+		const members = activeChanInfo?.members;
 		if (!buf || buf.network !== network || !members) return [];
 		const selfN = networks[network]?.nick;
 		if (!selfN || nick === selfN) return [];
@@ -1210,6 +1370,34 @@ export function App() {
 		const muted = isMuted(mutesRef.current, key);
 		const chan = isChannelName(buffer, networksRef.current[network]?.chantypes);
 		const ig = !chan && isIgnored(ignoresRef.current, network, buffer);
+		const confirmDestructiveClose = (leave) => setMenu({
+			x, y, title: buffer,
+			items: [{
+				label: leave
+					? "Really leave? This erases its scrollback"
+					: "Really close? This erases its scrollback",
+				danger: true,
+				onClick: async () => {
+					if (!leave) {
+						await closeBuffer(network, buffer).catch(() => {});
+						return;
+					}
+					const s = sock.current;
+					if (!s) {
+						setCmdError("not connected");
+						return;
+					}
+					try {
+						// part_channel also removes the channel from autojoin. History
+						// is deleted only after both operations are acknowledged.
+						await s.request("part_channel", { network, channel: buffer });
+						await closeBuffer(network, buffer);
+					} catch (e) {
+						setCmdError(e.message || "leaving channel failed");
+					}
+				},
+			}],
+		});
 		const items = [
 			...(chan
 				? [{ label: "Edit topic", onClick: () => editTopic(network, buffer) }]
@@ -1226,31 +1414,52 @@ export function App() {
 			},
 			chan
 				? {
-					label: "Leave channel", danger: true,
-					onClick: () => {
-						// part_channel also removes the channel from autojoin. Only
-						// delete the buffer's history AFTER the server confirms both
-						// the part and the autojoin persistence — closing eagerly
-						// erased history for a channel that (disconnected network,
-						// failed persist) would rejoin on reconnect.
-						sock.current?.request("part_channel", { network, channel: buffer })
-							.then(() => closeBuffer(network, buffer))
-							.catch(() => sendCommand(network, "PART", [buffer]));
-					},
+					label: "Leave channel…", danger: true,
+					onClick: () => confirmDestructiveClose(true),
 				}
-				: { label: "Close", danger: true, onClick: () => closeBuffer(network, buffer) },
+				: { label: "Close…", danger: true, onClick: () => confirmDestructiveClose(false) },
 		];
 		setMenu({ x, y, title: buffer, items });
 	}
 
 	// openNetworkMenu: click/right-click on a network header row.
+	function openJoinPrompt(network) {
+		const intent = ++chanPromptIntent.current;
+		setChanPromptError("");
+		setChanPromptBusy(false);
+		chanPromptBusyRef.current = false;
+		setChanPrompt({ network, intent });
+	}
+
+	function closeJoinPrompt() {
+		chanPromptIntent.current++;
+		setChanPrompt(null);
+		setChanPromptBusy(false);
+		chanPromptBusyRef.current = false;
+	}
+
+	function openNewNetwork() {
+		const intent = ++netFormIntent.current;
+		setNetFormError("");
+		setNetFormBusy(false);
+		netFormBusyRef.current = false;
+		setNetForm({ initial: null, oldName: "", intent });
+	}
+
+	function closeNetworkForm() {
+		netFormIntent.current++;
+		setNetForm(null);
+		setNetFormBusy(false);
+		netFormBusyRef.current = false;
+	}
+
 	function openNetworkMenu(network, x, y) {
 		setMenu({
 			x, y, title: network,
 			items: [
-				{ label: "Join channel…", onClick: () => { setChanPromptError(""); setChanPrompt({ network }); } },
+				{ label: "Join channel…", onClick: () => openJoinPrompt(network) },
 				{ label: "Edit network…", onClick: () => editNetwork(network) },
-				{ label: "Add network…", onClick: () => { setNetFormError(""); setNetForm({ initial: null, oldName: "" }); } },
+				{ label: "Add network…", onClick: openNewNetwork },
 				{
 					// Two-step, like the edit form's guarded delete: this permanently
 					// erases the network AND its scrollback, so one misclick on a
@@ -1272,48 +1481,104 @@ export function App() {
 	}
 
 	function editNetwork(network) {
-		sock.current?.request("get_networks", null).then((d) => {
-			const n = (d.networks || []).find((x) => x.name === network);
-			if (!n) return;
+		const intent = ++netFormIntent.current;
+		setCmdError("");
+		const s = sock.current;
+		if (!s) {
+			setCmdError("not connected");
+			return;
+		}
+		const stale = () => netFormIntent.current !== intent || sock.current !== s;
+		s.request("get_network", { network }).then((data) => {
+			if (stale()) return;
+			const n = editableNetwork(data, network);
 			setNetFormError("");
-			setNetForm({ initial: n.config, oldName: network });
-		}).catch(() => {});
+			setNetFormBusy(false);
+			setNetForm({ initial: n.config, oldName: network, intent });
+		}).catch((e) => {
+			if (stale()) return;
+			setCmdError(networkEditError(network, e));
+		});
 	}
 
 	function saveNetwork(cfg, oldName) {
+		const intent = netForm?.intent;
+		const s = sock.current;
+		if (!intent || !s || netFormBusyRef.current) return;
+		netFormBusyRef.current = true;
 		setNetFormBusy(true);
-		sock.current?.request("put_network", { old_name: oldName || undefined, config: cfg })
+		s.request("put_network", { old_name: oldName || undefined, config: cfg })
 			.then(() => {
+				if (netFormIntent.current !== intent || sock.current !== s) return;
 				setNetForm(null);
 				setNetFormError("");
 			})
-			.catch((e) => setNetFormError(e.message || "saving failed"))
-			.finally(() => setNetFormBusy(false));
+			.catch((e) => {
+				if (netFormIntent.current === intent && sock.current === s) setNetFormError(e.message || "saving failed");
+			})
+			.finally(() => {
+				if (netFormIntent.current === intent && sock.current === s) {
+					netFormBusyRef.current = false;
+					setNetFormBusy(false);
+				}
+			});
 	}
 
 	function deleteNetwork(name) {
+		const fromForm = netForm?.oldName === name;
+		const intent = fromForm ? netForm.intent : ++netFormIntent.current;
+		const s = sock.current;
+		if (!s || netFormBusyRef.current) return;
+		netFormBusyRef.current = true;
 		setNetFormBusy(true);
-		sock.current?.request("delete_network", { network: name })
+		s.request("delete_network", { network: name })
 			.then(() => {
+				if (netFormIntent.current !== intent || sock.current !== s) return;
 				setNetForm(null);
 				setNetFormError("");
 			})
-			.catch((e) => setNetFormError(e.message || "deleting failed"))
-			.finally(() => setNetFormBusy(false));
+			.catch((e) => {
+				if (netFormIntent.current !== intent || sock.current !== s) return;
+				if (fromForm) setNetFormError(e.message || "deleting failed");
+				else setCmdError(e.message || "deleting network failed");
+			})
+			.finally(() => {
+				if (netFormIntent.current === intent && sock.current === s) {
+					netFormBusyRef.current = false;
+					setNetFormBusy(false);
+				}
+			});
 	}
 
-	const pendingJoin = useRef(null);
+	// Target-correlated pending joins pair overlapping actions with their actual
+	// self-JOIN (including 470 aliases) without letting an async IRC rejection
+	// consume an unrelated later join.
+	const pendingJoins = useRef(new Map());
 	function joinChannel(network, channel) {
-		sock.current?.request("join_channel", { network, channel })
+		const intent = chanPrompt?.intent;
+		const s = sock.current;
+		if (!intent || !s || chanPromptBusyRef.current) return;
+		chanPromptBusyRef.current = true;
+		setChanPromptBusy(true);
+		// Arm before sending: the self-JOIN push can beat the response envelope.
+		const nav = beginNavigation();
+		const joinToken = armPendingJoin(pendingJoins.current, network, channel, nav);
+		s.request("join_channel", { network, channel })
 			.then(() => {
+				if (chanPromptIntent.current !== intent || sock.current !== s) return;
 				setChanPrompt(null);
 				setChanPromptError("");
-				// Select once our JOIN arrives (it may be a forward to a
-				// different channel); creating the buffer now would leave a
-				// phantom if the server redirects us.
-				pendingJoin.current = { network, ts: Date.now() };
 			})
-			.catch((e) => setChanPromptError(e.message || "join failed"));
+			.catch((e) => {
+				clearPendingJoin(pendingJoins.current, joinToken);
+				if (chanPromptIntent.current === intent && sock.current === s) setChanPromptError(e.message || "join failed");
+			})
+			.finally(() => {
+				if (chanPromptIntent.current === intent && sock.current === s) {
+					chanPromptBusyRef.current = false;
+					setChanPromptBusy(false);
+				}
+			});
 	}
 
 	// jumpTo opens a search result: load a window centered on the message
@@ -1321,6 +1586,9 @@ export function App() {
 	// events won't append (see the event handler).
 	function jumpTo(ev) {
 		const key = bufKey(ev.network, ev.buffer);
+		const s = sock.current;
+		if (!s) return;
+		const nav = beginNavigation();
 		setSearchOpen(false);
 		// Clear focus up front so re-jumping to the SAME result still registers
 		// as a focusId change — VirtualList only arms a scroll on a change, so
@@ -1333,8 +1601,7 @@ export function App() {
 		// around-window we install below, which would leave a temporal gap.
 		historyGen.current[key] = (historyGen.current[key] || 0) + 1;
 		const gen = historyGen.current[key];
-		sock.current
-			?.request("get_history", {
+		s.request("get_history", {
 				network: ev.network, buffer: ev.buffer,
 				around: { ts: ev.time, id: ev.id }, limit: PAGE,
 			})
@@ -1342,7 +1609,8 @@ export function App() {
 				// The buffer was closed/invalidated (e.g. buffer_closed from
 				// another device) while this was in flight — don't recreate a
 				// ghost buffer, mirroring the initial load and loadOlder guards.
-				if ((historyGen.current[key] || 0) !== gen) return;
+				if (sock.current !== s || navigationIntent.current !== nav ||
+					(historyGen.current[key] || 0) !== gen) return;
 				setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(ev.network, ev.buffer) }));
 				setMsgs((m) => {
 					const list = applyTombstones(page.messages || [], redactedIds.current.get(key));
@@ -1354,6 +1622,7 @@ export function App() {
 				location.hash = toHash(ev.network, ev.buffer);
 				setActiveKey(key);
 				setFocusId(ev.id);
+				setCmdError("");
 			})
 			.catch(() => {});
 	}
@@ -1408,7 +1677,7 @@ export function App() {
 							...prev,
 							list,
 							bytes,
-							reachedTop: older.length < PAGE,
+							reachedTop: !historyHasMore(page, PAGE),
 							atTail,
 						},
 					};
@@ -1438,11 +1707,14 @@ export function App() {
 	// sendInput returns a promise that resolves when the send is accepted and
 	// rejects on a parse error or a rejected request, so the composer can
 	// keep the user's text on failure instead of dropping it.
-	function sendInput(text) {
-		const buf = buffers[activeKey];
+	function sendInput(text, targetKey) {
+		// The composer captures its buffer key at submit time. State updates from
+		// a click/hash switch can otherwise make the parent render target B while
+		// the still-visible text originated in A.
+		const buf = buffersRef.current[targetKey];
 		if (!buf) return Promise.reject(new Error("no active buffer"));
 		setCmdError("");
-		const p = parseInput(text, buf.buffer, networks[buf.network]?.chantypes);
+		const p = parseInput(text, buf.buffer, networksRef.current[buf.network]?.chantypes);
 		const oops = (e) => {
 			setCmdError(e.message || "failed");
 			throw e; // propagate so submit keeps the draft
@@ -1455,25 +1727,34 @@ export function App() {
 				return sock.current
 					.request("send", { network: buf.network, target: buf.buffer, text: p.text })
 					.catch(oops);
-			case "msg":
-				return sock.current
+			case "msg": {
+				const s = sock.current;
+				if (!s) return Promise.reject(new Error("not connected")).catch(oops);
+				const nav = beginNavigation();
+				return s
 					.request("send", { network: buf.network, target: p.target, text: p.text })
-					.then(() => select(buf.network, p.target))
-					.catch(oops);
-			case "cmd":
-				if (p.command === "WHOIS") rememberPendingWhois(buf.network, p.params?.[0]);
-				return sock.current
-					.request("command", { network: buf.network, command: p.command, params: p.params })
 					.then(() => {
-						// switchTo is set only by /join. Select once our actual
-						// JOIN arrives (via pendingJoin), not the requested name —
-						// the server may forward the join (MODE +f, numeric 470),
-						// and selecting the requested name now would leave a
-						// persistent phantom buffer (mergeServerBuffers keeps
-						// ephemeral buffers). Mirrors the UI joinChannel path.
-						if (p.switchTo) pendingJoin.current = { network: buf.network, ts: Date.now() };
+						if (sock.current === s) selectForNavigation(nav, buf.network, p.target);
 					})
 					.catch(oops);
+			}
+			case "cmd":
+				if (p.command === "WHOIS") rememberPendingWhois(buf.network, p.params?.[0]);
+				const s = sock.current;
+				if (!s) return Promise.reject(new Error("not connected")).catch(oops);
+				// Like the modal path, arm /join before the request so a fast
+				// self-JOIN cannot arrive in the response/JOIN scheduling gap.
+				const joinToken = p.switchTo
+					? armPendingJoin(
+						pendingJoins.current, buf.network, p.switchTo, beginNavigation(),
+					)
+					: null;
+				return s
+					.request("command", { network: buf.network, command: p.command, params: p.params })
+					.catch((e) => {
+						if (joinToken) clearPendingJoin(pendingJoins.current, joinToken);
+						return oops(e);
+					});
 			default:
 				return Promise.reject(new Error("unknown input"));
 		}
@@ -1507,40 +1788,56 @@ export function App() {
 	const selfNick = activeBuf ? networks[activeBuf.network]?.nick : "";
 	const netState = activeBuf ? networks[activeBuf.network]?.state : "";
 	const isChan = activeBuf && isChannelName(activeBuf.buffer, networks[activeBuf.network]?.chantypes);
-	const topicText = topicFor(activeBuf, netState, chanInfo);
+	// State clearing is a passive effect, so correctness cannot depend on it
+	// running before paint. Only consume a snapshot naming this exact buffer.
+	const activeChanInfo = chanInfo && activeBuf &&
+		chanInfo.network === activeBuf.network && chanInfo.buffer === activeBuf.buffer
+		? chanInfo
+		: null;
+	const topicText = topicFor(activeBuf, netState, activeChanInfo);
 	// Lowercased nick -> "user@host" for the active channel, so a message nick
 	// can show its ident/host on hover (from userhost-in-names / JOIN / CHGHOST).
 	const userhosts = useMemo(() => {
 		const m = new Map();
-		for (const mem of chanInfo?.members || []) {
+		for (const mem of activeChanInfo?.members || []) {
 			if (mem.user || mem.host) m.set(mem.nick.toLowerCase(), `${mem.user || ""}@${mem.host || ""}`);
 		}
 		return m;
-	}, [chanInfo]);
+	}, [activeChanInfo]);
 	// Lowercased nick -> highest mode symbol (@, +, …) for the active channel,
 	// so the message list can prefix a sender's nick with their status (the
 	// nickPrefixes pref). Empty for queries (no roster).
 	const memberPrefixes = useMemo(() => {
 		const m = new Map();
-		for (const mem of chanInfo?.members || []) {
+		for (const mem of activeChanInfo?.members || []) {
 			const p = (mem.prefix || "")[0];
 			if (p) m.set(mem.nick.toLowerCase(), p);
 		}
 		return m;
-	}, [chanInfo]);
+	}, [activeChanInfo]);
 	const ignoredHere = activeBuf ? ignores[activeBuf.network] || [] : [];
 	const mutedSet = new Set(mutes);
 	const timeFmt = { clock: prefs.clock, seconds: prefs.seconds, ampm: prefs.ampm };
+	// Any of these can change wrapping/row height without changing message ids.
+	// VirtualList uses the key to invalidate measurements while preserving a
+	// stable visible-row anchor.
+	const rowLayoutKey = JSON.stringify([
+		theme, prefs.textSize, prefs.density, prefs.msgFont, prefs.css,
+		prefs.statusMsgs, prefs.statusHost, prefs.clock, prefs.seconds,
+		prefs.ampm, prefs.nickSep, prefs.highlightNames, prefs.nickPrefixes,
+		previews,
+	]);
 
 	return (
 		<div class="app">
 			<div class={"sidebar" + (sideOpen ? " open" : "")}>
 				<Sidebar
 					networks={networks} buffers={buffers} activeKey={activeKey}
-					monitors={monitors} theme={theme} mutedSet={mutedSet} onSelect={select}
+					monitors={monitors} truncated={buffersTruncated}
+					theme={theme} mutedSet={mutedSet} onSelect={select}
 					onSettings={() => setSettingsOpen(true)}
 					onBufferMenu={openBufferMenu} onNetworkMenu={openNetworkMenu}
-					onAddNetwork={() => { setNetFormError(""); setNetForm({ initial: null, oldName: "" }); }}
+					onAddNetwork={openNewNetwork}
 					onAddMonitor={addMonitor} onRemoveMonitor={removeMonitor}
 				/>
 			</div>
@@ -1560,10 +1857,10 @@ export function App() {
 						buf={activeBuf} msgs={msgs[activeKey]} selfNick={selfNick} theme={theme}
 						connected={connected && netState === "registered"}
 						error={cmdError}
-						typers={Object.keys(typers[activeKey] || {})}
+						typers={Array.from(typers.get(activeKey)?.keys() || [])}
 						focusId={focusId}
 						completionNicks={isChan
-							? (chanInfo?.members || []).map((m) => m.nick)
+							? (activeChanInfo?.members || []).map((m) => m.nick)
 							: [activeBuf.buffer]}
 						ignoredNicks={ignoredHere}
 						statusMode={prefs.statusMsgs}
@@ -1573,6 +1870,7 @@ export function App() {
 						userhosts={userhosts}
 						nickPrefixes={prefs.nickPrefixes}
 						memberPrefixes={memberPrefixes}
+						layoutKey={rowLayoutKey}
 						composerApi={composerApi}
 						onNick={(nick, x, y) => openUserMenu(activeBuf.network, nick, x, y)}
 						isHighlight={(t) => highlightText(t, selfNick, rules, activeBuf.network)}
@@ -1593,14 +1891,17 @@ export function App() {
 						}}
 					/>
 				) : (
-					<div class="empty-state">no buffers yet — waiting for traffic</div>
+					<div class="empty-state">
+						{cmdError && <div class="cmd-error">{cmdError}</div>}
+						<div>no buffers yet — waiting for traffic</div>
+					</div>
 				)}
 			</div>
 			{isChan && rightOpen && <div class="right-scrim" aria-hidden="true" onClick={() => setRightOpen(false)} />}
 			{isChan && (
 				<div class={"rightbar" + (rightOpen ? " open" : "")}>
 					<Members
-							info={chanInfo} theme={theme} ignoredNicks={ignoredHere}
+							info={activeChanInfo} theme={theme} ignoredNicks={ignoredHere}
 							onNick={(nick, x, y) => openUserMenu(activeBuf.network, nick, x, y)}
 						/>
 				</div>
@@ -1621,25 +1922,26 @@ export function App() {
 			{settingsOpen && (
 				<Settings
 					networks={networks} rules={rules} onRules={updateRules}
-					prefs={prefs} onPrefs={updatePrefs} onPreviews={(v) => { previewsPinned.current = true; setPreviews(v); }}
+					prefs={prefs} prefsError={prefsError} onPrefs={updatePrefs} onPreviews={(v) => { previewsPinned.current = true; setPreviews(v); }}
 					notifier={notifier.current} onClose={() => setSettingsOpen(false)}
 					onLogout={() => { setSettingsOpen(false); setPhase("login"); }}
 				/>
 			)}
 			{netForm && (
 				<NetworkForm
-					key={netForm.oldName || "new"}
+					key={netForm.intent}
 					initial={netForm.initial} oldName={netForm.oldName}
 					error={netFormError} busy={netFormBusy}
 					onSave={saveNetwork} onDelete={deleteNetwork}
-					onClose={() => setNetForm(null)}
+					onClose={closeNetworkForm}
 				/>
 			)}
 			{chanPrompt && (
 				<ChannelPrompt
 					network={chanPrompt.network} error={chanPromptError}
+					busy={chanPromptBusy}
 					chantypes={networks[chanPrompt.network]?.chantypes}
-					onJoin={joinChannel} onClose={() => setChanPrompt(null)}
+					onJoin={joinChannel} onClose={closeJoinPrompt}
 				/>
 			)}
 			<ContextMenu menu={menu} onClose={() => setMenu(null)} />

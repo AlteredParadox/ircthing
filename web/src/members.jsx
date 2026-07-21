@@ -55,6 +55,11 @@ export function Members({ info, theme, ignoredNicks, onNick }) {
 				/>
 				<div class="side-meta">{q ? `${shown.length}/${members.length}` : members.length}</div>
 			</div>
+			{info?.truncated === true && (
+				<div class="data-warning" role="status" title="The server response reached its safety limit.">
+					Member list incomplete — server limit reached
+				</div>
+			)}
 			<div class="side-list scroll">
 				{q && shown.length === 0 && <div class="member-group-head">no matches</div>}
 				{groupMembers(shown).map((g) => (

@@ -45,12 +45,12 @@ export class Geometry {
 		this.dirty = true;
 	}
 
-	setItems(items) {
+	setItems(items, forceRebuild = false) {
 		const old = this.items;
 		if (old === items) return;
 		// Append fast path: the common case is one message arriving at the
 		// end of a 50k list — extend the index instead of rebuilding it.
-		if (isAppendOf(old, items)) {
+		if (!forceRebuild && isAppendOf(old, items)) {
 			for (let i = old.length; i < items.length; i++) this.index.set(items[i].id, i);
 		} else {
 			this.rebuildIndex(items);
@@ -77,6 +77,21 @@ export class Geometry {
 	clearMeasured() {
 		this.measured.clear();
 		this.dirty = true;
+	}
+
+	// Rows can keep the same stable id while their rendered content changes
+	// (redaction, collapse expansion, preview metadata). Drop only those stale
+	// measurements; unchanged object identities retain their useful heights.
+	invalidateChanged(items) {
+		let changed = 0;
+		for (const it of items) {
+			const i = this.index.get(it.id);
+			if (i === undefined || this.items[i] === it) continue;
+			this.measured.delete(it.id);
+			changed++;
+		}
+		if (changed) this.dirty = true;
+		return changed;
 	}
 
 	heightAt(i) {
@@ -134,6 +149,74 @@ export class Geometry {
 			end: Math.min(n, findIndex(this.offsets, n, Math.max(0, y1)) + 1),
 		};
 	}
+}
+
+// Capture and restore a stable viewport identity across global measurement
+// invalidation (width/font/density/custom CSS). Keep the EXACT rendered row id
+// separately from its collapse-member fallback: while a collapse run is open,
+// the fallback id is also the id of a real child row. Looking that id up first
+// would move a viewport anchored on the summary all the way to the last child.
+// The previous immutable list provides a deterministic nearest-survivor
+// fallback when filtering removes the captured row itself (ignore/status-mode
+// changes), even when a long contiguous run disappears.
+export function captureViewportAnchor(geo, items, viewTop) {
+	if (!items.length) return null;
+	const i = geo.range(viewTop, viewTop).start;
+	const ref = (item) => ({ id: item.id, member: anchorId(item) });
+	return {
+		...ref(items[i]),
+		intra: Math.max(0, viewTop - geo.offsetOf(i)),
+		// Retaining the immutable old list for one layout commit avoids copying
+		// thousands of ids. restore can scan outward only if the exact row went
+		// away, finding a survivor even across a long filtered status/ignore run.
+		source: items,
+		index: i,
+	};
+}
+
+export function restoreViewportAnchor(geo, anchor) {
+	if (!anchor) return null;
+	const locate = (ref) => {
+		// Exact top-level identity always wins. This is what distinguishes an
+		// expanded run's summary row from its real last child.
+		let i = geo.indexOf(ref.id);
+		if (i !== -1) return i;
+		// A status-mode change may replace a real presence row with a collapsed
+		// synthetic row, or extend a run and change its synthetic id.
+		return geo.items.findIndex((it) =>
+			it.collapse?.some((ev) => ev.id === ref.member));
+	};
+	let i = locate(anchor);
+	if (i === -1 && anchor.source) {
+		const ref = (item) => ({ id: item.id, member: anchorId(item) });
+		for (let distance = 1; distance < anchor.source.length; distance++) {
+			// Prefer the following row at each distance: when the anchored row was
+			// filtered, it naturally moves into the vacated viewport position.
+			const after = anchor.index + distance;
+			if (after < anchor.source.length) i = locate(ref(anchor.source[after]));
+			if (i !== -1) break;
+			const before = anchor.index - distance;
+			if (before >= 0) i = locate(ref(anchor.source[before]));
+			if (i !== -1) break;
+		}
+	}
+	if (i === -1) return null;
+	const height = geo.offsetOf(i + 1) - geo.offsetOf(i);
+	return geo.offsetOf(i) + Math.min(anchor.intra, Math.max(0, height - 1));
+}
+
+// hasNonAppendIdentityChange reports a structural list rewrite: filtering,
+// reordering, trimming, or folding rows. A stable-id prefix followed only by
+// new tail rows is the ordinary live-message path and deliberately returns
+// false; anchoring that path would fight normal scrolling for every append.
+// anchorId makes this comparison aware of collapse/show transitions.
+export function hasNonAppendIdentityChange(oldItems, items) {
+	if (oldItems.length === 0) return false;
+	const common = Math.min(oldItems.length, items.length);
+	for (let i = 0; i < common; i++) {
+		if (anchorId(oldItems[i]) !== anchorId(items[i])) return true;
+	}
+	return items.length < oldItems.length;
 }
 
 // computeWindow picks the [start, end) row slice to render this frame. While

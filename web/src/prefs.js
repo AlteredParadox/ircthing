@@ -40,6 +40,32 @@ export const CLOCKS = ["24", "12"];
 // Longest allowed nick/message separator (e.g. ":"); a few chars is plenty
 // and bounds a hand-edited pref.
 export const MAX_NICK_SEP = 3;
+// Must match hub.MaxPrefsBytes. This is the byte length of the inner prefs
+// JSON value, not JavaScript characters: non-ASCII CSS and JSON escaping can
+// make those differ substantially.
+export const MAX_PREFS_BYTES = 64 * 1024;
+
+export function prefsByteLength(p) {
+	return new TextEncoder().encode(JSON.stringify(p)).byteLength;
+}
+
+// Clamp only the free-form field so every locally generated or remotely
+// loaded preference object is one the server can persist. Binary-searching
+// Unicode code points avoids splitting a surrogate pair and accounts for the
+// actual JSON encoding cost of quotes, backslashes and control characters.
+export function clampPrefsToBudget(p) {
+	const css = typeof p.css === "string" ? p.css : "";
+	const full = { ...p, css };
+	if (prefsByteLength(full) <= MAX_PREFS_BYTES) return full;
+	const chars = Array.from(css);
+	let lo = 0, hi = chars.length;
+	while (lo < hi) {
+		const mid = Math.ceil((lo + hi) / 2);
+		if (prefsByteLength({ ...p, css: chars.slice(0, mid).join("") }) <= MAX_PREFS_BYTES) lo = mid;
+		else hi = mid - 1;
+	}
+	return { ...p, css: chars.slice(0, lo).join("") };
+}
 
 // Swatch colors shown in settings; must match the data-accent blocks in
 // style.css.
@@ -89,7 +115,7 @@ export const DEFAULTS = {
 export function normalizePrefs(raw) {
 	const p = raw && typeof raw === "object" ? raw : {};
 	const pick = (v, allowed, def) => (allowed.includes(v) ? v : def);
-	return {
+	return clampPrefsToBudget({
 		theme: pick(p.theme, THEMES, DEFAULTS.theme),
 		accent: pick(p.accent, ACCENTS, DEFAULTS.accent),
 		textSize: pick(p.textSize, TEXT_SIZES, DEFAULTS.textSize),
@@ -108,7 +134,7 @@ export function normalizePrefs(raw) {
 		titleChannel: typeof p.titleChannel === "boolean" ? p.titleChannel : DEFAULTS.titleChannel,
 		nickPrefixes: typeof p.nickPrefixes === "boolean" ? p.nickPrefixes : DEFAULTS.nickPrefixes,
 		css: typeof p.css === "string" ? p.css : DEFAULTS.css,
-	};
+	});
 }
 
 // resolveTheme turns the theme preference into the concrete theme to

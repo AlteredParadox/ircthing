@@ -16,7 +16,16 @@
 
 import { deepStrictEqual as eq, strictEqual as is } from "node:assert";
 import { test } from "node:test";
-import { TypingSender, typingExpired, typingText } from "../src/irc.js";
+import {
+	clearTypingNick,
+	expireTypingState,
+	MAX_TYPERS_PER_BUFFER,
+	MAX_TYPING_BUFFERS,
+	TypingSender,
+	typingExpired,
+	typingText,
+	updateTypingState,
+} from "../src/irc.js";
 
 // harness: TypingSender with a manual clock, recording notifications.
 function sender(startAt = 100000) {
@@ -110,4 +119,30 @@ test("typingExpired per spec windows", () => {
 	is(typingExpired("active", 1000, 7100), true);
 	is(typingExpired("paused", 1000, 30500), false);
 	is(typingExpired("paused", 1000, 31100), true);
+});
+
+test("typing state ignores unknown buffers and stray done events", () => {
+	const empty = new Map();
+	is(updateTypingState(empty, "net\n#unknown", { nick: "alice", state: "active" }, false, 1), empty);
+	is(updateTypingState(empty, "net\n#known", { nick: "__proto__", state: "done" }, true, 1), empty);
+	const active = updateTypingState(empty, "net\n#known", { nick: "__proto__", state: "active" }, true, 1);
+	is(active.get("net\n#known").has("__proto__"), true, "Map safely stores special names");
+	is(clearTypingNick(active, "net\n#known", "__proto__").size, 0, "last nick removes outer entry");
+});
+
+test("typing state caps both dimensions and expires empty entries", () => {
+	let all = new Map();
+	for (let i = 0; i < MAX_TYPING_BUFFERS; i++) {
+		all = updateTypingState(all, `n\n#${i}`, { nick: "a", state: "active" }, true, 1);
+	}
+	is(all.size, MAX_TYPING_BUFFERS);
+	is(updateTypingState(all, "n\n#overflow", { nick: "a", state: "active" }, true, 1), all);
+
+	let one = new Map();
+	for (let i = 0; i < MAX_TYPERS_PER_BUFFER; i++) {
+		one = updateTypingState(one, "n\n#c", { nick: `n${i}`, state: "paused" }, true, 1);
+	}
+	is(one.get("n\n#c").size, MAX_TYPERS_PER_BUFFER);
+	is(updateTypingState(one, "n\n#c", { nick: "overflow", state: "active" }, true, 1), one);
+	is(expireTypingState(one, 40000).size, 0, "expiry removes the now-empty buffer");
 });

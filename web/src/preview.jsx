@@ -387,7 +387,12 @@ function LinkCard({ url, net }) {
 		<a class="preview-card" href={url} target="_blank" rel="noopener noreferrer">
 			{data.image && <CardImg url={data.image} net={net} />}
 			<div class="preview-card-body">
-				<div class="preview-card-site">{data.site_name || hostOf(url)}</div>
+				{/* The destination host is immutable security context. OpenGraph's
+				    attacker-controlled site_name is useful branding only and can
+				    never replace the origin the click will actually open. */}
+				<div class="preview-card-site">
+					{hostOf(url)}{data.site_name ? ` · ${data.site_name}` : ""}
+				</div>
 				{data.title && <div class="preview-card-title">{data.title}</div>}
 				{data.description && <div class="preview-card-desc">{data.description}</div>}
 			</div>

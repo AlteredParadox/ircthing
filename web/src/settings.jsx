@@ -15,7 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import { useEffect, useState } from "preact/hooks";
-import { ACCENT_RGB, ACCENTS, CLOCKS, MAX_NICK_SEP } from "./prefs.js";
+import { ACCENT_RGB, ACCENTS, CLOCKS, MAX_NICK_SEP, MAX_PREFS_BYTES, prefsByteLength } from "./prefs.js";
 import { uuid } from "./irc.js";
 
 // NotifControl renders the notification section for the current
@@ -214,7 +214,7 @@ export function resetSettingsSession() {
 // Settings modal: appearance preferences, desktop-notification
 // permission, and per-network highlight rules. Everything is edited live
 // and persisted by the parent.
-export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, onPreviews, onClose, onLogout }) {
+export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs, notifier, onPreviews, onClose, onLogout }) {
 	const [perm, setPerm] = useState(notifier.permission());
 	const [enabled, setEnabled] = useState(notifier.enabled);
 	const [logoutErr, setLogoutErr] = useState(false);
@@ -593,8 +593,9 @@ export function Settings({ networks, rules, onRules, prefs, onPrefs, notifier, o
 					<section class="settings-section">
 						<div class="settings-label">Custom CSS</div>
 						<div class="settings-note">
-							Applied live, on top of the theme. Synced across your devices.
+							Applied live, on top of the theme. Synced across your devices. {prefsByteLength(prefs).toLocaleString()} / {MAX_PREFS_BYTES.toLocaleString()} bytes.
 						</div>
+						{prefsError && <div class="cmd-error">{prefsError}</div>}
 						<textarea
 							class="css-input"
 							rows={4}
