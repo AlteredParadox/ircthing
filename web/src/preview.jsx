@@ -14,9 +14,11 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { useEffect, useState } from "preact/hooks";
-import { hostOf, looksLikeImageURL } from "./irc.js";
+import { useEffect, useRef, useState } from "preact/hooks";
+import { hostOf, looksLikeImageURL, mediaKindOf } from "./irc.js";
 import { LRU } from "./lru.js";
+import { mediaFileName, mintMediaToken, shouldRemint, streamSrc } from "./media.js";
+import { mediaPlayersEnabled, onMediaPlayersChange } from "./prefs.js";
 
 // Link previews and image thumbnails. All remote content is loaded
 // through the server media proxy — the browser never fetches a remote
@@ -337,8 +339,132 @@ function useThumb(url, net) {
 // else fetches page metadata via LinkCard. (No hooks here, so the branch is a
 // legal conditional render; each sub-component owns its own effects.)
 export function LinkPreview({ url, net }) {
+	// Playable media links get a player card INSTEAD of a link preview: no
+	// fetch at all until the user presses play (strictly more private than the
+	// metadata fetch a LinkCard would do). This whole component only renders
+	// when the server previews switch is on (chat.jsx gates it), so media
+	// cards inherit that gate; MediaLink additionally honors the client-side
+	// mediaPlayers pref and falls back to the ordinary LinkCard when it's off.
+	const kind = mediaKindOf(url);
+	if (kind) return <MediaLink url={url} net={net} kind={kind} />;
 	if (looksLikeImageURL(url)) return <ImageThumb url={url} net={net} />;
 	return <LinkCard url={url} net={net} />;
+}
+
+// useMediaPlayersPref subscribes to the client mediaPlayers pref so mounted
+// cards follow a settings toggle live.
+function useMediaPlayersPref() {
+	const [on, setOn] = useState(mediaPlayersEnabled());
+	useEffect(() => onMediaPlayersChange(setOn), []);
+	return on;
+}
+
+function MediaLink({ url, net, kind }) {
+	const players = useMediaPlayersPref();
+	if (!players) return <LinkCard url={url} net={net} />; // pref off: old behavior
+	return <MediaCard url={url} net={net} kind={kind} />;
+}
+
+// MediaCard: a compact card (filename + play button) for an audio/video link.
+// NOTHING is fetched at render time. On play: mint a stream token (POST — the
+// URL stays out of query strings/access logs), then mount a native
+// <audio>/<video controls> element whose src streams THROUGH the server
+// (/api/media/stream). preload="metadata", never autoplay.
+function MediaCard({ url, net, kind }) {
+	// phase: idle | minting | playing | error
+	const [phase, setPhase] = useState("idle");
+	const [tok, setTok] = useState(null); // { token, exp }
+	const reminted = useRef(false); // one expiry re-mint per card, then give up
+	const elRef = useRef(null);
+
+	// The virtualized list unmounts rows that scroll out of its render window.
+	// A removed <video> stops on its own, but a detached <audio> element can
+	// keep playing until it is garbage collected (engine-dependent) — pause
+	// deterministically on unmount instead of relying on GC timing.
+	useEffect(() => () => {
+		if (elRef.current) elRef.current.pause();
+	}, []);
+
+	const mint = async () => {
+		setPhase("minting");
+		try {
+			const d = await mintMediaToken(url, net);
+			setTok(d);
+			setPhase("playing");
+		} catch {
+			setPhase("error"); // retryable: the button comes back as "Retry"
+			setTok(null);
+		}
+	};
+
+	const onElementError = () => {
+		// A failing stream after the token's lifetime is (almost certainly)
+		// just expiry — mint once more; any other failure is real (origin gone,
+		// codec unsupported) and gets the open-original fallback.
+		if (tok && shouldRemint(tok.exp) && !reminted.current) {
+			reminted.current = true;
+			mint();
+			return;
+		}
+		setPhase("error");
+		setTok(null);
+	};
+
+	if (phase === "playing" && tok) {
+		const src = streamSrc(tok.token);
+		return (
+			<div class={"media-card media-card-playing media-card-" + kind}>
+				<div class="media-card-head">
+					<span class="preview-card-site">{hostOf(url)}</span>
+					<a class="media-card-name" href={url} target="_blank" rel="noopener noreferrer">{mediaFileName(url)}</a>
+				</div>
+				{kind === "audio" ? (
+					<audio ref={elRef} controls preload="metadata" src={src} onError={onElementError} />
+				) : (
+					<video ref={elRef} controls preload="metadata" src={src} onError={onElementError} />
+				)}
+			</div>
+		);
+	}
+
+	if (phase === "error" && reminted.current) {
+		// Re-mint already failed too: same open-original fallback pattern as
+		// unpreviewable thumbnails.
+		return (
+			<a class="preview-card preview-card-plain" href={url} target="_blank" rel="noopener noreferrer">
+				<div class="preview-card-body">
+					<div class="preview-card-site">{hostOf(url)}</div>
+					<div class="preview-card-title">Playback failed</div>
+					<div class="preview-card-desc">Open the original ↗</div>
+				</div>
+			</a>
+		);
+	}
+
+	return (
+		<div class={"media-card media-card-" + kind}>
+			<button
+				type="button"
+				class="media-play"
+				disabled={phase === "minting"}
+				onClick={mint}
+				aria-label={(phase === "error" ? "Retry " : "Play ") + kind}
+				title={phase === "error" ? "Retry" : "Play"}
+			>
+				{/* play triangle, inline SVG (no icon packs) */}
+				<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+					<path d="M8 5v14l11-7z" fill="currentColor" />
+				</svg>
+			</button>
+			<div class="media-card-head">
+				<a class="media-card-name" href={url} target="_blank" rel="noopener noreferrer">{mediaFileName(url)}</a>
+				<span class="preview-card-site">
+					{hostOf(url)}
+					{phase === "error" ? " · couldn’t start, tap to retry" : ""}
+				</span>
+			</div>
+		</div>
+	);
 }
 
 // LinkCard fetches page metadata for a non-obvious-image URL and renders a card

@@ -627,6 +627,21 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 								/>
 							</div>
 						)}
+						<div class="pref-row">
+							<span class="pref-name">Inline audio/video players</span>
+							<Seg
+								value={prefs.mediaPlayers ? "on" : "off"}
+								options={["off", "on"]}
+								labels={["Off", "On"]}
+								onPick={(v) => onPrefs({ ...prefs, mediaPlayers: v === "on" })}
+							/>
+						</div>
+						<div class="settings-note">
+							Show a play button on links to audio and video files. Nothing is
+							fetched until you press play; playback then streams through the
+							server (same privacy posture as previews — the browser never
+							contacts the remote site). Requires link previews to be on.
+						</div>
 					</section>
 
 					<section class="settings-section">

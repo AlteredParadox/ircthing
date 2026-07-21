@@ -112,6 +112,13 @@ export const DEFAULTS = {
 	// removes the buffer from the sidebar, no confirmation — it returns with
 	// its scrollback on new activity.
 	purgeOnClose: false,
+	// Render inline audio/video player cards for media links (streams through
+	// the server, same privacy posture as previews). Only effective while the
+	// server-side previews switch is on — previews off means no media cards at
+	// all. Default on: with previews already enabled, a player card is
+	// STRICTLY more private than the link-preview fetch it replaces (nothing
+	// is fetched until the user presses play).
+	mediaPlayers: true,
 	css: "",
 };
 
@@ -139,6 +146,7 @@ export function normalizePrefs(raw) {
 		titleChannel: typeof p.titleChannel === "boolean" ? p.titleChannel : DEFAULTS.titleChannel,
 		nickPrefixes: typeof p.nickPrefixes === "boolean" ? p.nickPrefixes : DEFAULTS.nickPrefixes,
 		purgeOnClose: typeof p.purgeOnClose === "boolean" ? p.purgeOnClose : DEFAULTS.purgeOnClose,
+		mediaPlayers: typeof p.mediaPlayers === "boolean" ? p.mediaPlayers : DEFAULTS.mediaPlayers,
 		css: typeof p.css === "string" ? p.css : DEFAULTS.css,
 	});
 }
@@ -171,9 +179,32 @@ export function savePrefs(p) {
 	localStorage.removeItem("theme");
 }
 
+// mediaPlayers pref, mirrored at module level: the preview components
+// (preview.jsx) render deep inside the virtualized message list, and the only
+// prop chat.jsx threads to them is the server previews switch. Rather than
+// widening that prop chain, applyPrefs (already called on every prefs change)
+// publishes the current value here and notifies subscribers, matching how the
+// other prefs apply globally (data attributes on <html>).
+let mediaPlayersOn = DEFAULTS.mediaPlayers;
+const mediaPlayersSubs = new Set();
+
+export function mediaPlayersEnabled() {
+	return mediaPlayersOn;
+}
+
+// onMediaPlayersChange subscribes to pref changes; returns an unsubscribe.
+export function onMediaPlayersChange(fn) {
+	mediaPlayersSubs.add(fn);
+	return () => mediaPlayersSubs.delete(fn);
+}
+
 // applyPrefs stamps the resolved preferences onto <html> and injects the
 // user CSS override as the last <style> in <head> so it wins the cascade.
 export function applyPrefs(p, resolvedTheme) {
+	if (p.mediaPlayers !== mediaPlayersOn) {
+		mediaPlayersOn = p.mediaPlayers;
+		for (const fn of mediaPlayersSubs) fn(mediaPlayersOn);
+	}
 	const root = document.documentElement;
 	root.dataset.theme = resolvedTheme;
 	root.dataset.accent = p.accent;

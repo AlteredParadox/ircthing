@@ -34,6 +34,7 @@ test("normalizePrefs: keeps valid values", () => {
 		density: "compact", sidebarWidth: "wide", msgFont: "mono", statusMsgs: "collapse",
 		statusHost: true, clock: "12", seconds: true, ampm: false, nickSep: ":", highlightNames: false,
 		sendTyping: false, titleUnread: false, titleChannel: true, nickPrefixes: true, purgeOnClose: true,
+		mediaPlayers: false,
 		css: "a { color: red }",
 	};
 	eq(normalizePrefs(full), full);
@@ -62,6 +63,13 @@ test("purgeOnClose: defaults off (closing keeps history) and round-trips", () =>
 	is(normalizePrefs({}).purgeOnClose, false);
 	is(normalizePrefs({ purgeOnClose: true }).purgeOnClose, true);
 	is(normalizePrefs({ purgeOnClose: false }).purgeOnClose, false);
+});
+
+test("mediaPlayers: defaults on (still gated by the server previews switch) and round-trips", () => {
+	is(DEFAULTS.mediaPlayers, true);
+	is(normalizePrefs({}).mediaPlayers, true);
+	is(normalizePrefs({ mediaPlayers: false }).mediaPlayers, false);
+	is(normalizePrefs({ mediaPlayers: "on" }).mediaPlayers, DEFAULTS.mediaPlayers); // non-boolean -> default
 });
 
 test("normalizePrefs: clamps unknown values field by field", () => {

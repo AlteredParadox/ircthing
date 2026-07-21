@@ -860,6 +860,27 @@ export function hostOf(u) {
 	}
 }
 
+// mediaKindOf classifies a link as playable media by its URL path extension
+// (case-insensitive, query/fragment ignored): "audio" | "video" | null.
+// Extension lists match what browsers commonly play natively; the server's
+// stream endpoint is authoritative (it allowlists by Content-Type), so a
+// mislabeled URL just yields a card whose player errors to "open original".
+const AUDIO_EXTS = new Set(["mp3", "ogg", "opus", "flac", "m4a", "wav", "aac"]);
+const VIDEO_EXTS = new Set(["mp4", "webm", "m4v", "ogv"]);
+export function mediaKindOf(u) {
+	try {
+		const path = new URL(u).pathname.toLowerCase();
+		const dot = path.lastIndexOf(".");
+		if (dot < 0 || dot === path.length - 1 || path.includes("/", dot)) return null;
+		const ext = path.slice(dot + 1);
+		if (AUDIO_EXTS.has(ext)) return "audio";
+		if (VIDEO_EXTS.has(ext)) return "video";
+		return null;
+	} catch {
+		return null;
+	}
+}
+
 // SERVER_BUFFER is the per-network "server buffer" target (must match the
 // hub's serverBufferTarget): server/service notices and server-info lines
 // live here, surfaced as the sidebar's network header (The Lounge lobby).

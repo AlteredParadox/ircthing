@@ -21,6 +21,7 @@ package api
 
 import (
 	"context"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -108,10 +109,21 @@ type Server struct {
 	// not proxy URL.
 	tunnelHTMLByNet  map[string]*fetcher
 	tunnelImageByNet map[string]*fetcher
-	previewCache     *ttlCache[PreviewData]
-	thumbCache       *ttlCache[thumbResult]
-	mediaSem         chan struct{} // image-decode concurrency (thumbnails)
-	previewSem       chan struct{} // link-preview (HTML) concurrency, decoupled from decodes
+	// Stream fetchers for inline audio/video playback (media.go): same
+	// per-proxy / per-tunnel-network pooling as the buffered fetchers, but
+	// with no body cap or overall timeout (the stream handler bounds
+	// progress instead).
+	streamByProxy     map[string]*fetcher
+	tunnelStreamByNet map[string]*fetcher
+	previewCache      *ttlCache[PreviewData]
+	thumbCache        *ttlCache[thumbResult]
+	mediaSem          chan struct{} // image-decode concurrency (thumbnails)
+	previewSem        chan struct{} // link-preview (HTML) concurrency, decoupled from decodes
+	streamSem         chan struct{} // media stream relay concurrency (see streamSlots)
+
+	// mediaTokenAEAD seals /api/media/stream tokens (media.go). Per-process
+	// random key: tokens die on restart, by design.
+	mediaTokenAEAD cipher.AEAD
 
 	login *loginLimiter
 
@@ -237,15 +249,17 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		cfg:              cfg,
-		hub:              h,
-		mux:              http.NewServeMux(),
-		previewsOn:       previewsOn,
-		htmlByProxy:      make(map[string]*fetcher),
-		imageByProxy:     make(map[string]*fetcher),
-		tunnelHTMLByNet:  make(map[string]*fetcher),
-		tunnelImageByNet: make(map[string]*fetcher),
-		previewCache:     newTTLCache[PreviewData](30*time.Minute, 512),
+		cfg:               cfg,
+		hub:               h,
+		mux:               http.NewServeMux(),
+		previewsOn:        previewsOn,
+		htmlByProxy:       make(map[string]*fetcher),
+		imageByProxy:      make(map[string]*fetcher),
+		tunnelHTMLByNet:   make(map[string]*fetcher),
+		tunnelImageByNet:  make(map[string]*fetcher),
+		streamByProxy:     make(map[string]*fetcher),
+		tunnelStreamByNet: make(map[string]*fetcher),
+		previewCache:      newTTLCache[PreviewData](30*time.Minute, 512),
 		// 30 min, matching the preview cache: a thumbnail is the longest-lived
 		// server-side copy of a message's media, and redaction doesn't purge it
 		// (keys are (net,url), shared across messages), so a shorter TTL bounds
@@ -254,12 +268,17 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		thumbCache: newTTLCache[thumbResult](30*time.Minute, maxThumbCache),
 		mediaSem:   make(chan struct{}, mediaSlots),
 		previewSem: make(chan struct{}, previewSlots),
+		streamSem:  make(chan struct{}, streamSlots),
 		login:      newLoginLimiter(),
 		tokens:     make(map[string]time.Time),
 		wsCancels:  make(map[string]map[uint64]context.CancelFunc),
 		wsConns:    make(map[uint64]*websocket.Conn),
 	}
 	s.sessionTTL.Store(int64(sessionTTL))
+	s.mediaTokenAEAD, err = newMediaTokenAEAD()
+	if err != nil {
+		return nil, err
+	}
 	initHash, err := loadPasswordHash(context.Background(), h.Store(), cfg)
 	if err != nil {
 		return nil, err
@@ -283,6 +302,15 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 	// per-fetch correlation ID on both endpoints' responses (see proxy.go).
 	s.mux.HandleFunc("POST /api/preview", s.sameSiteOnly(s.requireAuth(withMediaID(s.handlePreview))))
 	s.mux.HandleFunc("POST /api/thumb", s.sameSiteOnly(s.requireAuth(withMediaID(s.handleThumb))))
+	// Inline audio/video playback (media.go). The token mint is a media
+	// endpoint like preview/thumb — POST body (URL never in a query string),
+	// sameSiteOnly, withMediaID for the debug correlation header. The stream
+	// endpoint is GET (media elements can only GET): the query carries only
+	// the SEALED token (opaque in access logs), session auth is still
+	// required, and it is not state-changing, so sameSiteOnly's POST-shaped
+	// Origin fallback (browsers omit Origin on GET) does not apply.
+	s.mux.HandleFunc("POST /api/media/token", s.sameSiteOnly(s.requireAuth(withMediaID(s.handleMediaToken))))
+	s.mux.HandleFunc("GET /api/media/stream", s.requireAuth(s.handleMediaStream))
 	// AGPL §13 requires OFFERING THE SOURCE to every network user. These three
 	// are deliberately UNauthenticated so anyone using a deployment can reach
 	// them: /license and /third-party-licenses serve the embedded license TEXTS;
