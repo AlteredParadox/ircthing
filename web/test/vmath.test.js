@@ -16,7 +16,14 @@
 
 import { deepStrictEqual as eq, strictEqual as is } from "node:assert";
 import { test } from "node:test";
-import { estimateMsgHeight, findIndex, Geometry, prependedCount } from "../src/vmath.js";
+import {
+	computeWindow,
+	estimateMsgHeight,
+	findIndex,
+	Geometry,
+	pinnedAfterScroll,
+	prependedCount,
+} from "../src/vmath.js";
 
 const items = (n, from = 0) =>
 	Array.from({ length: n }, (_, i) => ({ id: from + i, raw: "x" }));
@@ -86,6 +93,69 @@ test("range boundaries are exclusive of the next row", () => {
 	const g = geo(items(10));
 	// Viewport exactly [30, 60) shows only row 1.
 	eq(g.range(30, 59.9), { start: 1, end: 2 });
+});
+
+test("pinned window renders a bounded tail instead of joining top to bottom", () => {
+	const list = items(5000);
+	const g = geo(list);
+	const got = computeWindow(g, list.length, {
+		viewTop: 0,
+		viewH: 800,
+		overscan: 600,
+		pinned: true,
+		focusing: false,
+		focusIdx: -1,
+		prepended: 0,
+	});
+	is(got.end, 5000);
+	is(got.start > 4900, true, "first paint remains a small tail window");
+	is(got.end - got.start < 100, true, "DOM row count stays bounded");
+	const latePrepend = computeWindow(g, list.length, {
+		viewTop: 0,
+		viewH: 800,
+		overscan: 600,
+		pinned: true,
+		focusing: false,
+		focusIdx: -1,
+		prepended: 100,
+	});
+	is(latePrepend.start > 4900, true, "a late prepend cannot reopen the whole pinned buffer");
+	is(latePrepend.end - latePrepend.start < 100, true, "late-prepend tail stays bounded");
+	const prepended = computeWindow(geo(items(200)), 200, {
+		viewTop: 200,
+		viewH: 800,
+		overscan: 600,
+		pinned: false,
+		focusing: false,
+		focusIdx: -1,
+		prepended: 100,
+	});
+	is(prepended.start, 0, "new rows are present for real-height measurement");
+	is(prepended.end > 100, true, "the future anchored viewport is rendered too");
+	is(prepended.end < 200, true, "prepend anchoring remains windowed");
+
+	eq(computeWindow(g, list.length, {
+		viewTop: 0,
+		viewH: 800,
+		overscan: 600,
+		pinned: false,
+		focusing: false,
+		focusIdx: -1,
+		prepended: 0,
+	}), { start: 0, end: 47 }, "an unpinned top viewport remains at the top");
+});
+
+test("pinned intent survives layout growth but not a real upward scroll", () => {
+	is(pinnedAfterScroll(true, true, 1000, 1400), true,
+		"a tagged bottom write stays pinned while the layout grows");
+	is(pinnedAfterScroll(true, false, 1200, 2000), false,
+		"an unmatched thumb move unpins even if concurrent growth raises scrollTop");
+	is(pinnedAfterScroll(true, false, 700, 1400), false,
+		"an unmatched move upward away from the tail unpins");
+	is(pinnedAfterScroll(false, false, 900, 1400), false,
+		"an unpinned viewport stays unpinned away from the tail");
+	is(pinnedAfterScroll(false, false, 1370, 1400), true,
+		"reaching the bottom repins");
 });
 
 test("findIndex binary search", () => {

@@ -14,57 +14,73 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
-import { anchorId, Geometry, prependedCount } from "./vmath.js";
+import { useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import { anchorId, computeWindow, Geometry, pinnedAfterScroll, prependedCount } from "./vmath.js";
 
-// computeWindow picks the [start, end) row slice to render this frame: the
-// overscan window around the scroll position, widened to (a) include the tail
-// while pinned, (b) surround the focus target during a search jump, and (c)
-// cover the ENTIRE just-prepended page so the layout effect can measure real
-// heights — the estimate ignores density and font, so estimate-based anchoring
-// overshoots (compact + mono rows are ~20px, the estimate assumes ~27+) and the
-// async ResizeObserver correction otherwise shows up as a jarring scroll jump.
-function computeWindow(geo, items, { viewTop, viewH, overscan, pinned, focusing, focusIdx, prepended }) {
-	let { start, end } = geo.range(viewTop - overscan, viewTop + viewH + overscan);
-	if (pinned && items.length) {
-		// While pinned the tail must be in the window even before the scroll
-		// position catches up (first paint, buffer switch, append).
-		end = items.length;
-		start = Math.max(0, Math.min(start, end - 1));
-		const bottom = geo.total();
-		const r = geo.range(bottom - viewH - overscan, bottom);
-		start = Math.min(start, r.start);
+const SCROLL_SETTLE_MS = 160;
+
+// writeScroll is the only path for code-owned scroll changes. Remembering the
+// browser-clamped result lets handleScroll distinguish those events from a
+// Firefox thumb/wheel movement without a timeout that could swallow real input.
+function writeScroll(sc, position, top) {
+	sc.scrollTop = top;
+	const actual = sc.scrollTop;
+	position.current.internalTop = actual;
+	position.current.knownTop = actual;
+	position.current.owned = true;
+}
+
+// A native thumb can move scrollTop before its queued scroll event reaches
+// Preact. If layout work lands in that interval, do not let a stale pinned ref
+// overwrite the physical user movement. Layout growth alone leaves scrollTop
+// unchanged (overflow-anchor is disabled), while shrink clamping lands at the
+// new bottom, so an untagged changed position away from bottom is user intent.
+function canRestoreTail(sc, position, pinned, tailNeedsRestore, reportPinned) {
+	if (!pinned.current) return false;
+	// A keyed remount can inherit Firefox's saved nonzero scrollTop. Until this
+	// component has placed a nonempty list itself, that position is not user
+	// intent and must not veto the initial jump to the live tail.
+	if (!position.current.owned) return true;
+	const top = sc.scrollTop;
+	const maxTop = Math.max(0, sc.scrollHeight - sc.clientHeight);
+	const internal = position.current.internalTop !== null &&
+		Math.abs(top - position.current.internalTop) <= 1;
+	if (maxTop - top >= 40 && !internal && Math.abs(top - position.current.knownTop) > 1) {
+		pinned.current = false;
+		tailNeedsRestore.current = false;
+		position.current.internalTop = null;
+		position.current.knownTop = top;
+		reportPinned?.(false);
+		return false;
 	}
-	if (focusing && focusIdx !== -1) {
-		// Force the target and its neighbors into the DOM so the layout effect
-		// can scroll to a rendered, measurable row.
-		start = Math.min(start, Math.max(0, focusIdx - 12));
-		end = Math.max(end, Math.min(items.length, focusIdx + 12));
-	}
-	if (prepended > 0) {
-		start = 0;
-		end = Math.max(end, Math.min(items.length, prepended));
-	}
-	return { start, end };
+	return true;
+}
+
+// Geometry offsets start after the scroll container's top padding and header.
+// Keep that origin consistent for windowing, focus centering, and deciding
+// whether a resized row is wholly above the visible viewport.
+function contentOrigin(sc, header) {
+	const paddingTop = Number.parseFloat(getComputedStyle(sc).paddingTop) || 0;
+	return paddingTop + (header?.offsetHeight || 0);
 }
 
 // centerRow scrolls so row `idx` sits centered in the viewport (used for a
 // search-jump focus).
-function centerRow(sc, geo, headerH, idx) {
+function centerRow(sc, position, geo, origin, idx) {
 	const rowH = geo.offsetOf(idx + 1) - geo.offsetOf(idx);
-	sc.scrollTop = headerH + geo.offsetOf(idx) - (sc.clientHeight - rowH) / 2;
+	writeScroll(sc, position, origin + geo.offsetOf(idx) - (sc.clientHeight - rowH) / 2);
 }
 
 // anchorPrepended measures the k just-prepended rows (in the DOM, pre-paint)
 // and compensates scrollTop by their real height, so the previously-visible
 // content stays put with no jump instead of using the density/font-blind
 // estimate.
-function anchorPrepended(sc, geo, items, rowEls, k) {
+function anchorPrepended(sc, position, geo, items, rowEls, k) {
 	for (let i = 0; i < k; i++) {
 		const node = rowEls.get(items[i].id);
 		if (node) geo.measure(items[i].id, node.offsetHeight);
 	}
-	sc.scrollTop += geo.offsetOf(k);
+	writeScroll(sc, position, sc.scrollTop + geo.offsetOf(k));
 }
 
 // VirtualList: windowed rendering for the message list. Only the rows
@@ -103,12 +119,21 @@ export function VirtualList({
 
 	const pinned = useRef(true);
 	const prevFirstId = useRef(null);
-	const prevLastId = useRef(null);
 	const pendingPrepend = useRef(0);
 	const pendingFocus = useRef(false);
+	const pendingFocusUnpin = useRef(false);
 	const prevFocus = useRef(undefined);
-	const width = useRef(0);
+	const headerHeight = useRef(null);
 	const rowEls = useRef(new Map()); // id -> element
+	const position = useRef({ knownTop: 0, internalTop: null, owned: false });
+	const prevItems = useRef(null);
+	const tailNeedsRestore = useRef(true);
+	const onPinnedRef = useRef(onPinned);
+	onPinnedRef.current = onPinned;
+	if (prevItems.current !== items) {
+		prevItems.current = items;
+		tailNeedsRestore.current = true;
+	}
 
 	geo.setItems(items);
 
@@ -118,30 +143,32 @@ export function VirtualList({
 	const focusIdx = focusId == null ? -1 : geo.indexOf(focusId);
 	if (focusId !== prevFocus.current) {
 		prevFocus.current = focusId;
-		if (focusId != null && focusIdx !== -1) {
-			pendingFocus.current = true;
-			pinned.current = false;
-		}
+		pendingFocus.current = focusId != null;
+	}
+	// A search page and its focus id can arrive in separate renders. Keep the
+	// request armed until the target exists instead of consuming it early.
+	if (pendingFocus.current && focusId != null && focusIdx !== -1) {
+		if (pinned.current) pendingFocusUnpin.current = true;
+		pinned.current = false;
 	}
 
 	// Detect a prepend during render; the layout effect below compensates
 	// scrollTop after the new spacers apply.
 	const k = prependedCount(prevFirstId.current, items);
 	if (k > 0) pendingPrepend.current = k;
-	const appended = items.length > 0 && prevLastId.current !== items[items.length - 1].id;
 	// Anchor on the top row's stable identity (collapse-run aware) so the
 	// prepend compensation survives a lone presence event folding into a run.
 	prevFirstId.current = items.length ? anchorId(items[0]) : null;
-	prevLastId.current = items.length ? items[items.length - 1].id : null;
 
 	// Current window from the last known scroll position.
 	const el = scroller.current;
-	const headerH = headerEl.current?.offsetHeight || 0;
-	const viewTop = el ? el.scrollTop - headerH : 0;
+	const origin = el ? contentOrigin(el, headerEl.current) : 0;
+	const viewTop = el ? el.scrollTop - origin : 0;
 	const viewH = el ? el.clientHeight : 800;
-	const { start, end } = computeWindow(geo, items, {
+	const { start, end } = computeWindow(geo, items.length, {
 		viewTop, viewH, overscan,
-		pinned: pinned.current, focusing: pendingFocus.current, focusIdx, prepended: k,
+		pinned: pinned.current, focusing: pendingFocus.current, focusIdx,
+		prepended: pendingPrepend.current,
 	});
 
 	const topPad = geo.offsetOf(start);
@@ -157,8 +184,12 @@ export function VirtualList({
 				// Two passes so the offset table is rebuilt once, not per
 				// entry: classify rows against pre-measure geometry, then
 				// apply all measurements.
-				const hh = headerEl.current?.offsetHeight || 0;
-				const batch = classifyEntries(entries, geo, sc.scrollTop, hh);
+				const batch = classifyEntries(
+					entries,
+					geo,
+					sc.scrollTop,
+					contentOrigin(sc, headerEl.current),
+				);
 				let above = 0;
 				let changed = false;
 				for (const b of batch) {
@@ -169,13 +200,47 @@ export function VirtualList({
 					}
 				}
 				if (!changed) return;
-				if (pinned.current) sc.scrollTop = sc.scrollHeight;
-				else if (above !== 0) sc.scrollTop += above;
+				if (pinned.current) {
+					tailNeedsRestore.current = true;
+					if (canRestoreTail(
+						sc, position, pinned, tailNeedsRestore, onPinnedRef.current,
+					)) writeScroll(sc, position, sc.scrollHeight);
+				}
+				else if (above !== 0) writeScroll(sc, position, sc.scrollTop + above);
 				bump();
 			}),
 		[],
 	);
 	useLayoutEffect(() => () => ro.disconnect(), []);
+
+	// Container dimensions can change without a component render (window
+	// resize, mobile browser chrome, composer/sidebar layout). Observe them so
+	// a tail-following viewport remains at the tail; width changes also
+	// invalidate row measurements because wrapping changes.
+	useLayoutEffect(() => {
+		const sc = scroller.current;
+		if (!sc) return;
+		let lastWidth = sc.clientWidth;
+		let lastHeight = sc.clientHeight;
+		const observer = new ResizeObserver(() => {
+			const nextWidth = sc.clientWidth;
+			const nextHeight = sc.clientHeight;
+			if (nextWidth === lastWidth && nextHeight === lastHeight) return;
+			const widthChanged = nextWidth !== lastWidth;
+			lastWidth = nextWidth;
+			lastHeight = nextHeight;
+			if (widthChanged) geo.clearMeasured();
+			if (pinned.current) {
+				tailNeedsRestore.current = true;
+				if (canRestoreTail(
+					sc, position, pinned, tailNeedsRestore, onPinnedRef.current,
+				)) writeScroll(sc, position, sc.scrollHeight);
+			}
+			bump();
+		});
+		observer.observe(sc);
+		return () => observer.disconnect();
+	}, []);
 
 	// Emit the initial pinned state once after mount. The parent (Chat) is
 	// NOT remounted per buffer, so its own pinned tracking would otherwise
@@ -183,7 +248,8 @@ export function VirtualList({
 	// read-marker updates; this list IS keyed per buffer, so it knows the
 	// truth — true at the tail, false for a focus (search) jump.
 	useLayoutEffect(() => {
-		onPinned?.(pinned.current);
+		onPinnedRef.current?.(pinned.current);
+		pendingFocusUnpin.current = false;
 	}, []);
 
 	// Row ref callback: (un)observe and track elements by id.
@@ -200,42 +266,64 @@ export function VirtualList({
 		};
 	}
 
-	// Scrollbar-thumb drags break prepend anchoring: while the thumb is
-	// held, the browser re-derives scrollTop from the thumb's position on
-	// EVERY mouse move, so a prepend that grows scrollHeight mid-drag
-	// clobbers the anchored scrollTop and teleports the content
-	// proportionally — and near the top each teleport lands under
-	// nearTopPx and re-fires onNearTop, cascading page loads until the
-	// view sits at the beginning of the loaded window. Content anchoring
-	// and a user-held thumb are inherently incompatible (the thumb under
-	// the cursor wins), so hold onNearTop while the gutter is being
-	// dragged and run it once on release. Chromium dispatches pointer
-	// events for scrollbar interactions (target = the scroller, offsetX
-	// past clientWidth); Firefox never delivers them, so there this is a
-	// no-op and behavior is unchanged.
-	const barDrag = useRef(false);
+	// Loading a page while Firefox still owns a native scrollbar-thumb drag
+	// makes it recompute scrollTop against the newly-grown scrollHeight and can
+	// cascade the viewport toward the beginning. Wait for the browser's native
+	// scrollend before loading. Older engines use a quiet-period fallback.
 	const onNearTopRef = useRef(onNearTop);
 	onNearTopRef.current = onNearTop;
-	function gutterDown(e) {
-		const sc = scroller.current;
-		if (sc && e.target === sc && e.offsetX >= sc.clientWidth) barDrag.current = true;
+	const nearTopPxRef = useRef(nearTopPx);
+	nearTopPxRef.current = nearTopPx;
+	const nativeScrollEnd = useRef(false);
+	const settleTimer = useRef(null);
+	const fallbackActive = useRef(false);
+	const userScrollPending = useRef(false);
+
+	function clearUserScroll() {
+		if (settleTimer.current !== null) {
+			clearTimeout(settleTimer.current);
+			settleTimer.current = null;
+		}
+		fallbackActive.current = false;
+		userScrollPending.current = false;
 	}
-	useEffect(() => {
-		const release = () => {
-			if (!barDrag.current) return;
-			barDrag.current = false;
-			const sc = scroller.current;
-			// The drag may have parked the view in the near-top zone with
-			// loads suppressed; retrigger once so paging resumes.
-			if (sc && sc.scrollTop < nearTopPx) onNearTopRef.current?.();
-		};
-		window.addEventListener("pointerup", release);
-		window.addEventListener("pointercancel", release);
-		window.addEventListener("blur", release);
+
+	function finishUserScroll() {
+		if (settleTimer.current !== null) clearTimeout(settleTimer.current);
+		settleTimer.current = null;
+		fallbackActive.current = false;
+		if (!userScrollPending.current) return;
+		userScrollPending.current = false;
+		const sc = scroller.current;
+		if (sc && !pinned.current && sc.scrollTop < nearTopPxRef.current) {
+			onNearTopRef.current?.();
+		}
+	}
+
+	function armSettleFallback() {
+		userScrollPending.current = true;
+		fallbackActive.current = true;
+		if (settleTimer.current !== null) clearTimeout(settleTimer.current);
+		settleTimer.current = setTimeout(finishUserScroll, SCROLL_SETTLE_MS);
+	}
+
+	function finishNativeScroll() {
+		// Wheel/trackpad motion owns a quiet timer because Firefox can emit an
+		// early scrollend while its remaining wheel scroll events are still
+		// arriving. Native thumb drags never arm that timer.
+		if (!fallbackActive.current) finishUserScroll();
+	}
+
+	useLayoutEffect(() => {
+		const sc = scroller.current;
+		if (!sc) return;
+		nativeScrollEnd.current = "onscrollend" in sc;
+		if (nativeScrollEnd.current) {
+			sc.addEventListener("scrollend", finishNativeScroll);
+		}
 		return () => {
-			window.removeEventListener("pointerup", release);
-			window.removeEventListener("pointercancel", release);
-			window.removeEventListener("blur", release);
+			sc.removeEventListener("scrollend", finishNativeScroll);
+			if (settleTimer.current !== null) clearTimeout(settleTimer.current);
 		};
 	}, []);
 
@@ -243,12 +331,29 @@ export function VirtualList({
 	function handleScroll() {
 		const sc = scroller.current;
 		if (!sc) return;
-		const nowPinned = sc.scrollHeight - sc.scrollTop - sc.clientHeight < 40;
-		if (nowPinned !== pinned.current) {
+		const top = sc.scrollTop;
+		const maxTop = Math.max(0, sc.scrollHeight - sc.clientHeight);
+		const internal = position.current.internalTop !== null &&
+			Math.abs(top - position.current.internalTop) <= 1;
+		position.current.internalTop = null;
+
+		const wasPinned = pinned.current;
+		const nowPinned = pinnedAfterScroll(wasPinned, internal, top, maxTop);
+		if (nowPinned !== wasPinned) {
 			pinned.current = nowPinned;
-			onPinned?.(nowPinned);
+			onPinnedRef.current?.(nowPinned);
 		}
-		if (sc.scrollTop < nearTopPx && !barDrag.current) onNearTop?.();
+		// A row grew underneath a tail-following viewport. Preserve the intent
+		// immediately instead of treating the temporary gap as a user unpin.
+		if (nowPinned && maxTop - top >= 40) {
+			writeScroll(sc, position, sc.scrollHeight);
+		}
+
+		if (!internal) {
+			userScrollPending.current = true;
+			if (!nativeScrollEnd.current || fallbackActive.current) armSettleFallback();
+		}
+		position.current.knownTop = sc.scrollTop;
 		// One re-render per frame, however many scroll events arrive.
 		if (scrollScheduled.current) return;
 		scrollScheduled.current = true;
@@ -258,33 +363,79 @@ export function VirtualList({
 		});
 	}
 
-	// After every commit: apply prepend anchoring, follow the bottom while
-	// pinned, and watch for width changes that invalidate measurements.
+	// Firefox 140 advertises scrollend but can emit its last such event before
+	// the last wheel-driven scroll event. Wheel events are not generated by a
+	// native scrollbar-thumb drag, so this fallback closes that hole without
+	// reintroducing a timer that can fire while a held thumb is stationary.
+	function handleWheel(e) {
+		if (e.ctrlKey || e.deltaY === 0) return; // browser zoom / horizontal gesture
+		// Upward wheel intent precedes the browser's scroll event. Record it now
+		// so a simultaneous append/preview ResizeObserver commit cannot restore
+		// the tail in the small event-delivery window.
+		if (e.deltaY < 0 && pinned.current) {
+			pinned.current = false;
+			tailNeedsRestore.current = false;
+			position.current.internalTop = null;
+			position.current.knownTop = scroller.current?.scrollTop || 0;
+			onPinnedRef.current?.(false);
+		}
+		armSettleFallback();
+	}
+
+	// After every commit: apply focus/prepend/header anchoring and restore a
+	// tail position only when an actual geometry change requested it.
 	useLayoutEffect(() => {
 		const sc = scroller.current;
 		if (!sc) return;
+		const hh = headerEl.current?.offsetHeight || 0;
+		const headerDelta = headerHeight.current === null ? 0 : hh - headerHeight.current;
+		headerHeight.current = hh;
+		if (pinned.current && headerDelta !== 0) tailNeedsRestore.current = true;
 		if (pendingFocus.current && focusIdx !== -1) {
 			// A focus jump replaces the window wholesale, so discard any prepend
 			// detected in the same commit — otherwise it fires on the next commit
 			// and scrolls the view off the focused row.
 			pendingPrepend.current = 0;
-			centerRow(sc, geo, headerEl.current?.offsetHeight || 0, focusIdx);
+			tailNeedsRestore.current = false;
+			clearUserScroll();
+			centerRow(sc, position, geo, contentOrigin(sc, headerEl.current), focusIdx);
 			pendingFocus.current = false;
+			if (pendingFocusUnpin.current) {
+				pendingFocusUnpin.current = false;
+				onPinnedRef.current?.(false);
+			}
+			if (!pinned.current && sc.scrollHeight - sc.clientHeight < 40) {
+				pinned.current = true;
+				onPinnedRef.current?.(true);
+			}
 			return;
 		}
 		if (pendingPrepend.current > 0) {
-			anchorPrepended(sc, geo, items, rowEls.current, pendingPrepend.current);
+			if (pinned.current) {
+				// The user returned to the live tail while this page was in flight;
+				// there is no historical viewport left to preserve.
+				tailNeedsRestore.current = true;
+			} else {
+				anchorPrepended(sc, position, geo, items, rowEls.current, pendingPrepend.current);
+				if (headerDelta !== 0) writeScroll(sc, position, sc.scrollTop + headerDelta);
+			}
 			pendingPrepend.current = 0;
+		} else if (!pinned.current && headerDelta !== 0) {
+			writeScroll(sc, position, sc.scrollTop + headerDelta);
 		}
-		if (pinned.current && appended) {
-			sc.scrollTop = sc.scrollHeight;
-		}
-		const w = sc.clientWidth;
-		if (w !== width.current) {
-			width.current = w;
-			geo.clearMeasured();
-			if (pinned.current) sc.scrollTop = sc.scrollHeight;
-			bump();
+		// Tail-following is an intent, but only write when mount/items/geometry
+		// actually moved. An unrelated parent render can land between native
+		// thumb movement and its queued scroll event and must not erase it.
+		if (pinned.current && tailNeedsRestore.current) {
+			if (canRestoreTail(
+				sc, position, pinned, tailNeedsRestore, onPinnedRef.current,
+			)) writeScroll(sc, position, sc.scrollHeight);
+			// Keep the mount exception alive across an empty/loading list; the
+			// first commit containing messages is the authoritative placement.
+			if (items.length === 0) position.current.owned = false;
+			tailNeedsRestore.current = false;
+		} else if (!pinned.current) {
+			tailNeedsRestore.current = false;
 		}
 		// A list whose content is shorter than the viewport never fires a scroll
 		// event, so handleScroll can't flip `pinned` true. Signal it here so a
@@ -296,12 +447,12 @@ export function VirtualList({
 		if (!pendingFocus.current && !pinned.current &&
 			sc.scrollHeight - sc.clientHeight < 40) {
 			pinned.current = true;
-			onPinned?.(true);
+			onPinnedRef.current?.(true);
 		}
 	});
 
 	return (
-		<div class="msgs scroll" ref={scroller} onScroll={handleScroll} onPointerDown={gutterDown}>
+		<div class="msgs scroll" ref={scroller} onScroll={handleScroll} onWheel={handleWheel}>
 			<div ref={headerEl}>{header}</div>
 			<div style={{ height: topPad }} />
 			{items.slice(start, end).map((item, j) => (
@@ -317,7 +468,7 @@ export function VirtualList({
 // classifyEntries turns ResizeObserver entries into measurement records,
 // noting which rows sit above the viewport (their growth must be
 // compensated in scrollTop).
-function classifyEntries(entries, geo, scrollTop, headerH) {
+function classifyEntries(entries, geo, scrollTop, origin) {
 	const batch = [];
 	for (const e of entries) {
 		const id = idOf(e.target.dataset.vid);
@@ -325,7 +476,7 @@ function classifyEntries(entries, geo, scrollTop, headerH) {
 		const h = e.borderBoxSize?.[0]?.blockSize ?? e.target.offsetHeight;
 		if (h === 0) continue; // detached row
 		const i = geo.indexOf(id);
-		batch.push({ id, h, above: i !== -1 && geo.offsetOf(i) + headerH < scrollTop });
+		batch.push({ id, h, above: i !== -1 && geo.offsetOf(i + 1) + origin <= scrollTop });
 	}
 	return batch;
 }

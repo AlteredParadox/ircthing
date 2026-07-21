@@ -136,6 +136,60 @@ export class Geometry {
 	}
 }
 
+// computeWindow picks the [start, end) row slice to render this frame. While
+// following the live tail it deliberately replaces the stale viewport range
+// with a bounded tail range: on first paint scrollTop is still zero, and
+// unioning that top range with the tail would render the entire buffer before
+// the layout effect can move the scrollbar to the bottom.
+export function computeWindow(
+	geo,
+	itemCount,
+	{ viewTop, viewH, overscan, pinned, focusing, focusIdx, prepended },
+) {
+	let { start, end } = geo.range(viewTop - overscan, viewTop + viewH + overscan);
+	if (pinned && itemCount > 0) {
+		const bottom = geo.total();
+		// Estimates can be taller than compact rendered rows. Include at least
+		// another half viewport so a tall display cannot briefly expose a blank
+		// band while ResizeObserver replaces estimates with real heights.
+		const tailOverscan = Math.max(overscan, viewH / 2);
+		({ start, end } = geo.range(
+			Math.max(0, bottom - viewH - tailOverscan),
+			bottom,
+		));
+		end = itemCount;
+	}
+	if (focusing && focusIdx !== -1) {
+		// Force the target and its neighbors into the DOM so the layout effect
+		// can scroll to a rendered, measurable row.
+		start = Math.min(start, Math.max(0, focusIdx - 12));
+		end = Math.max(end, Math.min(itemCount, focusIdx + 12));
+	}
+	if (!pinned && prepended > 0) {
+		// Render the whole new page so prepend anchoring can use real heights,
+		// plus the viewport where the old rows will land after compensation.
+		// Without the shifted range, the layout effect scrolls into a spacer
+		// and shows a blank frame before the next render catches up.
+		const shiftedTop = viewTop + geo.offsetOf(prepended);
+		const shifted = geo.range(
+			shiftedTop - overscan,
+			shiftedTop + viewH + overscan,
+		);
+		start = 0;
+		end = Math.max(end, shifted.end, Math.min(itemCount, prepended));
+	}
+	return { start, end };
+}
+
+// pinnedAfterScroll preserves tail intent for a scroll event caused by one of
+// our tagged writes. Every unmatched event away from the bottom is user/browser
+// movement and unpins even if concurrent layout growth made its absolute
+// scrollTop increase while a Firefox thumb moved toward older content.
+export function pinnedAfterScroll(wasPinned, internal, top, maxTop, threshold = 40) {
+	if (maxTop - top < threshold) return true;
+	return internal && wasPinned;
+}
+
 // findIndex: largest i in [0, n-1] with offsets[i] <= y (binary search).
 export function findIndex(offsets, n, y) {
 	let lo = 0;
