@@ -221,9 +221,9 @@ export function VirtualList({
 	prevFirstId.current = items.length ? anchorId(items[0]) : null;
 
 	// Current window from the last known scroll position.
-	const anchorTop = !pinned.current
-		? restoreViewportAnchor(geo, pendingLayoutAnchor.current)
-		: null;
+	const anchorTop = pinned.current
+		? null
+		: restoreViewportAnchor(geo, pendingLayoutAnchor.current);
 	const viewTop = anchorTop ?? actualViewTop;
 	const viewH = el ? el.clientHeight : 800;
 	const { start, end } = computeWindow(geo, items.length, {
