@@ -139,6 +139,16 @@ type Server struct {
 	wsConns   map[uint64]*websocket.Conn
 	wsNextID  uint64
 
+	// streamCancels tracks the cancel func of every in-flight media stream
+	// relay (/api/media/stream) by session token, mirroring wsCancels: every
+	// token deletion funnels through deleteTokenLocked, which cancels
+	// registered streams alongside sockets — so logout, password rotation,
+	// lazy expiry, and capacity eviction all tear down a session's streams
+	// instead of letting them relay until the track ends. Guarded by mu
+	// (paired with tokens).
+	streamCancels map[string]map[uint64]context.CancelFunc
+	streamNextID  uint64
+
 	// sessionTTL is the effective session-cookie lifetime in nanoseconds,
 	// runtime-settable (Settings → Session). Atomic so the login path reads it
 	// without the token lock.
@@ -273,6 +283,8 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		tokens:     make(map[string]time.Time),
 		wsCancels:  make(map[string]map[uint64]context.CancelFunc),
 		wsConns:    make(map[uint64]*websocket.Conn),
+
+		streamCancels: make(map[string]map[uint64]context.CancelFunc),
 	}
 	s.sessionTTL.Store(int64(sessionTTL))
 	s.mediaTokenAEAD, err = newMediaTokenAEAD()
@@ -835,14 +847,72 @@ func (s *Server) registerWSCancel(token string, cancel context.CancelFunc, conn 
 	}, true
 }
 
-// deleteTokenLocked removes a session token and collects its live sockets'
-// cancel funcs. EVERY token deletion must go through here (logout, rotation,
-// expiry, capacity eviction) — a deletion that skips the sweep leaves the
-// token's sockets running until the revalidation ticker. Caller holds s.mu
-// and must invoke the returned funcs AFTER releasing it.
+// registerStreamCancel records an in-flight media stream's cancel func under
+// its session token and returns the matching unregister — the stream
+// counterpart of registerWSCancel, and like it VALIDATES the token under the
+// same lock: a logout/rotation landing between requireAuth and this point has
+// already run its cancel sweep, so registering blind would leave the stream
+// relaying until the track ends. ok=false means the token is gone/expired and
+// the handler must refuse the stream.
+func (s *Server) registerStreamCancel(token string, cancel context.CancelFunc) (unregister func(), ok bool) {
+	noop := func() {
+		// Intentionally empty: registration was refused, so there is nothing
+		// to unregister — a no-op lets the caller defer it unconditionally.
+	}
+	if token == "" {
+		return noop, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	expiry, live := s.tokens[token]
+	if !live || time.Now().After(expiry) {
+		return noop, false
+	}
+	id := s.streamNextID
+	s.streamNextID++
+	m := s.streamCancels[token]
+	if m == nil {
+		m = make(map[uint64]context.CancelFunc)
+		s.streamCancels[token] = m
+	}
+	m[id] = cancel
+	return func() {
+		s.mu.Lock()
+		if m := s.streamCancels[token]; m != nil {
+			delete(m, id)
+			if len(m) == 0 {
+				delete(s.streamCancels, token)
+			}
+		}
+		s.mu.Unlock()
+	}, true
+}
+
+// deleteTokenLocked removes a session token and collects the cancel funcs of
+// its live sockets AND in-flight media streams. EVERY token deletion must go
+// through here (logout, rotation, expiry, capacity eviction) — a deletion
+// that skips the sweep leaves the token's sockets running until the
+// revalidation ticker and its streams running until the track ends. Caller
+// holds s.mu and must invoke the returned funcs AFTER releasing it.
 func (s *Server) deleteTokenLocked(token string) []context.CancelFunc {
 	delete(s.tokens, token)
-	return s.cancelSocketsLocked(token)
+	return append(s.cancelSocketsLocked(token), s.cancelStreamsLocked(token)...)
+}
+
+// cancelStreamsLocked collects the cancel funcs of every in-flight stream on
+// `token` and removes them from the registry — same contract as
+// cancelSocketsLocked (caller holds s.mu; call the funcs after releasing it).
+func (s *Server) cancelStreamsLocked(token string) []context.CancelFunc {
+	m := s.streamCancels[token]
+	if m == nil {
+		return nil
+	}
+	delete(s.streamCancels, token)
+	out := make([]context.CancelFunc, 0, len(m))
+	for _, c := range m {
+		out = append(out, c)
+	}
+	return out
 }
 
 // cancelSocketsLocked collects the cancel funcs of every live socket on

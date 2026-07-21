@@ -432,3 +432,232 @@ func TestMediaStreamIdleWatchdog(t *testing.T) {
 		t.Fatal("hung origin pinned the stream past the idle watchdog")
 	}
 }
+
+// streamIntro/streamOutro are sized WELL past net/http's response buffering
+// (2 KiB): a tiny first chunk would sit in the server's bufio unflushed,
+// streamGet would block on headers until the relay ended, and a "held open"
+// stream test would silently degrade into a watchdog test. 8 KiB forces
+// headers + bytes through to the client so the stream is genuinely in-flight
+// before the test acts on it.
+var (
+	streamIntro = strings.Repeat("i", 8<<10)
+	streamOutro = strings.Repeat("o", 8<<10)
+)
+
+// holdingOrigin serves an origin that sends streamIntro, flushes, then holds
+// the connection open until `hold` closes — a stream that only session
+// revocation (or the 60 s idle watchdog, far beyond these tests' deadlines)
+// can end early. established is closed once the request has arrived, which
+// also guarantees the stream registered its cancel func (registration
+// precedes the origin fetch).
+func holdingOrigin(established, hold chan struct{}) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		io.WriteString(w, streamIntro)
+		w.(http.Flusher).Flush()
+		close(established)
+		<-hold
+	}))
+}
+
+// startHeldStream opens a stream against a holding origin and returns a
+// channel that closes when the client-side body read ends.
+func startHeldStream(t *testing.T, ts *httptest.Server, cookie *http.Cookie, token string, established chan struct{}) <-chan struct{} {
+	t.Helper()
+	resp := streamGet(t, ts, cookie, token, "")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+	}()
+	select {
+	case <-established:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stream never reached the origin")
+	}
+	return done
+}
+
+// An in-flight stream must die with its session: logout deletes the token via
+// deleteTokenLocked, which cancels registered streams alongside WebSockets.
+func TestMediaStreamCanceledByLogout(t *testing.T) {
+	established, hold := make(chan struct{}), make(chan struct{})
+	origin := holdingOrigin(established, hold)
+	defer origin.Close()
+	defer close(hold)
+
+	ts, srv := newTestServerWithRef(t)
+	permitStream(srv)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	token := sealFor(t, srv, origin.URL+"/a.mp3")
+	done := startHeldStream(t, ts, cookie, token, established)
+
+	req, _ := http.NewRequest("POST", ts.URL+"/api/logout", nil)
+	req.Header.Set("Origin", ts.URL)
+	req.AddCookie(cookie)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("logout status = %d", resp.StatusCode)
+	}
+
+	select {
+	case <-done:
+		// Revocation tore the relay down; the origin is still holding, and
+		// the idle watchdog (60 s) is far past this deadline, so only the
+		// logout sweep can have ended it.
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream survived logout")
+	}
+}
+
+// Password rotation revokes EVERY session (the compromise-recovery action);
+// its revoke loop runs through deleteTokenLocked too, so in-flight streams on
+// any session must end with it.
+func TestMediaStreamCanceledByPasswordRotation(t *testing.T) {
+	established, hold := make(chan struct{}), make(chan struct{})
+	origin := holdingOrigin(established, hold)
+	defer origin.Close()
+	defer close(hold)
+
+	ts, srv := newTestServerWithRef(t)
+	permitStream(srv)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	token := sealFor(t, srv, origin.URL+"/a.mp3")
+	done := startHeldStream(t, ts, cookie, token, established)
+
+	body := `{"current":"hunter2","new":"correct horse battery"}`
+	req, _ := http.NewRequest("POST", ts.URL+"/api/password", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", ts.URL)
+	req.AddCookie(cookie)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("password change status = %d", resp.StatusCode)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream survived the password-rotation session revoke")
+	}
+}
+
+// Pins an explicitly REJECTED behavior (M2 review decision, 2026-07-21):
+// disabling previews governs NEW fetches only — token minting and fresh
+// stream requests refuse (TestMediaStreamDisabledWithPreviews) — but it must
+// NOT cancel an in-flight stream. Only session revocation or the idle
+// watchdog ends a running stream early.
+func TestMediaStreamSurvivesPreviewsToggle(t *testing.T) {
+	established, proceed := make(chan struct{}), make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		io.WriteString(w, streamIntro)
+		w.(http.Flusher).Flush()
+		close(established)
+		<-proceed
+		io.WriteString(w, streamOutro)
+	}))
+	defer origin.Close()
+
+	ts, srv := newTestServerWithRef(t)
+	permitStream(srv)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	token := sealFor(t, srv, origin.URL+"/a.mp3")
+
+	resp := streamGet(t, ts, cookie, token, "")
+	defer resp.Body.Close()
+	bodyDone := make(chan []byte, 1)
+	go func() {
+		b, _ := io.ReadAll(resp.Body)
+		bodyDone <- b
+	}()
+	select {
+	case <-established:
+	case <-time.After(10 * time.Second):
+		t.Fatal("stream never reached the origin")
+	}
+
+	if err := srv.applyPreviews(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	close(proceed) // origin finishes the track AFTER the toggle landed
+
+	select {
+	case b := <-bodyDone:
+		if string(b) != streamIntro+streamOutro {
+			t.Fatalf("streamed body = %d bytes, want the full %d-byte track (toggle must not cancel in-flight streams)", len(b), len(streamIntro)+len(streamOutro))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream did not complete after the previews toggle")
+	}
+}
+
+// A stream that ends normally must unregister its cancel func — the registry
+// must not leak entries across streams.
+func TestMediaStreamRegistryCleanup(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "audio/mpeg")
+		io.WriteString(w, "x")
+	}))
+	defer origin.Close()
+
+	ts, srv := newTestServerWithRef(t)
+	permitStream(srv)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	token := sealFor(t, srv, origin.URL+"/a.mp3")
+
+	resp := streamGet(t, ts, cookie, token, "")
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	// The handler's deferred unregister may still be running just after the
+	// client sees the body end; poll briefly rather than racing it.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		srv.mu.Lock()
+		n := len(srv.streamCancels)
+		srv.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("streamCancels holds %d entries after the stream ended", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The stream transport must never solicit compression: with DisableCompression
+// unset, Go's transport adds Accept-Encoding: gzip on the no-Range path and
+// transparently decompresses, letting relayed bytes diverge from the origin's
+// Content-Length.
+func TestMediaStreamNoTransparentGzip(t *testing.T) {
+	var acceptEnc string
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		acceptEnc = r.Header.Get("Accept-Encoding")
+		w.Header().Set("Content-Type", "audio/mpeg")
+		io.WriteString(w, "x")
+	}))
+	defer origin.Close()
+
+	ts, srv := newTestServerWithRef(t)
+	permitStream(srv)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	token := sealFor(t, srv, origin.URL+"/a.mp3")
+
+	resp := streamGet(t, ts, cookie, token, "")
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if strings.Contains(acceptEnc, "gzip") {
+		t.Fatalf("stream request solicited gzip (Accept-Encoding = %q)", acceptEnc)
+	}
+}

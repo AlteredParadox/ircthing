@@ -281,11 +281,31 @@ func (s *Server) handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ctx is canceled by the idle watchdog (origin made no progress) or by
-	// the client going away (r.Context()); either tears the origin fetch down
-	// so a hung origin cannot pin this stream slot.
+	// ctx is canceled by the idle watchdog (origin made no progress), by the
+	// client going away (r.Context()), or by revocation of the session it
+	// rides on; any of these tears the origin fetch down so neither a hung
+	// origin nor a dead session can pin this stream slot.
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	// Register the cancel under the session token, exactly like the WebSocket
+	// path: requireAuth checked the session ONCE, and every token-deletion
+	// path (logout, password rotation, lazy expiry, capacity eviction)
+	// funnels through deleteTokenLocked, which cancels registered streams
+	// alongside sockets — so a stream never outlives its session.
+	// Registration re-validates the token under the registry lock; a
+	// revocation that landed since requireAuth already ran its cancel sweep,
+	// so registering blind would leave this stream relaying until the track
+	// ends.
+	var token string
+	if ck, err := r.Cookie(s.cookieName()); err == nil {
+		token = ck.Value
+	}
+	unregister, live := s.registerStreamCancel(token, cancel)
+	if !live {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	defer unregister()
 	watchdog := time.AfterFunc(streamIdleTimeout, cancel)
 	defer watchdog.Stop()
 
@@ -384,9 +404,15 @@ func relayStreamBody(w http.ResponseWriter, resp *http.Response, watchdog *time.
 	buf := make([]byte, streamCopyBufBytes)
 	var copied int
 	for {
-		watchdog.Reset(streamIdleTimeout)
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			// Re-arm the idle watchdog only AFTER a successful origin read:
+			// re-arming before it would make one idle budget span
+			// read + client write + next loop, spuriously canceling a
+			// slow-but-progressing transfer. Nothing is lost on the
+			// stalled-client side — the per-write deadline below bounds that
+			// case on its own.
+			watchdog.Reset(streamIdleTimeout)
 			_ = rc.SetWriteDeadline(time.Now().Add(streamIdleTimeout))
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				logMedia("stream", url, start, mediaLogResult{event: "client_gone", class: "network_io", outputBytes: copied})
@@ -453,13 +479,23 @@ func tagDialPhase(dial func(context.Context, string, string) (net.Conn, error)) 
 // bounded connect/TLS/first-byte phases, but no overall deadline and NO wire
 // budget — a stream's payload is unbounded by design (the user is playing
 // it), memory is bounded by the relay buffer, and the handler's idle-progress
-// watchdog bounds a stalled connection. TLS-padding inflation, which the wire
-// budget exists to cap for buffered fetches, only inflates bytes that are
-// already streamed straight back out.
+// watchdog bounds a stalled connection. The absent wire budget leaves a real
+// gap the buffered fetchers don't have: TLS strips record padding BELOW
+// Response.Body, so a hostile origin can pad its records into ingress bytes
+// that never reach the client — ingress amplification that body-level
+// accounting cannot see. Accepted posture (2026-07-21): the exposure is
+// bounded by the 2-slot cap, the idle watchdog, and a stream existing only
+// because the user pressed play on that link; a below-TLS wire meter was
+// considered and rejected as disproportionate.
 func streamTransport(dial func(context.Context, string, string) (net.Conn, error)) *http.Transport {
 	return &http.Transport{
-		Proxy:                  nil, // never honor $HTTP_PROXY implicitly
-		DialContext:            tagDialPhase(dial),
+		Proxy:       nil, // never honor $HTTP_PROXY implicitly
+		DialContext: tagDialPhase(dial),
+		// Determinism on the no-Range path: without this the transport adds
+		// Accept-Encoding: gzip (only when no Range header is set) and would
+		// transparently decompress, making the relayed bytes diverge from the
+		// origin's Content-Length. Zero UX cost — no real origin gzips a/v.
+		DisableCompression:     true,
 		TLSHandshakeTimeout:    8 * time.Second,
 		ResponseHeaderTimeout:  15 * time.Second, // time-to-first-byte bound
 		MaxResponseHeaderBytes: 64 << 10,
