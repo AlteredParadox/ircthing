@@ -24,15 +24,15 @@ import (
 
 // Setting returns the stored value for key, or "" when unset.
 func (s *Store) Setting(ctx context.Context, key string) (string, error) {
-	v, _, err := s.settingValue(ctx, key)
+	v, _, err := s.SettingValue(ctx, key)
 	return v, err
 }
 
-// settingValue reads a setting and reports whether the row is PRESENT, so a
+// SettingValue reads a setting and reports whether the row is PRESENT, so a
 // caller can tell an absent key ("" , present=false) from a stored empty value
 // ("", present=true) — the STS lookup needs that distinction to treat a
 // present-but-empty (tampered) record as corrupt rather than "no policy".
-func (s *Store) settingValue(ctx context.Context, key string) (value string, present bool, err error) {
+func (s *Store) SettingValue(ctx context.Context, key string) (value string, present bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

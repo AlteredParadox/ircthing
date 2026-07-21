@@ -18,12 +18,15 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -31,9 +34,97 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
+	"time"
 
 	"ircthing/internal/proxydial"
 )
+
+func TestDebugFlagValueRequiresExplicitTrue(t *testing.T) {
+	for _, v := range []string{"1", "true", "TRUE", " yes ", "on"} {
+		if !debugFlagValue(v) {
+			t.Errorf("debugFlagValue(%q) = false, want true", v)
+		}
+	}
+	for _, v := range []string{"", "0", "false", "off", "debug", "2"} {
+		if debugFlagValue(v) {
+			t.Errorf("debugFlagValue(%q) = true, want false", v)
+		}
+	}
+}
+
+func TestMediaTargetIDIsKeyedAndStable(t *testing.T) {
+	key := newMediaTargetIDKey(bytes.NewReader(bytes.Repeat([]byte{0x11}, mediaTargetIDKeySize)))
+	otherKey := newMediaTargetIDKey(bytes.NewReader(bytes.Repeat([]byte{0x22}, mediaTargetIDKeySize)))
+	target := "https://alice:secret@example.test/private?token=hunter2"
+
+	id := key.id(target)
+	if again := key.id(target); again != id {
+		t.Fatalf("same target and key produced different IDs: %q, %q", id, again)
+	}
+	if other := key.id("https://other.example.test/private"); other == id {
+		t.Fatalf("different targets produced the same ID %q", id)
+	}
+	if other := otherKey.id(target); other == id {
+		t.Fatalf("different keys produced the same ID %q", id)
+	}
+
+	raw := sha256.Sum256([]byte(target))
+	if rawID := fmt.Sprintf("%x", raw[:8]); id == rawID {
+		t.Fatalf("keyed ID equals raw SHA-256 prefix %q", id)
+	}
+	for _, secret := range []string{target, "alice", "secret", "example.test", "private", "hunter2"} {
+		if strings.Contains(id, secret) {
+			t.Fatalf("media target ID leaked %q: %q", secret, id)
+		}
+	}
+}
+
+func TestMediaTargetIDRedactsOnRandomFailure(t *testing.T) {
+	random := io.MultiReader(
+		bytes.NewReader(bytes.Repeat([]byte{0x11}, mediaTargetIDKeySize-1)),
+		iotest.ErrReader(errors.New("entropy unavailable")),
+	)
+	key := newMediaTargetIDKey(random)
+
+	first := key.id("https://one.example.test/private")
+	second := key.id("https://two.example.test/secret")
+	if first != mediaTargetIDRedacted || second != mediaTargetIDRedacted {
+		t.Fatalf("failed key initialization produced IDs %q and %q, want fixed %q", first, second, mediaTargetIDRedacted)
+	}
+}
+
+func TestMediaLogDoesNotExposeTargetOrUpstreamText(t *testing.T) {
+	oldDebug := mediaDebug
+	oldWriter := log.Writer()
+	oldFlags := log.Flags()
+	oldPrefix := log.Prefix()
+	t.Cleanup(func() {
+		mediaDebug = oldDebug
+		log.SetOutput(oldWriter)
+		log.SetFlags(oldFlags)
+		log.SetPrefix(oldPrefix)
+	})
+	mediaDebug = true
+	var out bytes.Buffer
+	log.SetOutput(&out)
+	log.SetFlags(0)
+	log.SetPrefix("")
+
+	target := "https://alice:secret@example.test/private?token=hunter2"
+	logMedia("preview", target, time.Now(), mediaLogResult{
+		event: "fetch_error", class: mediaErrorClass(&url.Error{Op: "Get", URL: target, Err: errors.New("attacker title\nforged")}), httpStatus: 502,
+	})
+	got := out.String()
+	for _, secret := range []string{"alice", "secret", "example.test", "private", "hunter2", "attacker", "forged"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("media debug log leaked %q: %q", secret, got)
+		}
+	}
+	if !strings.Contains(got, "id="+mediaTargetID(target)) || !strings.Contains(got, "event=fetch_error") {
+		t.Fatalf("media debug log lacks safe correlation fields: %q", got)
+	}
+}
 
 // fakeConnectProxy runs a minimal HTTP CONNECT proxy that tunnels to the
 // requested target, so a proxied fetcher can be exercised end to end. It

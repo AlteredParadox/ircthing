@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"ircthing/internal/netconf"
+	"ircthing/internal/store"
 )
 
 // Config file: JSON (stdlib, no dependency), parsed strictly — unknown
@@ -208,7 +209,8 @@ func (c *config) cookieConfigWarning() string {
 // negative that SQLite treats as unbounded. 100 years is longer than any real
 // retention/session and well clear of those edges.
 const (
-	maxConfigDays     = 36500     // ~100 years
+	maxConfigDays     = store.MaxRetentionDays // ~100 years
+	maxConfigMessages = store.MaxRetentionMessages
 	maxConfigRingSize = 1_000_000 // per-buffer hot messages; far over any sane value
 )
 
@@ -230,8 +232,8 @@ func (c *config) validate() error {
 	if c.RetentionDays < 0 || c.RetentionDays > maxConfigDays {
 		return fmt.Errorf("retention_days %d out of range (0..%d)", c.RetentionDays, maxConfigDays)
 	}
-	if c.RetentionMaxMessages < 0 {
-		return fmt.Errorf("retention_max_messages %d must not be negative", c.RetentionMaxMessages)
+	if c.RetentionMaxMessages < 0 || c.RetentionMaxMessages > maxConfigMessages {
+		return fmt.Errorf("retention_max_messages %d out of range (0..%d)", c.RetentionMaxMessages, maxConfigMessages)
 	}
 	if c.SessionTTLDays < 0 || c.SessionTTLDays > maxConfigDays {
 		return fmt.Errorf("session_ttl_days %d out of range (0..%d)", c.SessionTTLDays, maxConfigDays)

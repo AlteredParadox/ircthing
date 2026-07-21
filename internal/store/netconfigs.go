@@ -21,6 +21,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Network definitions managed from the web UI (network_configs table).
@@ -30,8 +33,61 @@ import (
 
 // NetworkConfig is one stored network definition.
 type NetworkConfig struct {
-	Name   string
-	Config string // JSON netconf.Network
+	Name        string
+	Config      string // JSON netconf.Network
+	Oversized   bool   // page reads omit a legacy row that exceeds the safe cap
+	InvalidName bool   // page reads omit a legacy name outside current invariants
+	PageID      int64  // rowid cursor populated only by NetworkConfigsPage
+}
+
+const (
+	ReservedRecoveryNetworkPrefix = "__ircthing_invalid_row_"
+	// MaxNetworkNameBytes keeps identifiers cheap in every state/event envelope
+	// and log context. IRC network names are local labels, not server-provided
+	// protocol fields; 128 bytes is deliberately generous.
+	MaxNetworkNameBytes = 128
+	// MaxNetworkConfigs bounds reconnect goroutines and every process-wide
+	// network map. Existing over-cap databases may still edit/delete rows, but
+	// no ingress can grow them further.
+	MaxNetworkConfigs = 64
+	// MaxNetworkConfigBytes bounds one canonical network definition at every
+	// store ingress. In particular, a hostile server cannot grow the persisted
+	// autojoin list until get_networks produces a multi-megabyte WebSocket frame.
+	MaxNetworkConfigBytes = 64 << 10
+)
+
+// ValidateNetworkConfigRecord is the final persistence-boundary guard shared
+// by UI puts, config-file seeds, and incremental autojoin updates.
+func ValidateNetworkConfigRecord(name, config string) error {
+	if err := validateNetworkName(name); err != nil {
+		return err
+	}
+	if len(config) == 0 || len(config) > MaxNetworkConfigBytes {
+		return fmt.Errorf("store: network config exceeds %d-byte limit", MaxNetworkConfigBytes)
+	}
+	return nil
+}
+
+func validateNetworkName(name string) error {
+	if name == "" || strings.HasPrefix(name, ReservedRecoveryNetworkPrefix) || len(name) > MaxNetworkNameBytes || !utf8.ValidString(name) {
+		return fmt.Errorf("store: invalid network name")
+	}
+	for _, r := range name {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return fmt.Errorf("store: invalid network name")
+		}
+	}
+	// Keep this fixed ECMAScript Object.prototype set aligned with netconf's
+	// user-facing validation. Legacy or direct store callers must not smuggle a
+	// key that mutates/inherits from the frontend's plain-object maps.
+	switch name {
+	case "__proto__", "constructor", "prototype",
+		"hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable",
+		"toLocaleString", "toString", "valueOf",
+		"__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__":
+		return fmt.Errorf("store: invalid network name")
+	}
+	return nil
 }
 
 // NetworkConfigs returns all stored definitions, name-ordered.
@@ -56,6 +112,71 @@ func (s *Store) NetworkConfigs(ctx context.Context) ([]NetworkConfig, error) {
 	return out, rows.Err()
 }
 
+// NetworkConfigsPage returns at most limit definitions after the supplied
+// opaque rowid cursor, plus whether another page exists. A legacy row larger
+// than MaxNetworkConfigBytes is represented by name with Oversized=true and no
+// Config bytes: this keeps the recovery listing bounded instead of allocating
+// and enqueueing an attacker-sized blob. New writes cannot create such rows.
+func (s *Store) NetworkConfigsPage(ctx context.Context, after int64, limit int) ([]NetworkConfig, bool, error) {
+	if limit <= 0 {
+		return []NetworkConfig{}, false, nil
+	}
+	if limit > 64 {
+		limit = 64
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT rowid,
+			CASE WHEN length(CAST(name AS BLOB)) <= ? THEN name ELSE NULL END,
+			length(CAST(name AS BLOB)),
+			CASE WHEN length(CAST(config AS BLOB)) <= ? THEN config ELSE NULL END,
+			length(CAST(config AS BLOB))
+		FROM network_configs
+		WHERE rowid > ?
+		ORDER BY rowid
+		LIMIT ?`, MaxNetworkNameBytes, MaxNetworkConfigBytes, after, limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	out := make([]NetworkConfig, 0, limit+1)
+	for rows.Next() {
+		var nc NetworkConfig
+		var name sql.NullString
+		var nameSize int64
+		var config sql.NullString
+		var size int64
+		if err := rows.Scan(&nc.PageID, &name, &nameSize, &config, &size); err != nil {
+			return nil, false, err
+		}
+		if name.Valid && validateNetworkName(name.String) == nil {
+			nc.Name = name.String
+		} else {
+			nc.InvalidName = true
+		}
+		if nc.InvalidName {
+			// Recovery of an invalid-name row is delete-only by opaque PageID. Do
+			// not expose its definition to callers that cannot safely address it.
+			nc.Config = ""
+		} else if config.Valid {
+			nc.Config = config.String
+		} else {
+			nc.Oversized = size > MaxNetworkConfigBytes
+		}
+		out = append(out, nc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
+}
+
 // NetworkConfig returns one stored definition by name (ok=false when
 // absent).
 func (s *Store) NetworkConfig(ctx context.Context, name string) (NetworkConfig, bool, error) {
@@ -63,21 +184,56 @@ func (s *Store) NetworkConfig(ctx context.Context, name string) (NetworkConfig, 
 	defer s.mu.Unlock()
 
 	var nc NetworkConfig
+	var config sql.NullString
+	var size int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT name, config FROM network_configs WHERE name = ?`, name).Scan(&nc.Name, &nc.Config)
+		`SELECT name,
+			CASE WHEN length(CAST(config AS BLOB)) <= ? THEN config ELSE NULL END,
+			length(CAST(config AS BLOB))
+		 FROM network_configs WHERE name = ?`, MaxNetworkConfigBytes, name).
+		Scan(&nc.Name, &config, &size)
 	if errors.Is(err, sql.ErrNoRows) {
 		return NetworkConfig{}, false, nil
 	}
 	if err != nil {
 		return NetworkConfig{}, false, err
 	}
+	if config.Valid {
+		nc.Config = config.String
+	}
+	nc.Oversized = size > MaxNetworkConfigBytes
 	return nc, true, nil
+}
+
+// NetworkConfigCount reports how many definitions exist without loading any
+// config blobs. Startup uses it to decide whether config-file seeding applies.
+func (s *Store) NetworkConfigCount(ctx context.Context) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM network_configs`).Scan(&count)
+	return count, err
 }
 
 // PutNetworkConfig inserts or replaces a definition.
 func (s *Store) PutNetworkConfig(ctx context.Context, name, config string) error {
+	if err := ValidateNetworkConfigRecord(name, config); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var exists, count int
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM network_configs WHERE name = ?)`, name).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM network_configs`).Scan(&count); err != nil {
+			return err
+		}
+		if count >= MaxNetworkConfigs {
+			return fmt.Errorf("store: network limit reached (%d)", MaxNetworkConfigs)
+		}
+	}
 
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO network_configs (name, config) VALUES (?, ?)
@@ -93,6 +249,9 @@ func (s *Store) PutNetworkConfig(ctx context.Context, name, config string) error
 // changes nothing. oldName == "" or == name is a plain upsert. Caches
 // are evicted only after commit.
 func (s *Store) ReplaceNetworkConfig(ctx context.Context, oldName, name, config string) error {
+	if err := ValidateNetworkConfigRecord(name, config); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -102,6 +261,28 @@ func (s *Store) ReplaceNetworkConfig(ctx context.Context, oldName, name, config 
 	}
 	defer tx.Rollback()
 	renamed := oldName != "" && oldName != name
+	var count, oldExists, targetExists int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM network_configs`).Scan(&count); err != nil {
+		return err
+	}
+	if renamed {
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM network_configs WHERE name = ?)`, oldName).Scan(&oldExists); err != nil {
+			return err
+		}
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM network_configs WHERE name = ?)`, name).Scan(&targetExists); err != nil {
+		return err
+	}
+	projected := count
+	if renamed && oldExists != 0 {
+		projected--
+	}
+	if targetExists == 0 {
+		projected++
+	}
+	if projected > count && count >= MaxNetworkConfigs {
+		return fmt.Errorf("store: network limit reached (%d)", MaxNetworkConfigs)
+	}
 	if renamed {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE networks SET name = ? WHERE user_id = ? AND name = ?`,
@@ -164,30 +345,118 @@ func (s *Store) DeleteNetwork(ctx context.Context, name string) error {
 	return nil
 }
 
+// DeleteNetworkByPageID is the recovery-only counterpart for a legacy row
+// whose stored name is too large or malformed to expose outside SQLite. The
+// name stays inside SQL; clearing all small in-memory caches avoids ever
+// materializing it merely for cache-key eviction.
+func (s *Store) DeleteNetworkByPageID(ctx context.Context, id int64) error {
+	if id <= 0 {
+		return errors.New("store: invalid network recovery id")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM networks
+		WHERE user_id = ? AND name =
+			(SELECT name FROM network_configs WHERE rowid = ?)`, defaultUserID, id); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM network_configs WHERE rowid = ?`, id)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		if err != nil {
+			return err
+		}
+		return errors.New("store: network recovery row not found")
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	clear(s.networks)
+	clear(s.buffers)
+	clear(s.rings)
+	s.ringBytes = 0
+	return nil
+}
+
 // DeleteBuffer removes one stored buffer and, via cascades, its
 // messages (FTS rows via trigger) and read marker. Used by the
 // close_buffer request: a closed buffer must not resurrect from the
 // store on the next buffer-list refresh.
 func (s *Store) DeleteBuffer(ctx context.Context, network, target string) error {
+	_, err := s.DeleteBufferFolded(ctx, network, target, nil, nil)
+	return err
+}
+
+// DeleteBufferFolded resolves target to the stored spelling under the
+// connection's casemapping and deletes it while holding the same store lock as
+// AppendFoldedGuarded. afterDelete runs after a successful database operation
+// but before that lock is released; the hub uses it to install its close
+// tombstone, making delete+tombstone atomic with respect to every append.
+// The canonical spelling is returned even when no row exists.
+func (s *Store) DeleteBufferFolded(ctx context.Context, network, target string, fold func(string) string, afterDelete func(canonical string)) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	canonical, err := s.canonicalBufferLocked(ctx, network, target, fold)
+	if err != nil {
+		return "", err
+	}
 
 	res, err := s.db.ExecContext(ctx, `
 		DELETE FROM buffers WHERE name = ? AND network_id =
 			(SELECT id FROM networks WHERE user_id = ? AND name = ?)`,
-		target, defaultUserID, network)
+		canonical, defaultUserID, network)
 	if err != nil {
-		return err
+		return "", err
+	}
+	if afterDelete != nil {
+		afterDelete(canonical)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return nil // nothing stored: closing a purely client-side buffer
+		return canonical, nil // closing a purely client-side buffer
 	}
-	k := bufKey{network: network, target: target}
+	k := bufKey{network: network, target: canonical}
 	if id, ok := s.buffers[k]; ok {
 		s.dropRingLocked(id)
 		delete(s.buffers, k)
 	}
-	return nil
+	return canonical, nil
+}
+
+func (s *Store) canonicalBufferLocked(ctx context.Context, network, target string, fold func(string) string) (string, error) {
+	if fold == nil {
+		return target, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT b.name FROM buffers b
+		JOIN networks n ON n.id = b.network_id
+		WHERE n.user_id = ? AND n.name = ?`, defaultUserID, network)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	want := fold(target)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return "", err
+		}
+		if fold(name) == want {
+			return name, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return target, nil
 }
 
 // dropRingLocked removes a resident ring AND subtracts its bytes from the
@@ -219,6 +488,14 @@ func (s *Store) dropNetworkCachesLocked(network string) {
 // seed would strand the remaining networks forever, because a non-empty
 // table makes every later run ignore the config file.
 func (s *Store) SeedNetworkConfigs(ctx context.Context, configs []NetworkConfig) (bool, error) {
+	if len(configs) > MaxNetworkConfigs {
+		return false, fmt.Errorf("store: network limit reached (%d)", MaxNetworkConfigs)
+	}
+	for _, nc := range configs {
+		if err := ValidateNetworkConfigRecord(nc.Name, nc.Config); err != nil {
+			return false, err
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

@@ -26,10 +26,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"log"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -117,6 +119,13 @@ type Hub struct {
 	// cascade-removed) or sees the network gone and skips — never
 	// resurrecting an orphan networks row.
 	lifecycleGate sync.RWMutex
+	// bufferMutationMu linearizes live store append+broadcast operations with
+	// close_buffer's delete+tombstone+buffer_closed broadcast. Store-level
+	// atomic guards prevent database resurrection, but without this wider
+	// boundary an append completed just before a delete could broadcast its
+	// event just after buffer_closed and resurrect the client-only buffer.
+	// Lock order: lifecycleGate (when needed), bufferMutationMu, store, h.mu.
+	bufferMutationMu sync.Mutex
 
 	// monMu serializes the monitor-add folded-duplicate check with its
 	// insert: SQLite uniqueness is byte-exact, so without this two
@@ -124,18 +133,24 @@ type Hub struct {
 	// persist — the casemapped-duplicate state the check exists to prevent.
 	monMu sync.Mutex
 
-	mu         sync.Mutex
-	networks   map[string]Conn
-	states     map[string]string          // last known connection state per network
-	presence   map[string]map[string]bool // network -> monitored nick -> online (MONITOR)
-	motdWanted map[string][]string        // queued explicit /motd targets per network ("" = untargeted)
-	procs      map[string]*netProc        // running network lifecycles
-	sessions   map[*Session]struct{}
+	mu                sync.Mutex
+	networks          map[string]Conn
+	states            map[string]string          // last known connection state per network
+	presence          map[string]map[string]bool // network -> monitored nick -> online (MONITOR)
+	motdWanted        map[string][]string        // queued explicit /motd targets per network ("" = untargeted)
+	procs             map[string]*netProc        // running network lifecycles
+	recoveryRows      map[string]int64           // synthetic stopped label -> invalid DB rowid
+	sessions          map[*Session]struct{}
+	queuedBytes       atomic.Int64
+	sessionQueueBytes int64
+	hubQueueBytes     int64
+	largeResponseSem  chan struct{}
 	// recentClose bounds the buffer-resurrection race: a buffer closed
 	// from the UI (close_buffer) must not be re-created by straggler
 	// inbound traffic that was already in flight. Keyed by
 	// network+"\x00"+foldedBuffer -> unix-ms of the close.
-	recentClose map[string]int64
+	recentClose      map[string]int64
+	recentCloseBytes int
 }
 
 // Store exposes the shared store so the HTTP layer can read/write its own
@@ -145,14 +160,18 @@ func (h *Hub) Store() *store.Store { return h.store }
 
 func New(st *store.Store) *Hub {
 	return &Hub{
-		store:       st,
-		recentClose: make(map[string]int64),
-		networks:    make(map[string]Conn),
-		states:      make(map[string]string),
-		presence:    make(map[string]map[string]bool),
-		motdWanted:  make(map[string][]string),
-		procs:       make(map[string]*netProc),
-		sessions:    make(map[*Session]struct{}),
+		store:             st,
+		recentClose:       make(map[string]int64),
+		networks:          make(map[string]Conn),
+		states:            make(map[string]string),
+		presence:          make(map[string]map[string]bool),
+		motdWanted:        make(map[string][]string),
+		procs:             make(map[string]*netProc),
+		recoveryRows:      make(map[string]int64),
+		sessions:          make(map[*Session]struct{}),
+		sessionQueueBytes: defaultSessionQueueBytes,
+		hubQueueBytes:     defaultHubQueueBytes,
+		largeResponseSem:  make(chan struct{}, 4),
 	}
 }
 
@@ -226,7 +245,8 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 				// second of the two signals post-registration synchronization
 				// waits for. Checked here — not inside onMessage — because it
 				// must fire regardless of how the numeric is otherwise routed.
-				if !reg.burstEnded && (ev.Msg.Command == "376" || ev.Msg.Command == "422") {
+				if !historyReplay(ev, histBatches) && !reg.burstEnded &&
+					(ev.Msg.Command == "376" || ev.Msg.Command == "422") {
 					reg.burstEnded = true
 					h.maybeStartSync(ctx, c, reg)
 				}
@@ -349,10 +369,10 @@ func (h *Hub) handleControlNumeric(ctx context.Context, c Conn, ev irc.Event) bo
 			h.monMu.Lock()
 			if desired, lerr := h.store.Monitors(ctx, ev.Network); lerr == nil {
 				// One atomic, gen-checked call: learn the authoritative limit
-					// and clear+rebuild if this connection has not recovered at it.
-					if rerr := c.MonitorRejected(strings.Split(ev.Msg.Params[2], ","), limit, ev.Gen, desired); rerr != nil {
-						log.Printf("irc[%s]: monitor rebuild after 734: %v", ev.Network, rerr)
-					}
+				// and clear+rebuild if this connection has not recovered at it.
+				if rerr := c.MonitorRejected(strings.Split(ev.Msg.Params[2], ","), limit, ev.Gen, desired); rerr != nil {
+					log.Printf("irc[%s]: monitor rebuild after 734: %v", ev.Network, rerr)
+				}
 			} else {
 				log.Printf("irc[%s]: monitor 734 skipped (list read failed): %v", ev.Network, lerr)
 			}
@@ -367,30 +387,6 @@ func (h *Hub) handleControlNumeric(ctx context.Context, c Conn, ev irc.Event) bo
 }
 
 func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches map[string]*histBatch, backfillPages map[string]int, whois map[string]*WhoisData) error {
-	// Standard-replies and MONITOR numerics are self-contained.
-	if h.handleControlNumeric(ctx, c, ev) {
-		return nil
-	}
-	// WHOIS replies accumulate into one card (consumed here).
-	if h.accumulateWhois(c, ev, whois) {
-		return nil
-	}
-	// ERR_LINKCHANNEL (470): the join was refused and forwarded elsewhere, so
-	// the ORIGINAL channel must leave the stored autojoin list (see
-	// autojoinChange). Handled here because 470 is an error numeric: the
-	// serverInfo branch below consumes it before liveHints would run. It
-	// still falls through so the "Forwarding to another channel" line
-	// surfaces to the user.
-	if ev.Msg.Command == "470" {
-		h.persistAutojoin(ctx, c, ev)
-	}
-	// Other command replies (WHOWAS/WHO/LIST/AWAY/...) and error numerics
-	// are pushed as ephemeral "server_info" lines.
-	if info, ok := h.serverInfo(ev); ok {
-		info.Network = ev.Network
-		h.broadcast(envelope("server_info", 0, info))
-		return nil
-	}
 	if ev.Msg.Command == "BATCH" {
 		h.trackHistoryBatch(ctx, ev, c, histBatches, backfillPages)
 		return nil
@@ -407,7 +403,7 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 	// notifications, unread counts, and duplicate own messages from
 	// history.
 	batchRef := clampBatchRef(ev.Msg.Tags["batch"])
-	replay := batchRef != "" && histBatches[batchRef] != nil
+	replay := historyReplay(ev, histBatches)
 	batch := histBatches[batchRef]
 	if replay {
 		// Track the batch's own newest message as the anchor for the
@@ -423,6 +419,24 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 		// which the writer drops as over-length anyway.
 		batch.lastID = clampDetach(ev.Msg.Tags["msgid"])
 	} else {
+		// Every live-only numeric/control effect runs only AFTER replay
+		// classification. Replayed 470/MONITOR/WHOIS/MOTD numerics are history,
+		// not current connection state, and must neither mutate state nor emit
+		// ephemeral cards.
+		if h.handleControlNumeric(ctx, c, ev) {
+			return nil
+		}
+		if h.accumulateWhois(c, ev, whois) {
+			return nil
+		}
+		if ev.Msg.Command == "470" {
+			h.persistAutojoin(ctx, c, ev)
+		}
+		if info, ok := h.serverInfo(ev); ok {
+			info.Network = ev.Network
+			h.broadcast(envelope("server_info", 0, info))
+			return nil
+		}
 		h.liveHints(ctx, c, ev)
 	}
 	switch ev.Msg.Command {
@@ -432,7 +446,9 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 		}
 		return nil
 	case "MARKREAD": // marker state, never persisted
-		h.applyUpstreamMarker(ctx, c, ev)
+		if !replay {
+			h.applyUpstreamMarker(ctx, c, ev)
+		}
 		return nil
 	case "REDACT": // updates an existing row, not a new one
 		h.applyRedaction(ctx, ev, c, replay, batch)
@@ -442,6 +458,11 @@ func (h *Hub) onMessage(ctx context.Context, c Conn, ev irc.Event, histBatches m
 		return nil
 	}
 	return h.persistEvent(ctx, c, ev, replay, batch)
+}
+
+func historyReplay(ev irc.Event, batches map[string]*histBatch) bool {
+	ref := clampBatchRef(ev.Msg.Tags["batch"])
+	return ref != "" && batches[ref] != nil
 }
 
 // liveHints handles the side effects only live (non-replayed) messages
@@ -661,6 +682,14 @@ func persistBuffer(ev irc.Event, c Conn, replay bool, batch *histBatch, queryOpe
 // persistEvent stores a message in its buffer and, when live, broadcasts
 // it. Duplicate msgids (overlapping backfill) are silently dropped.
 func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay bool, batch *histBatch) error {
+	// A live append and its publication are one observable mutation. Serialize
+	// them with close_buffer so the UI cannot see buffer_closed followed by an
+	// older, already-committed event. Replay writes publish only a later
+	// history_changed hint and remain protected by the store's atomic guard.
+	if !replay {
+		h.bufferMutationMu.Lock()
+		defer h.bufferMutationMu.Unlock()
+	}
 	// queryOpen reports whether a NON-channel query buffer with the given nick
 	// is already open, so an incoming private NOTICE from a service or bot
 	// files under that conversation instead of the lobby (see noticeTarget).
@@ -794,11 +823,13 @@ func (h *Hub) startMonitor(ctx context.Context, c Conn) {
 // server-fed structures (multiline batches, line length). Legitimate
 // use stays far below these.
 const (
-	maxOpenWhois       = 64               // concurrent WHOIS accumulations
-	maxOpenHistBatches = 256              // concurrent chathistory replay batches
-	maxBackfillTargets = 4096             // distinct targets tracked for paginated backfill
-	closeGraceMs       = 10_000           // buffer stays closed against stragglers this long
-	ownDedupWindow     = 10 * time.Minute // reconcile a replayed own message with its local placeholder
+	maxOpenWhois        = 64               // concurrent WHOIS accumulations
+	maxOpenHistBatches  = 256              // concurrent chathistory replay batches
+	maxBackfillTargets  = 4096             // distinct targets tracked for paginated backfill
+	closeGraceMs        = 10_000           // buffer stays closed against stragglers this long
+	maxRecentCloses     = 1024             // authenticated close flood bound
+	maxRecentCloseBytes = 1 << 20          // keys retained by recentClose
+	ownDedupWindow      = 10 * time.Minute // reconcile a replayed own message with its local placeholder
 )
 
 func (h *Hub) updatePresence(ctx context.Context, c Conn, network string, m *ircv4.Message, online bool) {
@@ -1369,17 +1400,41 @@ func (h *Hub) markClosed(network, foldedBuffer string, nowMs int64) {
 	defer h.mu.Unlock()
 	for k, t := range h.recentClose {
 		if nowMs-t > closeGraceMs {
-			delete(h.recentClose, k)
+			h.deleteRecentCloseLocked(k)
 		}
 	}
-	h.recentClose[network+"\x00"+foldedBuffer] = nowMs
+	key := network + "\x00" + foldedBuffer
+	if _, exists := h.recentClose[key]; !exists {
+		h.recentCloseBytes += len(key)
+	}
+	h.recentClose[key] = nowMs
+	for len(h.recentClose) > maxRecentCloses || h.recentCloseBytes > maxRecentCloseBytes {
+		var oldestKey string
+		var oldest int64
+		for k, t := range h.recentClose {
+			if oldestKey == "" || t < oldest {
+				oldestKey, oldest = k, t
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		h.deleteRecentCloseLocked(oldestKey)
+	}
+}
+
+func (h *Hub) deleteRecentCloseLocked(key string) {
+	if _, ok := h.recentClose[key]; ok {
+		delete(h.recentClose, key)
+		h.recentCloseBytes -= len(key)
+	}
 }
 
 // unmarkClosed clears a buffer's close grace (e.g. on a self-JOIN
 // reopen) so subsequent traffic re-creates it normally.
 func (h *Hub) unmarkClosed(network, foldedBuffer string) {
 	h.mu.Lock()
-	delete(h.recentClose, network+"\x00"+foldedBuffer)
+	h.deleteRecentCloseLocked(network + "\x00" + foldedBuffer)
 	h.mu.Unlock()
 }
 
@@ -1389,7 +1444,11 @@ func (h *Hub) recentlyClosed(network, foldedBuffer string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	t, ok := h.recentClose[network+"\x00"+foldedBuffer]
-	return ok && time.Now().UnixMilli()-t <= closeGraceMs
+	if ok && time.Now().UnixMilli()-t > closeGraceMs {
+		h.deleteRecentCloseLocked(network + "\x00" + foldedBuffer)
+		return false
+	}
+	return ok
 }
 
 func (h *Hub) network(name string) Conn {
@@ -1399,21 +1458,29 @@ func (h *Hub) network(name string) Conn {
 }
 
 func (h *Hub) broadcast(env Envelope) {
+	frame, err := json.Marshal(env)
+	if err != nil {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for s := range h.sessions {
-		s.push(env)
+		s.pushFrame(frame)
 	}
 }
 
 // broadcastExcept sends to every session but the originator, which gets
 // its own seq-tagged response instead.
 func (h *Hub) broadcastExcept(except *Session, env Envelope) {
+	frame, err := json.Marshal(env)
+	if err != nil {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for s := range h.sessions {
 		if s != except {
-			s.push(env)
+			s.pushFrame(frame)
 		}
 	}
 }
@@ -1603,6 +1670,9 @@ func eventData(m store.Message) EventData {
 // msgid dedup makes the fan-out idempotent under overlapping backfill.
 func (h *Hub) persistMembership(ctx context.Context, c Conn, ev irc.Event, replay bool, batch *histBatch) {
 	for _, target := range h.membershipTargets(ctx, ev, replay, batch, c.Fold) {
+		if !replay {
+			h.bufferMutationMu.Lock()
+		}
 		// Canonicalize under the network casemapping (like persistEvent) so
 		// a QUIT/NICK for #FOO lands in the existing #foo buffer instead of
 		// splitting off a case-variant duplicate: the channel targets come
@@ -1620,13 +1690,20 @@ func (h *Hub) persistMembership(ctx context.Context, c Conn, ev irc.Event, repla
 			storeMessage(ev))
 		if err != nil {
 			log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
+			if !replay {
+				h.bufferMutationMu.Unlock()
+			}
 			continue
 		}
 		if stored.ID == 0 {
+			if !replay {
+				h.bufferMutationMu.Unlock()
+			}
 			continue // duplicate msgid: already stored and announced
 		}
 		if !replay {
 			h.broadcast(envelope("event", 0, eventData(stored)))
+			h.bufferMutationMu.Unlock()
 		}
 	}
 }

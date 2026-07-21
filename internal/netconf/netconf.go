@@ -29,6 +29,8 @@ import (
 	"io"
 	"os"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"ircthing/internal/irc"
 	"ircthing/internal/proxydial"
@@ -110,8 +112,9 @@ func (n *Network) EffectiveName() string {
 // each name to internal/hub.maxPersistedChannelLen for the same reason: a name
 // the persist path would skip must not be storable in the first place.
 const (
-	maxChannels   = 4096
-	maxChannelLen = 200
+	maxChannels         = 4096
+	maxChannelLen       = 200
+	maxNetworkNameBytes = 128 // mirrored by store.MaxNetworkNameBytes
 )
 
 func (n *Network) Validate() error {
@@ -142,6 +145,18 @@ func (n *Network) validateIdentity() error {
 	if n.Nick == "" {
 		return errors.New("nick is required")
 	}
+	name := n.EffectiveName()
+	if len(name) > maxNetworkNameBytes || !utf8.ValidString(name) {
+		return fmt.Errorf("network name must be valid UTF-8 and at most %d bytes", maxNetworkNameBytes)
+	}
+	for _, r := range name {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return errors.New("network name must not contain whitespace or control characters")
+		}
+	}
+	if strings.HasPrefix(name, "__ircthing_invalid_row_") {
+		return fmt.Errorf("network name %q is reserved", name)
+	}
 	// Egress is either a proxy or a WireGuard tunnel, never both. The full
 	// WireGuard validation is deferred to wgdial.Validate via IRCConfig/NewManager;
 	// this cheap mutual-exclusion check lives here too so the config layer rejects
@@ -156,12 +171,12 @@ func (n *Network) validateIdentity() error {
 	// the full set of Object.prototype property names (plus "prototype") at this
 	// single choke point rather than reshaping every keyed store client-side; the
 	// set is fixed by the ECMAScript spec.
-	switch n.EffectiveName() {
+	switch name {
 	case "__proto__", "constructor", "prototype",
 		"hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable",
 		"toLocaleString", "toString", "valueOf",
 		"__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__":
-		return fmt.Errorf("network name %q is reserved", n.EffectiveName())
+		return fmt.Errorf("network name %q is reserved", name)
 	}
 	return nil
 }

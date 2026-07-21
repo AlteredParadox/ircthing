@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ircthing/internal/irc"
@@ -36,15 +37,54 @@ import (
 // falls this far behind is disconnected (see push).
 var sessionBuffer = 64
 
+const (
+	defaultSessionQueueBytes  = int64(2 << 20) // 2 MiB per browser connection
+	defaultHubQueueBytes      = int64(8 << 20) // 8 MiB across all connections
+	maxHistoryPayloadBytes    = 512 << 10      // encoded history data, before envelope
+	maxHistoryMessages        = 64             // also bounds pre-encoding materialization
+	maxSearchQueryBytes       = 1024
+	maxSearchTerms            = 32
+	maxSearchMessages         = 64
+	maxBufferResponseRows     = 512
+	maxNetworkResponseRows    = 64
+	maxChannelResponseMembers = 256
+)
+
+// OutboundFrame is a fully encoded WebSocket text frame and owns one
+// queued-byte reservation. Encoding before admission is important: retaining
+// an Envelope and then allocating another full JSON copy in the write pump
+// could make the real queue footprint roughly twice its accounted budget.
+// The transport must call Release exactly once after receiving it; Release is
+// idempotent so concurrent session teardown can safely drain the queue.
+type OutboundFrame struct {
+	Data    []byte
+	session *Session
+	bytes   int64
+	once    sync.Once
+}
+
+func (q *OutboundFrame) Release() {
+	if q == nil || q.session == nil {
+		return
+	}
+	q.once.Do(func() {
+		q.session.queuedBytes.Add(-q.bytes)
+		q.session.hub.queuedBytes.Add(-q.bytes)
+	})
+}
+
 // Session is one connected client (one browser tab / device). The
 // transport (internal/api) feeds client envelopes to Handle and writes
 // everything from Outbound to the wire; when Done closes, the transport
 // must drop the connection.
 type Session struct {
-	hub  *Hub
-	out  chan Envelope
-	done chan struct{}
-	once sync.Once
+	hub         *Hub
+	out         chan *OutboundFrame
+	done        chan struct{}
+	once        sync.Once
+	queuedBytes atomic.Int64
+	queueMu     sync.Mutex
+	closed      bool
 }
 
 // maxHubSessions bounds concurrent hub (WebSocket) sessions: each costs
@@ -65,7 +105,7 @@ const maxMonitorsPerNetwork = 1024
 func (h *Hub) NewSession() *Session {
 	s := &Session{
 		hub:  h,
-		out:  make(chan Envelope, sessionBuffer),
+		out:  make(chan *OutboundFrame, sessionBuffer),
 		done: make(chan struct{}),
 	}
 	h.mu.Lock()
@@ -86,7 +126,7 @@ func (s *Session) Close() {
 	s.disconnect()
 }
 
-func (s *Session) Outbound() <-chan Envelope { return s.out }
+func (s *Session) Outbound() <-chan *OutboundFrame { return s.out }
 
 // Done closes when the session has been evicted (or Closed); the
 // transport must stop writing and drop the connection.
@@ -97,16 +137,80 @@ func (s *Session) Done() <-chan struct{} { return s.done }
 // events mid-stream — after a reconnect the client refetches history and
 // misses nothing.
 func (s *Session) push(env Envelope) {
+	frame, err := json.Marshal(env)
+	if err != nil {
+		return // all envelopes are composed from JSON-safe application types
+	}
+	s.pushFrame(frame)
+}
+
+// pushFrame admits one immutable, fully encoded frame. Broadcasts share the
+// same backing allocation between sessions, while accounting it
+// conservatively once per session so the cap remains safe even if that sharing
+// changes later.
+func (s *Session) pushFrame(frame []byte) {
+	n := int64(len(frame))
+	if !reserveBytes(&s.queuedBytes, n, s.hub.sessionQueueBytes) {
+		s.disconnect()
+		return
+	}
+	if !reserveBytes(&s.hub.queuedBytes, n, s.hub.hubQueueBytes) {
+		s.queuedBytes.Add(-n)
+		s.disconnect()
+		return
+	}
+	q := &OutboundFrame{Data: frame, session: s, bytes: n}
+	s.queueMu.Lock()
+	if s.closed {
+		s.queueMu.Unlock()
+		q.Release()
+		return
+	}
+	full := false
 	select {
-	case <-s.done:
-	case s.out <- env:
+	case s.out <- q:
 	default:
+		q.Release()
+		full = true
+	}
+	s.queueMu.Unlock()
+	if full {
 		s.disconnect()
 	}
 }
 
 func (s *Session) disconnect() {
-	s.once.Do(func() { close(s.done) })
+	s.once.Do(func() {
+		s.queueMu.Lock()
+		defer s.queueMu.Unlock()
+		s.closed = true
+		close(s.done)
+		// Release frames still owned by the queue. A transport may already own
+		// one received frame; its independent idempotent Release handles that.
+		for {
+			select {
+			case q := <-s.out:
+				q.Release()
+			default:
+				return
+			}
+		}
+	})
+}
+
+func reserveBytes(counter *atomic.Int64, n, limit int64) bool {
+	if n <= 0 || n > limit {
+		return false
+	}
+	for {
+		old := counter.Load()
+		if old > limit-n {
+			return false
+		}
+		if counter.CompareAndSwap(old, old+n) {
+			return true
+		}
+	}
 }
 
 // conn resolves a network name to its live connection, pushing the
@@ -160,6 +264,8 @@ func (s *Session) Handle(ctx context.Context, env Envelope) {
 		s.handleSetPrefs(ctx, env)
 	case "get_networks":
 		s.handleGetNetworks(ctx, env)
+	case "get_network":
+		s.handleGetNetwork(ctx, env)
 	case "put_network":
 		s.handlePutNetwork(ctx, env)
 	case "delete_network":
@@ -282,6 +388,8 @@ func (s *Session) persistOwn(ctx context.Context, conn Conn, network, target, te
 	if known, _ := s.hub.knownNetwork(ctx, network); !known {
 		return
 	}
+	s.hub.bufferMutationMu.Lock()
+	defer s.hub.bufferMutationMu.Unlock()
 	// The target is client-supplied: file under the canonical stored
 	// spelling (atomically, so "/msg #Go" cannot race the event
 	// consumer into a second buffer next to #go). Strip a leading STATUSMSG
@@ -291,7 +399,7 @@ func (s *Session) persistOwn(ctx context.Context, conn Conn, network, target, te
 	// wire target, matching what the server would echo.
 	msg := &ircv4.Message{Command: "PRIVMSG", Params: []string{target, text}}
 	buffer := stripStatusPrefix(target, conn.StatusPrefixes(), conn.IsChannel)
-	stored, err := s.hub.store.AppendFolded(ctx, network, buffer, conn.Fold, store.Message{
+	message := store.Message{
 		Time:    time.Now(),
 		Sender:  conn.Nick(),
 		Command: "PRIVMSG",
@@ -303,7 +411,21 @@ func (s *Session) persistOwn(ctx context.Context, conn Conn, network, target, te
 		// backfill on no-echo servers — storing the raw \x01ACTION…\x01
 		// here would never match and leave a duplicate.
 		Text: searchText(msg),
-	})
+	}
+	var (
+		stored store.Message
+		err    error
+	)
+	if conn.IsChannel(buffer) {
+		// A send whose local echo loses a race with close_buffer must not
+		// recreate a channel the user just closed. Query sends, on the other
+		// hand, are explicit reopen intent and clear the tombstone below.
+		stored, err = s.hub.store.AppendFoldedGuarded(ctx, network, buffer, conn.Fold,
+			func(bool) bool { return s.hub.recentlyClosed(network, conn.Fold(buffer)) }, message)
+	} else {
+		s.hub.unmarkClosed(network, conn.Fold(buffer))
+		stored, err = s.hub.store.AppendFolded(ctx, network, buffer, conn.Fold, message)
+	}
 	if err != nil {
 		return
 	}
@@ -650,21 +772,60 @@ func (s *Session) handleGetChannel(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", "malformed get_channel data"))
 		return
 	}
+	select {
+	case s.hub.largeResponseSem <- struct{}{}:
+		defer func() { <-s.hub.largeResponseSem }()
+	case <-ctx.Done():
+		return
+	}
 	data := ChannelData{Network: d.Network, Buffer: d.Buffer, Members: []MemberData{}}
 	if conn := s.hub.network(d.Network); conn != nil {
 		// Under no-implicit-names the roster is empty until we ask; this
 		// fetches lazily the first time a channel is viewed. The 366 reply
 		// raises members_changed and the client refetches.
 		conn.EnsureNames(d.Buffer)
-		topic, members, ok := conn.Channel(d.Buffer)
+		var (
+			topic     string
+			members   []irc.Member
+			truncated bool
+			ok        bool
+		)
+		if pager, supportsPage := conn.(interface {
+			ChannelPage(string, int) (string, []irc.Member, bool, bool)
+		}); supportsPage {
+			topic, members, truncated, ok = pager.ChannelPage(d.Buffer, maxChannelResponseMembers)
+		} else {
+			// Test/alternate connections implement the original interface. Cap
+			// their snapshot immediately after the call; production Managers use
+			// ChannelPage and never copy the full hostile roster here.
+			topic, members, ok = conn.Channel(d.Buffer)
+			if len(members) > maxChannelResponseMembers {
+				members = members[:maxChannelResponseMembers]
+				truncated = true
+			}
+		}
 		if ok {
 			data.Joined = true
 			data.Topic = topic
+			data.Truncated = truncated
+			base, _ := json.Marshal(data)
+			used := len(base)
 			for _, m := range members {
-				data.Members = append(data.Members, MemberData{
+				md := MemberData{
 					Nick: m.Nick, Prefix: m.Prefix, Away: m.Away,
 					Account: m.Account, Bot: m.Bot, User: m.User, Host: m.Host,
-				})
+				}
+				encoded, _ := json.Marshal(md)
+				extra := len(encoded)
+				if len(data.Members) > 0 {
+					extra++
+				}
+				if used+extra > maxHistoryPayloadBytes {
+					data.Truncated = true
+					break
+				}
+				used += extra
+				data.Members = append(data.Members, md)
 			}
 		}
 	}
@@ -672,20 +833,21 @@ func (s *Session) handleGetChannel(ctx context.Context, env Envelope) {
 }
 
 func (s *Session) handleGetBuffers(ctx context.Context, env Envelope) {
-	infos, err := s.hub.store.Buffers(ctx)
+	select {
+	case s.hub.largeResponseSem <- struct{}{}:
+		defer func() { <-s.hub.largeResponseSem }()
+	case <-ctx.Done():
+		return
+	}
+	infos, storeMore, err := s.hub.store.RecentBuffers(ctx, maxBufferResponseRows)
 	if err != nil {
 		s.push(errEnvelope(env.Seq, "internal", "buffer list query failed"))
 		return
 	}
 	data := BuffersData{
-		Networks: make([]NetworkInfo, 0, 4),
-		Buffers:  make([]BufferInfo, 0, len(infos)),
-	}
-	for _, b := range infos {
-		data.Buffers = append(data.Buffers, BufferInfo{
-			Network: b.Network, Buffer: b.Target,
-			LastTime: b.LastTS, Marker: b.Marker, Unread: b.Unread,
-		})
+		Networks:  make([]NetworkInfo, 0, 4),
+		Buffers:   make([]BufferInfo, 0, len(infos)),
+		Truncated: storeMore,
 	}
 	s.hub.mu.Lock()
 	names := make([]string, 0, len(s.hub.states))
@@ -693,15 +855,77 @@ func (s *Session) handleGetBuffers(ctx context.Context, env Envelope) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	// Prefer networks represented by the recent buffer page, then fill with
+	// the remaining configured/running names. This avoids spending the buffer
+	// row budget on networks that an alphabetical network cap would omit.
+	ordered := make([]string, 0, len(names))
+	seenNames := make(map[string]struct{}, len(names))
+	for _, b := range infos {
+		if _, exists := s.hub.states[b.Network]; !exists {
+			continue
+		}
+		if _, seen := seenNames[b.Network]; seen {
+			continue
+		}
+		seenNames[b.Network] = struct{}{}
+		ordered = append(ordered, b.Network)
+	}
+	for _, name := range names {
+		if _, seen := seenNames[name]; seen {
+			continue
+		}
+		seenNames[name] = struct{}{}
+		ordered = append(ordered, name)
+	}
+	names = ordered
+	if len(names) > maxNetworkResponseRows {
+		names = names[:maxNetworkResponseRows]
+		data.Truncated = true
+	}
+	includedNetworks := make(map[string]struct{}, len(names))
+	base, _ := json.Marshal(data)
+	used := len(base)
 	for _, name := range names {
 		info := NetworkInfo{Name: name, State: s.hub.states[name]}
 		if c := s.hub.networks[name]; c != nil {
 			info.Nick = c.Nick()
 			info.ChanTypes = c.ChanTypes()
 		}
+		encoded, _ := json.Marshal(info)
+		extra := len(encoded)
+		if len(data.Networks) > 0 {
+			extra++
+		}
+		if used+extra > maxHistoryPayloadBytes {
+			data.Truncated = true
+			break
+		}
+		used += extra
 		data.Networks = append(data.Networks, info)
+		includedNetworks[name] = struct{}{}
 	}
 	s.hub.mu.Unlock()
+	for _, b := range infos {
+		if _, ok := includedNetworks[b.Network]; !ok {
+			data.Truncated = true
+			continue
+		}
+		info := BufferInfo{
+			Network: b.Network, Buffer: b.Target,
+			LastTime: b.LastTS, Marker: b.Marker, Unread: b.Unread,
+		}
+		encoded, _ := json.Marshal(info)
+		extra := len(encoded)
+		if len(data.Buffers) > 0 {
+			extra++
+		}
+		if used+extra > maxHistoryPayloadBytes {
+			data.Truncated = true
+			break
+		}
+		used += extra
+		data.Buffers = append(data.Buffers, info)
+	}
 	s.push(envelope("buffers", env.Seq, data))
 }
 
@@ -715,30 +939,52 @@ func (s *Session) handleGetHistory(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", "get_history needs network and buffer"))
 		return
 	}
+	// SQLite access is serialized, but without an admission bound many request
+	// goroutines could each retain their materialized page while waiting to
+	// enqueue it. Keep that transient memory bounded independently of the
+	// outbound queue budgets.
+	select {
+	case s.hub.largeResponseSem <- struct{}{}:
+		defer func() { <-s.hub.largeResponseSem }()
+	case <-ctx.Done():
+		return
+	}
+	limit := d.Limit
+	if limit <= 0 || limit > maxHistoryMessages {
+		limit = maxHistoryMessages
+	}
+	// Fetch one sentinel row so HasMore remains correct even when a count-full
+	// page happens to be the end of history. The store's public cap is 500, so
+	// maxHistoryMessages+1 remains within it.
+	fetchLimit := limit + 1
 
 	var (
 		msgs []store.Message
 		err  error
 	)
+	direction := historyBackward
 	switch {
 	case d.Before != nil:
-		msgs, err = s.hub.store.Before(ctx, d.Network, d.Buffer, store.Cursor(*d.Before), d.Limit)
+		msgs, err = s.hub.store.Before(ctx, d.Network, d.Buffer, store.Cursor(*d.Before), fetchLimit)
 	case d.After != nil:
-		msgs, err = s.hub.store.After(ctx, d.Network, d.Buffer, store.Cursor(*d.After), d.Limit)
+		direction = historyForward
+		msgs, err = s.hub.store.After(ctx, d.Network, d.Buffer, store.Cursor(*d.After), fetchLimit)
 	case d.Around != nil:
-		msgs, err = s.hub.store.Around(ctx, d.Network, d.Buffer, store.Cursor(*d.Around), d.Limit)
+		direction = historyAround
+		msgs, err = s.hub.store.Around(ctx, d.Network, d.Buffer, store.Cursor(*d.Around), fetchLimit)
 	case d.BeforeMsgID != "":
 		var c store.Cursor
 		if c, err = s.hub.store.CursorForMsgID(ctx, d.Network, d.Buffer, d.BeforeMsgID); err == nil {
-			msgs, err = s.hub.store.Before(ctx, d.Network, d.Buffer, c, d.Limit)
+			msgs, err = s.hub.store.Before(ctx, d.Network, d.Buffer, c, fetchLimit)
 		}
 	case d.AfterMsgID != "":
+		direction = historyForward
 		var c store.Cursor
 		if c, err = s.hub.store.CursorForMsgID(ctx, d.Network, d.Buffer, d.AfterMsgID); err == nil {
-			msgs, err = s.hub.store.After(ctx, d.Network, d.Buffer, c, d.Limit)
+			msgs, err = s.hub.store.After(ctx, d.Network, d.Buffer, c, fetchLimit)
 		}
 	default:
-		msgs, err = s.hub.store.Latest(ctx, d.Network, d.Buffer, d.Limit)
+		msgs, err = s.hub.store.Latest(ctx, d.Network, d.Buffer, fetchLimit)
 	}
 	if errors.Is(err, store.ErrMsgIDNotFound) {
 		s.push(errEnvelope(env.Seq, "unknown_msgid", "no message with that msgid"))
@@ -749,15 +995,107 @@ func (s *Session) handleGetHistory(ctx context.Context, env Envelope) {
 		return
 	}
 
-	page := HistoryData{
-		Network:  d.Network,
-		Buffer:   d.Buffer,
-		Messages: make([]EventData, 0, len(msgs)),
-	}
-	for _, m := range msgs {
-		page.Messages = append(page.Messages, eventData(m))
-	}
+	page := boundedHistoryPage(d.Network, d.Buffer, msgs, limit, direction, d.Around)
 	s.push(envelope("history", env.Seq, page))
+}
+
+type historyDirection uint8
+
+const (
+	historyBackward historyDirection = iota
+	historyForward
+	historyAround
+)
+
+// boundedHistoryPage keeps the portion adjacent to the request anchor while
+// enforcing an encoded payload limit. That detail is essential for Before:
+// retaining the oldest prefix would create a permanent gap between the page
+// and its anchor on the next request.
+func boundedHistoryPage(network, buffer string, msgs []store.Message, limit int, direction historyDirection, around *Cursor) HistoryData {
+	page := HistoryData{Network: network, Buffer: buffer, Messages: []EventData{}}
+	countMore := len(msgs) > limit
+	if countMore {
+		switch direction {
+		case historyBackward:
+			msgs = msgs[len(msgs)-limit:]
+		default:
+			msgs = msgs[:limit]
+		}
+	}
+	events := make([]EventData, len(msgs))
+	costs := make([]int, len(msgs))
+	base, _ := json.Marshal(page) // includes the empty [] and false (longer than true)
+	used := len(base)
+	for i, m := range msgs {
+		events[i] = eventData(m)
+		b, _ := json.Marshal(events[i])
+		costs[i] = len(b)
+	}
+	add := func(i int) bool {
+		extra := costs[i]
+		if len(page.Messages) > 0 {
+			extra++ // comma
+		}
+		if used+extra > maxHistoryPayloadBytes {
+			return false
+		}
+		used += extra
+		page.Messages = append(page.Messages, events[i])
+		return true
+	}
+	switch direction {
+	case historyBackward:
+		// Select newest-to-oldest, then restore chronological order.
+		for i := len(events) - 1; i >= 0; i-- {
+			if !add(i) {
+				break
+			}
+		}
+		for i, j := 0, len(page.Messages)-1; i < j; i, j = i+1, j-1 {
+			page.Messages[i], page.Messages[j] = page.Messages[j], page.Messages[i]
+		}
+	case historyAround:
+		pivot := 0
+		if around != nil {
+			for i, ev := range events {
+				if ev.Time > around.TS || ev.Time == around.TS && ev.ID >= around.ID {
+					pivot = i
+					break
+				}
+			}
+		}
+		selected := make([]bool, len(events))
+		for left, right := pivot, pivot+1; left >= 0 || right < len(events); {
+			if left >= 0 {
+				if !add(left) {
+					break
+				}
+				selected[left] = true
+				left--
+			}
+			if right < len(events) {
+				if !add(right) {
+					break
+				}
+				selected[right] = true
+				right++
+			}
+		}
+		page.Messages = page.Messages[:0]
+		for i, ok := range selected {
+			if ok {
+				page.Messages = append(page.Messages, events[i])
+			}
+		}
+	default:
+		for i := range events {
+			if !add(i) {
+				break
+			}
+		}
+	}
+	page.HasMore = countMore || len(page.Messages) < len(events)
+	return page
 }
 
 func (s *Session) handleSearch(ctx context.Context, env Envelope) {
@@ -766,12 +1104,27 @@ func (s *Session) handleSearch(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", "malformed search data"))
 		return
 	}
-	if strings.TrimSpace(d.Query) == "" {
+	query := strings.TrimSpace(d.Query)
+	if query == "" {
 		s.push(errEnvelope(env.Seq, "bad_request", "search needs a query"))
 		return
 	}
+	if len(query) > maxSearchQueryBytes || len(strings.Fields(query)) > maxSearchTerms {
+		s.push(errEnvelope(env.Seq, "bad_request", "search query is too long"))
+		return
+	}
+	select {
+	case s.hub.largeResponseSem <- struct{}{}:
+		defer func() { <-s.hub.largeResponseSem }()
+	case <-ctx.Done():
+		return
+	}
+	limit := d.Limit
+	if limit <= 0 || limit > maxSearchMessages {
+		limit = maxSearchMessages
+	}
 	opts := store.SearchOptions{
-		Query: d.Query, Network: d.Network, Target: d.Buffer, Limit: d.Limit,
+		Query: query, Network: d.Network, Target: d.Buffer, Limit: limit + 1,
 	}
 	if d.Before != nil {
 		opts.Before = store.Cursor(*d.Before)
@@ -781,9 +1134,26 @@ func (s *Session) handleSearch(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "internal", "search failed"))
 		return
 	}
-	out := SearchData{Query: d.Query, Messages: make([]EventData, 0, len(msgs))}
+	out := SearchData{Query: query, Messages: make([]EventData, 0, min(limit, len(msgs)))}
+	if len(msgs) > limit {
+		out.HasMore = true
+		msgs = msgs[:limit]
+	}
+	base, _ := json.Marshal(out)
+	used := len(base)
 	for _, m := range msgs {
-		out.Messages = append(out.Messages, eventData(m))
+		ev := eventData(m)
+		encoded, _ := json.Marshal(ev)
+		extra := len(encoded)
+		if len(out.Messages) > 0 {
+			extra++
+		}
+		if used+extra > maxHistoryPayloadBytes {
+			out.HasMore = true
+			break
+		}
+		used += extra
+		out.Messages = append(out.Messages, ev)
 	}
 	s.push(envelope("search_results", env.Seq, out))
 }

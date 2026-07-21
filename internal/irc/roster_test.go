@@ -82,6 +82,28 @@ func TestRosterUserHost(t *testing.T) {
 	}
 }
 
+func TestRosterChannelPageReturnsSortedBoundedPrefix(t *testing.T) {
+	r := testRoster()
+	feed(t, r,
+		joinGo,
+		":srv 353 AlteredParadox = #go :n4 n1 n3 AlteredParadox n0 n2",
+		":srv 366 AlteredParadox #go :end",
+	)
+	topic, got, truncated, ok := r.channelPage("#go", 3)
+	if !ok || topic != "" || !truncated {
+		t.Fatalf("page metadata = ok=%v topic=%q truncated=%v", ok, topic, truncated)
+	}
+	want := []string{"AlteredParadox", "n0", "n1"}
+	if len(got) != len(want) {
+		t.Fatalf("members = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].Nick != want[i] {
+			t.Fatalf("member %d = %q, want %q", i, got[i].Nick, want[i])
+		}
+	}
+}
+
 // join sets up our own membership of #go.
 var joinGo = ":AlteredParadox!u@h JOIN #go"
 

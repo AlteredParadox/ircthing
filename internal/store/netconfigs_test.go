@@ -19,11 +19,13 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -64,6 +66,203 @@ func TestNetworkConfigCRUD(t *testing.T) {
 	configs, _ = s.NetworkConfigs(ctx)
 	if len(configs) != 1 {
 		t.Fatalf("after delete: %+v", configs)
+	}
+}
+
+func TestNetworkConfigBoundsAndPaging(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+
+	if err := s.PutNetworkConfig(ctx, strings.Repeat("n", MaxNetworkNameBytes+1), `{}`); err == nil {
+		t.Fatal("oversized network name was accepted")
+	}
+	if err := s.PutNetworkConfig(ctx, "bad name", `{}`); err == nil {
+		t.Fatal("whitespace-bearing network name was accepted")
+	}
+	if err := s.PutNetworkConfig(ctx, "__proto__", `{}`); err == nil {
+		t.Fatal("prototype-colliding network name was accepted")
+	}
+	if err := s.PutNetworkConfig(ctx, "large", strings.Repeat("x", MaxNetworkConfigBytes+1)); err == nil {
+		t.Fatal("oversized network config was accepted")
+	}
+	for i := 0; i < 3; i++ {
+		name := fmt.Sprintf("net-%d", i)
+		if err := s.PutNetworkConfig(ctx, name, fmt.Sprintf(`{"addr":"a:%d"}`, i+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, more, err := s.NetworkConfigsPage(ctx, 0, 2)
+	if err != nil || !more || len(first) != 2 || first[1].PageID == 0 {
+		t.Fatalf("first page = %#v more=%v err=%v", first, more, err)
+	}
+	second, more, err := s.NetworkConfigsPage(ctx, first[1].PageID, 2)
+	if err != nil || more || len(second) != 1 || second[0].Name != "net-2" {
+		t.Fatalf("second page = %#v more=%v err=%v", second, more, err)
+	}
+
+	// Simulate a legacy row created before the ingress cap. Paging must return
+	// only its small recovery metadata, never materialize its large config.
+	s.mu.Lock()
+	_, err = s.db.ExecContext(ctx, `INSERT INTO network_configs(name, config) VALUES (?, ?)`,
+		"legacy", strings.Repeat("x", MaxNetworkConfigBytes+1))
+	if err == nil {
+		_, err = s.db.ExecContext(ctx, `INSERT INTO network_configs(name, config) VALUES (?, ?)`,
+			"legacy-nul", strings.Repeat("x", MaxNetworkConfigBytes)+"\x00tail")
+	}
+	if err == nil {
+		_, err = s.db.ExecContext(ctx, `INSERT INTO network_configs(name, config) VALUES (?, ?)`,
+			"__proto__", `{}`)
+	}
+	s.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	safe, ok, err := s.NetworkConfig(ctx, "legacy")
+	if err != nil || !ok || !safe.Oversized || safe.Config != "" {
+		t.Fatalf("bounded exact legacy read = %#v ok=%v err=%v", safe, ok, err)
+	}
+	rows, _, err := s.NetworkConfigsPage(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	foundNUL := false
+	foundPrototype := false
+	for _, row := range rows {
+		if row.Name == "legacy" {
+			found = true
+			if !row.Oversized || row.Config != "" {
+				t.Fatalf("legacy row = %#v, want omitted oversized config", row)
+			}
+		}
+		if row.Name == "legacy-nul" {
+			foundNUL = row.Oversized && row.Config == ""
+		}
+		if row.InvalidName && row.Name == "" && row.Config == "" {
+			foundPrototype = true
+		}
+	}
+	if !found || !foundNUL || !foundPrototype {
+		t.Fatalf("legacy recovery rows: regular=%v nul=%v prototype=%v", found, foundNUL, foundPrototype)
+	}
+}
+
+func TestNetworkConfigCountCap(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+	for i := 0; i < MaxNetworkConfigs; i++ {
+		if err := s.PutNetworkConfig(ctx, fmt.Sprintf("n%02d", i), `{}`); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	if err := s.PutNetworkConfig(ctx, "overflow", `{}`); err == nil {
+		t.Fatal("network count cap accepted a new definition")
+	}
+	if err := s.PutNetworkConfig(ctx, "n00", `{"edited":true}`); err != nil {
+		t.Fatalf("cap blocked an in-place repair: %v", err)
+	}
+	if err := s.ReplaceNetworkConfig(ctx, "n00", "renamed", `{}`); err != nil {
+		t.Fatalf("cap blocked a non-growing rename: %v", err)
+	}
+}
+
+func TestDeleteNetworkByPageIDKeepsInvalidNameInsideSQLite(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+	name := strings.Repeat("n", MaxNetworkNameBytes+1)
+	s.mu.Lock()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO network_configs(name, config) VALUES (?, ?)`, name, `{}`)
+	s.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Append(ctx, name, "#x", Message{Time: time.Now(), Sender: "a", Command: "PRIVMSG", Raw: ":a PRIVMSG #x :hi"}); err != nil {
+		t.Fatal(err)
+	}
+	rows, _, err := s.NetworkConfigsPage(ctx, 0, 10)
+	if err != nil || len(rows) != 1 || !rows[0].InvalidName || rows[0].Name != "" {
+		t.Fatalf("invalid-name page = %#v err=%v", rows, err)
+	}
+	if err := s.DeleteNetworkByPageID(ctx, rows[0].PageID); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := s.NetworkConfigCount(ctx); err != nil || count != 0 {
+		t.Fatalf("config count after recovery delete = %d err=%v", count, err)
+	}
+	var historyRows int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM networks WHERE name = ?`, name).Scan(&historyRows); err != nil || historyRows != 0 {
+		t.Fatalf("history network survived: rows=%d err=%v", historyRows, err)
+	}
+	if err := s.DeleteNetworkByPageID(ctx, rows[0].PageID); err == nil {
+		t.Fatal("stale recovery id reported success")
+	}
+}
+
+func TestDeleteBufferFoldedAtomicWithGuardedAppend(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+	fold := strings.ToLower
+	if _, err := s.Append(ctx, "net", "#Go", Message{Sender: "a", Command: "PRIVMSG", Raw: "seed"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var closed atomic.Bool
+	inside := make(chan struct{})
+	release := make(chan struct{})
+	deleteDone := make(chan error, 1)
+	go func() {
+		canonical, err := s.DeleteBufferFolded(ctx, "net", "#gO", fold, func(name string) {
+			if name != "#Go" {
+				t.Errorf("canonical = %q, want #Go", name)
+			}
+			closed.Store(true)
+			close(inside)
+			<-release
+		})
+		if canonical != "#Go" {
+			t.Errorf("returned canonical = %q", canonical)
+		}
+		deleteDone <- err
+	}()
+	<-inside
+	appendDone := make(chan Message, 1)
+	go func() {
+		m, _ := s.AppendFoldedGuarded(ctx, "net", "#GO", fold,
+			func(bool) bool { return closed.Load() }, Message{Sender: "b", Command: "PRIVMSG", Raw: "late"})
+		appendDone <- m
+	}()
+	select {
+	case <-appendDone:
+		t.Fatal("append passed the delete/tombstone critical section")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-deleteDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := <-appendDone; got.ID != 0 {
+		t.Fatalf("guarded append resurrected buffer: %+v", got)
+	}
+	if bufs, _ := s.Buffers(ctx); len(bufs) != 0 {
+		t.Fatalf("buffer survived atomic close: %+v", bufs)
+	}
+}
+
+func TestDeleteBufferFoldedCanceledDoesNotInstallTombstone(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	if _, err := s.DeleteBufferFolded(ctx, "net", "#go", strings.ToLower, func(string) { called = true }); err == nil {
+		t.Fatal("canceled delete succeeded")
+	}
+	if called {
+		t.Fatal("canceled delete installed tombstone")
 	}
 }
 

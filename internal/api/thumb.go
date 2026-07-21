@@ -20,7 +20,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"image"
 	"image/color"
 	_ "image/gif" // register the GIF decoder (first frame only)
@@ -379,21 +378,21 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		// original rather than blanking. (Still 502: permanent, don't retry.)
 		if errors.Is(err, errTooLarge) {
 			w.Header().Set(thumbUnpreviewableHeader, "too-large")
-			logMedia("thumb", target, start, "image too large (>10 MiB body)→502 unpreviewable")
+			logMedia("thumb", target, start, mediaLogResult{event: "fetch_error", class: "too_large", httpStatus: 502, unpreviewable: true})
 			http.Error(w, "image too large", http.StatusBadGateway)
 			return
 		}
 		if fetchErrorRetryable(err) {
-			logMedia("thumb", target, start, "fetch failed (transient→503): "+err.Error())
+			logMedia("thumb", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), retryable: true, httpStatus: 503})
 			http.Error(w, "thumbnail fetch failed", http.StatusServiceUnavailable)
 		} else {
-			logMedia("thumb", target, start, "fetch failed (permanent→502): "+err.Error())
+			logMedia("thumb", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), httpStatus: 502})
 			http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
 		}
 		return
 	}
 	if !isImageType(ct) && !isImageType(http.DetectContentType(body)) {
-		logMedia("thumb", target, start, fmt.Sprintf("not an image (ct=%q, %d bytes)→415", ct, len(body)))
+		logMedia("thumb", target, start, mediaLogResult{event: "reject", class: "not_image", bytes: len(body), httpStatus: 415})
 		http.Error(w, "not an image", http.StatusUnsupportedMediaType)
 		return
 	}
@@ -405,14 +404,14 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		// Real image, but its declared pixel area (or a lossless-WebP bitstream)
 		// exceeds the decode-memory budget — offer the original instead of a blank.
 		w.Header().Set(thumbUnpreviewableHeader, "too-large")
-		logMedia("thumb", target, start, fmt.Sprintf("decode gate rejected (ct=%q, %d bytes)→415", ct, len(body)))
+		logMedia("thumb", target, start, mediaLogResult{event: "reject", class: "decode_budget", bytes: len(body), httpStatus: 415, unpreviewable: true})
 		http.Error(w, "unsupported image", http.StatusUnsupportedMediaType)
 		return
 	}
 
 	src, _, err := image.Decode(bytes.NewReader(body))
 	if err != nil {
-		logMedia("thumb", target, start, "decode failed: "+err.Error())
+		logMedia("thumb", target, start, mediaLogResult{event: "reject", class: "decode", httpStatus: 415})
 		http.Error(w, "decode failed", http.StatusUnsupportedMediaType)
 		return
 	}
@@ -420,7 +419,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	out := thumbnail(src, thumbMaxDim)
 	res, err := encodeThumb(out)
 	if err != nil {
-		logMedia("thumb", target, start, "encode failed: "+err.Error())
+		logMedia("thumb", target, start, mediaLogResult{event: "error", class: "encode", httpStatus: 500})
 		http.Error(w, "encode failed", http.StatusInternalServerError)
 		return
 	}
@@ -432,11 +431,11 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// blob residency at count × maxThumbCacheEntry.
 	if len(res.data) > maxThumbCacheEntry {
 		w.Header().Set(thumbUnpreviewableHeader, "too-large")
-		logMedia("thumb", target, start, fmt.Sprintf("thumbnail too large (%d > %d cap)→413", len(res.data), maxThumbCacheEntry))
+		logMedia("thumb", target, start, mediaLogResult{event: "reject", class: "encoded_size", bytes: len(res.data), capBytes: maxThumbCacheEntry, httpStatus: 413, unpreviewable: true})
 		http.Error(w, "thumbnail too large", http.StatusRequestEntityTooLarge)
 		return
 	}
-	logMedia("thumb", target, start, fmt.Sprintf("ok (%d src bytes → %s %d bytes)", len(body), res.contentType, len(res.data)))
+	logMedia("thumb", target, start, mediaLogResult{event: "ok", class: "thumbnail", bytes: len(body), outputBytes: len(res.data)})
 	s.thumbCache.put(ck, res)
 	writeThumb(w, res)
 }

@@ -18,6 +18,9 @@ package api
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -56,19 +59,133 @@ import (
 
 const proxyUserAgent = "ircthing-media-proxy/1.0 (+https://github.com/ircthing)"
 
-// mediaDebug enables per-fetch phase logging (IRCTHING_DEBUG_MEDIA=1). Off by
-// default — media fetches are frequent and carry full target URLs. When on,
-// every /api/preview and /api/thumb outcome is logged with its phase, status,
-// byte count, and duration, so a preview that never appears can be diagnosed
-// (dial vs headers vs slow body vs decode vs size cap) instead of guessed at.
-var mediaDebug = os.Getenv("IRCTHING_DEBUG_MEDIA") != ""
+// mediaDebug enables privacy-preserving per-fetch phase logging. It requires
+// an explicit true value; in particular IRCTHING_DEBUG_MEDIA=0 stays off.
+// Targets are represented only by a short one-way correlation ID, and neither
+// URL components, page metadata, nor upstream-controlled error strings reach
+// the log.
+var mediaDebug = debugFlagValue(os.Getenv("IRCTHING_DEBUG_MEDIA"))
 
-// logMedia records one media-fetch outcome when mediaDebug is on. kind is
-// "preview"/"thumb"; result is the phase and disposition.
-func logMedia(kind, target string, start time.Time, result string) {
-	if mediaDebug {
-		log.Printf("media[%s] %q: %s (%dms)", kind, target, result, time.Since(start).Milliseconds())
+const (
+	mediaTargetIDKeySize  = 32
+	mediaTargetIDRedacted = "redacted"
+)
+
+type mediaTargetIDKey struct {
+	value [mediaTargetIDKeySize]byte
+	valid bool
+}
+
+// mediaTargetKey is generated once so IDs correlate fetches only within this
+// process. If the OS random source fails, the invalid key makes every ID a
+// fixed redacted value rather than falling back to an unkeyed digest.
+var mediaTargetKey = newMediaTargetIDKey(rand.Reader)
+
+func debugFlagValue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
+}
+
+func newMediaTargetIDKey(random io.Reader) mediaTargetIDKey {
+	var key mediaTargetIDKey
+	if _, err := io.ReadFull(random, key.value[:]); err != nil {
+		return mediaTargetIDKey{}
+	}
+	key.valid = true
+	return key
+}
+
+func (key mediaTargetIDKey) id(target string) string {
+	if !key.valid {
+		return mediaTargetIDRedacted
+	}
+	mac := hmac.New(sha256.New, key.value[:])
+	_, _ = mac.Write([]byte(target))
+	sum := mac.Sum(nil)
+	return fmt.Sprintf("%x", sum[:8])
+}
+
+func mediaTargetID(target string) string {
+	return mediaTargetKey.id(target)
+}
+
+type mediaLogResult struct {
+	event         string
+	class         string
+	retryable     bool
+	httpStatus    int
+	bytes         int
+	outputBytes   int
+	capBytes      int
+	blank         bool
+	unpreviewable bool
+}
+
+// logMedia records one media-fetch outcome when mediaDebug is on. Every field
+// is locally generated and structurally typed, so a future call site cannot
+// accidentally feed a target URL, title, content type, or raw upstream error
+// into the log.
+func logMedia(kind, target string, start time.Time, result mediaLogResult) {
+	if mediaDebug {
+		log.Printf("media[%s] id=%s event=%s class=%s retryable=%t http=%d bytes=%d output_bytes=%d cap_bytes=%d blank=%t unpreviewable=%t duration_ms=%d",
+			kind, mediaTargetID(target), result.event, result.class, result.retryable,
+			result.httpStatus, result.bytes, result.outputBytes, result.capBytes,
+			result.blank, result.unpreviewable, time.Since(start).Milliseconds())
+	}
+}
+
+// mediaErrorClass turns a potentially sensitive upstream error into a fixed
+// diagnostic category. Raw url.Error values repeat the full URL, and proxy or
+// origin errors may contain attacker-controlled text, so callers must never
+// append err.Error() to media logs.
+func mediaErrorClass(err error) string {
+	switch {
+	case errors.Is(err, errTooLarge):
+		return "too_large"
+	case errors.Is(err, errBadURL):
+		return "bad_url"
+	case errors.Is(err, errBlocked):
+		return "blocked_address"
+	case errors.Is(err, errRedirectLoop), errors.Is(err, errRedirectScheme):
+		return "redirect"
+	case errors.Is(err, proxydial.ErrProxyConfig):
+		return "proxy_config"
+	case errors.Is(err, proxydial.ErrProxyRejected):
+		return "proxy_rejected"
+	case errors.Is(err, proxydial.ErrProxyProtocol):
+		return "proxy_protocol"
+	case errors.Is(err, errWireBudget):
+		return "wire_budget"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	}
+	var se *upstreamStatusError
+	if errors.As(err, &se) {
+		return "upstream_http_" + strconv.Itoa(se.code)
+	}
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return "tls_certificate"
+	}
+	var dpe *dialPhaseError
+	if errors.As(err, &dpe) {
+		return "dial"
+	}
+	var bre *bodyReadError
+	if errors.As(err, &bre) {
+		return "body_read"
+	}
+	var ne net.Error
+	if errors.As(err, &ne) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "network_io"
+	}
+	return "protocol"
 }
 
 // mediaSlots is the IMAGE-DECODE concurrency: each slot admits one whole

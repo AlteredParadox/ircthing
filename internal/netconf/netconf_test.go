@@ -46,6 +46,8 @@ func TestParse(t *testing.T) {
 		// Empty mechanism + no password auto-selects EXTERNAL, so it needs a keypair too.
 		{"auto-EXTERNAL without keypair", `{"addr": "a:1", "nick": "me", "sasl": {}}`, "cert_file and key_file"},
 		{"reserved network name", `{"name": "__proto__", "addr": "a:1", "nick": "me"}`, "reserved"},
+		{"network name whitespace", `{"name": "bad name", "addr": "a:1", "nick": "me"}`, "whitespace"},
+		{"network name control", `{"name": "bad\u001bname", "addr": "a:1", "nick": "me"}`, "control"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -63,5 +65,9 @@ func TestParse(t *testing.T) {
 				t.Fatalf("err = %v, want containing %q", err, tc.errSub)
 			}
 		})
+	}
+	long := &Network{Name: strings.Repeat("n", maxNetworkNameBytes+1), Addr: "a:1", Nick: "me"}
+	if err := long.Validate(); err == nil || !strings.Contains(err.Error(), "at most") {
+		t.Fatalf("long network name validation = %v", err)
 	}
 }

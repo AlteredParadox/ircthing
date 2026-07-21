@@ -129,6 +129,10 @@ func newHandshake(cfg *Config) *handshake {
 		caps:    make(map[string]string),
 		enabled: make(map[string]bool),
 		nick:    cfg.Nick,
+		// register overwrites this with the effective transport (including an
+		// STS upgrade). The configured value is the safe default for pure state-
+		// machine callers and tests.
+		secure: cfg.TLS,
 	}
 }
 
@@ -142,16 +146,18 @@ func newMsg(cmd string, params ...string) *ircv4.Message {
 // gives SASL room to run; servers without CAP support ignore it and
 // register us directly.
 func (h *handshake) start() []*ircv4.Message {
-	// PASS is the one secret in the opening burst. On a SECURE link
-	// there is no eavesdropper, so send it up front — this also delivers
-	// it to servers that never reply to CAP LS (no IRCv3 support), which
-	// a deferred PASS would silently drop. On an INSECURE link PASS is
-	// deferred (passLine, from handleCapLS) until the CAP LS reply shows
-	// no pending STS upgrade, so it is not captured before STS aborts to
-	// redial over TLS. (A non-CAP server reached over plaintext with a
-	// required PASS is the one unhandled case; use TLS for such servers.)
-	// NICK/USER are public and always go here.
+	// On a SECURE link send the full opening burst. On an INSECURE link that
+	// carries credentials, send ONLY CAP LS: this connection exists solely to
+	// discover an STS upgrade, and NICK/USER can contain stable identity data
+	// (username/realname) that should not leak on the cleartext discovery leg.
+	// If no STS port is advertised, handleCapLS fails closed; if it is, the fresh
+	// secure handshake below sends PASS/NICK/USER normally. Thus delaying the
+	// identity has no additional non-CAP compatibility cost on this path — an
+	// insecure credentialed connection is never allowed to register anyway.
 	out := []*ircv4.Message{newMsg("CAP", "LS", "302")}
+	if !h.secure && (h.cfg.Pass != "" || h.cfg.SASL != nil) {
+		return out
+	}
 	if h.secure {
 		out = append(out, h.passLine()...)
 	}
@@ -170,9 +176,8 @@ func (h *handshake) start() []*ircv4.Message {
 }
 
 // passLine returns the PASS message the first time it is called (empty
-// when no server password is configured or PASS was already sent). On a
-// secure link start() sends it; on an insecure link handleCapLS does,
-// after the STS decision.
+// when no server password is configured or PASS was already sent). It is
+// called only for a connection whose actual transport is secure.
 func (h *handshake) passLine() []*ircv4.Message {
 	if h.cfg.Pass == "" || h.passSent {
 		return nil
@@ -270,6 +275,16 @@ func (h *handshake) handle(m *ircv4.Message) (out []*ircv4.Message, done bool, e
 // SASL was configured but never completed — fail closed rather than fall
 // through to an unauthenticated session (the server SHOULD have sent 906).
 func (h *handshake) handleWelcome(m *ircv4.Message) (out []*ircv4.Message, done bool, err error) {
+	// A non-CAP server can send 001 without ever giving handleCapLS the chance
+	// to run the post-STS credential gate. Refuse that alternate completion path
+	// too: withheld PASS must not become an apparently successful anonymous
+	// registration, and configured SASL must never be bypassed.
+	if !h.secure && h.cfg.Pass != "" {
+		return nil, false, errors.New("registered over plaintext without sending PASS; password authentication requires TLS")
+	}
+	if !h.secure && h.cfg.SASL != nil {
+		return nil, false, errors.New("registered over plaintext before SASL authentication; password authentication requires TLS")
+	}
 	if h.cfg.SASL != nil && !h.saslDone {
 		return nil, false, errors.New("registered before SASL authentication completed")
 	}
@@ -298,6 +313,12 @@ func (h *handshake) handleWelcome(m *ircv4.Message) (out []*ircv4.Message, done 
 // max-length nick past a small NICKLEN and loop forever (NICKLEN isn't known
 // until 005, after registration). Gives up after three tries.
 func (h *handshake) handleNickInUse() (out []*ircv4.Message, done bool, err error) {
+	// No NICK was sent on an insecure credentialed STS-discovery leg. A forged
+	// 433/436 must not trick us into revealing a derived fallback before the
+	// secure redial.
+	if !h.secure && (h.cfg.Pass != "" || h.cfg.SASL != nil) {
+		return nil, false, errors.New("server requested a nickname retry before the secure STS redial")
+	}
 	h.nickTries++
 	if h.nickTries > 3 {
 		return nil, false, fmt.Errorf("nickname %q and all fallbacks are in use", h.cfg.Nick)
@@ -379,10 +400,21 @@ func (h *handshake) handleCapLS(m *ircv4.Message) ([]*ircv4.Message, bool, error
 			h.stsDuration = &d
 		}
 	}
+	// CAP LS is attacker-controlled on a plaintext connection. In particular,
+	// an active attacker can strip both the STS port and SCRAM from the SASL
+	// mechanism list, making automatic SASL fall back to PLAIN. Once the STS
+	// upgrade decision above is final, fail closed before PASS, CAP REQ, or
+	// AUTHENTICATE can disclose or expose password-derived credentials. IRCv3
+	// STS requires the upgrade to happen at capability-negotiation time; the
+	// gate deliberately uses h.secure (the real connection), not cfg.TLS.
+	if !h.secure && (h.cfg.Pass != "" || h.cfg.SASL != nil) {
+		return nil, false, errors.New("IRC password authentication requires TLS")
+	}
 	if err := h.chooseMech(); err != nil {
 		return nil, false, err
 	}
-	// The STS decision is made (no upgrade): now it is safe to send PASS.
+	// The STS and credential-safety decisions are complete: PASS can only be
+	// emitted on the secure path.
 	out := h.passLine()
 	reqs := h.capsToRequest()
 	if len(reqs) == 0 {

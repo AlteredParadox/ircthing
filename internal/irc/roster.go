@@ -17,6 +17,7 @@
 package irc
 
 import (
+	"container/heap"
 	"sort"
 	"strings"
 	"sync"
@@ -232,6 +233,54 @@ func (r *roster) channel(name string) (topic string, members []Member, ok bool) 
 		members[i] = keyed[i].m
 	}
 	return st.topic, members, true
+}
+
+// maxStringHeap keeps the lexicographically largest selected key at the root,
+// allowing channelPage to retain only the first N folded member keys while it
+// scans a potentially much larger roster.
+type maxStringHeap []string
+
+func (h maxStringHeap) Len() int           { return len(h) }
+func (h maxStringHeap) Less(i, j int) bool { return h[i] > h[j] }
+func (h maxStringHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *maxStringHeap) Push(x any)        { *h = append(*h, x.(string)) }
+func (h *maxStringHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+// channelPage returns a bounded, nick-sorted member snapshot without copying
+// every retained Member first. Roster state may legitimately be much larger
+// than one WebSocket response; callers get an explicit truncated bit rather
+// than an oversized frame that disconnects on every reconnect.
+func (r *roster) channelPage(name string, limit int) (topic string, members []Member, truncated, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := r.chans[r.foldKey(name)]
+	if st == nil {
+		return "", nil, false, false
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	keys := make(maxStringHeap, 0, min(limit, len(st.members)))
+	for key := range st.members {
+		if len(keys) < limit {
+			heap.Push(&keys, key)
+		} else if limit > 0 && key < keys[0] {
+			keys[0] = key
+			heap.Fix(&keys, 0)
+		}
+	}
+	sort.Strings(keys)
+	members = make([]Member, 0, len(keys))
+	for _, key := range keys {
+		members = append(members, st.members[key])
+	}
+	return st.topic, members, len(st.members) > len(members), true
 }
 
 // handle updates state from one server message. ourNick identifies which

@@ -19,6 +19,7 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -149,6 +150,11 @@ func TestNetworkManagement(t *testing.T) {
 	if len(nets.Networks) != 1 || nets.Networks[0].Name != "alpha" {
 		t.Fatalf("networks = %+v", nets.Networks)
 	}
+	s.Handle(ctxb, request(t, "get_network", 40, GetNetworkReq{Network: "alpha"}))
+	one := decode[NetworkData](t, recv(t, s, "network", "state"))
+	if one.Network.Name != "alpha" || len(one.Network.Config) == 0 {
+		t.Fatalf("exact network = %+v", one.Network)
+	}
 
 	// Rename: history follows, the old name is announced as removed.
 	s.Handle(ctxb, request(t, "put_network", 5, PutNetworkReq{OldName: "alpha", Config: cfg("beta")}))
@@ -171,6 +177,147 @@ func TestNetworkManagement(t *testing.T) {
 	}
 	if msgs, _ := h.store.Latest(ctxb, "beta", "#x", 5); len(msgs) != 0 {
 		t.Fatalf("history survived delete: %v", msgs)
+	}
+}
+
+func TestGetNetworksIsByteBoundedAndPaged(t *testing.T) {
+	h := newTestHub(t)
+	s := h.NewSession()
+	defer s.Close()
+	ctx := context.Background()
+	padding := strings.Repeat("x", 60<<10)
+	for i := 0; i < 20; i++ {
+		name := fmt.Sprintf("net-%02d", i)
+		cfg, err := json.Marshal(map[string]string{"padding": padding})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h.store.PutNetworkConfig(ctx, name, string(cfg)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A malformed legacy row must be surfaced as recovery metadata instead of
+	// making RawMessage marshal fail and silently dropping the whole reply.
+	if err := h.store.PutNetworkConfig(ctx, "invalid", `{`); err != nil {
+		t.Fatal(err)
+	}
+
+	var after int64
+	seen := make(map[string]bool)
+	for page := 0; page < 10; page++ {
+		s.Handle(ctx, request(t, "get_networks", int64(page+1), GetNetworksReq{After: after}))
+		env := recv(t, s, "networks")
+		if len(env.Data) > maxHistoryPayloadBytes {
+			t.Fatalf("page payload = %d, cap = %d", len(env.Data), maxHistoryPayloadBytes)
+		}
+		data := decode[NetworksData](t, env)
+		if len(data.Networks) == 0 {
+			t.Fatal("paged listing made no progress")
+		}
+		for _, n := range data.Networks {
+			seen[n.Name] = true
+			if n.Name == "invalid" && (!n.Invalid || len(n.Config) != 0) {
+				t.Fatalf("invalid row = %#v", n)
+			}
+		}
+		if !data.HasMore {
+			break
+		}
+		if data.Next <= after {
+			t.Fatalf("cursor did not advance: after=%d next=%d", after, data.Next)
+		}
+		after = data.Next
+	}
+	if len(seen) != 21 || !seen["invalid"] {
+		t.Fatalf("saw %d definitions, want all 21", len(seen))
+	}
+}
+
+func TestStopNetworkClearsStoppedPlaceholder(t *testing.T) {
+	h := newTestHub(t)
+	h.NoteStoppedNetwork("broken")
+	h.StopNetwork("broken")
+	h.mu.Lock()
+	_, exists := h.states["broken"]
+	h.mu.Unlock()
+	if exists {
+		t.Fatal("stopped-network placeholder survived deletion/repair stop")
+	}
+}
+
+func TestRestartNetworkKeepsFailedDefinitionVisible(t *testing.T) {
+	h := newTestHub(t)
+	h.restartNetwork(&store.NetworkConfig{Name: "broken", Config: `{`})
+	h.mu.Lock()
+	state, exists := h.states["broken"]
+	h.mu.Unlock()
+	if !exists || state != irc.StateDisconnected.String() {
+		t.Fatalf("failed restart state = %+v, exists=%v; want disconnected placeholder", state, exists)
+	}
+}
+
+func TestLegacyNetworkEditRequiresRecreate(t *testing.T) {
+	for _, row := range []store.NetworkConfig{
+		{Oversized: true},
+		{Config: ""},
+	} {
+		if !legacyNetworkRequiresRecreate(true, row, true) {
+			t.Fatalf("legacy row %#v was considered safely editable", row)
+		}
+	}
+	if legacyNetworkRequiresRecreate(true, store.NetworkConfig{Config: `{}`}, true) {
+		t.Fatal("bounded non-empty row unexpectedly requires recreation")
+	}
+	if legacyNetworkRequiresRecreate(true, store.NetworkConfig{}, false) {
+		t.Fatal("add path unexpectedly classified as a legacy edit")
+	}
+}
+
+func TestRawInvalidLegacyNetworkMutationsAreRejected(t *testing.T) {
+	h := newTestHub(t)
+	s := h.NewSession()
+	defer s.Close()
+	ctx := context.Background()
+	cfg := json.RawMessage(`{"name":"replacement","addr":"127.0.0.1:1","allow_plaintext":true,"nick":"AlteredParadox"}`)
+
+	for i, name := range []string{"bad name", store.ReservedRecoveryNetworkPrefix + "7", strings.Repeat("n", store.MaxNetworkNameBytes+1)} {
+		s.Handle(ctx, request(t, "put_network", int64(i*2+1), PutNetworkReq{OldName: name, Config: cfg}))
+		if got := decode[ErrorData](t, recv(t, s, "error")); got.Code != "bad_request" {
+			t.Fatalf("put with raw legacy name %q: code=%q", name, got.Code)
+		}
+		s.Handle(ctx, request(t, "delete_network", int64(i*2+2), NetworkRef{Network: name}))
+		if got := decode[ErrorData](t, recv(t, s, "error")); got.Code != "bad_request" {
+			t.Fatalf("delete with raw legacy name %q: code=%q", name, got.Code)
+		}
+	}
+}
+
+func TestDeleteSyntheticRecoveryNetwork(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	if err := h.store.PutNetworkConfig(ctx, "legacy", `{}`); err != nil {
+		t.Fatal(err)
+	}
+	rows, _, err := h.store.NetworkConfigsPage(ctx, 0, 1)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("page = %#v err=%v", rows, err)
+	}
+	label := h.NoteInvalidNetwork(rows[0].PageID)
+	s := h.NewSession()
+	defer s.Close()
+	s.Handle(ctx, request(t, "delete_network", 1, NetworkRef{Network: label}))
+	if env := recv(t, s, "ok", "network_removed", "networks_changed"); env.Seq != 1 {
+		t.Fatalf("delete reply seq = %d", env.Seq)
+	}
+	if count, err := h.store.NetworkConfigCount(ctx); err != nil || count != 0 {
+		t.Fatalf("recovery row survived: count=%d err=%v", count, err)
+	}
+	h.mu.Lock()
+	_, stateExists := h.states[label]
+	_, mappingExists := h.recoveryRows[label]
+	h.mu.Unlock()
+	if stateExists || mappingExists {
+		t.Fatal("synthetic recovery placeholder survived successful delete")
 	}
 }
 
@@ -324,6 +471,106 @@ func TestCloseBufferResurrectionGuard(t *testing.T) {
 	}
 	if len(bufs) != 0 {
 		t.Fatalf("closed buffer resurrected by straggler: %+v", bufs)
+	}
+}
+
+func TestCloseSerializesCommittedEventThroughPublication(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{name: "libera", nick: "me", ch: make(chan irc.Event)}
+	s := h.NewSession()
+	defer s.Close()
+	ctx := context.Background()
+	ev := irc.Event{
+		Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+		Msg: ircv4.MustParseMessage(":alice!u@h PRIVMSG me :hello"),
+	}
+
+	// Stop the live path only at publication. A private message's grace guard
+	// short-circuits without h.mu, so its store append completes first and its
+	// broadcast then waits here.
+	h.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			h.mu.Unlock()
+		}
+	}()
+	eventDone := make(chan struct{})
+	go func() {
+		_ = h.persistEvent(ctx, conn, ev, false, nil)
+		close(eventDone)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		bufs, err := h.store.Buffers(ctx)
+		if err != nil {
+			h.mu.Unlock()
+			locked = false
+			t.Fatal(err)
+		}
+		if len(bufs) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			h.mu.Unlock()
+			locked = false
+			t.Fatal("live append did not commit before publication")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		h.bufferMutationMu.Lock()
+		defer h.bufferMutationMu.Unlock()
+		_, err := h.store.DeleteBufferFolded(ctx, "libera", "alice", conn.Fold, func(name string) {
+			h.markClosed("libera", conn.Fold(name), time.Now().UnixMilli())
+		})
+		if err == nil {
+			h.broadcast(envelope("buffer_closed", 0, BufferRef{Network: "libera", Buffer: "alice"}))
+		}
+		closeDone <- err
+	}()
+
+	// The close must still be waiting at the wider mutation boundary; without
+	// it the row is already deleted here while the old event has not published.
+	time.Sleep(25 * time.Millisecond)
+	bufs, err := h.store.Buffers(ctx)
+	if err != nil || len(bufs) != 1 {
+		h.mu.Unlock()
+		locked = false
+		t.Fatalf("close crossed append/publication boundary: buffers=%v err=%v", bufs, err)
+	}
+	h.mu.Unlock()
+	locked = false
+	<-eventDone
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := recv(t, s, "event"); got.Type != "event" {
+		t.Fatalf("first publication = %q, want event", got.Type)
+	}
+	if got := recv(t, s, "buffer_closed"); got.Type != "buffer_closed" {
+		t.Fatalf("second publication = %q, want buffer_closed", got.Type)
+	}
+	if bufs, err := h.store.Buffers(ctx); err != nil || len(bufs) != 0 {
+		t.Fatalf("closed row remains: buffers=%v err=%v", bufs, err)
+	}
+}
+
+func TestRecentCloseCountAndByteCaps(t *testing.T) {
+	h := newTestHub(t)
+	now := time.Now().UnixMilli()
+	for i := 0; i < maxRecentCloses*2; i++ {
+		h.markClosed("net", fmt.Sprintf("#%04d-%s", i, strings.Repeat("x", 500)), now+int64(i))
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.recentClose) > maxRecentCloses {
+		t.Fatalf("recentClose count = %d, cap %d", len(h.recentClose), maxRecentCloses)
+	}
+	if h.recentCloseBytes > maxRecentCloseBytes {
+		t.Fatalf("recentClose bytes = %d, cap %d", h.recentCloseBytes, maxRecentCloseBytes)
 	}
 }
 

@@ -173,6 +173,61 @@ func TestLinkChannelNumericPrunesAutojoin(t *testing.T) {
 	}
 }
 
+func TestReplayedNumericsHaveNoLiveSideEffects(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	raw, _ := json.Marshal(netconf.Network{Name: "libera", Addr: "irc.test:6697", Nick: "AlteredParadox", Channels: []string{"#chat"}})
+	if err := h.store.PutNetworkConfig(ctx, "libera", string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.AddMonitor(ctx, "libera", "bob"); err != nil {
+		t.Fatal(err)
+	}
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go h.Run(rctx, conn)
+	waitForNetwork(t, h, "libera")
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateRegistered}
+	feed := func(line string) {
+		conn.ch <- irc.Event{Network: "libera", Kind: irc.EventMessage, Time: time.Now(), Msg: ircv4.MustParseMessage(line)}
+	}
+	feed(":srv BATCH +r chathistory #chat")
+	feed("@batch=r :srv 470 AlteredParadox #chat ##chat :Forwarding")
+	feed("@batch=r :srv 730 AlteredParadox :bob!u@h")
+	feed("@batch=r :srv 734 AlteredParadox 1 bob :list full")
+	feed("@batch=r :srv 376 AlteredParadox :End of MOTD")
+	feed(":srv BATCH -r")
+	time.Sleep(100 * time.Millisecond)
+	nc, ok, err := h.store.NetworkConfig(ctx, "libera")
+	if err != nil || !ok {
+		t.Fatalf("config read: ok=%v err=%v", ok, err)
+	}
+	var parsed netconf.Network
+	if err := json.Unmarshal([]byte(nc.Config), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Channels) != 1 || parsed.Channels[0] != "#chat" {
+		t.Fatalf("replayed 470 changed autojoin: %v", parsed.Channels)
+	}
+	h.mu.Lock()
+	presence := len(h.presence["libera"])
+	h.mu.Unlock()
+	if presence != 0 {
+		t.Fatalf("replayed 730 changed presence: %d entries", presence)
+	}
+	conn.mu.Lock()
+	rejected := len(conn.monRejected)
+	reconciled := len(conn.monitored)
+	conn.mu.Unlock()
+	if rejected != 0 {
+		t.Fatalf("replayed 734 reached manager: %d entries", rejected)
+	}
+	if reconciled != 0 {
+		t.Fatalf("replayed 376 triggered registration sync: %d monitors", reconciled)
+	}
+}
+
 // persistAutojoin runs on the Hub event goroutine, which StopNetwork waits to
 // exit while holding netOps; it must therefore never BLOCK on netOps (that is
 // the deadlock finding). It uses TryLock and skips while a network op holds it.
@@ -481,6 +536,15 @@ func (f *fakeConn) HistoryPageSize() int {
 func (f *fakeConn) Channel(name string) (string, []irc.Member, bool) {
 	ms, ok := f.chans[name]
 	return f.topic, ms, ok
+}
+
+func (f *fakeConn) ChannelPage(name string, limit int) (string, []irc.Member, bool, bool) {
+	ms, ok := f.chans[name]
+	truncated := len(ms) > limit
+	if truncated {
+		ms = ms[:limit]
+	}
+	return f.topic, ms, truncated, ok
 }
 
 func (f *fakeConn) Send(m *ircv4.Message) error {

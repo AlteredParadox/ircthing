@@ -1497,30 +1497,37 @@ func TestManagerDisconnectsOversizedBatch(t *testing.T) {
 	waitState(t, m, StateRegistered)
 }
 
-func TestRedactRaw(t *testing.T) {
-	cases := []struct {
-		in, want string
-	}{
-		{"PASS hunter2", "PASS <redacted>"},
-		{"PASS s3cr3t\r\n", "PASS <redacted>"},
-		{"AUTHENTICATE AGF0YgBwYXNzd29yZA==", "AUTHENTICATE <redacted>"},
-		{"AUTHENTICATE PLAIN", "AUTHENTICATE <redacted>"}, // mechanism over-redacted, safe
-		{":srv AUTHENTICATE Zm9vYmFy", "AUTHENTICATE <redacted>"},
-		{"AUTHENTICATE +", "AUTHENTICATE +"}, // control token, not a secret
-		{"AUTHENTICATE *", "AUTHENTICATE *"},
-		{"NICK AlteredParadox", "NICK AlteredParadox"},
-		{"PRIVMSG #go :hello world", "PRIVMSG #go :hello world"},
-	}
-	for _, tc := range cases {
-		if got := redactRaw(tc.in); got != tc.want {
-			t.Errorf("redactRaw(%q) = %q, want %q", tc.in, got, tc.want)
+func TestSummarizeIRCLineIsContentFree(t *testing.T) {
+	for _, in := range []string{
+		"PASS hunter2",
+		"AUTHENTICATE AGF0YgBwYXNzd29yZA==",
+		"@account=alice :bob!user@secret.example PRIVMSG #private :hello world",
+		"NOTICE bob :signed-url=https://example.test/?token=secret",
+	} {
+		got := summarizeIRCLine(in)
+		for _, secret := range []string{"hunter2", "AGF0YgBwYXNzd29yZA==", "alice", "bob", "secret", "private", "hello", "signed-url", "example.test"} {
+			if strings.Contains(got, secret) {
+				t.Fatalf("summarizeIRCLine(%q) leaked %q: %q", in, secret, got)
+			}
+		}
+		if !strings.Contains(got, "command=") || !strings.Contains(got, "bytes=") {
+			t.Fatalf("summarizeIRCLine(%q) lacks diagnostic fields: %q", in, got)
 		}
 	}
-	// No credential material survives redaction of a PLAIN payload.
-	for _, secret := range []string{"hunter2", "AGF0YgBwYXNzd29yZA=="} {
-		if strings.Contains(redactRaw("PASS "+secret), secret) ||
-			strings.Contains(redactRaw("AUTHENTICATE "+secret), secret) {
-			t.Fatalf("secret %q survived redaction", secret)
+	if got := summarizeIRCLine("not a valid :irc line\r\n"); strings.Contains(got, "valid") || !strings.Contains(got, "bytes=") {
+		t.Fatalf("malformed summary leaked content or lacks length: %q", got)
+	}
+}
+
+func TestDebugEnvFlagRequiresExplicitTrue(t *testing.T) {
+	for _, v := range []string{"1", "true", "TRUE", " yes ", "on"} {
+		if !debugEnvFlag(v) {
+			t.Errorf("debugEnvFlag(%q) = false, want true", v)
+		}
+	}
+	for _, v := range []string{"", "0", "false", "off", "debug", "2"} {
+		if debugEnvFlag(v) {
+			t.Errorf("debugEnvFlag(%q) = true, want false", v)
 		}
 	}
 }

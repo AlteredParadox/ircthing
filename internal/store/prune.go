@@ -20,6 +20,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"strconv"
 	"time"
@@ -49,6 +50,9 @@ func (s *Store) Retention() (days, maxPerBuffer int) {
 // policies disagreeing. Callers MUST serialize it; the only caller (the API's
 // handleSetConfig) does, holding settingsMu across the whole read-modify-write.
 func (s *Store) SetRetention(ctx context.Context, days, maxPerBuffer int) error {
+	if err := ValidateRetention(days, maxPerBuffer); err != nil {
+		return err
+	}
 	// Both keys in one transaction: a partial write would leave the two
 	// dimensions inconsistent across a restart.
 	if err := s.SetSettings(ctx, map[string]string{
@@ -75,22 +79,31 @@ func (s *Store) SetRetention(ctx context.Context, days, maxPerBuffer int) error 
 // run (no stored keys) the config-seeded Options — already in s.retention — are
 // written through; otherwise the stored value overrides them.
 func (s *Store) loadRetention(ctx context.Context, opts Options) error {
-	dv, err := s.Setting(ctx, retentionDaysKey)
+	dv, dp, err := s.SettingValue(ctx, retentionDaysKey)
 	if err != nil {
 		return err
 	}
-	mv, err := s.Setting(ctx, retentionMaxKey)
+	mv, mp, err := s.SettingValue(ctx, retentionMaxKey)
 	if err != nil {
 		return err
 	}
-	if dv == "" && mv == "" { // first run: seed from config, both keys atomically
+	if !dp && !mp { // first run: seed from config, both keys atomically
 		return s.SetSettings(ctx, map[string]string{
 			retentionDaysKey: strconv.Itoa(opts.RetentionDays),
 			retentionMaxKey:  strconv.Itoa(opts.RetentionMaxMessages),
 		})
 	}
-	days, _ := strconv.Atoi(dv)
-	maxPer, _ := strconv.Atoi(mv)
+	if !dp || !mp {
+		return errors.New("store: incomplete persisted retention settings")
+	}
+	days, derr := strconv.Atoi(dv)
+	maxPer, merr := strconv.Atoi(mv)
+	if derr != nil || merr != nil {
+		return errors.New("store: malformed persisted retention settings")
+	}
+	if err := ValidateRetention(days, maxPer); err != nil {
+		return fmt.Errorf("persisted retention settings: %w", err)
+	}
 	s.mu.Lock()
 	s.retention = retentionPolicy{days: days, maxPerBuffer: maxPer}
 	s.mu.Unlock()

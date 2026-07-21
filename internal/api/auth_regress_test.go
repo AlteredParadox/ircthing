@@ -134,6 +134,12 @@ func TestLoadPasswordHashFailsClosed(t *testing.T) {
 	if _, err := loadPasswordHash(ctx, st, cfg); err == nil {
 		t.Fatal("corrupt override: loadPasswordHash returned no error (would fall back to the seed)")
 	}
+	if err := st.SetSetting(ctx, passwordHashKey, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPasswordHash(ctx, st, cfg); err == nil {
+		t.Fatal("present-empty override fell back to the seed")
+	}
 
 	override, _ := bcrypt.GenerateFromPassword([]byte("override1"), bcrypt.MinCost)
 	if err := st.SetSetting(ctx, passwordHashKey, string(override)); err != nil {

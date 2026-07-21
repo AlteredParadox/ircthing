@@ -59,6 +59,53 @@ func TestRetentionRuntimeSettableAndPersists(t *testing.T) {
 	}
 }
 
+func TestSetRetentionRejectsInvalidPolicyAtBoundary(t *testing.T) {
+	s, _ := openTest(t, 10)
+	beforeDays, beforeMax := s.Retention()
+	if err := s.SetRetention(context.Background(), MaxRetentionDays+1, 1); err == nil {
+		t.Fatal("SetRetention accepted an out-of-range policy")
+	}
+	afterDays, afterMax := s.Retention()
+	if afterDays != beforeDays || afterMax != beforeMax {
+		t.Fatalf("invalid policy changed live state: before %d/%d, after %d/%d",
+			beforeDays, beforeMax, afterDays, afterMax)
+	}
+}
+
+func TestRetentionSettingsCorruptionFailsOpen(t *testing.T) {
+	for _, tc := range []struct {
+		name, days, max string
+		deleteMax       bool
+	}{
+		{name: "empty", days: "", max: "10"},
+		{name: "malformed", days: "x", max: "10"},
+		{name: "negative", days: "-1", max: "10"},
+		{name: "overflow", days: "999999999999999999999", max: "10"},
+		{name: "partial", days: "10", max: "10", deleteMax: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "retention.db")
+			s, err := Open(path, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.SetSettings(context.Background(), map[string]string{retentionDaysKey: tc.days, retentionMaxKey: tc.max}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.deleteMax {
+				_ = s.DeleteSetting(context.Background(), retentionMaxKey)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if reopened, err := Open(path, Options{}); err == nil {
+				reopened.Close()
+				t.Fatal("corrupt retention settings did not fail startup")
+			}
+		})
+	}
+}
+
 // A fresh database uses INCREMENTAL auto_vacuum so retention deletes can be
 // reclaimed by incremental_vacuum.
 func TestAutoVacuumIncremental(t *testing.T) {

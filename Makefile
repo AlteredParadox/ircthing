@@ -128,9 +128,10 @@ IRCTEST_REF := a468d9fcd64abc72b02ecb20f4f8612fd72c8829
 irctest: build .cache/irctest-src .cache/irctest-venv
 	cd .cache/irctest-src && \
 	IRCTHING_BIN=$(CURDIR)/bin/ircd-web \
-	PYTHONPATH=$(CURDIR)/integration/irctest \
+	PYTHONPATH=$(CURDIR)/integration/irctest:$(CURDIR)/.cache/irctest-src \
 	$(CURDIR)/.cache/irctest-venv/bin/pytest irctest/client_tests \
-		--controller=ircthing_irctest -p no:cacheprovider --timeout=60
+		--controller=ircthing_irctest -p ircthing_secure_sasl \
+		-p no:cacheprovider --timeout=60
 
 .cache/irctest-src:
 	rm -rf .cache/irctest-src

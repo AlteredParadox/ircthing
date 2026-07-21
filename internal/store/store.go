@@ -40,9 +40,11 @@ const (
 	// DefaultRingSize is the per-buffer hot scrollback bound: with the
 	// 50-channel scenario from the memory target this keeps hot history
 	// around 10k messages total.
-	DefaultRingSize = 200
-	DefaultPageSize = 100
-	MaxPageSize     = 500
+	DefaultRingSize      = 200
+	DefaultPageSize      = 100
+	MaxPageSize          = 500
+	MaxRetentionDays     = 36500
+	MaxRetentionMessages = 1_000_000_000
 	// maxStoredMessageBytes caps a single message's Raw/Text. Generous over
 	// any legitimate IRC line (512 B content + ~8 KiB tags), it bounds the
 	// pathological case of a hostile server raising LINELEN and streaming
@@ -265,6 +267,9 @@ type bufKey struct{ network, target string }
 // pending migrations. WAL mode per the architecture; NORMAL synchronous is
 // the documented safe pairing with WAL.
 func Open(path string, opts Options) (*Store, error) {
+	if err := ValidateRetention(opts.RetentionDays, opts.RetentionMaxMessages); err != nil {
+		return nil, err
+	}
 	if opts.RingSize <= 0 {
 		opts.RingSize = DefaultRingSize
 	}
@@ -345,6 +350,15 @@ func Open(path string, opts Options) (*Store, error) {
 	// is a cheap no-op while both dimensions are 0.
 	s.startPruner(pruneInterval)
 	return s, nil
+}
+
+// ValidateRetention is shared by config, persisted-settings, and runtime API
+// paths so every ingress enforces the same overflow-safe bounds.
+func ValidateRetention(days, maxMessages int) error {
+	if days < 0 || days > MaxRetentionDays || maxMessages < 0 || maxMessages > MaxRetentionMessages {
+		return fmt.Errorf("store: retention out of range (days 0..%d, messages 0..%d)", MaxRetentionDays, MaxRetentionMessages)
+	}
+	return nil
 }
 
 // ensureIncrementalVacuum converts a pre-existing database to INCREMENTAL
@@ -876,6 +890,49 @@ func (s *Store) Buffers(ctx context.Context) ([]BufferInfo, error) {
 		out = append(out, b)
 	}
 	return out, rows.Err()
+}
+
+// RecentBuffers returns at most limit buffers, newest activity first, plus a
+// sentinel indicating that more rows exist. It is the bounded transport-facing
+// counterpart to Buffers: a hostile server can create thousands of maximally
+// sized buffer names, so the WebSocket initial snapshot must never materialize
+// the entire allowed store population before queue admission.
+func (s *Store) RecentBuffers(ctx context.Context, limit int) ([]BufferInfo, bool, error) {
+	if limit <= 0 {
+		return []BufferInfo{}, false, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT n.name, b.name,
+			COALESCE((SELECT MAX(ts) FROM messages WHERE buffer_id = b.id), 0) AS last_ts,
+			COALESCE((SELECT ts FROM read_markers WHERE buffer_id = b.id), 0),
+			(SELECT COUNT(*) FROM messages WHERE buffer_id = b.id
+				AND command IN ('PRIVMSG','NOTICE')
+				AND ts > COALESCE((SELECT ts FROM read_markers WHERE buffer_id = b.id), 0))
+		FROM buffers b
+		JOIN networks n ON n.id = b.network_id
+		WHERE n.user_id = ?
+		ORDER BY last_ts DESC, n.name, b.name
+		LIMIT ?`, defaultUserID, limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	out := make([]BufferInfo, 0, limit)
+	for rows.Next() {
+		var b BufferInfo
+		if err := rows.Scan(&b.Network, &b.Target, &b.LastTS, &b.Marker, &b.Unread); err != nil {
+			return nil, false, err
+		}
+		out = append(out, b)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
 }
 
 // bufferID resolves (network, target) to a buffer row id, creating rows

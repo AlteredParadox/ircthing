@@ -22,9 +22,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	ircv4 "gopkg.in/irc.v4"
 
@@ -70,6 +73,41 @@ func (h *Hub) NetworkTunnelDial(ctx context.Context, name, addr string) (net.Con
 func (h *Hub) UseRoot(ctx context.Context, wg *sync.WaitGroup) {
 	h.rootCtx = ctx
 	h.rootWG = wg
+}
+
+// NoteStoppedNetwork keeps a stored definition that could not be started
+// visible in get_buffers. That gives the owner a sidebar/context-menu path to
+// edit or delete malformed and legacy-oversized rows instead of making the
+// recovery target disappear from the UI entirely.
+func (h *Hub) NoteStoppedNetwork(name string) {
+	h.mu.Lock()
+	if _, exists := h.states[name]; !exists {
+		h.states[name] = irc.StateDisconnected.String()
+	}
+	h.mu.Unlock()
+}
+
+func invalidNetworkLabel(id int64) string {
+	return store.ReservedRecoveryNetworkPrefix + strconv.FormatInt(id, 10) + "__"
+}
+
+// NoteInvalidNetwork exposes a row whose local name violates current bounds as
+// a synthetic stopped network. The synthetic label is reserved from normal
+// configs and maps back to an opaque rowid, so the UI can delete the row
+// without ever materializing its attacker-sized/control-bearing real name.
+func (h *Hub) NoteInvalidNetwork(id int64) string {
+	label := invalidNetworkLabel(id)
+	h.mu.Lock()
+	h.recoveryRows[label] = id
+	h.states[label] = irc.StateDisconnected.String()
+	h.mu.Unlock()
+	return label
+}
+
+func (h *Hub) recoveryRowID(label string) int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.recoveryRows[label]
 }
 
 // StartNetwork builds a manager for the definition and runs it under the
@@ -129,22 +167,36 @@ func (h *Hub) StopNetwork(name string) {
 	p := h.procs[name]
 	delete(h.procs, name)
 	h.mu.Unlock()
-	if p == nil {
-		return
+	if p != nil {
+		p.cancel()
+		<-p.done
 	}
-	p.cancel()
-	<-p.done
 	h.mu.Lock()
 	delete(h.states, name)
 	delete(h.presence, name)
 	delete(h.motdWanted, name)
+	delete(h.recoveryRows, name)
 	h.mu.Unlock()
 }
 
 // ---- session request handlers ----
 
 func (s *Session) handleGetNetworks(ctx context.Context, env Envelope) {
-	configs, err := s.hub.store.NetworkConfigs(ctx)
+	var req GetNetworksReq
+	if len(env.Data) != 0 && string(env.Data) != "null" {
+		if err := json.Unmarshal(env.Data, &req); err != nil || req.After < 0 {
+			s.push(errEnvelope(env.Seq, "bad_request", "malformed get_networks data"))
+			return
+		}
+	}
+	select {
+	case s.hub.largeResponseSem <- struct{}{}:
+		defer func() { <-s.hub.largeResponseSem }()
+	case <-ctx.Done():
+		return
+	}
+	const pageRows = 16
+	configs, storeMore, err := s.hub.store.NetworkConfigsPage(ctx, req.After, pageRows)
 	if err != nil {
 		s.push(errEnvelope(env.Seq, "internal", errLoadNetworks))
 		return
@@ -155,15 +207,85 @@ func (s *Session) handleGetNetworks(ctx context.Context, env Envelope) {
 		states[k] = v
 	}
 	s.hub.mu.Unlock()
-	out := make([]NetworkConfigData, 0, len(configs))
+	data := NetworksData{Networks: make([]NetworkConfigData, 0, len(configs))}
 	for _, nc := range configs {
-		out = append(out, NetworkConfigData{
-			Name:   nc.Name,
-			State:  states[nc.Name],
-			Config: json.RawMessage(nc.Config),
-		})
+		stateName := nc.Name
+		if nc.InvalidName {
+			stateName = invalidNetworkLabel(nc.PageID)
+		}
+		item := makeNetworkConfigData(nc, states[stateName])
+		prevNext := data.Next
+		data.Networks = append(data.Networks, item)
+		data.HasMore = true // worst-case final metadata during admission
+		data.Next = nc.PageID
+		encoded, _ := json.Marshal(data)
+		if len(encoded) > maxHistoryPayloadBytes {
+			data.Networks = data.Networks[:len(data.Networks)-1]
+			data.Next = prevNext
+			data.HasMore = true
+			break
+		}
 	}
-	s.push(envelope("networks", env.Seq, NetworksData{Networks: out}))
+	data.HasMore = len(data.Networks) < len(configs) || storeMore
+	if !data.HasMore {
+		data.Next = 0
+	}
+	s.push(envelope("networks", env.Seq, data))
+}
+
+func makeNetworkConfigData(nc store.NetworkConfig, state string) NetworkConfigData {
+	item := NetworkConfigData{Name: nc.Name, State: state, Oversized: nc.Oversized}
+	if nc.InvalidName {
+		item.Name = invalidNetworkLabel(nc.PageID)
+		item.InvalidName = true
+		item.Invalid = true
+		item.RecoveryID = nc.PageID
+		return item
+	}
+	if nc.Config == "" {
+		item.Invalid = !nc.Oversized
+	} else if json.Valid([]byte(nc.Config)) {
+		item.Config = json.RawMessage(nc.Config)
+	} else {
+		item.Invalid = true
+	}
+	return item
+}
+
+func (s *Session) handleGetNetwork(ctx context.Context, env Envelope) {
+	var req GetNetworkReq
+	if err := json.Unmarshal(env.Data, &req); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", "get_network needs a valid network name"))
+		return
+	}
+	if id := s.hub.recoveryRowID(req.Network); id != 0 {
+		nc := store.NetworkConfig{InvalidName: true, PageID: id}
+		s.push(envelope("network", env.Seq, NetworkData{Network: makeNetworkConfigData(nc, irc.StateDisconnected.String())}))
+		return
+	}
+	if !validStoredNetworkName(req.Network) {
+		s.push(errEnvelope(env.Seq, "bad_request", "get_network needs a valid network name"))
+		return
+	}
+	select {
+	case s.hub.largeResponseSem <- struct{}{}:
+		defer func() { <-s.hub.largeResponseSem }()
+	case <-ctx.Done():
+		return
+	}
+	nc, found, err := s.hub.store.NetworkConfig(ctx, req.Network)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", errLoadNetworks))
+		return
+	}
+	if !found {
+		s.push(errEnvelope(env.Seq, "unknown_network", "network not found"))
+		return
+	}
+	s.hub.mu.Lock()
+	state := s.hub.states[nc.Name]
+	s.hub.mu.Unlock()
+	s.push(envelope("network", env.Seq, NetworkData{Network: makeNetworkConfigData(nc, state)}))
 }
 
 func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
@@ -186,28 +308,66 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 		return
 	}
 	name := nc.EffectiveName()
+	// Invalid legacy names are represented to clients only by an opaque
+	// synthetic recovery label. Never accept the raw spelling on the protocol:
+	// current write invariants could not restore it after a failed edit.
+	if d.OldName != "" && !validStoredNetworkName(d.OldName) {
+		s.push(errEnvelope(env.Seq, "bad_request", "old network name is invalid; remove it through its recovery entry"))
+		return
+	}
 
 	// Serialize start/stop against other network operations.
 	s.hub.netOps.Lock()
 	defer s.hub.netOps.Unlock()
 
-	stored, err := s.hub.store.NetworkConfigs(ctx)
+	prevName := d.OldName
+	if prevName == "" {
+		prevName = name
+	}
+	prevRow, prevFound, err := s.hub.store.NetworkConfig(ctx, prevName)
 	if err != nil {
 		s.push(errEnvelope(env.Seq, "internal", errLoadNetworks))
 		return
 	}
-	if msg := putNetworkConflict(stored, d.OldName, name); msg != "" {
-		s.push(errEnvelope(env.Seq, "bad_request", msg))
+	renamed := d.OldName != "" && d.OldName != name
+	if d.OldName != "" && !prevFound {
+		s.push(errEnvelope(env.Seq, "bad_request", fmt.Sprintf("network %q not found", d.OldName)))
 		return
+	}
+	if d.OldName == "" || renamed {
+		_, targetFound, lerr := s.hub.store.NetworkConfig(ctx, name)
+		if lerr != nil {
+			s.push(errEnvelope(env.Seq, "internal", errLoadNetworks))
+			return
+		}
+		if targetFound {
+			s.push(errEnvelope(env.Seq, "bad_request", fmt.Sprintf("network %q already exists", name)))
+			return
+		}
+	}
+	if legacyNetworkRequiresRecreate(prevFound, prevRow, d.OldName != "") {
+		// ReplaceNetworkConfig deliberately rejects an old >64 KiB blob or an
+		// empty legacy value. A later StartNetwork failure could not roll either
+		// one back atomically, so keep the contract honest: malformed legacy rows
+		// are delete-and-recreate only.
+		s.push(errEnvelope(env.Seq, "bad_request", "stored network config is invalid or exceeds the safe limit; remove and recreate it"))
+		return
+	}
+	var prev *store.NetworkConfig
+	if prevFound && prevRow.Config != "" {
+		copy := prevRow
+		prev = &copy
 	}
 	canonical, err := json.Marshal(nc)
 	if err != nil {
 		s.push(errEnvelope(env.Seq, "internal", "encoding network failed"))
 		return
 	}
+	if err := store.ValidateNetworkConfigRecord(name, string(canonical)); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
+		return
+	}
 
-	renamed := d.OldName != "" && d.OldName != name
-	prev := findConfig(stored, d.OldName, name)
 	if err := s.hub.applyPutNetwork(ctx, nc, d.OldName, prev, renamed, string(canonical)); err != nil {
 		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
 		return
@@ -217,6 +377,14 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcast(envelope("networks_changed", 0, nil))
+}
+
+func legacyNetworkRequiresRecreate(found bool, row store.NetworkConfig, explicitEdit bool) bool {
+	return found && explicitEdit && (row.Oversized || row.Config == "")
+}
+
+func validStoredNetworkName(name string) bool {
+	return store.ValidateNetworkConfigRecord(name, `{}`) == nil
 }
 
 // applyPutNetwork performs the state change of a validated put: stop the
@@ -295,21 +463,6 @@ func ValidateNetwork(nc *netconf.Network) error {
 	return err
 }
 
-// findConfig returns the stored definition a put would displace (the
-// old name when editing, the target name otherwise), nil for an add.
-func findConfig(stored []store.NetworkConfig, oldName, name string) *store.NetworkConfig {
-	want := oldName
-	if want == "" {
-		want = name
-	}
-	for i := range stored {
-		if stored[i].Name == want {
-			return &stored[i]
-		}
-	}
-	return nil
-}
-
 // restartNetwork best-effort restarts a stored definition after a
 // failed put, so an error leaves the previous network running.
 func (h *Hub) restartNetwork(prev *store.NetworkConfig) {
@@ -322,29 +475,8 @@ func (h *Hub) restartNetwork(prev *store.NetworkConfig) {
 	}
 	if err != nil {
 		log.Printf("network %q: restart after failed edit: %v", prev.Name, err)
+		h.NoteStoppedNetwork(prev.Name)
 	}
-}
-
-// putNetworkConflict reports (as a user-facing message, "" for none)
-// name conflicts for an add or edit: an existing name may not be taken,
-// and an edit must reference a definition that exists.
-func putNetworkConflict(stored []store.NetworkConfig, oldName, name string) string {
-	exists := func(n string) bool {
-		for _, c := range stored {
-			if c.Name == n {
-				return true
-			}
-		}
-		return false
-	}
-	renamed := oldName != "" && oldName != name
-	if oldName != "" && !exists(oldName) {
-		return fmt.Sprintf("network %q not found", oldName)
-	}
-	if (oldName == "" || renamed) && exists(name) {
-		return fmt.Sprintf("network %q already exists", name)
-	}
-	return ""
 }
 
 func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
@@ -355,16 +487,45 @@ func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
 	}
 	s.hub.netOps.Lock()
 	defer s.hub.netOps.Unlock()
+	if recoveryID := s.hub.recoveryRowID(d.Network); recoveryID != 0 {
+		// The real legacy name is intentionally never materialized. Delete its
+		// definition+history by opaque rowid inside SQLite, and clear the
+		// synthetic placeholder only after commit. On failure the mapping stays
+		// live so the owner can retry.
+		s.hub.lifecycleGate.Lock()
+		err := s.hub.store.DeleteNetworkByPageID(ctx, recoveryID)
+		s.hub.lifecycleGate.Unlock()
+		if err != nil {
+			s.push(errEnvelope(env.Seq, "internal", "deleting network failed"))
+			return
+		}
+		s.hub.StopNetwork(d.Network)
+		log.Printf("network recovery row %d deleted", recoveryID)
+		s.push(envelope("ok", env.Seq, nil))
+		s.hub.broadcast(envelope("network_removed", 0, NetworkRef{Network: d.Network}))
+		s.hub.broadcast(envelope("networks_changed", 0, nil))
+		return
+	}
+	// A raw invalid legacy name must never bypass the synthetic row-ID path:
+	// doing so would leave the recovery placeholder behind after deletion.
+	if !validStoredNetworkName(d.Network) {
+		s.push(errEnvelope(env.Seq, "bad_request", "network name is invalid; remove it through its recovery entry"))
+		return
+	}
 
 	// Capture the definition first: if the delete transaction fails
 	// after the stop, the network must come back up, not stay stopped
 	// with its definition intact.
-	stored, err := s.hub.store.NetworkConfigs(ctx)
+	prevRow, found, err := s.hub.store.NetworkConfig(ctx, d.Network)
 	if err != nil {
 		s.push(errEnvelope(env.Seq, "internal", errLoadNetworks))
 		return
 	}
-	prev := findConfig(stored, d.Network, d.Network)
+	var prev *store.NetworkConfig
+	if found && prevRow.Config != "" {
+		copy := prevRow
+		prev = &copy
+	}
 	s.hub.StopNetwork(d.Network)
 	// One transaction: the definition and the stored history (that is
 	// what "delete" means) go together or not at all. Under the
@@ -375,6 +536,9 @@ func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
 	s.hub.lifecycleGate.Unlock()
 	if err != nil {
 		s.hub.restartNetwork(prev)
+		if found && prev == nil {
+			s.hub.NoteStoppedNetwork(d.Network)
+		}
 		s.push(errEnvelope(env.Seq, "internal", "deleting network failed"))
 		return
 	}
@@ -443,22 +607,53 @@ func (s *Session) handleCloseBuffer(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", "close_buffer needs a network and a buffer"))
 		return
 	}
-	// Mark closed BEFORE deleting, so a straggler that races the delete
-	// already takes the non-creating AppendExisting path (see
-	// persistEvent) and cannot re-create the buffer in the gap between
-	// the two operations. Fold with the network's casemapping when it is
-	// connected; otherwise a plain key still matches most cases.
-	fold := func(x string) string { return x }
+	if !validCloseBuffer(d.Buffer) {
+		s.push(errEnvelope(env.Seq, "bad_request", "invalid buffer name"))
+		return
+	}
+	known, err := s.hub.knownNetwork(ctx, d.Network)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "checking network failed"))
+		return
+	}
+	if !known {
+		s.push(errEnvelope(env.Seq, "unknown_network", "unknown network"))
+		return
+	}
+	// Resolve/delete and install the close tombstone under the store lock, the
+	// same ordering used by guarded appends. No append can land in a gap
+	// between those operations.
+	fold := asciiFold
 	if c := s.hub.network(d.Network); c != nil {
 		fold = c.Fold
 	}
-	s.hub.markClosed(d.Network, fold(d.Buffer), time.Now().UnixMilli())
-	if err := s.hub.store.DeleteBuffer(ctx, d.Network, d.Buffer); err != nil {
+	// Delete+tombstone+publication is one observable mutation. Live append
+	// paths hold the same mutex through their event publication, preventing an
+	// older append from resurfacing the buffer after buffer_closed.
+	s.hub.bufferMutationMu.Lock()
+	defer s.hub.bufferMutationMu.Unlock()
+	canonical, err := s.hub.store.DeleteBufferFolded(ctx, d.Network, d.Buffer, fold, func(name string) {
+		s.hub.markClosed(d.Network, fold(name), time.Now().UnixMilli())
+	})
+	if err != nil {
 		s.push(errEnvelope(env.Seq, "internal", "closing buffer failed"))
 		return
 	}
-	s.push(envelope("ok", env.Seq, nil))
+	d.Buffer = canonical
+	s.push(envelope("ok", env.Seq, d))
 	s.hub.broadcast(envelope("buffer_closed", 0, d))
+}
+
+func validCloseBuffer(name string) bool {
+	if name == "" || len(name) > 512 || !utf8.ValidString(name) {
+		return false
+	}
+	for _, r := range name {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // knownNetwork reports whether name is a real network — a stored
@@ -469,16 +664,8 @@ func (h *Hub) knownNetwork(ctx context.Context, name string) (bool, error) {
 	if h.network(name) != nil {
 		return true, nil
 	}
-	configs, err := h.store.NetworkConfigs(ctx)
-	if err != nil {
-		return false, err
-	}
-	for _, c := range configs {
-		if c.Name == name {
-			return true, nil
-		}
-	}
-	return false, nil
+	_, found, err := h.store.NetworkConfig(ctx, name)
+	return found, err
 }
 
 // maxPersistedChannels caps a stored definition's channel list, matching the
@@ -501,21 +688,17 @@ func (h *Hub) updateAutojoin(ctx context.Context, network string, channels []str
 // regardless of comma-list length), so a hostile JOIN/PART flood cannot drive
 // one full-table read-modify-write per token.
 func (h *Hub) updateAutojoinLocked(ctx context.Context, network string, channels []string, add bool, fold func(string) string) error {
-	configs, err := h.store.NetworkConfigs(ctx)
+	stored, found, err := h.store.NetworkConfig(ctx, network)
 	if err != nil {
 		return err
 	}
-	var raw string
-	for _, nc := range configs {
-		if nc.Name == network {
-			raw = nc.Config
-			break
-		}
-	}
-	if raw == "" {
+	if !found {
 		return fmt.Errorf("no stored definition")
 	}
-	nc, err := netconf.Parse([]byte(raw))
+	if stored.Oversized {
+		return fmt.Errorf("stored definition exceeds the safe size limit")
+	}
+	nc, err := netconf.Parse([]byte(stored.Config))
 	if err != nil {
 		return err
 	}

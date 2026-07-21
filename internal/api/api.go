@@ -20,7 +20,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -46,24 +45,6 @@ import (
 )
 
 const sessionCookie = "ircthing_session"
-
-// wsWriteBufPool reuses the JSON encode buffer for outbound WebSocket frames so
-// a chathistory replay (one large pre-marshaled page per get_history) doesn't
-// allocate a second full copy of the page on every write. The bytes are handed
-// to a synchronous c.Write and the buffer is returned immediately after.
-var wsWriteBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
-
-// maxPooledWSBuf bounds what goes back into the pool: a single big history page
-// can grow a buffer to megabytes, and retaining that in the shared pool would
-// pin the high-water-mark allocation against the RSS budget. Oversized buffers
-// are dropped (GC'd) instead of pooled.
-const maxPooledWSBuf = 64 * 1024
-
-func putWSBuf(buf *bytes.Buffer) {
-	if buf.Cap() <= maxPooledWSBuf {
-		wsWriteBufPool.Put(buf)
-	}
-}
 
 // wsEnvelopeHeadroom is slack above the largest payload (a prefs blob)
 // for the JSON envelope wrapping it (v/type/seq/data keys and quoting).
@@ -143,6 +124,7 @@ type Server struct {
 	// traffic for that window. Guarded by mu (paired with tokens). The
 	// ticker in wsWritePump stays as the expiry backstop.
 	wsCancels map[string]map[uint64]context.CancelFunc
+	wsConns   map[uint64]*websocket.Conn
 	wsNextID  uint64
 
 	// sessionTTL is the effective session-cookie lifetime in nanoseconds,
@@ -171,23 +153,69 @@ type Server struct {
 	// and live state. One writer at a time closes both.
 	settingsMu sync.Mutex
 
+	// wsDrainMu makes closing WebSocket admission atomic with adding a handler
+	// to wsWG. Without it, DrainSessions could observe a zero count and return
+	// while a request concurrently called Add, letting that handler outlive the
+	// store. Once wsDraining is set, WebSocket admission never reopens.
+	wsDrainMu  sync.Mutex
+	wsDraining bool
 	// wsWG tracks live WebSocket handler goroutines so shutdown can drain them
 	// before the store is closed (a hijacked WS is not tracked by http.Server
 	// and its store reads/writes would otherwise race Store.Close).
 	wsWG sync.WaitGroup
 }
 
+// admitWS registers a WebSocket handler unless shutdown has closed admission.
+// The Add and draining transition share wsDrainMu so Add can never race the
+// first Wait in DrainSessions.
+func (s *Server) admitWS() bool {
+	s.wsDrainMu.Lock()
+	defer s.wsDrainMu.Unlock()
+	if s.wsDraining {
+		return false
+	}
+	s.wsWG.Add(1)
+	return true
+}
+
 // WaitSessions blocks until every live WebSocket handler has returned, or the
 // timeout elapses. Call it during shutdown AFTER the base context is canceled
 // (which unblocks the read loops) and BEFORE closing the store, so no session
 // goroutine touches the store after it is closed.
-func (s *Server) WaitSessions(timeout time.Duration) {
+func (s *Server) WaitSessions(timeout time.Duration) bool {
 	done := make(chan struct{})
 	go func() { s.wsWG.Wait(); close(done) }()
 	select {
 	case <-done:
+		return true
 	case <-time.After(timeout):
+		return false
 	}
+}
+
+// DrainSessions permits graceful cancellation first, then force-closes every
+// still-tracked hijacked connection and waits definitively. Store.Close may
+// run only after this returns.
+func (s *Server) DrainSessions(grace time.Duration) {
+	// Close admission before the first Wait. Any handler that won the lock is
+	// already represented in wsWG; every later request receives a 503.
+	s.wsDrainMu.Lock()
+	s.wsDraining = true
+	s.wsDrainMu.Unlock()
+
+	if s.WaitSessions(grace) {
+		return
+	}
+	s.mu.Lock()
+	conns := make([]*websocket.Conn, 0, len(s.wsConns))
+	for _, c := range s.wsConns {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	for _, c := range conns {
+		_ = c.CloseNow()
+	}
+	s.wsWG.Wait()
 }
 
 func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
@@ -200,11 +228,19 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 	if cfg.SessionTTL <= 0 {
 		cfg.SessionTTL = 30 * 24 * time.Hour
 	}
+	previewsOn, err := loadPreviews(context.Background(), h.Store(), cfg)
+	if err != nil {
+		return nil, err
+	}
+	sessionTTL, err := loadSessionTTL(context.Background(), h.Store(), cfg)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
 		cfg:              cfg,
 		hub:              h,
 		mux:              http.NewServeMux(),
-		previewsOn:       loadPreviews(context.Background(), h.Store(), cfg),
+		previewsOn:       previewsOn,
 		htmlByProxy:      make(map[string]*fetcher),
 		imageByProxy:     make(map[string]*fetcher),
 		tunnelHTMLByNet:  make(map[string]*fetcher),
@@ -221,8 +257,9 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 		login:      newLoginLimiter(),
 		tokens:     make(map[string]time.Time),
 		wsCancels:  make(map[string]map[uint64]context.CancelFunc),
+		wsConns:    make(map[uint64]*websocket.Conn),
 	}
-	s.sessionTTL.Store(int64(loadSessionTTL(context.Background(), h.Store(), cfg)))
+	s.sessionTTL.Store(int64(sessionTTL))
 	initHash, err := loadPasswordHash(context.Background(), h.Store(), cfg)
 	if err != nil {
 		return nil, err
@@ -724,7 +761,7 @@ func (s *Server) tokenValid(token string) bool {
 // cancel sweep ran before this registration, so registering blind would leave
 // the socket live until the ticker. ok=false means the token is gone/expired
 // and the handler must refuse the socket.
-func (s *Server) registerWSCancel(token string, cancel context.CancelFunc) (unregister func(), ok bool) {
+func (s *Server) registerWSCancel(token string, cancel context.CancelFunc, conn *websocket.Conn) (unregister func(), ok bool) {
 	if token == "" {
 		return func() {}, false
 	}
@@ -742,8 +779,10 @@ func (s *Server) registerWSCancel(token string, cancel context.CancelFunc) (unre
 		s.wsCancels[token] = m
 	}
 	m[id] = cancel
+	s.wsConns[id] = conn
 	return func() {
 		s.mu.Lock()
+		delete(s.wsConns, id)
 		if m := s.wsCancels[token]; m != nil {
 			delete(m, id)
 			if len(m) == 0 {
@@ -800,25 +839,13 @@ func (s *Server) wsWritePump(ctx context.Context, c *websocket.Conn, sess *hub.S
 		case <-sess.Done():
 			c.Close(websocket.StatusPolicyViolation, "too slow, reconnect and refetch")
 			return
-		case env := <-sess.Outbound():
-			// Encode into a pooled buffer. A chathistory replay pushes one large
-			// pre-marshaled page per get_history; reusing the buffer avoids a
-			// second full copy of every outbound frame. Safe because c.Write
-			// consumes the bytes synchronously before the buffer is returned.
-			buf := wsWriteBufPool.Get().(*bytes.Buffer)
-			buf.Reset()
-			err := json.NewEncoder(buf).Encode(env)
-			if err != nil {
-				putWSBuf(buf)
-				continue
-			}
-			// json.Encoder appends a newline; drop it to keep the frame
-			// byte-identical to the prior json.Marshal output.
-			b := bytes.TrimSuffix(buf.Bytes(), []byte{'\n'})
+		case queued := <-sess.Outbound():
+			// Frames are encoded before queue admission, so the reservation is
+			// exact and the write pump never holds a second full-frame copy.
 			wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
-			err = c.Write(wctx, websocket.MessageText, b)
+			err := c.Write(wctx, websocket.MessageText, queued.Data)
 			wcancel()
-			putWSBuf(buf)
+			queued.Release()
 			if err != nil {
 				return
 			}
@@ -830,14 +857,16 @@ func (s *Server) wsWritePump(ctx context.Context, c *websocket.Conn, sess *hub.S
 // to a hub.Session: one goroutine writes Outbound envelopes to the
 // socket, the request goroutine reads client envelopes into Handle.
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	if !s.admitWS() {
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.wsWG.Done()
+
 	if !s.authed(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	// Track this handler so shutdown can drain it before Store.Close (the
-	// connection is hijacked at upgrade, so http.Server.Shutdown won't wait).
-	s.wsWG.Add(1)
-	defer s.wsWG.Done()
 	// Same-origin check (host always, scheme when determinable — see sameOrigin).
 	// The coder/websocket default (Accept with nil opts) allows an ABSENT Origin,
 	// which a browser never sends on a WS handshake, so we require it and run our
@@ -885,7 +914,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	// re-validates the token atomically — a logout that landed between the
 	// auth check and this point already ran its cancel sweep, so a blind
 	// registration would leave this socket alive until the ticker.
-	unregister, live := s.registerWSCancel(token, cancel)
+	unregister, live := s.registerWSCancel(token, cancel, c)
 	if !live {
 		c.Close(websocket.StatusPolicyViolation, "session ended")
 		return

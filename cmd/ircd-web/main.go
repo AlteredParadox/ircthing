@@ -185,24 +185,33 @@ func run(cfg *config) error {
 		}
 	}()
 
+	var runErr error
 	select {
-	case err := <-serveErr:
-		stop()
-		wg.Wait()
-		return err
+	case runErr = <-serveErr:
 	case <-ctx.Done():
 	}
 
 	log.Print("shutting down")
+	// Both signals and unexpected Serve failures take the same teardown path.
+	// In particular, cancel the BaseContext before draining hijacked WebSocket
+	// handlers, and never close the store while either a session or a network
+	// goroutine can still use it.
+	stop()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	srv.Shutdown(shutdownCtx)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("graceful HTTP shutdown: %v; forcing active connections closed", err)
+		if closeErr := srv.Close(); closeErr != nil {
+			log.Printf("force-closing HTTP server: %v", closeErr)
+		}
+	}
 	// Drain live WebSocket handlers (their contexts were just canceled via
 	// BaseContext) before the deferred Store.Close, so no session goroutine
-	// races the store shutdown. Bounded so a wedged handler can't hang exit.
-	handler.WaitSessions(3 * time.Second)
+	// races the store shutdown. The graceful wait is bounded; after it expires,
+	// tracked sockets are force-closed and the final wait is definitive.
+	handler.DrainSessions(3 * time.Second)
 	wg.Wait()
-	return nil
+	return runErr
 }
 
 // startNetworks seeds the network_configs table from the config file on
@@ -215,44 +224,89 @@ func run(cfg *config) error {
 // config.json no longer helps because the database wins, so refusing
 // startup here leaves the database untouched. Later runs ignore the file
 // list and never reach this (it may reference retired cert paths).
-func seedNetworks(ctx context.Context, st *store.Store, fileNetworks []netconf.Network) ([]store.NetworkConfig, error) {
+func seedNetworks(ctx context.Context, st *store.Store, fileNetworks []netconf.Network) error {
 	for i := range fileNetworks {
 		if err := hub.ValidateNetwork(&fileNetworks[i]); err != nil {
-			return nil, fmt.Errorf("config networks[%d] (%s): %w", i, fileNetworks[i].EffectiveName(), err)
+			return fmt.Errorf("config networks[%d] (%s): %w", i, fileNetworks[i].EffectiveName(), err)
 		}
 	}
 	seedRows, err := hub.SeedRows(fileNetworks)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if _, err := st.SeedNetworkConfigs(ctx, seedRows); err != nil {
-		return nil, err
+		return err
 	}
 	log.Printf("networks: imported %d definitions from the config file", len(seedRows))
-	return st.NetworkConfigs(ctx)
+	return nil
 }
 
 func startNetworks(ctx context.Context, st *store.Store, h *hub.Hub, fileNetworks []netconf.Network) error {
-	stored, err := st.NetworkConfigs(ctx)
+	count, err := st.NetworkConfigCount(ctx)
 	if err != nil {
 		return err
 	}
-	if len(stored) == 0 && len(fileNetworks) > 0 {
-		if stored, err = seedNetworks(ctx, st, fileNetworks); err != nil {
+	if count == 0 && len(fileNetworks) > 0 {
+		if err = seedNetworks(ctx, st, fileNetworks); err != nil {
 			return err
 		}
 	} else if len(fileNetworks) > 0 {
-		log.Printf("networks: %d definitions in database; config file networks[] is ignored (manage networks in the web UI)", len(stored))
+		log.Printf("networks: %d definitions in database; config file networks[] is ignored (manage networks in the web UI)", count)
 	}
-	for _, row := range stored {
-		nc, err := netconf.Parse([]byte(row.Config))
+	// Iterate bounded pages. A legacy definition grown beyond the current
+	// ingress cap is surfaced to the UI as a stopped network for deletion or
+	// recreation, but its blob is never materialized here.
+	var after int64
+	tracked := 0
+	legacySkipped := 0
+loadPages:
+	for {
+		rows, more, err := st.NetworkConfigsPage(ctx, after, 16)
 		if err != nil {
-			log.Printf("networks: skipping %q: %v", row.Name, err)
-			continue
+			return err
 		}
-		if err := h.StartNetwork(nc); err != nil {
-			log.Printf("networks: starting %q: %v", row.Name, err)
+		if len(rows) == 0 {
+			if more {
+				return fmt.Errorf("network config pagination made no progress")
+			}
+			break
 		}
+		for _, row := range rows {
+			after = row.PageID
+			if tracked >= store.MaxNetworkConfigs {
+				if count > tracked {
+					legacySkipped = count - tracked
+				}
+				break loadPages
+			}
+			tracked++
+			if row.InvalidName {
+				label := h.NoteInvalidNetwork(row.PageID)
+				log.Printf("networks: %s represents row %d whose stored name violates current safety bounds; delete and recreate it", label, row.PageID)
+				continue
+			}
+			if row.Oversized {
+				log.Printf("networks: skipping row %d: stored definition exceeds the %d-byte safety limit", row.PageID, store.MaxNetworkConfigBytes)
+				h.NoteStoppedNetwork(row.Name)
+				continue
+			}
+			nc, err := netconf.Parse([]byte(row.Config))
+			if err != nil {
+				log.Printf("networks: skipping %q: %v", row.Name, err)
+				h.NoteStoppedNetwork(row.Name)
+				continue
+			}
+			if err := h.StartNetwork(nc); err != nil {
+				log.Printf("networks: starting %q: %v", row.Name, err)
+				h.NoteStoppedNetwork(row.Name)
+			}
+		}
+		if !more {
+			break
+		}
+	}
+	if legacySkipped > 0 {
+		log.Printf("networks: %d legacy definitions exceed the %d-network runtime cap and were not started; remove visible rows and restart to recover the remainder", legacySkipped, store.MaxNetworkConfigs)
 	}
 	return nil
 }

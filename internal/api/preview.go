@@ -18,7 +18,6 @@ package api
 
 import (
 	"encoding/json"
-	"fmt"
 	"html"
 	"net/http"
 	"net/url"
@@ -171,10 +170,10 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	ct, finalURL, body, err := f.get(r.Context(), target)
 	if err != nil {
 		if fetchErrorRetryable(err) {
-			logMedia("preview", target, start, "fetch failed (transient→503): "+err.Error())
+			logMedia("preview", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), retryable: true, httpStatus: 503})
 			http.Error(w, "preview fetch failed", http.StatusServiceUnavailable)
 		} else {
-			logMedia("preview", target, start, "fetch failed (permanent→502): "+err.Error())
+			logMedia("preview", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), httpStatus: 502})
 			http.Error(w, "preview unavailable", http.StatusBadGateway)
 		}
 		return
@@ -189,13 +188,13 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	if isImageType(ct) || isImageType(http.DetectContentType(body)) {
 		pv.Kind = "image"
 		pv.Image = target
-		logMedia("preview", target, start, fmt.Sprintf("ok image (ct=%q, %d bytes)", ct, len(body)))
+		logMedia("preview", target, start, mediaLogResult{event: "ok", class: "image", bytes: len(body)})
 	} else {
 		// Resolve relative og:image against the FINAL (post-redirect) URL, or a
 		// redirect would resolve them against the wrong origin/path.
 		extractMeta(string(body), finalURL, &pv)
 		blank := pv.Title == "" && pv.Description == "" && pv.Image == ""
-		logMedia("preview", target, start, fmt.Sprintf("ok card (%d bytes, title=%q, blank=%v)", len(body), pv.Title, blank))
+		logMedia("preview", target, start, mediaLogResult{event: "ok", class: "card", bytes: len(body), blank: blank})
 	}
 	s.previewCache.put(ck, pv)
 	writeJSON(w, pv)

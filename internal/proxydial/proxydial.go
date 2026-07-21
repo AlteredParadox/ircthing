@@ -316,7 +316,7 @@ func socks5Negotiate(conn net.Conn, user *url.Userinfo) error {
 		return fmt.Errorf("socks5 greeting: %w", err)
 	}
 	if sel[0] != 0x05 {
-		return fmt.Errorf("socks5: not a SOCKS5 proxy (version %d)", sel[0])
+		return fmt.Errorf("%w: bad SOCKS5 greeting version %d", ErrProxyProtocol, sel[0])
 	}
 	switch sel[1] {
 	case 0x00: // no auth
@@ -405,8 +405,10 @@ func socks5ReadReply(conn net.Conn) error {
 		switch head[1] {
 		case 0x02, 0x07, 0x08: // not-allowed-by-ruleset, command-not-supported, addr-not-supported
 			return fmt.Errorf("%w: %s", ErrProxyRejected, socks5Error(head[1]))
-		default:
+		case 0x01, 0x03, 0x04, 0x05, 0x06:
 			return fmt.Errorf("socks5: connect failed: %s", socks5Error(head[1]))
+		default:
+			return fmt.Errorf("%w: invalid SOCKS5 reply code %d", ErrProxyProtocol, head[1])
 		}
 	}
 	var bound int
@@ -422,7 +424,7 @@ func socks5ReadReply(conn net.Conn) error {
 		}
 		bound = int(n[0])
 	default:
-		return fmt.Errorf("socks5: bad address type %d in reply", head[3])
+		return fmt.Errorf("%w: bad SOCKS5 address type %d", ErrProxyProtocol, head[3])
 	}
 	_, err := io.ReadFull(conn, make([]byte, bound+2)) // addr + port
 	return err
@@ -482,7 +484,7 @@ func httpConnect(conn net.Conn, user *url.Userinfo, target string) error {
 	buf := make([]byte, 1)
 	for !strings.HasSuffix(head.String(), "\r\n\r\n") {
 		if head.Len() > 8192 {
-			return errors.New("http proxy: oversized CONNECT response")
+			return fmt.Errorf("%w: oversized HTTP CONNECT response", ErrProxyProtocol)
 		}
 		if _, err := io.ReadFull(conn, buf); err != nil {
 			return fmt.Errorf("http proxy response: %w", err)
@@ -494,18 +496,20 @@ func httpConnect(conn net.Conn, user *url.Userinfo, target string) error {
 	// Strict status line: "HTTP/x.y NNN ...". A malformed version or a
 	// non-3-digit status is a protocol error (not an HTTP proxy) — permanent.
 	if len(f) < 2 || !validHTTPVersion(f[0]) {
-		return fmt.Errorf("%w: bad HTTP status line %q", ErrProxyProtocol, status)
+		return fmt.Errorf("%w: bad HTTP status line", ErrProxyProtocol)
 	}
 	code, ok := parseHTTPStatus(f[1])
 	if !ok {
-		return fmt.Errorf("%w: bad HTTP status code %q", ErrProxyProtocol, f[1])
+		return fmt.Errorf("%w: bad HTTP status code", ErrProxyProtocol)
 	}
 	switch {
 	case code >= 200 && code < 300:
 		return nil // any 2xx establishes the tunnel
 	case code == 408 || code == 429 || (code >= 500 && code < 600):
 		// Timeout / rate-limit / server error: may clear on retry.
-		return fmt.Errorf("http proxy: CONNECT refused: %s", status)
+		// Keep the proxy-controlled reason phrase out of logs that report the
+		// dial error; the numeric code is sufficient for diagnosis.
+		return fmt.Errorf("http proxy: CONNECT refused with status %d", code)
 	default:
 		// 1xx (no final 2xx), 3xx, and 4xx other than 408/429 are DETERMINISTIC
 		// — 407 proxy-auth-required, 403 forbidden, an unexpected redirect:

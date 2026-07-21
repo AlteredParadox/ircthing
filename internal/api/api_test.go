@@ -170,6 +170,26 @@ func TestClientConfigPreviewsEnabled(t *testing.T) {
 	}
 }
 
+func TestPersistedMediaSettingsRejectCorruption(t *testing.T) {
+	_, srv := newTestServerWithRef(t)
+	st := srv.hub.Store()
+	ctx := context.Background()
+	if err := st.SetSetting(ctx, previewsKey, "yes"); err != nil {
+		t.Fatal(err)
+	}
+	if on, err := loadPreviews(ctx, st, Config{PreviewsDefault: true}); err == nil || on {
+		t.Fatalf("corrupt previews = %v, %v; want disabled error", on, err)
+	}
+	for _, value := range []string{"", "nope", "0", "36501", "999999999999999999999"} {
+		if err := st.SetSetting(ctx, sessionTTLKey, value); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadSessionTTL(ctx, st, Config{SessionTTL: 24 * time.Hour}); err == nil {
+			t.Fatalf("corrupt session TTL %q was accepted", value)
+		}
+	}
+}
+
 // A state-changing request from a cross-site or same-site (sibling subdomain)
 // context is refused via Sec-Fetch-Site; same-origin and direct navigation
 // ("none") are allowed. With the header ABSENT (older browser / stripping
@@ -313,7 +333,7 @@ func TestPreviewsToggleRuntime(t *testing.T) {
 	if !srv.previewsEnabled() {
 		t.Fatal("previews not re-enabled")
 	}
-	if !loadPreviews(context.Background(), srv.hub.Store(), Config{PreviewsDefault: false}) {
+	if on, err := loadPreviews(context.Background(), srv.hub.Store(), Config{PreviewsDefault: false}); err != nil || !on {
 		t.Fatal("stored previews=on not read back over the config default")
 	}
 }
@@ -699,9 +719,9 @@ type fakeConn struct {
 	nick string
 }
 
-func (f *fakeConn) Events() <-chan irc.Event  { return f.ch }
-func (f *fakeConn) Name() string              { return f.name }
-func (f *fakeConn) Nick() string              { return f.nick }
+func (f *fakeConn) Events() <-chan irc.Event       { return f.ch }
+func (f *fakeConn) Name() string                   { return f.name }
+func (f *fakeConn) Nick() string                   { return f.nick }
 func (f *fakeConn) Send(*ircv4.Message) error      { return nil }
 func (f *fakeConn) SendAll([]*ircv4.Message) error { return nil }
 
@@ -724,8 +744,8 @@ func (f *fakeConn) HistoryPageSize() int                     { return 100 }
 
 func (f *fakeConn) EnsureNames(string) {}
 
-func (f *fakeConn) SendMultiline(string, []string) error { return nil }
-func (f *fakeConn) ReconcileMonitored([]string) error    { return nil }
+func (f *fakeConn) SendMultiline(string, []string) error                  { return nil }
+func (f *fakeConn) ReconcileMonitored([]string) error                     { return nil }
 func (f *fakeConn) MonitorRejected([]string, int, uint64, []string) error { return nil }
 
 func (f *fakeConn) privmsg(line string) irc.Event {
@@ -820,6 +840,115 @@ func TestWSEndToEnd(t *testing.T) {
 	}
 	if ev.Sender != "bob" {
 		t.Fatalf("event = %+v", ev)
+	}
+}
+
+func TestDrainSessionsForceClosesAndRejectsWebSockets(t *testing.T) {
+	ts, srv := newTestServerWithRef(t)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	header := http.Header{}
+	header.Set("Cookie", cookie.Name+"="+cookie.Value)
+	header.Set("Origin", ts.URL)
+	c, _, err := websocket.Dial(ctx, ts.URL+"/api/ws", &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.CloseNow()
+
+	// Wait until the accepted connection is tracked so a zero grace period
+	// exercises the force-close path rather than racing socket registration.
+	deadline := time.Now().Add(time.Second)
+	for {
+		srv.mu.Lock()
+		tracked := len(srv.wsConns)
+		srv.mu.Unlock()
+		if tracked == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("WebSocket was not tracked")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	drained := make(chan struct{})
+	go func() {
+		srv.DrainSessions(0)
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(3 * time.Second):
+		t.Fatal("DrainSessions did not return after force-closing the WebSocket")
+	}
+
+	// Admission stays closed after the drain. It takes precedence over auth so
+	// every late WebSocket request gets the same retryable shutdown response.
+	late, resp, err := websocket.Dial(ctx, ts.URL+"/api/ws", &websocket.DialOptions{HTTPHeader: header})
+	if err == nil {
+		late.CloseNow()
+		t.Fatal("late WebSocket was admitted after DrainSessions")
+	}
+	if resp == nil {
+		t.Fatalf("late dial returned no HTTP response: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("late WebSocket status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+}
+
+func TestDrainSessionsClosesAdmissionBeforeWaiting(t *testing.T) {
+	_, srv := newTestServerWithRef(t)
+	if !srv.admitWS() {
+		t.Fatal("initial WebSocket admission was unexpectedly closed")
+	}
+	released := false
+	defer func() {
+		if !released {
+			srv.wsWG.Done()
+		}
+	}()
+
+	drained := make(chan struct{})
+	go func() {
+		srv.DrainSessions(5 * time.Second)
+		close(drained)
+	}()
+
+	// Before draining starts, this unauthenticated request gets 401. Once the
+	// admission transition wins the mutex, it must get 503 even though the
+	// already-counted handler above is still keeping DrainSessions in Wait.
+	deadline := time.Now().Add(time.Second)
+	for {
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/ws", nil))
+		if rec.Code == http.StatusServiceUnavailable {
+			break
+		}
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("WebSocket status during drain transition = %d", rec.Code)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("WebSocket admission did not close before the drain wait")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	select {
+	case <-drained:
+		t.Fatal("DrainSessions returned while an admitted handler was still active")
+	default:
+	}
+	srv.wsWG.Done()
+	released = true
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("DrainSessions did not return after the admitted handler exited")
 	}
 }
 

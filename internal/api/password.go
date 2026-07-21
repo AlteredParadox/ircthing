@@ -46,11 +46,11 @@ const (
 // genuinely-absent override (empty value, no error) uses the seed, so first
 // boot still works.
 func loadPasswordHash(ctx context.Context, st *store.Store, cfg Config) (string, error) {
-	v, err := st.Setting(ctx, passwordHashKey)
+	v, present, err := st.SettingValue(ctx, passwordHashKey)
 	if err != nil {
 		return "", fmt.Errorf("reading stored password override: %w", err)
 	}
-	if v == "" {
+	if !present {
 		return cfg.PasswordHash, nil // no override set yet (first boot)
 	}
 	if _, err := bcrypt.Cost([]byte(v)); err != nil {

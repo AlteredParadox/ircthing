@@ -19,6 +19,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -47,27 +48,34 @@ const previewsKey = "previews_enabled"
 // default that may be on — a persisted "off" must not be silently re-enabled.
 // (Setting returns "" with nil err for an absent key, so err != nil is a real
 // error, not "unset".)
-func loadPreviews(ctx context.Context, st *store.Store, cfg Config) bool {
-	v, err := st.Setting(ctx, previewsKey)
+func loadPreviews(ctx context.Context, st *store.Store, cfg Config) (bool, error) {
+	v, present, err := st.SettingValue(ctx, previewsKey)
 	if err != nil {
-		return false // fail closed on a read error
+		return false, fmt.Errorf("reading stored previews setting: %w", err)
 	}
-	if v != "" {
-		return v == "1"
+	if !present {
+		return cfg.PreviewsDefault, nil
 	}
-	return cfg.PreviewsDefault
+	switch v {
+	case "0":
+		return false, nil
+	case "1":
+		return true, nil
+	default:
+		return false, fmt.Errorf("stored previews setting is invalid (previews remain disabled)")
+	}
 }
 
 // maxRetentionDays bounds the runtime retention setting, matching the config
 // validator: past ~106752 days the time.Duration cutoff overflows into the
 // future and would delete all history.
-const maxRetentionDays = 36500
+const maxRetentionDays = store.MaxRetentionDays
 
 // maxRetentionMessages bounds retention_max_messages. Anything past 2^31-1
 // would round-trip through the frontend's 32-bit coercion as a negative
 // (breaking later saves); a billion messages is already beyond any real
 // SQLite deployment here.
-const maxRetentionMessages = 1_000_000_000
+const maxRetentionMessages = store.MaxRetentionMessages
 
 // sessionTTLKey stores the runtime session-cookie lifetime, in days.
 const sessionTTLKey = "session_ttl_days"
@@ -75,13 +83,19 @@ const sessionTTLKey = "session_ttl_days"
 // loadSessionTTL resolves the effective session lifetime: the settings-table
 // value (runtime-set via the UI, in days) when present, else the config value
 // (which New already defaulted to 30 days).
-func loadSessionTTL(ctx context.Context, st *store.Store, cfg Config) time.Duration {
-	if v, err := st.Setting(ctx, sessionTTLKey); err == nil && v != "" {
-		if days, err := strconv.Atoi(v); err == nil && days > 0 {
-			return time.Duration(days) * 24 * time.Hour
-		}
+func loadSessionTTL(ctx context.Context, st *store.Store, cfg Config) (time.Duration, error) {
+	v, present, err := st.SettingValue(ctx, sessionTTLKey)
+	if err != nil {
+		return 0, fmt.Errorf("reading stored session TTL: %w", err)
 	}
-	return cfg.SessionTTL
+	if !present {
+		return cfg.SessionTTL, nil
+	}
+	days, err := strconv.Atoi(v)
+	if err != nil || days < 1 || days > maxRetentionDays {
+		return 0, fmt.Errorf("stored session TTL is invalid")
+	}
+	return time.Duration(days) * 24 * time.Hour, nil
 }
 
 func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {

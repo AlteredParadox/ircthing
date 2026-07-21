@@ -25,13 +25,22 @@ package integration
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,6 +52,61 @@ import (
 )
 
 const testTimeout = 20 * time.Second
+
+// Each isolated Ergo fixture has its own trust root, keyed by its listener.
+// The integration stack and raw peer both consult this map so every test IRC
+// connection (including SASL/registration) traverses TLS. sync.Map keeps
+// independently parallel tests isolated without threading fixture structs
+// through every scenario helper.
+var integrationTLSRoots sync.Map // address -> *x509.CertPool
+
+func writeTestCertificate(t *testing.T, dir string) (certPath, keyPath string, roots *x509.CertPool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "ircthing integration fixture"},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	certPath = filepath.Join(dir, "server-cert.pem")
+	keyPath = filepath.Join(dir, "server-key.pem")
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	roots = x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(certPEM) {
+		t.Fatal("failed to install integration TLS root")
+	}
+	return certPath, keyPath, roots
+}
 
 func findErgo(t *testing.T) string {
 	t.Helper()
@@ -73,6 +137,9 @@ func startErgo(t *testing.T) string {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	certPath, keyPath, roots := writeTestCertificate(t, dir)
+	integrationTLSRoots.Store(addr, roots)
+	t.Cleanup(func() { integrationTLSRoots.Delete(addr) })
 
 	tmpl, err := os.ReadFile("testdata/ergo.yaml.tmpl")
 	if err != nil {
@@ -80,6 +147,8 @@ func startErgo(t *testing.T) string {
 	}
 	conf := strings.ReplaceAll(string(tmpl), "{{PORT}}", fmt.Sprint(port))
 	conf = strings.ReplaceAll(conf, "{{DIR}}", dir)
+	conf = strings.ReplaceAll(conf, "{{CERT}}", certPath)
+	conf = strings.ReplaceAll(conf, "{{KEY}}", keyPath)
 	confPath := filepath.Join(dir, "ircd.yaml")
 	if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
 		t.Fatal(err)
@@ -110,7 +179,10 @@ func startErgo(t *testing.T) string {
 
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		c, err := net.DialTimeout("tcp", addr, time.Second)
+		dialer := &net.Dialer{Timeout: time.Second}
+		c, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+			RootCAs: roots, ServerName: "127.0.0.1", MinVersion: tls.VersionTLS12,
+		})
 		if err == nil {
 			c.Close()
 			return addr
@@ -133,7 +205,14 @@ type rawClient struct {
 
 func dialRaw(t *testing.T, addr, nick string) *rawClient {
 	t.Helper()
-	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	rootsValue, ok := integrationTLSRoots.Load(addr)
+	if !ok {
+		t.Fatalf("no TLS root registered for integration endpoint %s", addr)
+	}
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	c, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+		RootCAs: rootsValue.(*x509.CertPool), ServerName: "127.0.0.1", MinVersion: tls.VersionTLS12,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +264,15 @@ type stack struct {
 
 func startStack(t *testing.T, st *store.Store, h *hub.Hub, cfg irc.Config) *stack {
 	t.Helper()
-	cfg.AllowPlaintext = true
+	rootsValue, ok := integrationTLSRoots.Load(cfg.Addr)
+	if !ok {
+		t.Fatalf("no TLS root registered for integration endpoint %s", cfg.Addr)
+	}
+	cfg.TLS = true
+	cfg.AllowPlaintext = false
+	cfg.TLSConfig = &tls.Config{
+		RootCAs: rootsValue.(*x509.CertPool), MinVersion: tls.VersionTLS12,
+	}
 	cfg.Backoff = irc.BackoffConfig{Min: 50 * time.Millisecond, Max: 200 * time.Millisecond}
 	// Keep flood protection out of the tests' way.
 	cfg.SendBurst = 64
@@ -220,7 +307,13 @@ func (s *stack) waitEnvelope(typ string, pred func(json.RawMessage) bool) hub.En
 	var seen []string
 	for {
 		select {
-		case env := <-s.sess.Outbound():
+		case queued := <-s.sess.Outbound():
+			var env hub.Envelope
+			if err := json.Unmarshal(queued.Data, &env); err != nil {
+				queued.Release()
+				s.t.Fatalf("decode queued frame: %v", err)
+			}
+			queued.Release()
 			if env.Type == typ && (pred == nil || pred(env.Data)) {
 				return env
 			}

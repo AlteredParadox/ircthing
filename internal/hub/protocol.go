@@ -149,6 +149,7 @@ type SearchReq struct {
 type SearchData struct {
 	Query    string      `json:"query"`
 	Messages []EventData `json:"messages"`
+	HasMore  bool        `json:"has_more"`
 }
 
 // HistoryData is the "history" response: messages in ascending time order.
@@ -156,6 +157,10 @@ type HistoryData struct {
 	Network  string      `json:"network"`
 	Buffer   string      `json:"buffer"`
 	Messages []EventData `json:"messages"`
+	// HasMore reports that additional messages exist beyond this response in
+	// the direction requested. A page may be shorter than the requested count
+	// when the encoded-byte limit, rather than the count limit, was reached.
+	HasMore bool `json:"has_more"`
 }
 
 // MarkerRef names a buffer's read marker ("get_read_marker").
@@ -202,6 +207,9 @@ type BufferInfo struct {
 type BuffersData struct {
 	Networks []NetworkInfo `json:"networks"`
 	Buffers  []BufferInfo  `json:"buffers"`
+	// Truncated is explicit because silently omitting buffers can otherwise
+	// look like data loss. The response favors the most recently active rows.
+	Truncated bool `json:"truncated"`
 }
 
 // SendData submits an outgoing message ("send"). Newlines split it into
@@ -247,6 +255,8 @@ type ChannelData struct {
 	Joined  bool         `json:"joined"`
 	Topic   string       `json:"topic"`
 	Members []MemberData `json:"members"`
+	// Truncated reports that the roster snapshot was bounded for transport.
+	Truncated bool `json:"truncated"`
 }
 
 // MembersChangedData is a server push hinting that channel state changed
@@ -340,14 +350,38 @@ func errEnvelope(seq int64, code, msg string) Envelope {
 // NetworkConfigData is one stored network definition plus its live
 // connection state ("" when not running).
 type NetworkConfigData struct {
-	Name   string          `json:"name"`
-	State  string          `json:"state,omitempty"`
-	Config json.RawMessage `json:"config"`
+	Name        string          `json:"name"`
+	State       string          `json:"state,omitempty"`
+	Config      json.RawMessage `json:"config,omitempty"`
+	Oversized   bool            `json:"oversized,omitempty"`
+	Invalid     bool            `json:"invalid,omitempty"`
+	InvalidName bool            `json:"invalid_name,omitempty"`
+	RecoveryID  int64           `json:"recovery_id,omitempty"`
 }
 
-// NetworksData answers "get_networks".
+// GetNetworksReq pages definitions by an opaque store cursor. Zero starts at
+// the beginning.
+type GetNetworksReq struct {
+	After int64 `json:"after,omitempty"`
+}
+
+// GetNetworkReq fetches exactly one definition for the edit form. Keeping this
+// separate from the recovery listing makes editability independent of page
+// count and concurrent insertions.
+type GetNetworkReq struct {
+	Network string `json:"network"`
+}
+
+// NetworksData answers "get_networks". Pages are explicit so a large set of
+// definitions can never exceed the WebSocket queue's single-frame budget.
 type NetworksData struct {
 	Networks []NetworkConfigData `json:"networks"`
+	HasMore  bool                `json:"has_more"`
+	Next     int64               `json:"next,omitempty"`
+}
+
+type NetworkData struct {
+	Network NetworkConfigData `json:"network"`
 }
 
 // PutNetworkReq adds or edits a network. OldName identifies the

@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,7 +50,13 @@ func recv(t *testing.T, s *Session, wantType string, skip ...string) Envelope {
 	timeout := time.After(5 * time.Second)
 	for {
 		select {
-		case env := <-s.Outbound():
+		case queued := <-s.Outbound():
+			var env Envelope
+			if err := json.Unmarshal(queued.Data, &env); err != nil {
+				queued.Release()
+				t.Fatalf("decode queued frame: %v", err)
+			}
+			queued.Release()
 			if env.Type == wantType {
 				return env
 			}
@@ -72,7 +79,10 @@ func recv(t *testing.T, s *Session, wantType string, skip ...string) Envelope {
 func expectSilence(t *testing.T, s *Session) {
 	t.Helper()
 	select {
-	case env := <-s.Outbound():
+	case queued := <-s.Outbound():
+		var env Envelope
+		_ = json.Unmarshal(queued.Data, &env)
+		queued.Release()
 		t.Fatalf("unexpected envelope: %+v", env)
 	case <-time.After(50 * time.Millisecond):
 	}
@@ -202,6 +212,115 @@ func TestSessionHistoryPaging(t *testing.T) {
 	}
 }
 
+func TestSessionQueueByteBudgetsReleaseExactlyOnce(t *testing.T) {
+	h := newTestHub(t)
+	h.sessionQueueBytes = 256
+	h.hubQueueBytes = 384
+	s := h.NewSession()
+	qenv := envelope("event", 0, strings.Repeat("x", 80))
+	s.push(qenv)
+	queued := <-s.Outbound()
+	if s.queuedBytes.Load() == 0 || h.queuedBytes.Load() == 0 {
+		t.Fatal("enqueue did not reserve bytes")
+	}
+	queued.Release()
+	queued.Release()
+	if got := s.queuedBytes.Load(); got != 0 {
+		t.Fatalf("session bytes after duplicate release = %d", got)
+	}
+	if got := h.queuedBytes.Load(); got != 0 {
+		t.Fatalf("hub bytes after duplicate release = %d", got)
+	}
+	s.Close()
+}
+
+func TestSessionQueuesFinalFrameAndBroadcastSharesEncoding(t *testing.T) {
+	h := newTestHub(t)
+	a := h.NewSession()
+	b := h.NewSession()
+	defer a.Close()
+	defer b.Close()
+	env := envelope("event", 0, map[string]string{"text": "hello"})
+	want, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.broadcast(env)
+	qa, qb := <-a.Outbound(), <-b.Outbound()
+	defer qa.Release()
+	defer qb.Release()
+	if string(qa.Data) != string(want) || string(qb.Data) != string(want) {
+		t.Fatalf("queued frame differs from final JSON: a=%q b=%q want=%q", qa.Data, qb.Data, want)
+	}
+	if len(qa.Data) > 0 && &qa.Data[0] != &qb.Data[0] {
+		t.Fatal("broadcast recipients did not share the immutable frame encoding")
+	}
+	if got := a.queuedBytes.Load(); got != int64(len(want)) {
+		t.Fatalf("exact reservation = %d, want %d", got, len(want))
+	}
+}
+
+func TestSessionDisconnectCannotRacePostDrainEnqueue(t *testing.T) {
+	h := newTestHub(t)
+	h.sessionQueueBytes = 1 << 20
+	h.hubQueueBytes = 1 << 20
+	s := h.NewSession()
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			s.push(envelope("event", 0, "payload"))
+		}()
+	}
+	close(start)
+	s.Close()
+	wg.Wait()
+	if got := s.queuedBytes.Load(); got != 0 {
+		t.Fatalf("session reservation leaked after close race: %d", got)
+	}
+	if got := h.queuedBytes.Load(); got != 0 {
+		t.Fatalf("hub reservation leaked after close race: %d", got)
+	}
+}
+
+func TestHistoryPayloadByteCapAndContinuation(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	raw := strings.Repeat("\x01", 16<<10)
+	for i := 0; i < 80; i++ {
+		if _, err := h.store.Append(ctx, "libera", "#big", store.Message{
+			Time: time.UnixMilli(int64(i + 1)), Sender: "alice", Command: "PRIVMSG", Raw: raw,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := h.NewSession()
+	defer s.Close()
+	s.Handle(ctx, request(t, "get_history", 1, HistoryReq{Network: "libera", Buffer: "#big", Limit: 500}))
+	env := recv(t, s, "history")
+	if len(env.Data) > maxHistoryPayloadBytes {
+		t.Fatalf("history payload = %d bytes, cap %d", len(env.Data), maxHistoryPayloadBytes)
+	}
+	page := decode[HistoryData](t, env)
+	if !page.HasMore || len(page.Messages) == 0 || len(page.Messages) >= maxHistoryMessages {
+		t.Fatalf("bounded page = %d messages, has_more=%v", len(page.Messages), page.HasMore)
+	}
+	oldest := page.Messages[0]
+	s.Handle(ctx, request(t, "get_history", 2, HistoryReq{
+		Network: "libera", Buffer: "#big", Before: &Cursor{TS: oldest.Time, ID: oldest.ID}, Limit: 500,
+	}))
+	older := decode[HistoryData](t, recv(t, s, "history"))
+	if len(older.Messages) == 0 {
+		t.Fatal("continuation page was empty")
+	}
+	if tail := older.Messages[len(older.Messages)-1]; tail.ID+1 != oldest.ID {
+		t.Fatalf("byte-capped pages left a gap: older tail=%+v, first=%+v", tail, oldest)
+	}
+}
+
 func TestSessionSearch(t *testing.T) {
 	h := newTestHub(t)
 	ctxb := context.Background()
@@ -248,6 +367,42 @@ func TestSessionSearch(t *testing.T) {
 	s.Handle(ctxb, request(t, "search", 6, SearchReq{Query: "   "}))
 	if got := decode[ErrorData](t, recv(t, s, "error")); got.Code != "bad_request" {
 		t.Fatalf("empty query code = %q", got.Code)
+	}
+}
+
+func TestSessionSearchBoundsQueryAndEncodedResponse(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	// Control bytes expand sixfold in JSON, exercising the encoded-byte cap
+	// well before the count cap.
+	raw := strings.Repeat("\x01", 16<<10)
+	for i := 0; i < maxSearchMessages+8; i++ {
+		if _, err := h.store.Append(ctx, "libera", "#big", store.Message{
+			Time: time.UnixMilli(int64(i + 1)), Sender: "alice", Command: "PRIVMSG",
+			Raw: raw, Text: "needle",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := h.NewSession()
+	defer s.Close()
+	s.Handle(ctx, request(t, "search", 1, SearchReq{Query: "needle", Limit: 500}))
+	env := recv(t, s, "search_results")
+	if len(env.Data) > maxHistoryPayloadBytes {
+		t.Fatalf("search payload = %d, cap %d", len(env.Data), maxHistoryPayloadBytes)
+	}
+	got := decode[SearchData](t, env)
+	if !got.HasMore || len(got.Messages) == 0 || len(got.Messages) >= maxSearchMessages {
+		t.Fatalf("bounded search = %d results, has_more=%v", len(got.Messages), got.HasMore)
+	}
+
+	s.Handle(ctx, request(t, "search", 2, SearchReq{Query: strings.Repeat("x", maxSearchQueryBytes+1)}))
+	if got := decode[ErrorData](t, recv(t, s, "error")); got.Code != "bad_request" {
+		t.Fatalf("oversized query code = %q", got.Code)
+	}
+	s.Handle(ctx, request(t, "search", 3, SearchReq{Query: strings.Repeat("x ", maxSearchTerms+1)}))
+	if got := decode[ErrorData](t, recv(t, s, "error")); got.Code != "bad_request" {
+		t.Fatalf("too-many-terms code = %q", got.Code)
 	}
 }
 
@@ -473,6 +628,39 @@ func TestSessionGetBuffers(t *testing.T) {
 	if len(data.Buffers) != 1 || data.Buffers[0].Buffer != "#go" ||
 		data.Buffers[0].Unread != 3 || data.Buffers[0].LastTime != 3000 {
 		t.Fatalf("buffers = %+v", data.Buffers)
+	}
+}
+
+func TestSessionGetBuffersIsBoundedAndExplicitlyTruncated(t *testing.T) {
+	h := newTestHub(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := &fakeConn{ch: make(chan irc.Event), name: "libera", nick: "me"}
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	for i := 0; i < maxBufferResponseRows+1; i++ {
+		target := fmt.Sprintf("#%04d-%s", i, strings.Repeat("x", 500))
+		if _, err := h.store.Append(ctx, "libera", target, store.Message{
+			Time: time.UnixMilli(int64(i + 1)), Sender: "alice", Command: "PRIVMSG", Raw: "message",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := h.NewSession()
+	defer s.Close()
+	s.Handle(ctx, request(t, "get_buffers", 1, nil))
+	env := recv(t, s, "buffers")
+	if len(env.Data) > maxHistoryPayloadBytes {
+		t.Fatalf("buffers payload = %d, cap %d", len(env.Data), maxHistoryPayloadBytes)
+	}
+	got := decode[BuffersData](t, env)
+	if !got.Truncated || len(got.Buffers) == 0 || len(got.Buffers) > maxBufferResponseRows {
+		t.Fatalf("bounded buffers = %d, truncated=%v", len(got.Buffers), got.Truncated)
+	}
+	select {
+	case <-s.Done():
+		t.Fatal("valid bounded buffer response evicted the session")
+	default:
 	}
 }
 
@@ -1007,6 +1195,41 @@ func TestSessionGetChannel(t *testing.T) {
 	s.Handle(ctx, request(t, "get_channel", 7, ChannelReq{Network: "ghost", Buffer: "#go"}))
 	if got := decode[ChannelData](t, recv(t, s, "channel")); got.Joined {
 		t.Fatalf("ghost network = %+v", got)
+	}
+}
+
+func TestSessionGetChannelIsBoundedAndExplicitlyTruncated(t *testing.T) {
+	h := newTestHub(t)
+	members := make([]irc.Member, maxChannelResponseMembers+20)
+	large := strings.Repeat("\x01", 512)
+	for i := range members {
+		members[i] = irc.Member{
+			Nick: fmt.Sprintf("nick%04d", i), Account: large, User: large, Host: large,
+		}
+	}
+	conn := &fakeConn{
+		ch: make(chan irc.Event), name: "libera", nick: "me",
+		chans: map[string][]irc.Member{"#large": members},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	s := h.NewSession()
+	defer s.Close()
+	s.Handle(ctx, request(t, "get_channel", 1, ChannelReq{Network: "libera", Buffer: "#large"}))
+	env := recv(t, s, "channel")
+	if len(env.Data) > maxHistoryPayloadBytes {
+		t.Fatalf("channel payload = %d, cap %d", len(env.Data), maxHistoryPayloadBytes)
+	}
+	got := decode[ChannelData](t, env)
+	if !got.Joined || !got.Truncated || len(got.Members) == 0 || len(got.Members) >= maxChannelResponseMembers {
+		t.Fatalf("bounded channel = joined=%v members=%d truncated=%v", got.Joined, len(got.Members), got.Truncated)
+	}
+	select {
+	case <-s.Done():
+		t.Fatal("valid bounded channel response evicted the session")
+	default:
 	}
 }
 

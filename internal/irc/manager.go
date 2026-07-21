@@ -177,6 +177,30 @@ type Manager struct {
 	stsPort    int
 	stsUntil   time.Time
 	stsLastDur time.Duration
+	// stsRevision is the persistent hostname-policy generation loaded/written
+	// by this manager. stsRevisionKnown says whether it is safe to use as a CAS
+	// base.
+	stsRevision      uint64
+	stsRevisionKnown bool
+	// stsPolicyEpoch is the semantic policy generation. Unlike stsRevision it
+	// does not change for disconnect-time expiry reschedules, so a successful
+	// reschedule by another profile cannot make us discard a newer verified
+	// policy whose full persistence failed.
+	stsPolicyEpoch      uint64
+	stsPolicyEpochKnown bool
+	stsSession          bool // insecure CAP LS upgrade not yet backed by persistence
+	// stsDirty retains an active policy learned on a verified TLS connection (or
+	// its disconnect-time expiry extension) when persistence fails. Reloads
+	// merge it with the store until a different shared policy epoch proves that
+	// another manager published a newer authoritative policy.
+	stsDirty bool
+	// stsDirtyFull is set when publishing a newly advertised policy failed.
+	// Disconnect-time rescheduling cannot repair that with an expiry-only CAS
+	// (the port/duration may also have changed), so it retains the local policy
+	// until a future secure advertisement retries the full write.
+	stsDirtyFull           bool
+	stsDirtyBaseEpoch      uint64
+	stsDirtyBaseEpochKnown bool
 
 	batchSeq atomic.Uint64 // outgoing multiline batch reference counter
 
@@ -186,11 +210,12 @@ type Manager struct {
 	dropCount int
 	dropLogAt time.Time
 
-	// wgMu guards wgTun, the lazily-built WireGuard egress tunnel. Built on
-	// first dial when cfg.WireGuard != nil, reused across reconnects, torn
-	// down when Run returns.
-	wgMu  sync.Mutex
-	wgTun *wgdial.Tunnel
+	// wgTun publishes the lazily-built WireGuard egress tunnel. Only the Run
+	// goroutine builds/re-resolves it and wgClose swaps it away, while media
+	// request goroutines only Load it. Keeping the long endpoint resolution and
+	// tunnel build outside a mutex means a canceled HTTP request can never hang
+	// behind that work merely to discover that the tunnel is not ready yet.
+	wgTun atomic.Pointer[wgdial.Tunnel]
 }
 
 // Name returns the configured network label.
@@ -349,6 +374,12 @@ func (m *Manager) StatusPrefixes() string {
 // ok is false for channels we are not in (or before registration).
 func (m *Manager) Channel(name string) (topic string, members []Member, ok bool) {
 	return m.roster.channel(name)
+}
+
+// ChannelPage is the transport-facing bounded roster snapshot. Channel stays
+// available for internal callers/tests that explicitly need the full state.
+func (m *Manager) ChannelPage(name string, limit int) (topic string, members []Member, truncated, ok bool) {
+	return m.roster.channelPage(name, limit)
 }
 
 // EnsureNames requests the membership of a channel we have not fetched
@@ -974,7 +1005,8 @@ func (m *Manager) setRegistered(v bool) {
 func (m *Manager) Run(ctx context.Context) error {
 	defer m.wgClose()
 	bo := newBackoff(m.cfg.Backoff)
-	// Load the STS policy before the first dial. For a PLAINTEXT-configured
+	stsBO := newBackoff(m.cfg.Backoff)
+	// Load the STS policy before EVERY dial. For a PLAINTEXT-configured
 	// network this is FAIL CLOSED: while the policy state is indeterminate — a
 	// store read error, or a nonempty corrupt record we cannot honor — we must
 	// not dial in cleartext, because an active policy may require TLS (STS
@@ -985,19 +1017,22 @@ func (m *Manager) Run(ctx context.Context) error {
 	// network from connecting until the sts:<host> row is cleared — that is
 	// the spec-mandated cost of fail-closed, not a bug.
 	for {
-		err := m.loadSTS(ctx)
-		if err == nil || m.cfg.TLS {
-			break
+		for {
+			err := m.loadSTS(ctx)
+			if err == nil || m.cfg.TLS {
+				if err != nil {
+					log.Printf("irc[%s]: STS policy reload failed on an already-TLS configuration: %v", m.cfg.Name, err)
+				}
+				stsBO.reset()
+				break
+			}
+			log.Printf("irc[%s]: refusing to connect until the STS policy is readable (a plaintext downgrade is unsafe): %v", m.cfg.Name, err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(stsBO.next()):
+			}
 		}
-		log.Printf("irc[%s]: refusing to connect until the STS policy is readable (a plaintext downgrade is unsafe): %v", m.cfg.Name, err)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(bo.next()):
-		}
-	}
-	bo.reset() // don't carry STS-load backoff into the connect loop
-	for {
 		m.emit(ctx, Event{Kind: EventState, State: StateConnecting})
 		err := m.runOnce(ctx, bo)
 		if ctx.Err() != nil {
@@ -1008,7 +1043,8 @@ func (m *Manager) Run(ctx context.Context) error {
 		var up errSTSUpgrade
 		if errors.As(err, &up) {
 			m.stsMu.Lock()
-			m.stsPort, m.stsUntil = up.port, time.Time{}
+			m.stsPort, m.stsUntil, m.stsLastDur = up.port, time.Time{}, 0
+			m.stsSession = true
 			m.stsMu.Unlock()
 			continue
 		}
@@ -1033,22 +1069,54 @@ func (m *Manager) loadSTS(ctx context.Context) error {
 	if err != nil {
 		return nil // a malformed addr fails at dial time; nothing to load here
 	}
-	port, until, duration, ok, err := m.cfg.STS.STSPolicy(ctx, host)
+	host = canonicalSTSHost(host)
+	port, until, duration, revision, policyEpoch, ok, err := m.cfg.STS.STSPolicy(ctx, host)
 	if err != nil {
 		return err
 	}
-	if !ok || !time.Now().Before(until) {
+	m.stsMu.Lock()
+	defer m.stsMu.Unlock()
+	now := time.Now()
+	storeActive := ok && now.Before(until)
+	localActive := m.stsPort > 0 && (m.stsUntil.IsZero() || now.Before(m.stsUntil))
+	if m.stsDirty {
+		// Only a changed POLICY epoch is an explicit hostname-wide update. The
+		// record revision also changes when another manager merely reschedules the
+		// OLD policy's expiry; treating that as authoritative would discard a
+		// newer verified policy after its full write failed, creating a live STS
+		// downgrade window.
+		newerShared := m.stsDirtyBaseEpochKnown && policyEpoch != m.stsDirtyBaseEpoch
+		if !newerShared && localActive {
+			// A failed FULL write is the only verified copy of its port/duration,
+			// so retain it until a semantic policy update supersedes it. A failed
+			// expiry-only write can merge with the same stored policy and keep the
+			// later expiry.
+			if m.stsDirtyFull || !storeActive || m.stsUntil.After(until) {
+				m.stsRevision, m.stsRevisionKnown = revision, true
+				m.stsPolicyEpoch, m.stsPolicyEpochKnown = policyEpoch, true
+				m.stsDirtyBaseEpoch, m.stsDirtyBaseEpochKnown = policyEpoch, true
+				return nil
+			}
+		}
+		// A newer shared policy epoch, an expired local policy, or an equal/
+		// stronger stored policy resolves the dirty state in favor of the store.
+		m.stsDirty = false
+		m.stsDirtyFull = false
+		m.stsDirtyBaseEpochKnown = false
+	}
+	m.stsRevision, m.stsRevisionKnown = revision, true
+	m.stsPolicyEpoch, m.stsPolicyEpochKnown = policyEpoch, true
+	if storeActive {
+		m.stsPort, m.stsUntil, m.stsLastDur = port, until, duration
+		m.stsSession = false
 		return nil
 	}
-	m.stsMu.Lock()
-	m.stsPort, m.stsUntil = port, until
-	// Restore the last advertised duration so rescheduleSTS can extend the
-	// expiry on disconnect after a restart — without it, a cached policy would
-	// expire at its stored `until` unless the server re-advertised STS.
-	if duration > 0 {
-		m.stsLastDur = duration
+	// Preserve an upgrade advertised on the immediately preceding insecure
+	// connection: it is deliberately session-only until the secure redial
+	// confirms a duration. Otherwise absence/expiry clears stale local state.
+	if !m.stsSession {
+		m.stsPort, m.stsUntil, m.stsLastDur = 0, time.Time{}, 0
 	}
-	m.stsMu.Unlock()
 	return nil
 }
 
@@ -1081,6 +1149,7 @@ func (m *Manager) applySTS(ctx context.Context, connAddr string, d time.Duration
 	if err != nil {
 		return
 	}
+	host = canonicalSTSHost(host)
 	_, portStr, err := net.SplitHostPort(connAddr)
 	if err != nil {
 		return
@@ -1091,11 +1160,14 @@ func (m *Manager) applySTS(ctx context.Context, connAddr string, d time.Duration
 	}
 	until := time.Now().Add(d)
 	m.stsMu.Lock()
+	baseRevision, baseRevisionKnown := m.stsRevision, m.stsRevisionKnown
+	baseEpoch, baseEpochKnown := m.stsPolicyEpoch, m.stsPolicyEpochKnown
 	if d == 0 {
 		m.stsPort, m.stsUntil, m.stsLastDur = 0, time.Time{}, 0
 	} else {
 		m.stsPort, m.stsUntil, m.stsLastDur = port, until, d
 	}
+	m.stsSession = false
 	m.stsMu.Unlock()
 	if m.cfg.STS == nil {
 		return
@@ -1104,12 +1176,41 @@ func (m *Manager) applySTS(ctx context.Context, connAddr string, d time.Duration
 	// process, but if the write never landed, a restart loses downgrade
 	// protection and a plaintext-configured network reconnects in cleartext.
 	if d == 0 {
-		if err := m.cfg.STS.ClearSTSPolicy(ctx, host); err != nil {
+		revision, policyEpoch, err := m.cfg.STS.ClearSTSPolicy(ctx, host)
+		m.stsMu.Lock()
+		if err == nil {
+			m.stsRevision, m.stsRevisionKnown = revision, true
+			m.stsPolicyEpoch, m.stsPolicyEpochKnown = policyEpoch, true
+		}
+		m.stsDirty = false // a failed clear leaves the stronger stored policy
+		m.stsDirtyFull = false
+		m.stsDirtyBaseEpochKnown = false
+		m.stsMu.Unlock()
+		if err != nil {
 			log.Printf("irc[%s]: STS policy clear failed (%v) — a stale policy may persist for %s", m.cfg.Name, err, host)
 		}
 		return
 	}
-	if err := m.cfg.STS.SetSTSPolicy(ctx, host, port, until, d); err != nil {
+	revision, policyEpoch, err := m.cfg.STS.SetSTSPolicy(ctx, host, port, until, d)
+	m.stsMu.Lock()
+	if err == nil {
+		m.stsRevision, m.stsRevisionKnown = revision, true
+		m.stsPolicyEpoch, m.stsPolicyEpochKnown = policyEpoch, true
+		m.stsDirty = false
+		m.stsDirtyFull = false
+		m.stsDirtyBaseEpochKnown = false
+	} else {
+		// Keep the verified local policy across the reload before reconnect.
+		// The base POLICY epoch lets a later semantic update supersede it while
+		// an expiry-only reschedule of the old policy cannot.
+		m.stsRevision, m.stsRevisionKnown = baseRevision, baseRevisionKnown
+		m.stsPolicyEpoch, m.stsPolicyEpochKnown = baseEpoch, baseEpochKnown
+		m.stsDirty = true
+		m.stsDirtyFull = true
+		m.stsDirtyBaseEpoch, m.stsDirtyBaseEpochKnown = baseEpoch, baseEpochKnown
+	}
+	m.stsMu.Unlock()
+	if err != nil {
 		log.Printf("irc[%s]: STS POLICY PERSIST FAILED (%v) — downgrade protection for %s will be lost on restart", m.cfg.Name, err, host)
 	}
 }
@@ -1119,6 +1220,9 @@ func (m *Manager) applySTS(ctx context.Context, connAddr string, d time.Duration
 func (m *Manager) rescheduleSTS(ctx context.Context) {
 	m.stsMu.Lock()
 	d, port := m.stsLastDur, m.stsPort
+	revision, revisionKnown := m.stsRevision, m.stsRevisionKnown
+	policyEpoch, policyEpochKnown := m.stsPolicyEpoch, m.stsPolicyEpochKnown
+	dirtyFull := m.stsDirty && m.stsDirtyFull
 	if d <= 0 || port == 0 {
 		m.stsMu.Unlock()
 		return
@@ -1129,10 +1233,44 @@ func (m *Manager) rescheduleSTS(ctx context.Context) {
 	if m.cfg.STS == nil {
 		return
 	}
+	if dirtyFull {
+		// The full policy write failed. An expiry-only CAS could persist the
+		// previous port/duration and then make reload replace the newer verified
+		// local policy. Keep enforcing the local extension; a later secure STS
+		// advertisement retries SetSTSPolicy.
+		return
+	}
 	if host, _, err := net.SplitHostPort(m.cfg.Addr); err == nil {
-		if perr := m.cfg.STS.SetSTSPolicy(context.WithoutCancel(ctx), host, port, until, d); perr != nil {
-			log.Printf("irc[%s]: STS POLICY RESCHEDULE PERSIST FAILED (%v) — downgrade protection for %s will be lost on restart", m.cfg.Name, perr, host)
+		if !revisionKnown {
+			return
 		}
+		host = canonicalSTSHost(host)
+		newRevision, applied, perr := m.cfg.STS.RescheduleSTSPolicy(context.WithoutCancel(ctx), host, revision, until)
+		if perr != nil {
+			m.stsMu.Lock()
+			m.stsDirty = true
+			m.stsDirtyFull = false
+			m.stsDirtyBaseEpoch, m.stsDirtyBaseEpochKnown = policyEpoch, policyEpochKnown
+			m.stsMu.Unlock()
+			log.Printf("irc[%s]: STS POLICY RESCHEDULE PERSIST FAILED (%v) — downgrade protection for %s will be lost on restart", m.cfg.Name, perr, host)
+			return
+		}
+		m.stsMu.Lock()
+		if applied {
+			m.stsRevision = newRevision
+			m.stsRevisionKnown = true
+			m.stsDirty = false
+			m.stsDirtyFull = false
+			m.stsDirtyBaseEpochKnown = false
+		} else {
+			// The local expiry extension was not persisted. Keep it dirty until
+			// reload sees the store's policy epoch: a semantic Set/Clear wins,
+			// while a same-policy reschedule/migration merges the later expiry.
+			m.stsDirty = true
+			m.stsDirtyFull = false
+			m.stsDirtyBaseEpoch, m.stsDirtyBaseEpochKnown = policyEpoch, policyEpochKnown
+		}
+		m.stsMu.Unlock()
 	}
 }
 
@@ -1250,12 +1388,12 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	blr := newBoundedLineReader(conn)
 	r := ircv4.NewReader(blr)
 	w := ircv4.NewWriter(conn)
-	if os.Getenv("IRCTHING_DEBUG_RAW") != "" {
+	if debugEnvFlag(os.Getenv("IRCTHING_DEBUG_RAW")) {
 		r.DebugCallback = func(line string) {
-			log.Printf("irc[%s] << %s", m.cfg.Name, redactRaw(line))
+			log.Printf("irc[%q] direction=in %s", m.cfg.Name, summarizeIRCLine(line))
 		}
 		w.DebugCallback = func(line string) {
-			log.Printf("irc[%s] >> %s", m.cfg.Name, redactRaw(line))
+			log.Printf("irc[%q] direction=out %s", m.cfg.Name, summarizeIRCLine(line))
 		}
 	}
 	// Snapshot the rejoin set BEFORE creating the internal lane so it can be
@@ -1864,29 +2002,41 @@ const maxChannelNameBytes = maxRosterField
 // own-message classification everywhere.
 const maxAuthoritativeNickBytes = maxRosterField
 
-// redactRaw prepares one raw IRC line for the debug log with credentials
-// removed: the PASS parameter (server password) and any non-control
-// AUTHENTICATE payload (SASL PLAIN reveals the password outright, and a
-// SCRAM transcript enables offline guessing). Everything else is logged
-// verbatim. "+" and "*" are AUTHENTICATE control tokens and carry no
-// secret.
-func redactRaw(line string) string {
+// debugEnvFlag requires an explicit affirmative value. This prevents a common
+// production mistake such as IRCTHING_DEBUG_RAW=0 enabling diagnostics.
+func debugEnvFlag(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// summarizeIRCLine provides useful protocol-level diagnostics without logging
+// targets, hostmasks, tags, message text, PASS, or SASL transcripts. Even
+// SCRAM exchanges enable offline guessing, and ordinary PRIVMSG/NOTICE content
+// is private, so redacting only the obvious password commands is insufficient
+// for an Internet-facing service whose logs may persist in journald/backups.
+func summarizeIRCLine(line string) string {
 	trimmed := strings.TrimRight(line, "\r\n")
 	msg, err := ircv4.ParseMessage(trimmed)
 	if err != nil {
-		return trimmed
+		return fmt.Sprintf("command=unparseable bytes=%d", len(trimmed))
 	}
-	switch strings.ToUpper(msg.Command) {
-	case "PASS":
-		if len(msg.Params) > 0 {
-			return "PASS <redacted>"
-		}
-	case "AUTHENTICATE":
-		if p := msg.Param(0); p != "" && p != "+" && p != "*" {
-			return "AUTHENTICATE <redacted>"
+	command := strings.ToUpper(msg.Command)
+	if len(command) == 0 || len(command) > 16 {
+		command = "invalid"
+	} else {
+		for _, c := range []byte(command) {
+			if (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
+				command = "invalid"
+				break
+			}
 		}
 	}
-	return trimmed
+	return fmt.Sprintf("command=%s params=%d tags=%d prefix=%t bytes=%d",
+		command, len(msg.Params), len(msg.Tags), msg.Prefix != nil, len(trimmed))
 }
 
 // writeLoop is the per-connection writer goroutine: it serializes
@@ -2045,37 +2195,31 @@ func (m *Manager) dial(ctx context.Context, addr string, secure bool) (net.Conn,
 // rather than caching the error forever. Target DNS resolves through the
 // tunnel's in-band resolver — no local-resolver leak.
 func (m *Manager) dialWireGuard(ctx context.Context, addr string) (net.Conn, error) {
-	// Invariant: the tunnel is BUILT and TORN DOWN only on the single Run
-	// goroutine — dialWireGuard (dial <- runOnce <- Run) builds; wgClose (Run's
-	// defer) closes. So wgTun is written only here and in wgClose, both under
-	// wgMu. wgMu IS contended: MediaDialContext reads wgTun from the media
-	// (HTTP) goroutine — but READ-ONLY, so it can't double-build or leak a
-	// tunnel past wgClose. Keep the build/teardown Run-goroutine-only: an
-	// off-Run path that BUILT a tunnel could do so after wgClose, leaking a
-	// device nothing would ever Close. wgMu therefore guards every wgTun access.
-	m.wgMu.Lock()
-	if m.wgTun == nil {
+	// Invariant: only the single Run goroutine builds and re-resolves a tunnel;
+	// MediaDialContext merely snapshots the published pointer. Build and DNS
+	// refresh can take the full DialTimeout, so they must happen before/without
+	// publishing rather than while holding a lock needed by HTTP cancellation.
+	tun := m.wgTun.Load()
+	if tun == nil {
 		// Build (incl. endpoint resolution) gets its OWN DialTimeout budget.
 		bctx, cancel := m.dialCtx(ctx)
 		t, err := wgdial.New(bctx, *m.cfg.WireGuard)
 		cancel()
 		if err != nil {
-			m.wgMu.Unlock()
 			return nil, err
 		}
-		m.wgTun = t
+		tun = t
+		m.wgTun.Store(t)
 	} else {
 		// Reconnect: best-effort endpoint refresh (DNS failover / dynamic
 		// endpoint), bounded by its OWN timeout so a stalled lookup can't consume
 		// the dial's budget below — on failure the existing endpoint is kept.
 		rctx, cancel := m.dialCtx(ctx)
-		if err := m.wgTun.Reresolve(rctx); err != nil {
+		if err := tun.Reresolve(rctx); err != nil {
 			log.Printf("irc[%s]: wireguard re-resolve endpoint: %v", m.cfg.Name, err)
 		}
 		cancel()
 	}
-	tun := m.wgTun
-	m.wgMu.Unlock()
 
 	// The dial gets a FRESH DialTimeout, independent of whatever the build or
 	// re-resolve above consumed — a slow endpoint lookup must never hand the dial
@@ -2097,17 +2241,15 @@ func (m *Manager) dialCtx(ctx context.Context) (context.Context, context.CancelF
 
 // MediaDialContext dials addr through this network's LIVE WireGuard tunnel for
 // an off-Run-goroutine caller (the media proxy fetching a link/image preview
-// for a link seen on this network). It only READS the current tunnel under
-// wgMu — it never builds or re-resolves one (that stays Run-goroutine-only, per
-// the dialWireGuard invariant), so it can't leak a tunnel past wgClose. Returns
+// for a link seen on this network). It only atomically READS the current tunnel
+// — it never builds or re-resolves one (that stays Run-goroutine-only, per the
+// dialWireGuard invariant), so it can't leak a tunnel past wgClose. Returns
 // an error when no tunnel is up yet (network connecting / between reconnects)
 // or if it was torn down concurrently (DialContext then fails gracefully, not
 // a panic); the media path turns that into a refused (no) preview rather than
 // ever falling back to a direct fetch that would leak the real IP.
 func (m *Manager) MediaDialContext(ctx context.Context, addr string) (net.Conn, error) {
-	m.wgMu.Lock()
-	tun := m.wgTun
-	m.wgMu.Unlock()
+	tun := m.wgTun.Load()
 	if tun == nil {
 		return nil, errors.New("irc: wireguard tunnel not available")
 	}
@@ -2118,10 +2260,7 @@ func (m *Manager) MediaDialContext(ctx context.Context, addr string) (net.Conn, 
 // returns (context cancelled), so a removed/stopped network doesn't leak the
 // userspace device goroutines or its UDP socket.
 func (m *Manager) wgClose() {
-	m.wgMu.Lock()
-	t := m.wgTun
-	m.wgTun = nil
-	m.wgMu.Unlock()
+	t := m.wgTun.Swap(nil)
 	if t != nil {
 		t.Close()
 	}

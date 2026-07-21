@@ -17,13 +17,32 @@
 package proxydial
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 )
+
+// scriptedConn supplies a fixed peer response while accepting writes. It lets
+// framing tests distinguish a complete deterministic rejection from a partial
+// network read without coordinating a second net.Pipe goroutine.
+type scriptedConn struct{ bytes.Reader }
+
+func newScriptedConn(in []byte) *scriptedConn {
+	return &scriptedConn{Reader: *bytes.NewReader(in)}
+}
+
+func (c *scriptedConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (c *scriptedConn) Close() error                     { return nil }
+func (c *scriptedConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *scriptedConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *scriptedConn) SetDeadline(time.Time) error      { return nil }
+func (c *scriptedConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *scriptedConn) SetWriteDeadline(time.Time) error { return nil }
 
 // A rejected proxy URL must not leak its credentials in the error message.
 func TestParseNeverLeaksCredentials(t *testing.T) {
@@ -78,7 +97,7 @@ func TestParse(t *testing.T) {
 		"socks5://host:0",         // port below range
 		"socks5://host:65536",     // port above range
 		// RFC 1929: one-byte length fields, both 1-255 octets.
-		"socks5://" + strings.Repeat("u", 256) + ":pw@host:1080", // username too long
+		"socks5://" + strings.Repeat("u", 256) + ":pw@host:1080",   // username too long
 		"socks5://user:" + strings.Repeat("p", 256) + "@host:1080", // password too long
 		"socks5://user@host:1080",                                  // SOCKS needs a password too
 		"socks5://user:@host:1080",                                 // empty SOCKS password
@@ -88,8 +107,8 @@ func TestParse(t *testing.T) {
 		// that is not tested here as an error.)
 		"http://a\x01b:pw@host:3128",   // control char in HTTP username
 		"http://user:p\x7fw@host:3128", // DEL in HTTP password
-		"socks5://host:+6667", // signed port — strconv.Atoi would accept it
-		"socks5://host:66 66", // whitespace in port
+		"socks5://host:+6667",          // signed port — strconv.Atoi would accept it
+		"socks5://host:66 66",          // whitespace in port
 	}
 	for _, s := range bad {
 		if _, err := Parse(s); err == nil {
@@ -168,5 +187,50 @@ func TestDialRejectsInvalidBeforeConnecting(t *testing.T) {
 		if strings.Contains(err.Error(), "secret") {
 			t.Errorf("%s: error leaked a credential: %v", tc.name, err)
 		}
+	}
+}
+
+func TestCompleteProxyFramingErrorsArePermanent(t *testing.T) {
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{"SOCKS greeting version", func() error {
+			return socks5Negotiate(newScriptedConn([]byte{4, 0}), nil)
+		}},
+		{"SOCKS reply address type", func() error {
+			return socks5ReadReply(newScriptedConn([]byte{5, 0, 0, 9}))
+		}},
+		{"SOCKS reply code", func() error {
+			return socks5ReadReply(newScriptedConn([]byte{5, 0xff, 0, 1}))
+		}},
+		{"HTTP CONNECT header cap", func() error {
+			return httpConnect(newScriptedConn(bytes.Repeat([]byte{'x'}, 8200)), nil, "example.com:443")
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.call(); !errors.Is(err, ErrProxyProtocol) {
+				t.Fatalf("err = %v, want ErrProxyProtocol", err)
+			}
+		})
+	}
+}
+
+func TestPartialProxyResponsesRemainTransientIOErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func() error
+	}{
+		{"SOCKS greeting", func() error { return socks5Negotiate(newScriptedConn([]byte{5}), nil) }},
+		{"SOCKS reply", func() error { return socks5ReadReply(newScriptedConn([]byte{5, 0})) }},
+		{"HTTP CONNECT", func() error { return httpConnect(newScriptedConn([]byte("HTTP/1.1 200")), nil, "example.com:443") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call()
+			if err == nil || errors.Is(err, ErrProxyProtocol) {
+				t.Fatalf("err = %v, want an unclassified partial-I/O failure", err)
+			}
+		})
 	}
 }

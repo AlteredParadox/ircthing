@@ -19,6 +19,7 @@ package irc
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -60,6 +61,7 @@ func b64(login, pass string) string {
 func TestHandshake(t *testing.T) {
 	baseCfg := Config{Addr: "irc.test:6667", Nick: "AlteredParadox", AllowPlaintext: true}
 	saslCfg := baseCfg
+	saslCfg.TLS = true
 	saslCfg.SASL = &SASLConfig{Mechanism: "PLAIN", Login: "AlteredParadox", Password: "sesame"}
 	authLine := "AUTHENTICATE " + b64("AlteredParadox", "sesame")
 
@@ -99,15 +101,15 @@ func TestHandshake(t *testing.T) {
 			name: "PASS and explicit username/realname",
 			cfg: func() Config {
 				c := baseCfg
+				c.TLS = true
 				c.Pass = "hunter2"
 				c.Username = "u"
 				c.Realname = "Real Name"
 				return c
 			}(),
-			wantStart: []string{"CAP LS 302", "NICK AlteredParadox", "USER u 0 * :Real Name"},
+			wantStart: []string{"CAP LS 302", "PASS hunter2", "NICK AlteredParadox", "USER u 0 * :Real Name"},
 			steps: []step{
-				// PASS is deferred until the CAP LS reply (post-STS-check).
-				{in: "CAP * LS :sasl", want: []string{"PASS hunter2", "CAP END"}},
+				{in: "CAP * LS :sasl", want: []string{"CAP END"}},
 				{in: ":irc.test 001 AlteredParadox :Welcome", done: true},
 			},
 		},
@@ -128,6 +130,7 @@ func TestHandshake(t *testing.T) {
 			name: "SASL EXTERNAL sends an empty response",
 			cfg: func() Config {
 				c := baseCfg
+				c.TLS = true
 				c.SASL = &SASLConfig{Mechanism: "EXTERNAL"}
 				return c
 			}(),
@@ -556,9 +559,9 @@ func TestMechListed(t *testing.T) {
 	}
 }
 
-// On a secure link PASS is sent up front (no eavesdropper), which also
-// reaches servers that never reply to CAP LS; on an insecure link it is
-// deferred to the CAP LS reply (STS protection).
+// PASS is emitted on a secure transport only. On an insecure connection it is
+// held through CAP LS so STS gets its required chance to upgrade, then refused
+// if no upgrade policy was advertised.
 func TestHandshakePassSecureVsInsecure(t *testing.T) {
 	cfg := Config{Addr: "x:1", Nick: "AlteredParadox", Pass: "s3cret", TLS: true}
 
@@ -577,24 +580,89 @@ func TestHandshakePassSecureVsInsecure(t *testing.T) {
 
 	insecure := newHandshake(&cfg)
 	insecure.secure = false
-	for _, l := range wire(insecure.start()) {
-		if l == "PASS s3cret" {
-			t.Fatal("insecure start() leaked PASS before the STS decision")
-		}
+	if got, want := wire(insecure.start()), []string{"CAP LS 302"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("insecure credentialed start() = %q, want only %q (no PASS/NICK/USER identity leak)", got, want)
 	}
-	// The deferred PASS comes with the CAP LS reply (no STS).
+	// No STS upgrade means the credential-bearing registration is refused.
 	out, _, err := insecure.handle(ircv4.MustParseMessage("CAP * LS :multi-prefix"))
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "requires TLS") {
+		t.Fatalf("insecure CAP LS err = %v, want TLS-required rejection", err)
 	}
-	found = false
 	for _, l := range wire(out) {
 		if l == "PASS s3cret" {
-			found = true
+			t.Fatalf("insecure CAP LS emitted PASS: %q", wire(out))
 		}
 	}
-	if !found {
-		t.Fatalf("insecure CAP LS reply = %q, want deferred PASS", wire(out))
+	// The peer has not actually seen a NICK, but a forged collision numeric must
+	// not elicit a fallback derived from the configured identity either.
+	forged := newHandshake(&cfg)
+	forged.secure = false
+	forged.start()
+	out, done, err := forged.handle(ircv4.MustParseMessage(":srv 433 * unknown :in use"))
+	if err == nil || done || len(out) != 0 {
+		t.Fatalf("forged plaintext 433 = out %q done=%v err=%v, want abort without NICK", wire(out), done, err)
+	}
+
+	// STS is processed before the credential gate, so an insecure bootstrap can
+	// still upgrade and retry without emitting PASS on the first connection.
+	upgrade := newHandshake(&cfg)
+	upgrade.secure = false
+	if got, want := wire(upgrade.start()), []string{"CAP LS 302"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("STS bootstrap start() = %q, want only %q", got, want)
+	}
+	out, _, err = upgrade.handle(ircv4.MustParseMessage("CAP * LS :sts=port=6697 multi-prefix"))
+	var up errSTSUpgrade
+	if !errors.As(err, &up) || len(out) != 0 {
+		t.Fatalf("STS bootstrap = out %q, err %v; want clean upgrade", wire(out), err)
+	}
+}
+
+func TestHandshakeRejectsSASLOnPlaintext(t *testing.T) {
+	for _, tc := range []struct {
+		name, mechanism, offered string
+	}{
+		{"plain", "PLAIN", "PLAIN"},
+		{"scram", "SCRAM-SHA-256", "SCRAM-SHA-256"},
+		// The offered list is unauthenticated: stripping SCRAM must not make
+		// automatic selection send a PLAIN response.
+		{"automatic downgrade", "", "PLAIN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Addr: "x:1", Nick: "AlteredParadox", AllowPlaintext: true,
+				SASL: &SASLConfig{Mechanism: tc.mechanism, Login: "account", Password: "secret"}}
+			hs := newHandshake(&cfg)
+			hs.secure = false
+			if got, want := wire(hs.start()), []string{"CAP LS 302"}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("plaintext SASL start() = %q, want only %q (no NICK/USER identity leak)", got, want)
+			}
+			out, _, err := hs.handle(ircv4.MustParseMessage("CAP * LS :sasl=" + tc.offered))
+			if err == nil || !strings.Contains(err.Error(), "requires TLS") {
+				t.Fatalf("err = %v, want TLS-required rejection", err)
+			}
+			for _, line := range wire(out) {
+				if strings.HasPrefix(line, "AUTHENTICATE") {
+					t.Fatalf("plaintext handshake emitted %q", line)
+				}
+			}
+		})
+	}
+}
+
+func TestHandshakeRejectsEarlyWelcomeWithPlaintextCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{"PASS", Config{Addr: "x:1", Nick: "n", AllowPlaintext: true, Pass: "secret"}},
+		{"SASL", Config{Addr: "x:1", Nick: "n", AllowPlaintext: true, SASL: &SASLConfig{Mechanism: "PLAIN", Login: "a", Password: "secret"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hs := newHandshake(&tc.cfg)
+			out, done, err := hs.handle(ircv4.MustParseMessage(":srv 001 n :welcome"))
+			if err == nil || done || len(out) != 0 || !strings.Contains(err.Error(), "requires TLS") {
+				t.Fatalf("early 001 = out %q done=%v err=%v, want TLS-required failure", wire(out), done, err)
+			}
+		})
 	}
 }
 

@@ -152,22 +152,227 @@ func TestManagerSTSPolicyState(t *testing.T) {
 // fakeSTSStore returns a fixed policy/error; err is the fail-closed signal.
 // setDur records the duration passed to the last SetSTSPolicy.
 type fakeSTSStore struct {
-	port     int
-	until    time.Time
-	duration time.Duration
-	ok       bool
-	err      error
-	setDur   time.Duration
+	port        int
+	until       time.Time
+	duration    time.Duration
+	ok          bool
+	err         error
+	setDur      time.Duration
+	revision    uint64
+	policyEpoch uint64
+	setErr      error
+	reschedErr  error
 }
 
-func (f *fakeSTSStore) STSPolicy(_ context.Context, _ string) (int, time.Time, time.Duration, bool, error) {
-	return f.port, f.until, f.duration, f.ok, f.err
+func (f *fakeSTSStore) STSPolicy(_ context.Context, _ string) (int, time.Time, time.Duration, uint64, uint64, bool, error) {
+	return f.port, f.until, f.duration, f.revision, f.policyEpoch, f.ok, f.err
 }
-func (f *fakeSTSStore) SetSTSPolicy(_ context.Context, _ string, _ int, _ time.Time, d time.Duration) error {
+func (f *fakeSTSStore) SetSTSPolicy(_ context.Context, _ string, port int, until time.Time, d time.Duration) (uint64, uint64, error) {
 	f.setDur = d
-	return nil
+	if f.setErr != nil {
+		return f.revision, f.policyEpoch, f.setErr
+	}
+	f.revision++
+	f.policyEpoch++
+	f.port, f.until, f.duration, f.ok = port, until, d, true
+	return f.revision, f.policyEpoch, nil
 }
-func (f *fakeSTSStore) ClearSTSPolicy(context.Context, string) error { return nil }
+func (f *fakeSTSStore) ClearSTSPolicy(context.Context, string) (uint64, uint64, error) {
+	f.revision++
+	f.policyEpoch++
+	f.ok = false
+	return f.revision, f.policyEpoch, nil
+}
+func (f *fakeSTSStore) RescheduleSTSPolicy(_ context.Context, _ string, expected uint64, until time.Time) (uint64, bool, error) {
+	if f.reschedErr != nil {
+		return f.revision, false, f.reschedErr
+	}
+	if expected != f.revision || !f.ok {
+		return f.revision, false, nil
+	}
+	f.setDur = f.duration
+	f.revision++
+	f.until = until
+	return f.revision, true, nil
+}
+
+func TestFailedSTSPersistRetainsActiveLocalPolicy(t *testing.T) {
+	store := &fakeSTSStore{revision: 7, policyEpoch: 3, setErr: errors.New("disk full")}
+	m, err := NewManager(Config{Addr: "irc.test:6667", Nick: "AlteredParadox", AllowPlaintext: true, STS: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.loadSTS(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	m.applySTS(t.Context(), "irc.test:6697", 2*time.Hour)
+	if addr, secure := m.effectiveAddr(); addr != "irc.test:6697" || !secure {
+		t.Fatalf("after failed persist: addr=%q secure=%v", addr, secure)
+	}
+	// A normal secure disconnect immediately tries to reschedule. Because no
+	// full record was persisted, an expiry-only CAS cannot repair it and must
+	// not clear the dirty local policy.
+	m.rescheduleSTS(t.Context())
+	// Run reloads before every reconnect. The still-absent store row must not
+	// erase the verified policy merely because its persistence failed.
+	if err := m.loadSTS(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if addr, secure := m.effectiveAddr(); addr != "irc.test:6697" || !secure {
+		t.Fatalf("after reload: addr=%q secure=%v; local policy was lost", addr, secure)
+	}
+	// A distinct shared semantic generation is authoritative, including a clear.
+	store.revision = 8
+	store.policyEpoch = 4
+	if err := m.loadSTS(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if addr, secure := m.effectiveAddr(); addr != "irc.test:6667" || secure {
+		t.Fatalf("newer shared clear did not win: addr=%q secure=%v", addr, secure)
+	}
+}
+
+// A record revision changes for both semantic policy writes and expiry-only
+// reschedules. Keep those generations separate: otherwise manager B extending
+// the old policy can make manager A discard a newer, verified policy whose full
+// Set failed, shortening downgrade protection and restoring the old TLS port.
+func TestFailedSTSSetSurvivesOtherManagerReschedule(t *testing.T) {
+	oldUntil := time.Now().Add(30 * time.Minute)
+	store := &fakeSTSStore{
+		port:        6697,
+		until:       oldUntil,
+		duration:    time.Hour,
+		ok:          true,
+		revision:    7,
+		policyEpoch: 3,
+		setErr:      errors.New("disk full"),
+	}
+	newManager := func(name string) *Manager {
+		t.Helper()
+		m, err := NewManager(Config{
+			Name: name, Addr: "irc.test:6667", Nick: "AlteredParadox",
+			AllowPlaintext: true, STS: store,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := m.loadSTS(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+
+	a := newManager("a")
+	b := newManager("b")
+	a.applySTS(t.Context(), "irc.test:7443", 24*time.Hour)
+	a.stsMu.Lock()
+	verifiedUntil := a.stsUntil
+	a.stsMu.Unlock()
+
+	// B still knows the old policy and successfully performs its expiry-only
+	// CAS. This changes the mutation revision, but not the semantic epoch.
+	b.rescheduleSTS(t.Context())
+	if store.revision != 8 || store.policyEpoch != 3 {
+		t.Fatalf("B reschedule generations = revision %d epoch %d, want 8/3", store.revision, store.policyEpoch)
+	}
+	if !store.until.Before(verifiedUntil) {
+		t.Fatalf("test setup did not create a shorter stored policy: store=%v verified=%v", store.until, verifiedUntil)
+	}
+
+	if err := a.loadSTS(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if addr, secure := a.effectiveAddr(); addr != "irc.test:7443" || !secure {
+		t.Fatalf("reschedule displaced failed Set: addr=%q secure=%v", addr, secure)
+	}
+	a.stsMu.Lock()
+	gotUntil, gotDuration := a.stsUntil, a.stsLastDur
+	a.stsMu.Unlock()
+	if !gotUntil.Equal(verifiedUntil) || gotDuration != 24*time.Hour {
+		t.Fatalf("verified policy changed after B reschedule: until=%v duration=%v, want %v/24h", gotUntil, gotDuration, verifiedUntil)
+	}
+}
+
+func TestFailedSTSRescheduleRetainsLocalExtension(t *testing.T) {
+	originalUntil := time.Now().Add(5 * time.Minute)
+	store := &fakeSTSStore{
+		port: 6697, until: originalUntil, duration: 2 * time.Hour, ok: true, revision: 3, policyEpoch: 2,
+		reschedErr: errors.New("database is read-only"),
+	}
+	m, err := NewManager(Config{Addr: "irc.test:6667", Nick: "AlteredParadox", AllowPlaintext: true, STS: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.loadSTS(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	m.rescheduleSTS(t.Context())
+	m.stsMu.Lock()
+	extendedUntil := m.stsUntil
+	m.stsMu.Unlock()
+	if !extendedUntil.After(originalUntil.Add(time.Hour)) {
+		t.Fatalf("local expiry was not extended: got %v, original %v", extendedUntil, originalUntil)
+	}
+	if err := m.loadSTS(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	m.stsMu.Lock()
+	gotUntil := m.stsUntil
+	m.stsMu.Unlock()
+	if !gotUntil.Equal(extendedUntil) {
+		t.Fatalf("reload replaced failed reschedule extension: got %v want %v", gotUntil, extendedUntil)
+	}
+
+	// A newer shared policy supersedes the dirty extension even when it expires
+	// sooner; its generation represents an explicit hostname-wide update.
+	store.revision = 4
+	store.policyEpoch = 3
+	store.port = 7000
+	store.until = time.Now().Add(30 * time.Minute)
+	store.duration = 30 * time.Minute
+	if err := m.loadSTS(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if addr, secure := m.effectiveAddr(); addr != "irc.test:7000" || !secure {
+		t.Fatalf("newer shared policy did not win: addr=%q secure=%v", addr, secure)
+	}
+}
+
+func TestStaleSTSRescheduleRetainsExtensionUntilEpochReload(t *testing.T) {
+	originalUntil := time.Now().Add(5 * time.Minute)
+	store := &fakeSTSStore{
+		port: 6697, until: originalUntil, duration: 2 * time.Hour,
+		ok: true, revision: 3, policyEpoch: 9,
+	}
+	m, err := NewManager(Config{Addr: "irc.test:6667", Nick: "AlteredParadox", AllowPlaintext: true, STS: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.loadSTS(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	// Another profile performed an expiry-only mutation. Our CAS is stale, but
+	// the unchanged semantic epoch means reload must merge rather than discard
+	// our later local disconnect extension.
+	store.revision++
+	m.rescheduleSTS(t.Context())
+	m.stsMu.Lock()
+	localUntil := m.stsUntil
+	dirty := m.stsDirty
+	m.stsMu.Unlock()
+	if !dirty || !localUntil.After(originalUntil.Add(time.Hour)) {
+		t.Fatalf("stale CAS did not retain a dirty extension: dirty=%v until=%v", dirty, localUntil)
+	}
+	if err := m.loadSTS(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	m.stsMu.Lock()
+	gotUntil := m.stsUntil
+	m.stsMu.Unlock()
+	if !gotUntil.Equal(localUntil) {
+		t.Fatalf("same-epoch reload lost extension: got %v want %v", gotUntil, localUntil)
+	}
+}
 
 // loadSTS must FAIL CLOSED on an indeterminate policy state (store error or a
 // corrupt record): it returns a non-nil error, which Run turns into "do not
@@ -210,7 +415,7 @@ func TestLoadSTSFailClosed(t *testing.T) {
 // re-advertised STS. loadSTS restores the duration; rescheduleSTS persists the
 // refreshed expiry using it.
 func TestLoadSTSRestoresDuration(t *testing.T) {
-	store := &fakeSTSStore{ok: true, port: 6697, until: time.Now().Add(time.Hour), duration: 2 * time.Hour}
+	store := &fakeSTSStore{ok: true, port: 6697, until: time.Now().Add(time.Hour), duration: 2 * time.Hour, revision: 1}
 	m, err := NewManager(Config{Addr: "irc.test:6667", Nick: "AlteredParadox", AllowPlaintext: true, STS: store})
 	if err != nil {
 		t.Fatal(err)

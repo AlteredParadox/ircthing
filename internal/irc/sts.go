@@ -19,10 +19,19 @@ package irc
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
 )
+
+func canonicalSTSHost(host string) string {
+	host = strings.TrimSuffix(strings.TrimSpace(host), ".")
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.Unmap().String()
+	}
+	return strings.ToLower(host)
+}
 
 // STS — strict transport security
 // (https://ircv3.net/specs/extensions/sts, fetched 2026-07-15).
@@ -50,9 +59,19 @@ type STSStore interface {
 	// is stored (expiry is not checked here — callers do that). duration is
 	// the last advertised policy duration, used to reschedule the expiry on
 	// disconnect after a restart; 0 when the record predates its persistence.
-	STSPolicy(ctx context.Context, host string) (port int, until time.Time, duration time.Duration, ok bool, err error)
-	SetSTSPolicy(ctx context.Context, host string, port int, until time.Time, duration time.Duration) error
-	ClearSTSPolicy(ctx context.Context, host string) error
+	// revision is the compare-and-swap generation of the whole record; it
+	// changes for expiry-only reschedules too. policyEpoch changes only when the
+	// semantic policy is set or cleared, so a manager can distinguish another
+	// connection merely extending the old expiry from an authoritative policy
+	// replacement.
+	STSPolicy(ctx context.Context, host string) (port int, until time.Time, duration time.Duration, revision, policyEpoch uint64, ok bool, err error)
+	SetSTSPolicy(ctx context.Context, host string, port int, until time.Time, duration time.Duration) (revision, policyEpoch uint64, err error)
+	ClearSTSPolicy(ctx context.Context, host string) (revision, policyEpoch uint64, err error)
+	// RescheduleSTSPolicy updates only the expiry (and mutation revision) when
+	// the current revision matches expectedRevision. A policy learned by a
+	// different network profile for the same hostname therefore cannot be
+	// overwritten by a stale connection's disconnect-time reschedule.
+	RescheduleSTSPolicy(ctx context.Context, host string, expectedRevision uint64, until time.Time) (revision uint64, applied bool, err error)
 }
 
 // stsValue is one parsed sts capability value.
