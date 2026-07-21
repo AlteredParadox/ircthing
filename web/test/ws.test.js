@@ -69,6 +69,35 @@ test("dispatch ignores a wrong protocol version", () => {
 	is(pushed, 0);
 });
 
+test("malformed envelopes neither stabilize nor deliver", () => {
+	const bad = [
+		null, // JSON.parse("null")
+		{ v: 1 }, // no type
+		{ v: 1, type: "" }, // empty type
+		{ v: 1, type: 42 }, // non-string type
+		{ v: 1, type: "event", seq: null, data: {} }, // present-but-null seq
+		{ v: 1, type: "event", seq: -3, data: {} },
+		{ v: 1, type: "event", seq: 1.5, data: {} },
+		{ v: 1, type: "event", seq: "7", data: {} },
+		{ v: 1, type: "event", seq: 2 ** 53, data: {} }, // not a safe integer
+	];
+	for (const env of bad) {
+		const s = new Socket("ws://x");
+		let pushed = 0;
+		s.on("event", () => pushed++);
+		s.dispatch(env);
+		is(s.stable, false, `stabilized on ${JSON.stringify(env)}`);
+		is(pushed, 0, `delivered ${JSON.stringify(env)}`);
+	}
+	// The shapes the server actually sends still stabilize.
+	const ok = new Socket("ws://x");
+	ok.dispatch({ v: 1, seq: 0, type: "event", data: {} });
+	is(ok.stable, true);
+	const okAbsent = new Socket("ws://x");
+	okAbsent.dispatch({ v: 1, type: "event", data: {} });
+	is(okAbsent.stable, true);
+});
+
 test("close synchronously rejects and clears every pending request", () => {
 	const s = new Socket("ws://x");
 	let rejected;

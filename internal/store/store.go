@@ -1044,13 +1044,15 @@ func (s *Store) bufferID(ctx context.Context, network, target string, create boo
 		// authenticated user action (close_buffer purge:false), never by
 		// server traffic, so the server-forgeable population stays bounded
 		// at the cap while a user's archived buffers do not erode it.
-		// Un-archiving can transiently push the active count past the cap;
-		// accepted (2026-07-21): every archived row was admitted under this
-		// cap once and archiving is a deliberate authenticated action, so the
-		// total stays bounded by user intent. The alternatives — refusing an
-		// archive at some second quota, or leaving a live message hidden at
-		// resurface time — both punish the user to enforce a bound the
-		// server cannot abuse.
+		// Un-archiving can push the active count past the cap, and the
+		// overshoot persists until the user closes buffers again. Accepted
+		// (2026-07-21): the archived reservoir grows only through explicit
+		// authenticated closes — unbounded across time, but priced one user
+		// action per row — and while a server can RESURFACE those rows with
+		// content, it can never mint them, so the total stays bounded by
+		// user intent. The alternatives — refusing an archive at some second
+		// quota, or leaving a live message hidden at resurface time — both
+		// punish the user to enforce a bound the server cannot abuse.
 		var count int
 		if err := s.db.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM buffers WHERE network_id = ? AND archived = 0`, netID).Scan(&count); err != nil {
@@ -1315,7 +1317,8 @@ func (s *Store) canonicalLocked(ctx context.Context, network, target string, fol
 // filtering in SQL: the store is deliberately casemapping-agnostic (fold is
 // a per-connection parameter, not stored), so the fold cannot live in an
 // index. The cost is O(buffers per network) per live QUIT/NICK — an ACCEPTED
-// bounded tradeoff: buffers are capped at maxBuffersPerNetwork, s.mu is
+// bounded tradeoff: active buffers are capped at maxBuffersPerNetwork and
+// archived rows add only what the user has deliberately closed, s.mu is
 // released between calls, and a real user has tens of buffers (microseconds).
 // A hostile server that first opens thousands of buffers could turn this into
 // a throughput drag, but not a stall or exhaustion. If that ever matters, an

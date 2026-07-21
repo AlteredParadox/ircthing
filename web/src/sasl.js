@@ -27,9 +27,10 @@
 //     a client cert with PLAIN — CertFP — remains supported.)
 //   - EXTERNAL: password AND login are dropped. Authentication is the TLS
 //     client cert, and login is the PLAIN/SCRAM authcid — EXTERNAL's
-//     optional authorization identity is the separate `authzid` config
-//     field (internal/irc/sasl.go newMech), which this form does not edit,
-//     so a kept login would just be inert stale state.
+//     optional authorization identity is SASLConfig.Authzid, an internal
+//     field on the Go side (internal/irc/sasl.go newMech) that the stored
+//     network JSON doesn't even carry, so a kept login would just be inert
+//     stale state.
 //   - "auto" (stored as mechanism ""): the server resolves it to EXTERNAL
 //     when the password is empty, else SCRAM/PLAIN (internal/irc/sasl.go
 //     newMech), so every field is potentially applicable and all are kept.

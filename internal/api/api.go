@@ -783,9 +783,11 @@ func (s *Server) authed(r *http.Request) bool {
 
 // tokenValid reports whether a session token is still live — used on every
 // authenticated request and to revoke an already-open WebSocket after
-// logout or expiry. An expired token is deleted AND its live sockets are
-// canceled (deleteTokenLocked), so expiry mid-session doesn't leave a
-// socket running until the ticker.
+// logout or expiry. An expired token is deleted AND its live sockets and
+// streams are canceled (deleteTokenLocked) — note the expiry itself is
+// passive: teardown happens when the expiry is next OBSERVED, i.e. this
+// check on any authenticated request, or the prune ticker, whichever
+// comes first.
 func (s *Server) tokenValid(token string) bool {
 	var cancels []context.CancelFunc
 	s.mu.Lock()

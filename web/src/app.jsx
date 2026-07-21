@@ -1832,9 +1832,12 @@ export function App() {
 					.catch(oops);
 			}
 			case "cmd": {
-				if (p.command === "WHOIS") rememberPendingWhois(buf.network, p.params?.[0]);
+				// Socket first, intent second (same rule as sendCommand): with
+				// no transport there is no request whose .catch retires the
+				// whois entry, so it must never be recorded.
 				const s = sock.current;
 				if (!s) return Promise.reject(new Error("not connected")).catch(oops);
+				if (p.command === "WHOIS") rememberPendingWhois(buf.network, p.params?.[0]);
 				// Like the modal path, arm /join before the request so a fast
 				// self-JOIN cannot arrive in the response/JOIN scheduling gap.
 				const joinToken = p.switchTo
@@ -1846,6 +1849,12 @@ export function App() {
 					.request("command", { network: buf.network, command: p.command, params: p.params })
 					.catch((e) => {
 						if (joinToken) clearPendingJoin(pendingJoins.current, joinToken);
+						// A rejected whois never gets a reply: retire its intent
+						// so a later unsolicited push can't ride it (same as
+						// sendCommand's catch).
+						if (p.command === "WHOIS" && p.params?.[0]) {
+							pendingWhois.current.delete(buf.network + "\n" + foldNick(p.params[0]));
+						}
 						return oops(e);
 					});
 			}

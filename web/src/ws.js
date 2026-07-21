@@ -93,7 +93,10 @@ export class Socket {
 		// timer instead.
 		if (!env || typeof env !== "object" || env.v !== V) return;
 		if (typeof env.type !== "string" || !env.type) return;
-		if (env.seq != null && env.seq !== 0 &&
+		// JSON.parse never yields undefined for a present key, so undefined
+		// means absent; anything else present — including null — must be zero
+		// or a positive safe integer, or the frame is not our envelope.
+		if (env.seq !== undefined && env.seq !== 0 &&
 			!(Number.isSafeInteger(env.seq) && env.seq > 0)) return;
 		this.markStable();
 		if (env.seq) {
