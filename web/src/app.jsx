@@ -700,6 +700,33 @@ export function App() {
 		return () => globalThis.removeEventListener("hashchange", onHash);
 	}, []);
 
+	// Live server RSS for the sidebar footer, polled while the toggle is
+	// on and the tab is visible. /api/config is reused (it already
+	// samples VmRSS per request); at one authed GET per 5s for a
+	// single-user server this costs nothing worth a dedicated endpoint.
+	const [rssBytes, setRssBytes] = useState(0);
+	useEffect(() => {
+		if (phase !== "app" || !prefs.showMemory) return undefined;
+		let alive = true;
+		const poll = async () => {
+			if (document.hidden) return;
+			try {
+				const r = await fetch("/api/config");
+				const c = r.ok ? await r.json() : null;
+				if (alive && typeof c?.memory_rss_bytes === "number") setRssBytes(c.memory_rss_bytes);
+			} catch {
+				// Transient; the next tick retries. The stale number stays
+				// up rather than flickering away.
+			}
+		};
+		poll();
+		const t = setInterval(poll, 5000);
+		return () => {
+			alive = false;
+			clearInterval(t);
+		};
+	}, [phase, prefs.showMemory]);
+
 	// Remember the active buffer for hashless cold starts (see
 	// loadActiveBuffer). Split the key rather than consulting buffers:
 	// navigation into a not-yet-listed buffer must persist too.
@@ -2226,6 +2253,7 @@ export function App() {
 				<Sidebar
 					networks={networks} buffers={buffers} activeKey={activeKey}
 					monitors={monitors} truncated={buffersTruncated}
+					memRSS={prefs.showMemory ? rssBytes : 0}
 					mutedSet={mutedSet} onSelect={select}
 					onSettings={() => setSettingsOpen(true)}
 					onBufferMenu={openBufferMenu} onNetworkMenu={openNetworkMenu}

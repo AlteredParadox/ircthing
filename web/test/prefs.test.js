@@ -34,7 +34,7 @@ test("normalizePrefs: keeps valid values", () => {
 		density: "compact", sidebarWidth: "wide", msgFont: "mono", statusMsgs: "collapse",
 		statusHost: true, clock: "12", seconds: true, ampm: false, nickSep: ":", highlightNames: false,
 		sendTyping: false, titleUnread: false, titleChannel: true, nickPrefixes: true, purgeOnClose: true,
-		mediaPlayers: false,
+		mediaPlayers: false, showMemory: true,
 		css: "a { color: red }",
 	};
 	eq(normalizePrefs(full), full);

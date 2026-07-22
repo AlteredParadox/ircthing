@@ -518,12 +518,22 @@ input::placeholder {
 	border-top: 1px solid var(--border);
 	padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
 	display: flex;
-	align-items: center;
-	gap: 10px;
+	flex-direction: column;
+	align-items: stretch;
+	gap: 6px;
+}
+
+.foot-mem {
+	text-align: center;
+	font-family: var(--mono-font);
+	font-size: 0.7857rem;
+	color: var(--text-faint);
+	/* Tabular digits: a live number must not wiggle the layout. */
+	font-variant-numeric: tabular-nums;
 }
 
 .foot-settings {
-	flex: 1;
+	width: 100%;
 	display: flex;
 	align-items: center;
 	justify-content: center;

@@ -119,6 +119,10 @@ export const DEFAULTS = {
 	// STRICTLY more private than the link-preview fetch it replaces (nothing
 	// is fetched until the user presses play).
 	mediaPlayers: true,
+	// Show the server's live memory use (RSS) in the sidebar footer,
+	// polled while the tab is visible. An ops nicety for eyeballing the
+	// GOMEMLIMIT headroom; off by default.
+	showMemory: false,
 	css: "",
 };
 
@@ -147,6 +151,7 @@ export function normalizePrefs(raw) {
 		nickPrefixes: typeof p.nickPrefixes === "boolean" ? p.nickPrefixes : DEFAULTS.nickPrefixes,
 		purgeOnClose: typeof p.purgeOnClose === "boolean" ? p.purgeOnClose : DEFAULTS.purgeOnClose,
 		mediaPlayers: typeof p.mediaPlayers === "boolean" ? p.mediaPlayers : DEFAULTS.mediaPlayers,
+		showMemory: typeof p.showMemory === "boolean" ? p.showMemory : DEFAULTS.showMemory,
 		css: typeof p.css === "string" ? p.css : DEFAULTS.css,
 	});
 }

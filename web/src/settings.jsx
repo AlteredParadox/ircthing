@@ -933,6 +933,14 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 								{about.rss > 0 && <span>{(about.rss / (1024 * 1024)).toFixed(1)} MB memory in use</span>}
 							</div>
 						)}
+						<label class="settings-toggle">
+							<input
+								type="checkbox"
+								checked={prefs.showMemory}
+								onChange={(e) => onPrefs({ ...prefs, showMemory: e.currentTarget.checked })}
+							/>
+							<span>Show live memory use in the sidebar</span>
+						</label>
 						<div class="settings-note">
 							ircthing is free software, licensed under the{" "}
 							<a href="/license" target="_blank" rel="noopener noreferrer">

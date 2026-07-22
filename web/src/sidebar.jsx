@@ -26,7 +26,7 @@ function stateDot(state) {
 	return "offline";
 }
 
-export function Sidebar({ networks, buffers, activeKey, monitors, truncated, mutedSet, onSelect, onSettings, onBufferMenu, onNetworkMenu, onAddNetwork, onAddMonitor, onRemoveMonitor }) {
+export function Sidebar({ networks, buffers, activeKey, monitors, truncated, memRSS, mutedSet, onSelect, onSettings, onBufferMenu, onNetworkMenu, onAddNetwork, onAddMonitor, onRemoveMonitor }) {
 	// One shared flag: a long-press that opened a menu suppresses the tap
 	// that follows it. pressTimer holds the pending hold timer across
 	// re-renders (see longPress) so a mid-hold re-render can't orphan it.
@@ -152,6 +152,11 @@ export function Sidebar({ networks, buffers, activeKey, monitors, truncated, mut
 					<span class="foot-settings-gear" aria-hidden="true">⚙</span>
 					<span>Settings</span>
 				</button>
+				{memRSS > 0 && (
+					<div class="foot-mem" title="Server memory in use (RSS), sampled every 5s">
+						{(memRSS / (1024 * 1024)).toFixed(1)} MB
+					</div>
+				)}
 			</div>
 		</div>
 	);
