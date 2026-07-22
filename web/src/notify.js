@@ -17,9 +17,12 @@
 import { mentionsMe, stripFormatting, uuid } from "./irc.js";
 
 // Notifications: highlight detection, desktop Web Notifications, and a
-// dynamically-drawn favicon badge. Highlight rules live in localStorage
-// (per-device: you may want alerts on desktop but not your phone) — a
-// future enhancement could sync them server-side for multi-device parity.
+// dynamically-drawn favicon badge. Highlight rules are synced server-side
+// (the "highlight_rules" setting — the server evaluates the same rules
+// for Web Push); localStorage is the first-paint cache. The
+// notifications on/off switch stays per-device: you may want alerts on
+// desktop but not your phone. The matcher below is mirrored in Go
+// (internal/hub/highlight.go) — changes here need the mirror change.
 
 // highlightText reports whether a message should highlight: it mentions
 // our nick, or matches a user highlight rule scoped to this network (or

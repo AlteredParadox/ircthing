@@ -492,6 +492,41 @@ export function App() {
 		}, 400);
 	}
 
+	// Highlight rules sync mirrors the prefs machinery: the server is the
+	// source of truth (it evaluates the same rules for Web Push while this
+	// device sleeps), localStorage is the first-paint cache. No error
+	// surface: a failed sync silently retries — rules are not worth a
+	// banner, and the local set still highlights this device meanwhile.
+	const rulesPush = useRef(null);
+	const rulesDirty = useRef(false);
+	// Last server-confirmed set: the rollback point for a rejected write.
+	const rulesConfirmed = useRef(null);
+	function persistRules(next, attempt = 0) {
+		if (rulesRef.current !== next) return;
+		const s = sock.current;
+		if (!s) return; // adoptRules re-pushes dirty rules on reconnect
+		s.request("set_rules", { rules: next })
+			.then(() => {
+				if (sock.current !== s) return;
+				rulesConfirmed.current = next;
+				if (rulesRef.current === next) rulesDirty.current = false;
+			})
+			.catch((e) => {
+				if (sock.current !== s || rulesRef.current !== next) return;
+				if (e?.code === "bad_request") {
+					rulesDirty.current = false;
+					if (rulesConfirmed.current) {
+						setRules(rulesConfirmed.current);
+						saveRules(rulesConfirmed.current);
+					}
+					return;
+				}
+				if (attempt < 3) {
+					rulesPush.current = setTimeout(() => persistRules(next, attempt + 1), 500 * 2 ** attempt);
+				}
+			});
+	}
+
 	// Track the OS theme so the "system" preference follows it live.
 	useEffect(() => {
 		const mq = globalThis.matchMedia("(prefers-color-scheme: dark)");
@@ -524,6 +559,7 @@ export function App() {
 		// the state just reset above.
 		resetSettingsSession();
 		clearTimeout(prefsPush.current);
+		clearTimeout(rulesPush.current);
 		setBuffersTruncated(false);
 		setNetForm(null);
 		netFormBusyRef.current = false;
@@ -683,6 +719,25 @@ export function App() {
 		}
 	}
 
+	// adoptRules applies the server's highlight rules; a server with none
+	// stored yet (fresh install, pre-sync upgrade) is seeded from this
+	// browser's localStorage — the one-time migration off per-device rules.
+	function adoptRules(d) {
+		if (rulesDirty.current) {
+			if (d.rules?.length) rulesConfirmed.current = d.rules;
+			persistRules(rulesRef.current);
+			return;
+		}
+		if (d.rules?.length) {
+			rulesConfirmed.current = d.rules;
+			setRules(d.rules);
+			saveRules(d.rules);
+		} else if (rulesRef.current.length) {
+			rulesDirty.current = true;
+			persistRules(rulesRef.current);
+		}
+	}
+
 	// Socket lifecycle, once authed.
 	useEffect(() => {
 		if (phase !== "app") return;
@@ -710,6 +765,9 @@ export function App() {
 			setConnected(true);
 			s.request("get_prefs", null)
 				.then((d) => { if (live()) adoptPrefs(d); })
+				.catch(() => {});
+			s.request("get_rules", null)
+				.then((d) => { if (live()) adoptRules(d); })
 				.catch(() => {});
 			// Drop cached pages up front so every open buffer refetches a
 			// fresh tail covering the offline window. This must NOT hang off
@@ -892,6 +950,15 @@ export function App() {
 			}
 		});
 
+		// Another device changed the highlight rules; adopt with the same
+		// dirty guard so a local edit in the debounce window survives.
+		on("rules", (d) => {
+			if (rulesDirty.current || !d.rules) return;
+			rulesConfirmed.current = d.rules;
+			setRules(d.rules);
+			saveRules(d.rules);
+		});
+
 		// Ephemeral server replies (/list, error numerics): shown as
 		// system lines in the active buffer, never persisted — a history
 		// refetch drops them.
@@ -1046,6 +1113,10 @@ export function App() {
 	function updateRules(next) {
 		setRules(next);
 		saveRules(next);
+		rulesDirty.current = true;
+		// Debounced: the pattern input changes on every keystroke.
+		clearTimeout(rulesPush.current);
+		rulesPush.current = setTimeout(() => persistRules(next), 400);
 	}
 
 	// Expire stale typing states (6s active / 30s paused per spec).
