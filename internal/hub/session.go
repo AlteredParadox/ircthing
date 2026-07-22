@@ -1566,10 +1566,51 @@ func (s *Session) handleGetFilters(ctx context.Context, env Envelope) {
 	s.push(envelope("filters", env.Seq, d))
 }
 
+// canonicalIgnores validates and normalizes the ignore map: nicks are
+// lowercased (the client's fold, so the pusher's lookup matches
+// regardless of which device wrote the list), empties dropped. A
+// non-empty problem string reports the first violation.
+func canonicalIgnores(in map[string][]string) (map[string][]string, string) {
+	out := make(map[string][]string, len(in))
+	for network, nicks := range in {
+		if network == "" || len(nicks) > maxIgnoresPerNetwork {
+			return nil, "bad ignore list"
+		}
+		kept := make([]string, 0, len(nicks))
+		for _, n := range nicks {
+			if n == "" {
+				continue
+			}
+			if len(n) > maxIgnoreNickChars {
+				return nil, "ignored nick too long"
+			}
+			kept = append(kept, strings.ToLower(n))
+		}
+		if len(kept) > 0 {
+			out[network] = kept
+		}
+	}
+	return out, ""
+}
+
+// canonicalMutes validates the mute list (client bufKey form), dropping
+// empties; a non-empty problem string reports the first violation.
+func canonicalMutes(in []string) ([]string, string) {
+	out := make([]string, 0, len(in))
+	for _, m := range in {
+		if m == "" {
+			continue
+		}
+		if len(m) > maxMuteKeyChars {
+			return nil, "mute key too long"
+		}
+		out = append(out, m)
+	}
+	return out, ""
+}
+
 // handleSetFilters stores the ignore/mute lists and pushes them to the
-// user's other sessions. Nicks are normalized to the client's ASCII
-// lowercase fold so the pusher's lookup matches regardless of which
-// device wrote the list.
+// user's other sessions.
 func (s *Session) handleSetFilters(ctx context.Context, env Envelope) {
 	var d FiltersData
 	if err := json.Unmarshal(env.Data, &d); err != nil {
@@ -1580,37 +1621,15 @@ func (s *Session) handleSetFilters(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", "too many filters"))
 		return
 	}
-	ignores := make(map[string][]string, len(d.Ignores))
-	for network, nicks := range d.Ignores {
-		if network == "" || len(nicks) > maxIgnoresPerNetwork {
-			s.push(errEnvelope(env.Seq, "bad_request", "bad ignore list"))
-			return
-		}
-		kept := make([]string, 0, len(nicks))
-		for _, n := range nicks {
-			if n == "" {
-				continue
-			}
-			if len(n) > maxIgnoreNickChars {
-				s.push(errEnvelope(env.Seq, "bad_request", "ignored nick too long"))
-				return
-			}
-			kept = append(kept, strings.ToLower(n))
-		}
-		if len(kept) > 0 {
-			ignores[network] = kept
-		}
+	ignores, problem := canonicalIgnores(d.Ignores)
+	if problem != "" {
+		s.push(errEnvelope(env.Seq, "bad_request", problem))
+		return
 	}
-	mutes := make([]string, 0, len(d.Mutes))
-	for _, m := range d.Mutes {
-		if m == "" {
-			continue
-		}
-		if len(m) > maxMuteKeyChars {
-			s.push(errEnvelope(env.Seq, "bad_request", "mute key too long"))
-			return
-		}
-		mutes = append(mutes, m)
+	mutes, problem := canonicalMutes(d.Mutes)
+	if problem != "" {
+		s.push(errEnvelope(env.Seq, "bad_request", problem))
+		return
 	}
 	canonical := FiltersData{Ignores: ignores, Mutes: mutes}
 	blob, err := json.Marshal(canonical)

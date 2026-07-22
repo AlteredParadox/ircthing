@@ -64,7 +64,11 @@ function PushControl({ pushKey }) {
 		Promise.race([currentSubscription(), timeout])
 			.then((sub) => {
 				if (!alive) return;
-				setState(sub === "timeout" ? "broken" : sub ? "on" : "off");
+				if (sub === "timeout") {
+					setState("broken");
+					return;
+				}
+				setState(sub ? "on" : "off");
 			})
 			.catch(() => alive && setState("off"));
 		return () => {
