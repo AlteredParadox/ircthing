@@ -65,19 +65,25 @@ export function loadRules() {
 }
 
 // sanitizeRulesForSync clamps a rule list to the server's set_rules
-// caps (64 rules; 256-byte patterns; 128-byte network scope — BYTES:
-// the editor's maxLength counts UTF-16 units, and legacy lists predate
-// any cap). Over-cap entries are DROPPED, not truncated — a truncated
-// pattern would silently match different text — so one oversized
-// legacy rule cannot get the whole batch rejected (and, on a first
-// sync with no confirmed baseline, the entire local list rolled back).
+// caps (64 rules; 256-byte patterns; 300-byte network scope; 64-byte
+// ids — BYTES: the editor's maxLength counts UTF-16 units, and legacy
+// lists predate any cap). Over-cap patterns/scopes are DROPPED, not
+// truncated — a truncated pattern would silently match different text —
+// so one oversized legacy rule cannot get the whole batch rejected
+// (and, on a first sync with no confirmed baseline, the entire local
+// list rolled back). A bad id is REPLACED, not dropped: ids only key
+// editor rows.
 export function sanitizeRulesForSync(rules) {
 	const bytes = (s) => new TextEncoder().encode(s).length;
 	const kept = [];
 	for (const r of rules) {
 		if (kept.length >= 64) break;
 		if (typeof r.pattern !== "string" || bytes(r.pattern) > 256) continue;
-		if (typeof r.network === "string" && bytes(r.network) > 128) continue;
+		if (typeof r.network === "string" && bytes(r.network) > 300) continue;
+		if (typeof r.id !== "string" || !r.id || bytes(r.id) > 64) {
+			kept.push({ ...r, id: uuid() });
+			continue;
+		}
 		kept.push(r);
 	}
 	return kept;

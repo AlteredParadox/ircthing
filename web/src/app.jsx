@@ -722,6 +722,10 @@ export function App() {
 		const onMsg = (e) => {
 			const d = e.data;
 			if (d?.type === "open_buffer" && typeof d.network === "string" && typeof d.buffer === "string") {
+				// A postMessage queued against a frozen page (iOS) can fire
+				// hours after the tap; a stale one must not yank the
+				// session. Same 60s window the worker's pull path uses.
+				if (typeof d.at === "number" && Date.now() - d.at > 60 * 1000) return;
 				location.hash = toHash(d.network, d.buffer);
 				// Consume the worker's pendingNav copy: a tap delivered to
 				// an ALREADY-VISIBLE window fires no visibilitychange, so
@@ -1139,6 +1143,38 @@ export function App() {
 		on("filters", (d) => {
 			if (filtersDirty.current || !d?.ignores || !d?.mutes) return;
 			adoptFilterLists(d.ignores, d.mutes);
+		});
+
+		// A network rename: rewrite the LOCAL copies of every synced list
+		// that references it by name — deliberately IGNORING the dirty
+		// guards, unlike the adopt handlers above: this is a mechanical
+		// rewrite of whatever is local, so a dirty copy's eventual re-push
+		// carries the new name instead of clobbering the server's rewrite
+		// with the old one. Refs are updated eagerly so an already-queued
+		// debounce sends the rewritten data.
+		on("network_renamed", (d) => {
+			if (typeof d?.old !== "string" || typeof d?.new !== "string" || !d.old || !d.new) return;
+			if (rulesRef.current.some((r) => r.network === d.old)) {
+				const next = rulesRef.current.map((r) => (r.network === d.old ? { ...r, network: d.new } : r));
+				rulesRef.current = next;
+				setRules(next);
+				saveRules(next);
+			}
+			if (ignoresRef.current[d.old]) {
+				const next = { ...ignoresRef.current };
+				next[d.new] = [...(next[d.new] || []), ...next[d.old]];
+				delete next[d.old];
+				ignoresRef.current = next;
+				setIgnores(next);
+				saveIgnores(next);
+			}
+			const pref = d.old + "\n";
+			if (mutesRef.current.some((m) => m.startsWith(pref))) {
+				const next = mutesRef.current.map((m) => (m.startsWith(pref) ? d.new + "\n" + m.slice(pref.length) : m));
+				mutesRef.current = next;
+				setMutes(next);
+				saveMutes(next);
+			}
 		});
 
 		// Ephemeral server replies (/list, error numerics): shown as

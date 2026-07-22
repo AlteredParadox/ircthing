@@ -79,7 +79,10 @@ globalThis.addEventListener("notificationclick", (event) => {
 			for (const w of wins) {
 				try {
 					await w.focus();
-					if (network && buffer) w.postMessage({ type: "open_buffer", network, buffer });
+					// `at` lets the page drop a stale delivery: a message
+					// posted to a frozen-but-alive client (iOS) queues and
+					// can fire hours later when the page finally resumes.
+					if (network && buffer) w.postMessage({ type: "open_buffer", network, buffer, at: Date.now() });
 					return;
 				} catch {
 					// Stale client: try the next.
@@ -103,7 +106,7 @@ globalThis.addEventListener("message", (event) => {
 	// Staleness cap: a tap the page never picked up must not yank a
 	// deliberately-opened session to an old target minutes later.
 	if (nav && Date.now() - nav.at < 60 * 1000) {
-		event.source?.postMessage({ type: "open_buffer", network: nav.network, buffer: nav.buffer });
+		event.source?.postMessage({ type: "open_buffer", network: nav.network, buffer: nav.buffer, at: nav.at });
 	}
 });
 

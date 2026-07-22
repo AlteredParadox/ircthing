@@ -156,9 +156,12 @@ func TestNetworkManagement(t *testing.T) {
 		t.Fatalf("exact network = %+v", one.Network)
 	}
 
-	// Rename: history follows, the old name is announced as removed.
+	// Rename: history follows, the old name is announced as removed and
+	// the rename itself broadcast (clients rewrite their local synced
+	// rule/filter references).
 	s.Handle(ctxb, request(t, "put_network", 5, PutNetworkReq{OldName: "alpha", Config: cfg("beta")}))
 	recv(t, s, "network_removed", "state", "networks_changed")
+	recv(t, s, "network_renamed", "state", "networks_changed")
 	recv(t, s, "ok", "state", "networks_changed")
 	if msgs, err := h.store.Latest(ctxb, "beta", "#x", 5); err != nil || len(msgs) != 1 {
 		t.Fatalf("history after rename: %v, %v", msgs, err)

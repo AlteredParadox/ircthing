@@ -117,6 +117,26 @@ func (s *Store) CountPushSubscriptions(ctx context.Context) (int, error) {
 	return n, err
 }
 
+// BufferState reports whether the buffer exists under its EXACT stored
+// name and whether it is archived — the pusher's fire-time visibility
+// check: a purged buffer must not push, and an archived one (hidden
+// from every sidebar) must not either.
+func (s *Store) BufferState(ctx context.Context, network, target string) (found, archived bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bufID, err := s.bufferID(ctx, network, target, false)
+	if err != nil || bufID == 0 {
+		return false, false, err
+	}
+	var a int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT archived FROM buffers WHERE id = ?`, bufID).Scan(&a); err != nil {
+		return false, false, err
+	}
+	return true, a != 0, nil
+}
+
 // MessageRedacted reports whether the message with msgid in the buffer
 // has been redacted — the pusher's fire-time re-check, mirroring the
 // read-marker one: the store is authoritative, the cancel channel is

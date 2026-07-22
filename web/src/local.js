@@ -69,9 +69,10 @@ export function ignoredFor(ignores, network) {
 
 // sanitizeFiltersForSync mirrors the server's set_filters caps (128
 // networks / 512 nicks per network / 128-byte nicks / 1024 mutes /
-// 512-byte keys) so one over-cap legacy entry cannot get the whole
-// sync rejected — and, on a first sync with no confirmed baseline, the
-// local lists rolled back to empty. Offenders are dropped.
+// 1024-byte keys — sized for a 300-byte unnamed-network host:port name
+// plus a 512-byte target) so one over-cap legacy entry cannot get the
+// whole sync rejected — and, on a first sync with no confirmed
+// baseline, the local lists rolled back to empty. Offenders are dropped.
 export function sanitizeFiltersForSync(ignores, mutes) {
 	const bytes = (s) => new TextEncoder().encode(s).length;
 	const ig = {};
@@ -87,7 +88,7 @@ export function sanitizeFiltersForSync(ignores, mutes) {
 		}
 	}
 	const mu = (Array.isArray(mutes) ? mutes : [])
-		.filter((m) => typeof m === "string" && m && bytes(m) <= 512)
+		.filter((m) => typeof m === "string" && m && bytes(m) <= 1024)
 		.slice(0, 1024);
 	return { ignores: ig, mutes: mu };
 }

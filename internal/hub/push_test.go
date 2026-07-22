@@ -446,6 +446,100 @@ func TestRenameSyncedNetworkRefs(t *testing.T) {
 	}
 }
 
+// TestRenameMapHealsStaleWrites: a client that was dirty across a
+// network rename re-pushes old-name references; set_rules/set_filters
+// rewrite them through the persisted rename map so last-write-wins
+// cannot undo the rename's blob rewrite.
+func TestRenameMapHealsStaleWrites(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	a := h.NewSession()
+	defer a.Close()
+
+	h.renameSyncedNetworkRefs(ctx, "libera", "libera2")
+
+	// A stale client pushes rules and filters still scoped to "libera".
+	a.Handle(ctx, request(t, "set_rules", 1, RulesData{Rules: []Rule{
+		{Pattern: "release", Network: "libera", ID: "r1"},
+	}}))
+	recv(t, a, "ok")
+	if rules := h.loadRules(ctx); rules[0].Network != "libera2" {
+		t.Fatalf("stale rule scope not rewritten: %+v", rules)
+	}
+	a.Handle(ctx, request(t, "set_filters", 2, FiltersData{
+		Ignores: map[string][]string{"libera": {"troll"}},
+		Mutes:   []string{"libera\n#noisy"},
+	}))
+	recv(t, a, "ok")
+	d := h.loadFilters(ctx)
+	if len(d.Ignores["libera2"]) != 1 || len(d.Ignores["libera"]) != 0 {
+		t.Fatalf("stale ignore key not rewritten: %+v", d.Ignores)
+	}
+	if len(d.Mutes) != 1 || d.Mutes[0] != "libera2\n#noisy" {
+		t.Fatalf("stale mute key not rewritten: %+v", d.Mutes)
+	}
+
+	// Once a network with the old name exists again, the mapping is
+	// cleared and references to it are stored verbatim.
+	h.clearNetworkRename(ctx, "libera")
+	a.Handle(ctx, request(t, "set_rules", 3, RulesData{Rules: []Rule{
+		{Pattern: "release", Network: "libera", ID: "r1"},
+	}}))
+	recv(t, a, "ok")
+	if rules := h.loadRules(ctx); rules[0].Network != "libera" {
+		t.Fatalf("cleared mapping still rewrites: %+v", rules)
+	}
+}
+
+// TestPusherSkipsArchivedBuffer: archiving (close_buffer purge:false)
+// keeps the row, so the fire-time check must consult the archived flag,
+// not mere existence.
+func TestPusherSkipsArchivedBuffer(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	addTestSubscription(t, h, "https://push.example/dev1")
+	seedBuffer(t, h, "libera", "#chan")
+	if _, err := h.store.ArchiveBufferFolded(ctx, "libera", "#chan", foldRFC1459); err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeSender{}
+	startTestPusher(t, h, f)
+
+	h.pushCandidates <- candidate("#chan", "bob", "me: ping", time.Now().UnixMilli(), true)
+	time.Sleep(5 * testPushDelay)
+	if got := f.count(); got != 0 {
+		t.Fatalf("sends for archived buffer = %d, want 0", got)
+	}
+}
+
+// TestPusherRuleRemovalSweepsPending: deleting the keyword that admitted
+// a sole pending highlight (e.g. a half-typed rule) cancels it.
+func TestPusherRuleRemovalSweepsPending(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	if err := h.store.SetSetting(ctx, rulesKey, `{"rules":[{"pattern":"de","network":"","id":"r1"}]}`); err != nil {
+		t.Fatal(err)
+	}
+	addTestSubscription(t, h, "https://push.example/dev1")
+	seedBuffer(t, h, "libera", "#go")
+	f := &fakeSender{}
+	startTestPusher(t, h, f)
+
+	// "de" (a keyword mid-edit) matches channel chatter and schedules.
+	h.pushCandidates <- candidate("#go", "bob", "the deal is done", time.Now().UnixMilli(), true)
+	waitDrained(t, h.pushCandidates)
+	// The user finishes typing: the rule set is replaced and no longer
+	// matches; the pending push is swept.
+	if err := h.store.SetSetting(ctx, rulesKey, `{"rules":[{"pattern":"deploy","network":"","id":"r1"}]}`); err != nil {
+		t.Fatal(err)
+	}
+	h.notifyPushConfigChanged()
+	time.Sleep(5 * testPushDelay)
+	if got := f.count(); got != 0 {
+		t.Fatalf("sends after rule correction = %d, want 0", got)
+	}
+}
+
 // TestPusherSkipsPurgedBuffer: the fire-time existence check backstops a
 // dropped close/delete cancel — a buffer the store no longer knows gets
 // no push.

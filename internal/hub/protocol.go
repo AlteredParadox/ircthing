@@ -358,6 +358,15 @@ type RulesData struct {
 // nicks (the client's ASCII fold — deliberately not the server's
 // casemapping, mirroring web/src/local.js isIgnored); mutes are buffer
 // keys in the client's network+"\n"+buffer form.
+// NetworkRenameData announces a network rename ("network_renamed"
+// broadcast) so clients rewrite their LOCAL copies of the synced,
+// name-referencing lists (rule scopes, ignores, mutes) — including
+// dirty copies whose eventual re-push must not carry the old name back.
+type NetworkRenameData struct {
+	Old string `json:"old"`
+	New string `json:"new"`
+}
+
 // Seeded: same semantics as RulesData.Seeded.
 type FiltersData struct {
 	Ignores map[string][]string `json:"ignores"`

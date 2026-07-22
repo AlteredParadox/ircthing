@@ -22,9 +22,22 @@ import { sanitizeFiltersForSync } from "../src/local.js";
 test("sanitizeRulesForSync drops only the over-cap offenders", () => {
 	const ok = { pattern: "deploy", network: "", id: "a" };
 	const cjk = { pattern: "重".repeat(90), network: "", id: "b" }; // 270 bytes, 90 chars
-	const longNet = { pattern: "x", network: "n".repeat(129), id: "c" };
+	const longNet = { pattern: "x", network: "n".repeat(301), id: "c" };
 	const out = sanitizeRulesForSync([ok, cjk, longNet]);
 	eq(out, [ok], "over-byte pattern and over-byte network dropped, valid kept");
+
+	// A 300-byte network scope (unnamed network's host:port) is legal.
+	const onion = { pattern: "x", network: "n".repeat(300), id: "d" };
+	eq(sanitizeRulesForSync([onion]), [onion]);
+
+	// A corrupt or over-cap id is REPLACED (ids only key editor rows),
+	// never a reason to drop the rule or reject the batch.
+	const badId = { pattern: "y", network: "", id: 42 };
+	const fixed = sanitizeRulesForSync([badId]);
+	is(fixed.length, 1);
+	is(fixed[0].pattern, "y");
+	is(typeof fixed[0].id, "string");
+	is(fixed[0].id.length > 0, true);
 
 	// 256 bytes exactly is allowed (mirror of the server's <= cap).
 	const edge = { pattern: "重".repeat(85) + "x", network: "", id: "d" }; // 256 bytes
@@ -42,7 +55,7 @@ test("sanitizeFiltersForSync drops offenders, keeps the rest", () => {
 			"": ["ghost"], // empty network dropped
 			oftc: ["carol"],
 		},
-		["libera\n#chan", "", "m".repeat(513)],
+		["libera\n#chan", "", "m".repeat(1025)],
 	);
 	eq(ignores, { libera: ["bob"], oftc: ["carol"] });
 	eq(mutes, ["libera\n#chan"]);

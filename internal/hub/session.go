@@ -1426,7 +1426,10 @@ const rulesKey = "highlight_rules"
 const (
 	maxRules            = 64
 	maxRulePatternChars = 256
-	maxRuleNetworkChars = 128
+	// Sized to store.MaxNetworkNameBytes: an unnamed network's effective
+	// name is its host:port, and a rule scoped to it must survive the
+	// server cap or the client-side clamp silently drops it.
+	maxRuleNetworkChars = store.MaxNetworkNameBytes
 	maxRuleIDChars      = 64
 )
 
@@ -1483,6 +1486,12 @@ func (s *Session) handleSetRules(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", "too many rules"))
 		return
 	}
+	s.hub.syncedSettingsMu.Lock()
+	defer s.hub.syncedSettingsMu.Unlock()
+	// A client that was dirty across a network rename re-pushes scopes
+	// under the old name; rewrite them so last-write-wins cannot undo
+	// the rename's blob rewrite.
+	renames := s.hub.loadRenameMap(ctx)
 	kept := make([]Rule, 0, len(d.Rules))
 	for _, r := range d.Rules {
 		if len(r.Pattern) > maxRulePatternChars || len(r.Network) > maxRuleNetworkChars || len(r.ID) > maxRuleIDChars {
@@ -1495,6 +1504,7 @@ func (s *Session) handleSetRules(ctx context.Context, env Envelope) {
 		if r.Pattern == "" {
 			continue
 		}
+		r.Network = resolveRenamed(renames, r.Network)
 		kept = append(kept, r)
 	}
 	blob, err := json.Marshal(RulesData{Rules: kept})
@@ -1516,13 +1526,91 @@ const filtersKey = "filters"
 
 // Filter caps: like the rule caps, sanity bounds rather than expected
 // sizes — the lists are consulted per live message in the pusher.
+// maxMuteKeyChars covers the longest legal bufKey: a 300-byte network
+// name (store.MaxNetworkNameBytes — an unnamed network's host:port
+// fallback) + "\n" + a 512-byte stored target.
 const (
 	maxFilterNetworks    = 128
 	maxIgnoresPerNetwork = 512
 	maxIgnoreNickChars   = 128
 	maxMutes             = 1024
-	maxMuteKeyChars      = 512
+	maxMuteKeyChars      = 1024
 )
+
+// renamesKey is the settings-table key for the network rename map
+// (old name -> current name, flattened). It exists for one reason: a
+// client that was DIRTY (offline edit, debounce window) during a rename
+// later re-pushes rules/filters still referencing the old name, and
+// last-write-wins would silently undo the rename rewrite. Applying this
+// map at set_rules/set_filters time makes such stale writes self-heal.
+// An entry is dropped the moment a network with the old name exists
+// again (the mapping would then corrupt legitimate references).
+const renamesKey = "network_renames"
+
+// maxNetworkRenames bounds the map; renames are rare one-off events.
+const maxNetworkRenames = 128
+
+func (h *Hub) loadRenameMap(ctx context.Context) map[string]string {
+	v, err := h.store.Setting(ctx, renamesKey)
+	if err != nil || v == "" {
+		return map[string]string{}
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(v), &m); err != nil || m == nil {
+		return map[string]string{}
+	}
+	return m
+}
+
+func (h *Hub) saveRenameMap(ctx context.Context, m map[string]string) {
+	blob, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+	if err := h.store.SetSetting(ctx, renamesKey, string(blob)); err != nil {
+		log.Printf("push: storing network rename map: %v", err)
+	}
+}
+
+// recordNetworkRename folds old->new into the map, keeping it
+// flattened (existing entries pointing at old now point at new) and
+// dropping new as a key (that name exists again). Caller holds
+// syncedSettingsMu.
+func (h *Hub) recordNetworkRename(ctx context.Context, oldName, newName string) {
+	m := h.loadRenameMap(ctx)
+	for k, v := range m {
+		if v == oldName {
+			m[k] = newName
+		}
+	}
+	delete(m, newName)
+	if len(m) < maxNetworkRenames {
+		m[oldName] = newName
+	}
+	h.saveRenameMap(ctx, m)
+}
+
+// clearNetworkRename drops name from the map when a network with that
+// name (re)appears — rewriting its references would then be corruption.
+func (h *Hub) clearNetworkRename(ctx context.Context, name string) {
+	h.syncedSettingsMu.Lock()
+	defer h.syncedSettingsMu.Unlock()
+	m := h.loadRenameMap(ctx)
+	if _, ok := m[name]; !ok {
+		return
+	}
+	delete(m, name)
+	h.saveRenameMap(ctx, m)
+}
+
+// resolveRenamed maps a possibly-stale network reference to its current
+// name.
+func resolveRenamed(m map[string]string, name string) string {
+	if next, ok := m[name]; ok {
+		return next
+	}
+	return name
+}
 
 // loadFilters parses the stored ignore/mute lists; corrupt or absent
 // data yields empty lists (nothing filtered).
@@ -1568,14 +1656,16 @@ func (s *Session) handleGetFilters(ctx context.Context, env Envelope) {
 
 // canonicalIgnores validates and normalizes the ignore map: nicks are
 // lowercased (the client's fold, so the pusher's lookup matches
-// regardless of which device wrote the list), empties dropped. A
+// regardless of which device wrote the list), empties dropped, and
+// network keys mapped through the rename map (see renamesKey). A
 // non-empty problem string reports the first violation.
-func canonicalIgnores(in map[string][]string) (map[string][]string, string) {
+func canonicalIgnores(in map[string][]string, renames map[string]string) (map[string][]string, string) {
 	out := make(map[string][]string, len(in))
 	for network, nicks := range in {
 		if network == "" || len(nicks) > maxIgnoresPerNetwork {
 			return nil, "bad ignore list"
 		}
+		network = resolveRenamed(renames, network)
 		kept := make([]string, 0, len(nicks))
 		for _, n := range nicks {
 			if n == "" {
@@ -1587,15 +1677,17 @@ func canonicalIgnores(in map[string][]string) (map[string][]string, string) {
 			kept = append(kept, strings.ToLower(n))
 		}
 		if len(kept) > 0 {
-			out[network] = kept
+			// A stale old-name key can merge into the renamed one.
+			out[network] = append(out[network], kept...)
 		}
 	}
 	return out, ""
 }
 
 // canonicalMutes validates the mute list (client bufKey form), dropping
-// empties; a non-empty problem string reports the first violation.
-func canonicalMutes(in []string) ([]string, string) {
+// empties and mapping the network part through the rename map; a
+// non-empty problem string reports the first violation.
+func canonicalMutes(in []string, renames map[string]string) ([]string, string) {
 	out := make([]string, 0, len(in))
 	for _, m := range in {
 		if m == "" {
@@ -1603,6 +1695,9 @@ func canonicalMutes(in []string) ([]string, string) {
 		}
 		if len(m) > maxMuteKeyChars {
 			return nil, "mute key too long"
+		}
+		if network, buffer, ok := strings.Cut(m, "\n"); ok {
+			m = resolveRenamed(renames, network) + "\n" + buffer
 		}
 		out = append(out, m)
 	}
@@ -1621,12 +1716,15 @@ func (s *Session) handleSetFilters(ctx context.Context, env Envelope) {
 		s.push(errEnvelope(env.Seq, "bad_request", "too many filters"))
 		return
 	}
-	ignores, problem := canonicalIgnores(d.Ignores)
+	s.hub.syncedSettingsMu.Lock()
+	defer s.hub.syncedSettingsMu.Unlock()
+	renames := s.hub.loadRenameMap(ctx)
+	ignores, problem := canonicalIgnores(d.Ignores, renames)
 	if problem != "" {
 		s.push(errEnvelope(env.Seq, "bad_request", problem))
 		return
 	}
-	mutes, problem := canonicalMutes(d.Mutes)
+	mutes, problem := canonicalMutes(d.Mutes, renames)
 	if problem != "" {
 		s.push(errEnvelope(env.Seq, "bad_request", problem))
 		return
@@ -1656,6 +1754,12 @@ func (s *Session) handleSetFilters(ctx context.Context, env Envelope) {
 // Broadcast to EVERY session (including the renamer's) so clients
 // re-adopt the rewritten lists.
 func (h *Hub) renameSyncedNetworkRefs(ctx context.Context, oldName, newName string) {
+	h.syncedSettingsMu.Lock()
+	defer h.syncedSettingsMu.Unlock()
+	// Record old->new first: a client that was dirty across this rename
+	// re-pushes old-name references later, and set_rules/set_filters
+	// rewrite them through this map.
+	h.recordNetworkRename(ctx, oldName, newName)
 	rules := h.loadRules(ctx)
 	changedRules := false
 	for i := range rules {

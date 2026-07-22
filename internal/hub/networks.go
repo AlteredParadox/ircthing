@@ -322,8 +322,19 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 		// Pending pushes carry the OLD network name in their keys and
 		// payloads; cancel rather than deliver stale names.
 		s.hub.notifyPushCancel(d.OldName, "", "")
-		// Synced rules/ignores/mutes reference the network by name.
-		s.hub.renameSyncedNetworkRefs(ctx, d.OldName, nc.Name)
+		// Synced rules/ignores/mutes reference the network by name. Use
+		// the EFFECTIVE name (`name`, the stored identity): nc.Name is
+		// "" for an unnamed network — rewriting scopes to "" would turn
+		// them GLOBAL and corrupt ignore/mute keys.
+		s.hub.renameSyncedNetworkRefs(ctx, d.OldName, name)
+		// Tell live clients so they rewrite their LOCAL copies too —
+		// including dirty ones, whose eventual re-push must not carry
+		// the old name back to the server.
+		s.hub.broadcast(envelope("network_renamed", 0, NetworkRenameData{Old: d.OldName, New: name}))
+	} else {
+		// A (re)created network invalidates any rename-map entry for its
+		// name: rewriting references to it would now be corruption.
+		s.hub.clearNetworkRename(ctx, name)
 	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcast(envelope("networks_changed", 0, nil))

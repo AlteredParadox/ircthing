@@ -469,6 +469,14 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 	// failure must not show the login screen over a still-valid session.
 	async function logout() {
 		setLogoutErr(false);
+		// Retire THIS device's push subscription first, while the session
+		// cookie still works: signing out must stop the notification tray
+		// from receiving sender names and message text — a signed-out
+		// shared machine kept getting PMs otherwise. Best effort: browser-
+		// side removal wins even if the server POST fails (the dead
+		// endpoint 404/410s and prunes on the next delivery), and an
+		// unsubscribe failure must not block signing out.
+		await unsubscribePush().catch(() => {});
 		try {
 			const r = await fetch("/api/logout", { method: "POST" });
 			if (!r.ok) throw new Error("logout failed: HTTP " + r.status);
@@ -494,14 +502,7 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 		if (rules.length >= 64) return;
 		onRules([...rules, { id: uuid(), pattern: "", network: "" }]);
 	};
-	const updateRule = (i, patch) => {
-		// The server caps patterns at 256 BYTES; the input's maxLength
-		// counts UTF-16 units, which CJK/emoji exceed well before 256
-		// characters. Refuse the over-byte edit outright — the field
-		// simply stops accepting input, like maxLength does.
-		if (typeof patch.pattern === "string" && new TextEncoder().encode(patch.pattern).length > 256) return;
-		onRules(rules.map((r, j) => (j === i ? { ...r, ...patch } : r)));
-	};
+	const updateRule = (i, patch) => onRules(rules.map((r, j) => (j === i ? { ...r, ...patch } : r)));
 	const removeRule = (i) => onRules(rules.filter((_, j) => j !== i));
 
 	return (
@@ -876,7 +877,20 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 									value={r.pattern}
 									placeholder="keyword"
 									maxLength={256}
-									onInput={(e) => updateRule(i, { pattern: e.currentTarget.value })}
+									onInput={(e) => {
+										// The server caps patterns at 256 BYTES; maxLength
+										// counts UTF-16 units, which CJK/emoji exceed well
+										// before 256 characters. Refuse the over-byte edit
+										// AND snap the field back — a controlled input whose
+										// state update was skipped keeps showing the refused
+										// text otherwise.
+										const v = e.currentTarget.value;
+										if (new TextEncoder().encode(v).length > 256) {
+											e.currentTarget.value = r.pattern;
+											return;
+										}
+										updateRule(i, { pattern: v });
+									}}
 								/>
 								<select
 									class="rule-net"

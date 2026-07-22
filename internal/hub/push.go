@@ -106,8 +106,9 @@ type pendingPush struct {
 	sender      string // first unread highlight's sender/text head the notification
 	text        string
 	msgid       string
-	ts          int64 // first highlight's time (shown time)
-	newestTS    int64 // newest coalesced highlight (cancel threshold)
+	nick        string // our nick when admitted (for re-evaluating rules changes)
+	ts          int64  // first highlight's time (shown time)
+	newestTS    int64  // newest coalesced highlight (cancel threshold)
 	count       int
 	channelLike bool
 }
@@ -305,11 +306,11 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 		case <-h.pushConfigDirty:
 			rules = h.loadRules(ctx)
 			filters = buildPushFilters(h.loadFilters(ctx))
-			// Muting a buffer (or ignoring its latest pinger) mid-window
-			// is exactly when the user expects silence: re-apply the new
-			// filters to what is already scheduled, not just to future
-			// candidates.
-			if sweepFilteredPending(pending, filters) {
+			// Muting a buffer, ignoring its latest pinger, or deleting a
+			// (half-typed) keyword mid-window is exactly when the user
+			// expects silence: re-apply the new config to what is
+			// already scheduled, not just to future candidates.
+			if sweepFilteredPending(pending, rules, filters) {
 				rearmPushTimer(timer, pending)
 			}
 
@@ -360,15 +361,26 @@ func applyPushCancel(pending map[string]*pendingPush, cn pushCancel) bool {
 	return false
 }
 
-// sweepFilteredPending drops pending pushes the just-reloaded filters
-// now exclude; reports whether anything changed. Only the FIRST
-// coalesced sender is known per entry — good enough: that is the sender
-// the user just reacted to.
-func sweepFilteredPending(pending map[string]*pendingPush, filters pushFilters) bool {
+// sweepFilteredPending drops pending pushes the just-reloaded config
+// now excludes; reports whether anything changed. Only the FIRST
+// coalesced message is known per entry — good enough: that is what the
+// user just reacted to (the mid-window mute/ignore, or deleting the
+// half-typed keyword that spuriously matched).
+func sweepFilteredPending(pending map[string]*pendingPush, rules []Rule, filters pushFilters) bool {
 	changed := false
 	for key, p := range pending {
 		network, buffer, _ := strings.Cut(key, "\x00")
 		if filters.drops(network, buffer, p.sender) {
+			delete(pending, key)
+			changed = true
+			continue
+		}
+		// A sole channel highlight whose headline no longer matches any
+		// rule or mention was admitted by a since-changed rule set (a
+		// keyword mid-edit, a deleted rule). Coalesced entries stay:
+		// later siblings may have matched independently.
+		if p.channelLike && p.count == 1 && p.text != "" &&
+			!highlightText(p.text, p.nick, rules, network) {
 			delete(pending, key)
 			changed = true
 		}
@@ -403,7 +415,7 @@ func admitCandidate(pending map[string]*pendingPush, c pushCandidate, rules []Ru
 	}
 	pending[key] = &pendingPush{
 		fireAt: time.Now().Add(delay),
-		sender: c.sender, text: c.text, msgid: c.msgid,
+		sender: c.sender, text: c.text, msgid: c.msgid, nick: c.nick,
 		ts: c.ts, newestTS: c.ts, count: 1, channelLike: c.channelLike,
 	}
 	return true
@@ -487,19 +499,21 @@ func (h *Hub) deliverPush(ctx context.Context, sender PushSender, key string, p 
 	if t, err := h.store.ReadMarker(ctx, network, buffer); err == nil && !t.IsZero() && t.UnixMilli() >= p.newestTS {
 		return
 	}
-	// The buffer may have been purged after scheduling — the close/delete
-	// hooks cancel pending pushes, but their channel sends are best
-	// effort. A buffer the store no longer knows gets no push (and its
-	// notification would navigate nowhere). Identity fold: `buffer` is
-	// already the canonical stored spelling.
-	name, found, err := h.store.FindBuffer(ctx, network, buffer, func(s string) string { return s })
+	// The buffer may have been purged OR archived after scheduling — the
+	// close hooks cancel pending pushes for both modes, but their channel
+	// sends are best effort. A buffer the store no longer knows gets no
+	// push (its notification would navigate nowhere); an archived one is
+	// hidden from every sidebar and must stay silent too, mirroring
+	// persistEvent's stillArchived suppression. `buffer` is already the
+	// canonical stored spelling, so the exact-name lookup is faithful.
+	found, archived, err := h.store.BufferState(ctx, network, buffer)
 	if err != nil {
 		// Fail closed (skip the push) but never silently: a transient
 		// store error here eats a notification.
 		log.Printf("push: checking buffer %s/%s: %v", network, buffer, err)
 		return
 	}
-	if !found || name != buffer {
+	if !found || archived {
 		return
 	}
 	// Fire-time redaction re-check, mirroring the marker one: the

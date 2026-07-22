@@ -170,6 +170,13 @@ type Hub struct {
 	// path turns into all pushes silently off.
 	pushCountMu sync.Mutex
 	pushPubKey  string
+
+	// syncedSettingsMu serializes read-modify-writes of the synced
+	// rules/filters/rename-map settings blobs (set_rules, set_filters,
+	// renameSyncedNetworkRefs): a rename rewriting the blobs must not
+	// interleave with a client write, or one side's update is silently
+	// lost.
+	syncedSettingsMu sync.Mutex
 }
 
 // Store exposes the shared store so the HTTP layer can read/write its own
