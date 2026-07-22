@@ -319,14 +319,19 @@ function mergeHistoryPage(m, key, page, tombstones) {
 }
 
 // useServerRSS polls /api/config for the server's live memory use while
-// `active` (the toggle is on and we're in the app) and the tab is
-// visible. /api/config already samples VmRSS per request, so at one
-// authed GET per 5s for a single-user server this needs no dedicated
-// endpoint. Returns the last-read byte count (0 until the first read).
-function useServerRSS(active) {
+// the toggle is on, we're in the app, and the tab is visible.
+// /api/config already samples VmRSS per request, so at one authed GET
+// per 5s for a single-user server this needs no dedicated endpoint.
+// Returns the last-read byte count, or 0 whenever inactive (so the
+// caller can render it unconditionally).
+function useServerRSS(phase, showMemory) {
+	const active = phase === "app" && showMemory;
 	const [rss, setRss] = useState(0);
 	useEffect(() => {
-		if (!active) return undefined;
+		if (!active) {
+			setRss(0);
+			return undefined;
+		}
 		let alive = true;
 		const poll = async () => {
 			if (document.hidden) return;
@@ -789,8 +794,9 @@ export function App() {
 		return () => globalThis.removeEventListener("hashchange", onHash);
 	}, []);
 
-	// Live server RSS for the sidebar footer (extracted to a hook below).
-	const rssBytes = useServerRSS(phase === "app" && prefs.showMemory);
+	// Live server RSS for the sidebar footer (extracted to a hook below);
+	// 0 whenever the toggle is off, so the footer renders it directly.
+	const rssBytes = useServerRSS(phase, prefs.showMemory);
 
 	// Remember the active buffer for hashless cold starts (see
 	// loadActiveBuffer). Split the key rather than consulting buffers:
@@ -2296,7 +2302,7 @@ export function App() {
 				<Sidebar
 					networks={networks} buffers={buffers} activeKey={activeKey}
 					monitors={monitors} truncated={buffersTruncated}
-					memRSS={prefs.showMemory ? rssBytes : 0}
+					memRSS={rssBytes}
 					mutedSet={mutedSet} onSelect={select}
 					onSettings={() => setSettingsOpen(true)}
 					onBufferMenu={openBufferMenu} onNetworkMenu={openNetworkMenu}
