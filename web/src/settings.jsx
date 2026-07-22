@@ -218,6 +218,17 @@ function ChangePassword({ onRotated }) {
 	);
 }
 
+// fetchConfig GETs the server settings snapshot; null on any failure
+// (callers keep their current values).
+async function fetchConfig() {
+	try {
+		const r = await fetch("/api/config");
+		return r.ok ? await r.json() : null;
+	} catch {
+		return null;
+	}
+}
+
 // saveConfig PUTs a settings patch and reports whether the server accepted
 // it (2xx). Callers revert their optimistic UI on false so this session
 // can't silently diverge from the persisted state (and other devices).
@@ -331,13 +342,7 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 			const genM = retentionGens.max.current;
 			const genS = sessionGen.current;
 			const genP = previewsGen.current;
-			let d = null;
-			try {
-				const r = await fetch("/api/config");
-				d = r.ok ? await r.json() : null;
-			} catch {
-				d = null;
-			}
+			const d = await fetchConfig();
 			if (!d || stale()) return; // logged out while the GET ran: drop it
 			// Not `|0`: that wraps values above 2^31-1 negative, corrupting
 			// the display and making every later retention save a 400.

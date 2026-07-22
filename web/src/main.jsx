@@ -18,11 +18,18 @@ import { render } from "preact";
 import { App } from "./app.jsx";
 import "./style.css";
 
-// The push-only service worker (sw.js — no fetch handler, no caching).
-// Registration is idempotent; failures leave the app fully functional
-// with push simply unavailable.
-if ("serviceWorker" in navigator) {
-	navigator.serviceWorker.register("/sw.js").catch(() => {});
-}
-
 render(<App />, document.getElementById("app"));
+
+// The push-only service worker (sw.js — no fetch handler, no caching).
+// Registered AFTER first render so a slow registration never delays
+// paint; registration is idempotent, and a failure leaves the app fully
+// functional with push simply unavailable. Top-level await is safe
+// here: this is the entry module, nothing imports (and thus waits on)
+// it.
+if ("serviceWorker" in navigator) {
+	try {
+		await navigator.serviceWorker.register("/sw.js");
+	} catch {
+		// No push on this browser/session.
+	}
+}

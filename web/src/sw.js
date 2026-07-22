@@ -18,10 +18,10 @@
 // app's network and auth paths are untouched. Payload shape comes from
 // the server's pushPayload (internal/hub/push.go).
 
-self.addEventListener("install", () => self.skipWaiting());
-self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
+globalThis.addEventListener("install", () => globalThis.skipWaiting());
+globalThis.addEventListener("activate", (event) => event.waitUntil(globalThis.clients.claim()));
 
-self.addEventListener("push", (event) => {
+globalThis.addEventListener("push", (event) => {
 	// iOS revokes the push subscription after a few pushes that display
 	// nothing, so ALWAYS show a notification — an unparseable payload
 	// gets a generic one rather than being swallowed.
@@ -41,7 +41,7 @@ self.addEventListener("push", (event) => {
 		if (d.count > 1) body = `${body}\n(and ${d.count - 1} more)`;
 	}
 	event.waitUntil(
-		self.registration.showNotification(title, {
+		globalThis.registration.showNotification(title, {
 			body,
 			// One notification per buffer: a later push replaces the
 			// earlier one instead of stacking.
@@ -58,7 +58,7 @@ self.addEventListener("push", (event) => {
 // worker instance is still alive from handling it.
 let pendingNav = null;
 
-self.addEventListener("notificationclick", (event) => {
+globalThis.addEventListener("notificationclick", (event) => {
 	event.notification.close();
 	const { network, buffer } = event.notification.data || {};
 	// Hash shape mirrors toHash (web/src/irc.js): #/<network>/<buffer>.
@@ -70,7 +70,7 @@ self.addEventListener("notificationclick", (event) => {
 			// client.navigate would reload the whole SPA. matchAll can
 			// return STALE clients whose page the OS already killed; if
 			// none can be focused, fall through to a fresh window.
-			const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+			const wins = await globalThis.clients.matchAll({ type: "window", includeUncontrolled: true });
 			for (const w of wins) {
 				try {
 					await w.focus();
@@ -80,12 +80,18 @@ self.addEventListener("notificationclick", (event) => {
 					// Stale client: try the next.
 				}
 			}
-			await self.clients.openWindow(`/${hash}`);
+			await globalThis.clients.openWindow(`/${hash}`);
 		})(),
 	);
 });
 
-self.addEventListener("message", (event) => {
+globalThis.addEventListener("message", (event) => {
+	// Only same-origin pages can hold a reference to this worker, but
+	// verify anyway: a cross-origin sender has no business here. Empty
+	// origin is tolerated as same-origin — some engines omit it on
+	// client->worker messages, and rejecting those would silently break
+	// the pull path this handler exists for.
+	if (event.origin && event.origin !== globalThis.location.origin) return;
 	if (event.data?.type !== "get_pending_nav") return;
 	const nav = pendingNav;
 	pendingNav = null; // deliver once
@@ -96,7 +102,7 @@ self.addEventListener("message", (event) => {
 	}
 });
 
-self.addEventListener("pushsubscriptionchange", (event) => {
+globalThis.addEventListener("pushsubscriptionchange", (event) => {
 	// Safari fires this rarely (and unreliably); the app-load resync in
 	// push.js is the real repair path. Best effort here for browsers
 	// that do fire it: re-subscribe with the same server key and
@@ -106,7 +112,7 @@ self.addEventListener("pushsubscriptionchange", (event) => {
 	event.waitUntil(
 		(async () => {
 			try {
-				const sub = await self.registration.pushManager.subscribe(opts);
+				const sub = await globalThis.registration.pushManager.subscribe(opts);
 				await fetch("/api/push/subscribe", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },

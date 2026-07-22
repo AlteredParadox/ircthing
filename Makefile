@@ -17,9 +17,12 @@ BINARY_BUDGET_BYTES := 31457280
 BUNDLE_BUDGET_BYTES := 102400
 
 ESBUILD := node_modules/.bin/esbuild
+# es2022 for top-level await (the SW registration in main.jsx). Every
+# browser this app targets (anything with the Push API / installable
+# PWAs) is comfortably past ES2022.
 ESBUILD_FLAGS := --bundle --minify --format=esm \
 	--jsx=automatic --jsx-import-source=preact \
-	--target=es2020
+	--target=es2022
 
 .PHONY: build build-debug frontend check vet staticcheck test binary-size-gate bundle-size-gate go-version-gate notices-check integration irctest memcheck clean
 
@@ -48,7 +51,7 @@ frontend: web/node_modules
 	cd web && $(ESBUILD) $(ESBUILD_FLAGS) src/main.jsx --outfile=dist/app.js
 	# Service worker: separate entry, classic script (iife) — Safari's
 	# module-SW support isn't worth depending on. Counted by the bundle gate.
-	cd web && $(ESBUILD) --bundle --minify --format=iife --target=es2020 src/sw.js --outfile=dist/sw.js
+	cd web && $(ESBUILD) --bundle --minify --format=iife --target=es2022 src/sw.js --outfile=dist/sw.js
 	cp web/index.html web/manifest.json web/icon.svg web/dist/
 
 web/node_modules: web/package.json web/package-lock.json

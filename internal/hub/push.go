@@ -244,59 +244,21 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 	pending := make(map[string]*pendingPush) // network+"\x00"+buffer
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
-	rearm := func() {
-		// One timer tracks the earliest deadline. Go 1.23+ timer
-		// semantics: Stop/Reset without the drain dance is safe.
-		timer.Stop()
-		var next time.Time
-		for _, p := range pending {
-			if next.IsZero() || p.fireAt.Before(next) {
-				next = p.fireAt
-			}
-		}
-		if !next.IsZero() {
-			timer.Reset(time.Until(next))
-		}
-	}
 	for {
 		select {
 		case <-ctx.Done():
 			return // pending pushes die with the process: best effort by design
 
 		case c := <-h.pushCandidates:
-			// Ignored senders and muted buffers never push — the synced
-			// mirror of the client's alert exclusions (app.jsx event path).
-			if filters.drops(c.network, c.buffer, c.sender) {
-				continue
+			if admitCandidate(pending, c, rules, filters, delay) {
+				rearmPushTimer(timer, pending)
 			}
-			// PMs always push; channels (and "*") need a mention/keyword.
-			if c.channelLike && !highlightText(c.text, c.nick, rules, c.network) {
-				continue
-			}
-			key := c.network + "\x00" + c.buffer
-			if p, ok := pending[key]; ok {
-				// Coalesce; do NOT extend fireAt — a chatty channel must
-				// not defer its notification forever.
-				p.count++
-				p.newestTS = max(p.newestTS, c.ts)
-				continue
-			}
-			if len(pending) >= maxPendingPushes {
-				log.Printf("push: pending cap reached, dropping highlight in %s/%s", c.network, c.buffer)
-				continue
-			}
-			pending[key] = &pendingPush{
-				fireAt: time.Now().Add(delay),
-				sender: c.sender, text: c.text, msgid: c.msgid,
-				ts: c.ts, newestTS: c.ts, count: 1, channelLike: c.channelLike,
-			}
-			rearm()
 
 		case m := <-h.pushMarkers:
 			key := m.network + "\x00" + m.buffer
 			if p, ok := pending[key]; ok && p.newestTS <= m.ts {
 				delete(pending, key)
-				rearm()
+				rearmPushTimer(timer, pending)
 			}
 
 		case <-h.pushConfigDirty:
@@ -304,16 +266,70 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 			filters = buildPushFilters(h.loadFilters(ctx))
 
 		case <-timer.C:
-			now := time.Now()
-			for key, p := range pending {
-				if p.fireAt.After(now) {
-					continue
-				}
-				delete(pending, key)
-				h.deliverPush(ctx, sender, key, p)
-			}
-			rearm()
+			h.fireDuePushes(ctx, sender, pending)
+			rearmPushTimer(timer, pending)
 		}
+	}
+}
+
+// admitCandidate applies the filter and highlight policy to one live
+// message and schedules (or coalesces) its push. Reports whether a NEW
+// entry was scheduled, i.e. the timer needs rearming.
+func admitCandidate(pending map[string]*pendingPush, c pushCandidate, rules []Rule, filters pushFilters, delay time.Duration) bool {
+	// Ignored senders and muted buffers never push — the synced mirror
+	// of the client's alert exclusions (app.jsx event path).
+	if filters.drops(c.network, c.buffer, c.sender) {
+		return false
+	}
+	// PMs always push; channels (and "*") need a mention/keyword.
+	if c.channelLike && !highlightText(c.text, c.nick, rules, c.network) {
+		return false
+	}
+	key := c.network + "\x00" + c.buffer
+	if p, ok := pending[key]; ok {
+		// Coalesce; do NOT extend fireAt — a chatty channel must not
+		// defer its notification forever.
+		p.count++
+		p.newestTS = max(p.newestTS, c.ts)
+		return false
+	}
+	if len(pending) >= maxPendingPushes {
+		log.Printf("push: pending cap reached, dropping highlight in %s/%s", c.network, c.buffer)
+		return false
+	}
+	pending[key] = &pendingPush{
+		fireAt: time.Now().Add(delay),
+		sender: c.sender, text: c.text, msgid: c.msgid,
+		ts: c.ts, newestTS: c.ts, count: 1, channelLike: c.channelLike,
+	}
+	return true
+}
+
+// rearmPushTimer points the single timer at the earliest pending
+// deadline (stopped when none). Go 1.23+ timer semantics: Stop/Reset
+// without the drain dance is safe.
+func rearmPushTimer(timer *time.Timer, pending map[string]*pendingPush) {
+	timer.Stop()
+	var next time.Time
+	for _, p := range pending {
+		if next.IsZero() || p.fireAt.Before(next) {
+			next = p.fireAt
+		}
+	}
+	if !next.IsZero() {
+		timer.Reset(time.Until(next))
+	}
+}
+
+// fireDuePushes delivers every pending push whose deadline has passed.
+func (h *Hub) fireDuePushes(ctx context.Context, sender PushSender, pending map[string]*pendingPush) {
+	now := time.Now()
+	for key, p := range pending {
+		if p.fireAt.After(now) {
+			continue
+		}
+		delete(pending, key)
+		h.deliverPush(ctx, sender, key, p)
 	}
 }
 
@@ -376,30 +392,37 @@ func (h *Hub) deliverPush(ctx context.Context, sender PushSender, key string, p 
 		return
 	}
 	for _, sub := range subs {
-		p256dh, err1 := base64.RawURLEncoding.DecodeString(sub.P256dh)
-		auth, err2 := base64.RawURLEncoding.DecodeString(sub.Auth)
-		if err1 != nil || err2 != nil {
-			// Unusable keys can never decrypt anything: prune the row.
-			h.prunePushSubscription(ctx, sub.Endpoint, errors.New("stored keys undecodable"))
-			continue
+		h.pushToSubscription(ctx, sender, sub, payload)
+	}
+}
+
+// pushToSubscription encrypts and sends one payload to one endpoint,
+// pruning subscriptions that can never work again (undecodable keys,
+// push-service 404/410).
+func (h *Hub) pushToSubscription(ctx context.Context, sender PushSender, sub store.PushSubscription, payload []byte) {
+	p256dh, err1 := base64.RawURLEncoding.DecodeString(sub.P256dh)
+	auth, err2 := base64.RawURLEncoding.DecodeString(sub.Auth)
+	if err1 != nil || err2 != nil {
+		// Unusable keys can never decrypt anything: prune the row.
+		h.prunePushSubscription(ctx, sub.Endpoint, errors.New("stored keys undecodable"))
+		return
+	}
+	body, err := webpush.Encrypt(payload, p256dh, auth)
+	if err != nil {
+		h.prunePushSubscription(ctx, sub.Endpoint, err)
+		return
+	}
+	switch err := sender.Send(ctx, webpush.Subscription{Endpoint: sub.Endpoint, P256dh: p256dh, Auth: auth}, body, pushTTLSeconds); {
+	case err == nil:
+		if err := h.store.TouchPushSuccess(ctx, sub.Endpoint, time.Now()); err != nil {
+			log.Printf("push: recording success: %v", err)
 		}
-		body, err := webpush.Encrypt(payload, p256dh, auth)
-		if err != nil {
-			h.prunePushSubscription(ctx, sub.Endpoint, err)
-			continue
-		}
-		switch err := sender.Send(ctx, webpush.Subscription{Endpoint: sub.Endpoint, P256dh: p256dh, Auth: auth}, body, pushTTLSeconds); {
-		case err == nil:
-			if err := h.store.TouchPushSuccess(ctx, sub.Endpoint, time.Now()); err != nil {
-				log.Printf("push: recording success: %v", err)
-			}
-		case errors.Is(err, webpush.ErrGone):
-			h.prunePushSubscription(ctx, sub.Endpoint, err)
-		default:
-			// Transient (network, 5xx, 429): no retry — the push service
-			// owns redelivery, and the next highlight tries again.
-			log.Printf("push: delivering to %s: %v", sub.Endpoint, err)
-		}
+	case errors.Is(err, webpush.ErrGone):
+		h.prunePushSubscription(ctx, sub.Endpoint, err)
+	default:
+		// Transient (network, 5xx, 429): no retry — the push service
+		// owns redelivery, and the next highlight tries again.
+		log.Printf("push: delivering to %s: %v", sub.Endpoint, err)
 	}
 }
 

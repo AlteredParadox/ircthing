@@ -97,6 +97,26 @@ func flagPassed(name string) bool {
 	return set
 }
 
+// logStartupWarnings surfaces misconfiguration that is worth a log line
+// but not a refusal to start. Retention warns on the EFFECTIVE value,
+// not the config file: the settings table (runtime-set via the UI) is
+// authoritative once seeded, so cfg.* can be stale in both directions
+// after any UI change.
+func logStartupWarnings(cfg *config, st *store.Store) {
+	if days, maxPer := st.Retention(); days == 0 && maxPer == 0 {
+		log.Print("retention: disabled (retention_days and retention_max_messages both 0) — stored history grows without bound; set a limit or place the database on a quota'd filesystem")
+	}
+	if w := cfg.proxyConfigWarning(); w != "" {
+		log.Print("config: " + w)
+	}
+	if w := cfg.cookieConfigWarning(); w != "" {
+		log.Print("config: " + w)
+	}
+	if w := api.MediaDebugURLsWarning(); w != "" {
+		log.Print("env: " + w)
+	}
+}
+
 func run(cfg *config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -111,21 +131,7 @@ func run(cfg *config) error {
 	}
 	defer st.Close()
 
-	// Warn on the EFFECTIVE retention, not the config file: the settings table
-	// (runtime-set via the UI) is authoritative once seeded, so cfg.* can be
-	// stale in both directions after any UI change.
-	if days, maxPer := st.Retention(); days == 0 && maxPer == 0 {
-		log.Print("retention: disabled (retention_days and retention_max_messages both 0) — stored history grows without bound; set a limit or place the database on a quota'd filesystem")
-	}
-	if w := cfg.proxyConfigWarning(); w != "" {
-		log.Print("config: " + w)
-	}
-	if w := cfg.cookieConfigWarning(); w != "" {
-		log.Print("config: " + w)
-	}
-	if w := api.MediaDebugURLsWarning(); w != "" {
-		log.Print("env: " + w)
-	}
+	logStartupWarnings(cfg, st)
 
 	h := hub.New(st)
 

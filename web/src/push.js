@@ -46,8 +46,9 @@ export function isIOSNeedingInstall() {
 // the Uint8Array pushManager.subscribe expects.
 export function urlB64ToBytes(s) {
 	const pad = "=".repeat((4 - (s.length % 4)) % 4);
-	const raw = atob((s + pad).replace(/-/g, "+").replace(/_/g, "/"));
-	return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+	const raw = atob((s + pad).replaceAll("-", "+").replaceAll("_", "/"));
+	// codePointAt === charCodeAt here: atob output is latin1 (0-255).
+	return Uint8Array.from(raw, (c) => c.codePointAt(0));
 }
 
 async function postJSON(path, body) {
