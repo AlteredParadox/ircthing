@@ -151,6 +151,17 @@ type Hub struct {
 	// network+"\x00"+foldedBuffer -> unix-ms of the close.
 	recentClose      map[string]int64
 	recentCloseBytes int
+
+	// Web Push scheduler plumbing (see push.go). The channels feed the
+	// single runPusher goroutine; sends are always non-blocking. pushSubs
+	// caches the subscription count so the per-message fast path is one
+	// atomic load; pushPubKey (under mu) is the VAPID public key the
+	// HTTP layer serves to clients.
+	pushCandidates chan pushCandidate
+	pushMarkers    chan markerAdvance
+	pushRulesDirty chan struct{}
+	pushSubs       atomic.Int64
+	pushPubKey     string
 }
 
 // Store exposes the shared store so the HTTP layer can read/write its own
@@ -172,6 +183,9 @@ func New(st *store.Store) *Hub {
 		sessionQueueBytes: defaultSessionQueueBytes,
 		hubQueueBytes:     defaultHubQueueBytes,
 		largeResponseSem:  make(chan struct{}, 4),
+		pushCandidates:    make(chan pushCandidate, 256),
+		pushMarkers:       make(chan markerAdvance, 64),
+		pushRulesDirty:    make(chan struct{}, 1),
 	}
 }
 
@@ -752,6 +766,7 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 		return nil
 	}
 	h.publishPersisted(stored, target, replay, batch)
+	h.maybePushCandidate(c, ev, stored, target, replay, own)
 	return nil
 }
 
@@ -1009,6 +1024,7 @@ func (h *Hub) applyUpstreamMarker(ctx context.Context, c Conn, ev irc.Event) {
 	h.broadcast(envelope("read_marker", 0, MarkerData{
 		Network: ev.Network, Buffer: target, Time: markerMillis(authoritative),
 	}))
+	h.notifyMarkerAdvance(ev.Network, target, authoritative)
 }
 
 // histBatch is the replay progress of one open chathistory batch.
@@ -1502,11 +1518,6 @@ func (h *Hub) network(name string) Conn {
 	defer h.mu.Unlock()
 	return h.networks[name]
 }
-
-// notifyRulesChanged tells the Web Push pusher the stored highlight
-// rules changed. No-op until the pusher lands (it will drain a dirty
-// channel); split out now so set_rules is complete.
-func (h *Hub) notifyRulesChanged() {}
 
 func (h *Hub) broadcast(env Envelope) {
 	frame, err := json.Marshal(env)

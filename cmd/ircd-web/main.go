@@ -156,6 +156,14 @@ func run(cfg *config) error {
 	// rows exist the file list is ignored.
 	var wg sync.WaitGroup
 	h.UseRoot(ctx, &wg)
+	// Web Push scheduler (provisions the VAPID key on first run). On the
+	// process WaitGroup so shutdown drains an in-flight delivery before
+	// the deferred st.Close().
+	if err := h.StartPusher(ctx, &wg); err != nil {
+		stop()
+		wg.Wait()
+		return fmt.Errorf("web push: %w", err)
+	}
 	if err := startNetworks(ctx, st, h, cfg.Networks); err != nil {
 		// Some networks may already be running: cancel and WAIT for them
 		// before the deferred st.Close() pulls the store out from under them.

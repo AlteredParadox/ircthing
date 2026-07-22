@@ -1356,6 +1356,7 @@ func (s *Session) handleSetMarker(ctx context.Context, env Envelope) {
 	data := MarkerData{Network: d.Network, Buffer: d.Buffer, Time: markerMillis(t)}
 	s.push(envelope("read_marker", env.Seq, data))
 	s.hub.broadcastExcept(s, envelope("read_marker", 0, data))
+	s.hub.notifyMarkerAdvance(d.Network, d.Buffer, t)
 	// Bridge to draft/read-marker: other clients of this account (e.g.
 	// on a bouncer) learn our read position. The authoritative value is
 	// sent, never a regression. The synthetic server buffer is local-only —
