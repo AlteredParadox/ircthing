@@ -32,6 +32,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"ircthing/internal/netguard"
 )
 
 // Inline audio/video playback: the browser's <audio>/<video> elements stream
@@ -187,7 +189,7 @@ func (s *Server) handleMediaToken(w http.ResponseWriter, r *http.Request) {
 	// hostname is not resolved here — the stream fetch re-validates it at
 	// dial time (direct) or defers DNS to the proxy/tunnel, exactly like
 	// preview/thumb fetches.
-	if ip := net.ParseIP(u.Hostname()); ip != nil && !isPublicIP(ip) {
+	if ip := net.ParseIP(u.Hostname()); ip != nil && !netguard.IsPublicIP(ip) {
 		http.Error(w, "bad url", http.StatusBadRequest)
 		return
 	}
@@ -546,7 +548,7 @@ func streamTransport(dial func(context.Context, string, string) (net.Conn, error
 // checks via the dialer Control hook; proxied: literal-IP refusal with DNS
 // deferred to the proxy).
 func newStreamFetcher(proxy *url.URL) *fetcher {
-	f := &fetcher{allowIP: isPublicIP}
+	f := &fetcher{allowIP: netguard.IsPublicIP}
 	f.client = &http.Client{
 		Transport:     streamTransport(f.dialContext(proxy)),
 		CheckRedirect: f.checkRedirect,
@@ -558,7 +560,7 @@ func newStreamFetcher(proxy *url.URL) *fetcher {
 // newTunnelFetcher: the tunnel owns egress and DNS, dial fails closed when it
 // is down.
 func newTunnelStreamFetcher(dial func(ctx context.Context, addr string) (net.Conn, error)) *fetcher {
-	f := &fetcher{allowIP: isPublicIP, proxied: true}
+	f := &fetcher{allowIP: netguard.IsPublicIP, proxied: true}
 	f.client = &http.Client{
 		Transport: streamTransport(func(ctx context.Context, _, addr string) (net.Conn, error) {
 			return dial(ctx, addr)
