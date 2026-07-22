@@ -148,15 +148,15 @@ export function Sidebar({ networks, buffers, activeKey, monitors, truncated, mem
 				{/* No avatar/nick/status chip: the composer already shows the
 				    current nick, and per-network state lives on the network
 				    headers — one wide settings affordance instead. */}
+				{memRSS > 0 && (
+					<div class="foot-mem" title="Server memory in use (RSS), sampled every 5s">
+						Memory: {(memRSS / (1024 * 1024)).toFixed(1)} MB
+					</div>
+				)}
 				<button class="foot-settings" onClick={onSettings}>
 					<span class="foot-settings-gear" aria-hidden="true">⚙</span>
 					<span>Settings</span>
 				</button>
-				{memRSS > 0 && (
-					<div class="foot-mem" title="Server memory in use (RSS), sampled every 5s">
-						{(memRSS / (1024 * 1024)).toFixed(1)} MB
-					</div>
-				)}
 			</div>
 		</div>
 	);
