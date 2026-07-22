@@ -9,7 +9,7 @@ picks up exactly where you left off.
 
 No CGO, no runtime dependencies beyond the config file and the SQLite
 database it creates. The binary is ~16 MB; the web bundle inside it is
-~53 KB gzipped; a working setup with 5 networks and 10k messages of hot
+~55 KB gzipped; a working setup with 5 networks and 10k messages of hot
 scrollback runs in ~32 MB of RSS.
 
 <img src="docs/screenshots/main_dark.png" alt="ircthing in dark mode: channel view with an image thumbnail and an inline audio player, member list on the right">
@@ -53,9 +53,20 @@ scrollback runs in ~32 MB of RSS.
   keeps its history by default (the buffer returns, intact, on new
   activity or a rejoin); a settings toggle makes closing delete
   instead, behind a confirmation.
-- **Multi-device**: read markers, unread counts, and appearance
-  preferences sync through the server; `draft/read-marker` bridges read
-  state to other bouncer clients.
+- **Multi-device**: read markers, unread counts, appearance
+  preferences, and highlight keywords sync through the server;
+  `draft/read-marker` bridges read state to other bouncer clients.
+- **Web Push**: the server notifies your devices about highlights and
+  private messages even with the app closed — including iOS home-screen
+  PWAs (iOS 16.4+, delivered via APNs), where a backgrounded WebSocket
+  cannot survive. A push waits ~20 s and is cancelled if any device
+  reads the buffer first; per-buffer coalescing keeps a busy channel to
+  one notification. Payloads are end-to-end encrypted (RFC 8291), keys
+  are provisioned automatically (no Apple/Google account or
+  configuration needed), and enabling it is a per-device toggle in
+  settings. Requires HTTPS (the reverse proxy you already have); on
+  iOS, add the app to the Home Screen first. Known limitation: ignore
+  and mute lists are per-device, so a muted buffer can still push.
 - **Theming**: dark/light/system, accent colors, text size, density,
   message font — plus a raw custom-CSS override. Usable at 360 px wide;
   installable as a PWA.
