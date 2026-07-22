@@ -318,6 +318,37 @@ function mergeHistoryPage(m, key, page, tombstones) {
 	};
 }
 
+// useServerRSS polls /api/config for the server's live memory use while
+// `active` (the toggle is on and we're in the app) and the tab is
+// visible. /api/config already samples VmRSS per request, so at one
+// authed GET per 5s for a single-user server this needs no dedicated
+// endpoint. Returns the last-read byte count (0 until the first read).
+function useServerRSS(active) {
+	const [rss, setRss] = useState(0);
+	useEffect(() => {
+		if (!active) return undefined;
+		let alive = true;
+		const poll = async () => {
+			if (document.hidden) return;
+			try {
+				const r = await fetch("/api/config");
+				const c = r.ok ? await r.json() : null;
+				if (alive && typeof c?.memory_rss_bytes === "number") setRss(c.memory_rss_bytes);
+			} catch {
+				// Transient; the next tick retries. The stale number stays
+				// up rather than flickering away.
+			}
+		};
+		poll();
+		const t = setInterval(poll, 5000);
+		return () => {
+			alive = false;
+			clearInterval(t);
+		};
+	}, [active]);
+	return rss;
+}
+
 // useNotificationNav wires notification-tap navigation. The service
 // worker delivers the tapped buffer BOTH by direct postMessage and,
 // because a message to a suspended/killed iOS page is silently lost, by
@@ -758,32 +789,8 @@ export function App() {
 		return () => globalThis.removeEventListener("hashchange", onHash);
 	}, []);
 
-	// Live server RSS for the sidebar footer, polled while the toggle is
-	// on and the tab is visible. /api/config is reused (it already
-	// samples VmRSS per request); at one authed GET per 5s for a
-	// single-user server this costs nothing worth a dedicated endpoint.
-	const [rssBytes, setRssBytes] = useState(0);
-	useEffect(() => {
-		if (phase !== "app" || !prefs.showMemory) return undefined;
-		let alive = true;
-		const poll = async () => {
-			if (document.hidden) return;
-			try {
-				const r = await fetch("/api/config");
-				const c = r.ok ? await r.json() : null;
-				if (alive && typeof c?.memory_rss_bytes === "number") setRssBytes(c.memory_rss_bytes);
-			} catch {
-				// Transient; the next tick retries. The stale number stays
-				// up rather than flickering away.
-			}
-		};
-		poll();
-		const t = setInterval(poll, 5000);
-		return () => {
-			alive = false;
-			clearInterval(t);
-		};
-	}, [phase, prefs.showMemory]);
+	// Live server RSS for the sidebar footer (extracted to a hook below).
+	const rssBytes = useServerRSS(phase === "app" && prefs.showMemory);
 
 	// Remember the active buffer for hashless cold starts (see
 	// loadActiveBuffer). Split the key rather than consulting buffers:
