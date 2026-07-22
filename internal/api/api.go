@@ -305,6 +305,10 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 	s.mux.HandleFunc("GET /api/config", s.requireAuth(s.handleClientConfig))
 	s.mux.HandleFunc("PUT /api/config", s.sameSiteOnly(s.requireAuth(s.handleSetConfig)))
 	s.mux.HandleFunc("POST /api/password", s.sameSiteOnly(s.requireAuth(s.handleChangePassword)))
+	// Web Push registration (push.go). HTTP rather than WS types so the
+	// service worker can re-register from pushsubscriptionchange.
+	s.mux.HandleFunc("POST /api/push/subscribe", s.sameSiteOnly(s.requireAuth(s.handlePushSubscribe)))
+	s.mux.HandleFunc("POST /api/push/unsubscribe", s.sameSiteOnly(s.requireAuth(s.handlePushUnsubscribe)))
 	// The media endpoints are always registered; they refuse (403) at
 	// runtime when previews are disabled, so the switch is editable live.
 	// POST, not GET: the target URL travels in the request body so it never

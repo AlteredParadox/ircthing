@@ -102,15 +102,19 @@ func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
 	days, maxPer := s.hub.Store().Retention()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
-		Previews             bool `json:"previews"`
-		RetentionDays        int  `json:"retention_days"`
-		RetentionMaxMessages int  `json:"retention_max_messages"`
-		SessionTTLDays       int  `json:"session_ttl_days"`
+		Previews             bool   `json:"previews"`
+		RetentionDays        int    `json:"retention_days"`
+		RetentionMaxMessages int    `json:"retention_max_messages"`
+		SessionTTLDays       int    `json:"session_ttl_days"`
+		PushPublicKey        string `json:"push_public_key"`
 	}{
 		Previews:             s.previewsEnabled(),
 		RetentionDays:        days,
 		RetentionMaxMessages: maxPer,
 		SessionTTLDays:       int(s.sessionTTLDur() / (24 * time.Hour)),
+		// The VAPID applicationServerKey; "" until the pusher has
+		// provisioned one (client treats that as push-unavailable).
+		PushPublicKey: s.hub.PushPublicKey(),
 	})
 }
 
