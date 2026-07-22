@@ -40,15 +40,21 @@ import (
 const testPushDelay = 30 * time.Millisecond
 
 type fakeSender struct {
-	mu    sync.Mutex
-	calls []webpush.Subscription
-	err   error
+	mu     sync.Mutex
+	calls  []webpush.Subscription
+	err    error
+	onSend func(n int) // ran after recording call n (1-based); for mid-delivery state changes
 }
 
 func (f *fakeSender) Send(_ context.Context, sub webpush.Subscription, _ []byte, _ int) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls = append(f.calls, sub)
+	n := len(f.calls)
+	hook := f.onSend
+	f.mu.Unlock()
+	if hook != nil {
+		hook(n)
+	}
 	return f.err
 }
 
@@ -609,6 +615,80 @@ func TestVapidKeyReplacementClearsSubscriptions(t *testing.T) {
 	}
 	if n, _ := h.store.CountPushSubscriptions(ctx); n != 1 {
 		t.Fatalf("subscriptions after clean reload = %d, want 1", n)
+	}
+}
+
+// TestPusherFailsClosedOnUnreadableFilters: a corrupt filters blob that
+// NEVER loaded must suppress all pushes (fail closed), not degrade to an
+// empty "nothing filtered" policy that leaks suppressed content.
+func TestPusherFailsClosedOnUnreadableFilters(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	if err := h.store.SetSetting(ctx, filtersKey, "{ corrupt"); err != nil {
+		t.Fatal(err)
+	}
+	addTestSubscription(t, h, "https://push.example/dev1")
+	seedBuffer(t, h, "libera", "alice")
+	f := &fakeSender{}
+	startTestPusher(t, h, f)
+
+	// A PM (always-push) is suppressed while the filter policy is
+	// untrustworthy.
+	h.pushCandidates <- candidate("alice", "alice", "hi", time.Now().UnixMilli(), false)
+	time.Sleep(5 * testPushDelay)
+	if got := f.count(); got != 0 {
+		t.Fatalf("sends with unreadable filters = %d, want 0", got)
+	}
+
+	// Repairing the filters and poking the reload lets pushes resume.
+	if err := h.store.SetSetting(ctx, filtersKey, `{"ignores":{},"mutes":[]}`); err != nil {
+		t.Fatal(err)
+	}
+	h.notifyPushConfigChanged()
+	waitDrained(t, h.pushConfigDirty)
+	h.pushCandidates <- candidate("alice", "alice", "back", time.Now().UnixMilli(), false)
+	waitSends(t, f, 1)
+}
+
+// TestPusherRevalidatesBeforeEachSend: a redaction arriving MID-delivery
+// (after the first endpoint, before the second) stops the remaining
+// sends — the per-send store re-check, not just the once-at-start one.
+func TestPusherRevalidatesBeforeEachSend(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	addTestSubscription(t, h, "https://push.example/dev1")
+	addTestSubscription(t, h, "https://push.example/dev2")
+	stored, err := h.store.Append(ctx, "libera", "alice", store.Message{
+		Time: time.Now(), Sender: "alice", Command: "PRIVMSG", Text: "secret", MsgID: "m1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeSender{}
+	// After the FIRST send, redact the message in the store.
+	f.onSend = func(n int) {
+		if n == 1 {
+			_, _ = h.store.SetRedacted(ctx, "libera", "alice", "m1", "oops")
+		}
+	}
+	startTestPusher(t, h, f)
+
+	c := candidate("alice", "alice", "secret", stored.Time.UnixMilli(), false)
+	c.msgid = "m1"
+	h.pushCandidates <- c
+	// Exactly ONE send: the second is suppressed by the mid-delivery
+	// redaction re-check.
+	deadline := time.After(3 * time.Second)
+	for f.count() < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("no send at all")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	time.Sleep(10 * testPushDelay)
+	if got := f.count(); got != 1 {
+		t.Fatalf("sends = %d, want exactly 1 (second suppressed by redaction)", got)
 	}
 }
 

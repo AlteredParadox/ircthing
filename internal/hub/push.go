@@ -172,20 +172,15 @@ func (h *Hub) loadOrCreateVapidKey(ctx context.Context) (*ecdsa.PrivateKey, erro
 	if err != nil {
 		return nil, err
 	}
-	if err := h.store.SetSetting(ctx, vapidKeyKey, marshaled); err != nil {
+	// Store the new key AND wipe subscriptions in ONE transaction:
+	// anything bound to a retired key is cryptographically dead (the push
+	// service rejects the new VAPID signature 401/403 — which never
+	// prunes, only 404/410 do — so it fails forever and squats the cap).
+	// On first-ever generation there are no subscriptions, so the wipe is
+	// a harmless no-op. Failing here fails startup — a half-rotated
+	// credential is worse than not starting.
+	if err := h.store.SetSettingAndWipePushSubscriptions(ctx, vapidKeyKey, marshaled); err != nil {
 		return nil, err
-	}
-	// Subscriptions bound to a replaced key are cryptographically dead:
-	// the push service rejects the new VAPID signature with 401/403 —
-	// which never prunes (only 404/410 do) — so they would fail forever
-	// AND squat the subscription cap. Wipe them; devices re-subscribe on
-	// next load (the client detects the applicationServerKey change).
-	if n, cerr := h.store.CountPushSubscriptions(ctx); cerr == nil && n > 0 {
-		if derr := h.store.DeleteAllPushSubscriptions(ctx); derr != nil {
-			log.Printf("push: clearing subscriptions for replaced VAPID key: %v", derr)
-		} else {
-			log.Printf("push: cleared %d subscription(s) bound to the replaced VAPID key", n)
-		}
 	}
 	return priv, nil
 }
@@ -288,34 +283,61 @@ func (h *Hub) notifyPushCancel(network, buffer, msgid string) {
 	}
 }
 
-// runPusher is the scheduler loop; sole owner of pending-push state and
-// the rules cache.
-// maxConcurrentDeliveries bounds the delivery goroutines fireDuePushes
-// spawns: enough to keep one slow push service (15s client timeout) from
-// serializing everything behind it, small enough to stay irrelevant
-// under GOMEMLIMIT.
-const maxConcurrentDeliveries = 4
+// Fixed delivery workers consume a bounded job channel. FIXED, not
+// spawn-per-job: a spawn-per-due-entry model bounds only the ACTIVE
+// sends (a semaphore) while waiting goroutines pile up unbounded — with
+// slow endpoints and buffers re-scheduling, that grows until OOM.
+const (
+	maxConcurrentDeliveries = 4
+	pushJobQueue            = maxPendingPushes // bounded; a full queue drops (best effort)
+)
 
+// pushJob is one buffer's due notification, handed to a worker. *p is
+// owned exclusively once removed from the pending map.
+type pushJob struct {
+	key string
+	p   *pendingPush
+}
+
+// runPusher is the scheduler loop; sole owner of pending-push state and
+// the rules/filters caches. Delivery runs on a FIXED worker pool reading
+// a bounded channel, so a slow push service can neither stall the loop
+// (marker cancels, redaction scrubs, mute sweeps stay responsive) nor
+// leak goroutines. Every store/sender access from a worker is
+// mutex-guarded, so off-loop delivery is safe.
 func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Duration) {
-	rules, filters := h.reloadPushConfig(ctx, nil, pushFilters{})
+	rules, filters, filtersOK := h.reloadPushConfig(ctx, nil, pushFilters{}, false)
 	pending := make(map[string]*pendingPush) // network+"\x00"+buffer
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
-	// Deliveries run OFF this goroutine (an entry removed from pending is
-	// exclusively owned, and store/sender accesses are all mutex-guarded),
-	// so a slow push service cannot stall marker cancels, redaction
-	// scrubs, or mute sweeps for the other buffers. Bounded by sem;
-	// drained before returning so shutdown still beats store close.
-	var deliveries sync.WaitGroup
-	sem := make(chan struct{}, maxConcurrentDeliveries)
-	defer deliveries.Wait()
+
+	jobs := make(chan pushJob, pushJobQueue)
+	var workers sync.WaitGroup
+	for range maxConcurrentDeliveries {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job := <-jobs:
+					h.deliverPush(ctx, sender, job.key, job.p)
+				}
+			}
+		}()
+	}
+	// Workers drain before runPusher returns, which (via the process
+	// WaitGroup) precedes store close — no store use after close.
+	defer workers.Wait()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return // pending pushes die with the process: best effort by design
 
 		case c := <-h.pushCandidates:
-			if admitCandidate(pending, c, rules, filters, delay) {
+			if admitCandidate(pending, c, rules, filters, filtersOK, delay) {
 				rearmPushTimer(timer, pending)
 			}
 
@@ -332,7 +354,7 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 			}
 
 		case <-h.pushConfigDirty:
-			rules, filters = h.reloadPushConfig(ctx, rules, filters)
+			rules, filters, filtersOK = h.reloadPushConfig(ctx, rules, filters, filtersOK)
 			// Muting a buffer, ignoring its latest pinger, or deleting a
 			// (half-typed) keyword mid-window is exactly when the user
 			// expects silence: re-apply the new config to what is
@@ -342,7 +364,7 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 			}
 
 		case <-timer.C:
-			h.fireDuePushes(ctx, sender, pending, &deliveries, sem)
+			enqueueDuePushes(pending, jobs)
 			rearmPushTimer(timer, pending)
 		}
 	}
@@ -351,9 +373,12 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 // reloadPushConfig loads the rules and filters, KEEPING the previous
 // values when a stored blob is unreadable: a corrupt filters blob
 // silently becoming "nothing filtered" would push exactly the content
-// the user suppressed. prev may be nil/zero on first load (nothing to
-// keep — absent settings legitimately mean empty).
-func (h *Hub) reloadPushConfig(ctx context.Context, prevRules []Rule, prevFilters pushFilters) ([]Rule, pushFilters) {
+// the user suppressed. Returns filtersOK = whether the filter policy is
+// TRUSTWORTHY (loaded or legitimately absent): while false — an
+// unreadable blob with no prior good value, e.g. a first-load failure —
+// the caller suppresses ALL candidates (fail closed). prevOK carries the
+// last trustworthy state forward.
+func (h *Hub) reloadPushConfig(ctx context.Context, prevRules []Rule, prevFilters pushFilters, prevOK bool) ([]Rule, pushFilters, bool) {
 	rules := prevRules
 	if r, ok := h.loadRulesChecked(ctx); ok {
 		rules = r
@@ -361,12 +386,16 @@ func (h *Hub) reloadPushConfig(ctx context.Context, prevRules []Rule, prevFilter
 		log.Printf("push: keeping previous highlight rules (stored blob unreadable)")
 	}
 	filters := prevFilters
+	filtersOK := prevOK
 	if f, ok := h.loadFiltersChecked(ctx); ok {
 		filters = buildPushFilters(f)
-	} else {
+		filtersOK = true
+	} else if prevOK {
 		log.Printf("push: keeping previous ignore/mute filters (stored blob unreadable)")
+	} else {
+		log.Printf("push: ignore/mute filters unreadable and never loaded — suppressing all pushes until they load")
 	}
-	return rules, filters
+	return rules, filters, filtersOK
 }
 
 // applyPushCancel applies one pushCancel to the pending map; reports
@@ -439,7 +468,13 @@ func sweepFilteredPending(pending map[string]*pendingPush, rules []Rule, filters
 // admitCandidate applies the filter and highlight policy to one live
 // message and schedules (or coalesces) its push. Reports whether a NEW
 // entry was scheduled, i.e. the timer needs rearming.
-func admitCandidate(pending map[string]*pendingPush, c pushCandidate, rules []Rule, filters pushFilters, delay time.Duration) bool {
+func admitCandidate(pending map[string]*pendingPush, c pushCandidate, rules []Rule, filters pushFilters, filtersOK bool, delay time.Duration) bool {
+	// Fail closed while the filter policy is untrustworthy (a corrupt
+	// blob that never loaded): pushing here could leak content the user
+	// suppressed. Recovers on the next successful config reload.
+	if !filtersOK {
+		return false
+	}
 	// Ignored senders and muted buffers never push — the synced mirror
 	// of the client's alert exclusions (app.jsx event path).
 	if filters.drops(c.network, c.buffer, c.sender) {
@@ -485,27 +520,24 @@ func rearmPushTimer(timer *time.Timer, pending map[string]*pendingPush) {
 	}
 }
 
-// fireDuePushes hands every due pending push to a bounded delivery
-// goroutine. Deleting the entry FIRST transfers exclusive ownership of
-// *p to its delivery; the scheduler loop never touches it again.
-func (h *Hub) fireDuePushes(ctx context.Context, sender PushSender, pending map[string]*pendingPush, deliveries *sync.WaitGroup, sem chan struct{}) {
+// enqueueDuePushes hands every due pending push to the worker queue.
+// Deleting the entry FIRST transfers exclusive ownership of *p to its
+// job; the scheduler loop never touches it again. A full queue drops the
+// job (best effort — the queue is already backed up on slow endpoints),
+// logged rather than silent.
+func enqueueDuePushes(pending map[string]*pendingPush, jobs chan pushJob) {
 	now := time.Now()
 	for key, p := range pending {
 		if p.fireAt.After(now) {
 			continue
 		}
 		delete(pending, key)
-		deliveries.Add(1)
-		go func(key string, p *pendingPush) {
-			defer deliveries.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				return
-			}
-			h.deliverPush(ctx, sender, key, p)
-		}(key, p)
+		select {
+		case jobs <- pushJob{key: key, p: p}:
+		default:
+			network, buffer, _ := strings.Cut(key, "\x00")
+			log.Printf("push: delivery queue full, dropping notification for %s/%.60q", network, buffer)
+		}
 	}
 }
 
@@ -603,39 +635,63 @@ func (h *Hub) pushStillDue(ctx context.Context, network, buffer string, p *pendi
 	return true
 }
 
-// deliverPush sends one due notification to every subscription, after
-// the authoritative fire-time re-checks (pushStillDue).
+// deliverPush sends one due notification to every subscription. Runs on
+// a worker goroutine, so it re-validates against the AUTHORITATIVE store
+// before EACH endpoint send: a delivery can take up to ~15s per
+// subscription, and a read, redaction, close, mute, ignore, or
+// credential rotation arriving mid-delivery must stop (or scrub) the
+// remaining sends. Every check is a store read — safe off the scheduler
+// loop.
 func (h *Hub) deliverPush(ctx context.Context, sender PushSender, key string, p *pendingPush) {
 	network, buffer, _ := strings.Cut(key, "\x00")
-	if !h.pushStillDue(ctx, network, buffer, p) {
-		return
-	}
 	subs, err := h.store.PushSubscriptions(ctx)
 	if err != nil {
-		log.Printf("push: loading subscriptions: %v", err)
-		return
-	}
-	if len(subs) == 0 {
-		return
-	}
-	payload, err := json.Marshal(pushPayload{
-		Network: network, Buffer: buffer, Sender: p.sender,
-		Text: truncatePushText(stripCodes(p.text)), TS: p.ts,
-		MsgID: p.msgid, Count: p.count, Channel: p.channelLike,
-	})
-	if err != nil {
-		return
-	}
-	// Belt and braces below the per-field clamps: an over-limit payload
-	// must be skipped HERE, once — Encrypt would reject it per
-	// subscription, and that failure must never look prune-worthy.
-	if len(payload) > webpush.MaxPlaintext {
-		log.Printf("push: payload for %s/%.60q is %d bytes (limit %d), skipping", network, buffer, len(payload), webpush.MaxPlaintext)
+		log.Printf("push: loading subscriptions for %s/%.60q: %v", network, buffer, err)
 		return
 	}
 	for _, sub := range subs {
+		if !h.deliveryStillAllowed(ctx, network, buffer, p) {
+			return
+		}
+		// Build the payload PER SEND from the current *p: pushStillDue may
+		// have scrubbed a coalesced-redacted headline since the last one.
+		payload, err := json.Marshal(pushPayload{
+			Network: network, Buffer: buffer, Sender: p.sender,
+			Text: truncatePushText(stripCodes(p.text)), TS: p.ts,
+			MsgID: p.msgid, Count: p.count, Channel: p.channelLike,
+		})
+		if err != nil {
+			return
+		}
+		// An over-limit payload must be skipped, never pruned: Encrypt
+		// would reject it per subscription and that must not look
+		// prune-worthy.
+		if len(payload) > webpush.MaxPlaintext {
+			log.Printf("push: payload for %s/%.60q is %d bytes (limit %d), skipping", network, buffer, len(payload), webpush.MaxPlaintext)
+			return
+		}
 		h.pushToSubscription(ctx, sender, sub, payload)
 	}
+}
+
+// deliveryStillAllowed re-runs every authoritative privacy/liveness gate
+// immediately before a send. All store reads: read marker, buffer
+// existence/archive, headline redaction (pushStillDue), a FRESH filter
+// re-check (a mute/ignore during the delivery), and the subscription
+// count (a credential rotation wiped them). Fail closed on an
+// unreadable filter policy.
+func (h *Hub) deliveryStillAllowed(ctx context.Context, network, buffer string, p *pendingPush) bool {
+	if h.pushSubs.Load() == 0 {
+		return false // rotation/prune emptied the table mid-delivery
+	}
+	if !h.pushStillDue(ctx, network, buffer, p) {
+		return false
+	}
+	f, ok := h.loadFiltersChecked(ctx)
+	if !ok {
+		return false // indeterminate filter policy: suppress
+	}
+	return !buildPushFilters(f).drops(network, buffer, p.sender)
 }
 
 // pushToSubscription encrypts and sends one payload to one endpoint,

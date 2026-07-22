@@ -1787,26 +1787,36 @@ func (s *Session) handleSetFilters(ctx context.Context, env Envelope) {
 	s.hub.notifyPushConfigChanged()
 }
 
-// renameSyncedNetworkRefs rewrites network-name references inside the
-// synced highlight rules and ignore/mute lists after a network rename.
-// The store moves buffers/markers/monitors with the renamed row, but
-// these blobs reference the network BY NAME — left stale, an ignored
-// harasser or muted channel resumes alerting (and pushing) under the
-// new name, and scoped keywords silently stop, with no hint anywhere.
-// Broadcast to EVERY session (including the renamer's) so clients
-// re-adopt the rewritten lists.
+// Renaming a network moves its buffers/markers/monitors with the row,
+// but the synced highlight rules and ignore/mute lists reference the
+// network BY NAME — left stale, an ignored harasser or muted channel
+// resumes alerting (and pushing) under the new name, and scoped keywords
+// silently stop. Production splits the fix so the rename MAP commits in
+// the same transaction as the network move (renameMapWrite, below) and
+// the rules/filters rewrite follows (rewriteRuleFilterRefsLocked); the
+// combined renameSyncedNetworkRefs below is for callers with no network
+// move of their own (tests).
+
+// renameSyncedNetworkRefs does the whole settings-side rename (map +
+// rules + filters) as one locked operation.
 func (h *Hub) renameSyncedNetworkRefs(ctx context.Context, oldName, newName string) {
 	h.syncedSettingsMu.Lock()
 	defer h.syncedSettingsMu.Unlock()
-	// ALL settings mutations commit in ONE SetSettings transaction: the
-	// rename map (which heals stale writes from dirty clients), the
-	// rewritten rules, and the rewritten filters go together or not at
-	// all — a partial commit could leave rewritten blobs with no healing
-	// map, or vice versa. (The network rename itself commits separately
-	// in ReplaceNetworkConfig before this runs; if the process dies in
-	// the gap, the next stale-client write still heals through the map
-	// once this retries via that client's set_* — the accepted residual.)
-	writes := map[string]string{}
+	if writes := h.renameMapWrite(ctx, oldName, newName); writes != nil {
+		if err := h.store.SetSettings(ctx, writes); err != nil {
+			log.Printf("network %q -> %q: writing rename map: %v", oldName, newName, err)
+			return
+		}
+	}
+	h.rewriteRuleFilterRefsLocked(ctx, oldName, newName)
+}
+
+// renameMapWrite computes the updated network-rename map as a settings
+// write for ReplaceNetworkConfigWithSettings's transaction, so the map
+// entry commits ATOMICALLY with the history move — the healing entry can
+// never be orphaned. Caller holds syncedSettingsMu. Returns nil if the
+// map can't be encoded (the rules/filters rewrite still runs).
+func (h *Hub) renameMapWrite(ctx context.Context, oldName, newName string) map[string]string {
 	renames := h.loadRenameMap(ctx)
 	for k, v := range renames {
 		if v == oldName {
@@ -1817,29 +1827,41 @@ func (h *Hub) renameSyncedNetworkRefs(ctx context.Context, oldName, newName stri
 	if len(renames) < maxNetworkRenames {
 		renames[oldName] = newName
 	}
-	if blob, err := json.Marshal(renames); err == nil {
-		writes[renamesKey] = string(blob)
+	blob, err := json.Marshal(renames)
+	if err != nil {
+		return nil
 	}
+	return map[string]string{renamesKey: string(blob)}
+}
 
+// rewriteRuleFilterRefsLocked rewrites the rules and ignore/mute lists
+// from oldName to newName and broadcasts the canonical results. Runs
+// AFTER the rename map committed with the network move, so a failure
+// here is self-healing: the guaranteed map entry rewrites any stale
+// old-name reference on its next set_rules/set_filters. Caller holds
+// syncedSettingsMu.
+func (h *Hub) rewriteRuleFilterRefsLocked(ctx context.Context, oldName, newName string) {
 	rules := h.loadRules(ctx)
 	changedRules := rewriteRuleRefs(rules, oldName, newName)
+	filters := h.loadFilters(ctx)
+	changedFilters := rewriteFilterRefs(&filters, oldName, newName)
+
+	writes := map[string]string{}
 	if changedRules {
 		if blob, err := json.Marshal(RulesData{Rules: rules}); err == nil {
 			writes[rulesKey] = string(blob)
 		}
 	}
-
-	filters := h.loadFilters(ctx)
-	changedFilters := rewriteFilterRefs(&filters, oldName, newName)
 	if changedFilters {
 		if blob, err := json.Marshal(filters); err == nil {
 			writes[filtersKey] = string(blob)
 		}
 	}
-
-	if err := h.store.SetSettings(ctx, writes); err != nil {
-		log.Printf("network %q -> %q: rewriting synced settings: %v", oldName, newName, err)
-		return
+	if len(writes) > 0 {
+		if err := h.store.SetSettings(ctx, writes); err != nil {
+			log.Printf("network %q -> %q: rewriting synced settings: %v", oldName, newName, err)
+			return
+		}
 	}
 	if changedRules {
 		h.broadcast(envelope("rules", 0, RulesData{Rules: rules, Seeded: true}))

@@ -760,7 +760,12 @@ export function App() {
 				// hours after the tap; a stale one must not yank the
 				// session. Same 60s window the worker's pull path uses.
 				if (typeof d.at === "number" && Date.now() - d.at > 60 * 1000) return;
-				location.hash = toHash(d.network, d.buffer);
+				// Route through select(), not a bare hash set: select →
+				// navigate creates a placeholder for a not-yet-discovered
+				// PM AND drops any stale search/history window so the live
+				// tail (with the message that was pushed) reloads — a bare
+				// hash set no-ops when the hash already equals the target.
+				select(d.network, d.buffer);
 				// Consume the worker's pendingNav copy: a tap delivered to
 				// an ALREADY-VISIBLE window fires no visibilitychange, so
 				// without this the stashed target survives and the next

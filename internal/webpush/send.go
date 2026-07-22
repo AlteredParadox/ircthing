@@ -164,7 +164,16 @@ func (s *Sender) Send(ctx context.Context, sub Subscription, body []byte, ttl in
 	req.Header.Set("Authorization", auth)
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return err
+		// client.Do returns *url.Error, whose .URL is the FULL endpoint —
+		// a capability URL (endpoint + VAPID key = delivery rights). Drop
+		// it here at the source so no caller can log it, even through a
+		// wrapped error; keep the operation and underlying cause (a dial
+		// timeout etc. names a host, never the secret path).
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			return fmt.Errorf("webpush: %s failed: %v", ue.Op, ue.Err)
+		}
+		return errors.New("webpush: delivery transport error")
 	}
 	defer resp.Body.Close()
 	// Drain a little for connection hygiene, never trust the size.

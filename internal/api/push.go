@@ -80,6 +80,16 @@ func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad auth secret", http.StatusBadRequest)
 		return
 	}
+	// Re-check auth AFTER the (attacker-pausable) body read: requireAuth
+	// validated the cookie before the body arrived, so a stolen session
+	// could pause its upload past a password rotation — which revokes the
+	// token and wipes subscriptions — then finish and re-plant its
+	// endpoint. authed() revalidates against the live token map, so a
+	// rotation in the gap makes this fail closed.
+	if !s.authed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	err = s.hub.Store().UpsertPushSubscription(r.Context(), store.PushSubscription{
 		Endpoint: body.Endpoint,
 		P256dh:   base64.RawURLEncoding.EncodeToString(p256dh),

@@ -72,17 +72,31 @@ func (s *Store) UpsertPushSubscription(ctx context.Context, sub PushSubscription
 	return tx.Commit()
 }
 
-// DeleteAllPushSubscriptions removes every registered endpoint — the
-// credential-rotation hammer: any endpoint registered under retired
-// trust (a stolen session's plant, or subscriptions bound to a replaced
-// VAPID key) dies with it. Legitimate devices re-register automatically
-// via the client's on-load resync after their next authenticated open.
-func (s *Store) DeleteAllPushSubscriptions(ctx context.Context) error {
+// SetSettingAndWipePushSubscriptions stores a setting and clears every
+// push subscription in ONE transaction — the atomic form of "rotate a
+// credential and revoke the push grants bound to it." Used for password
+// rotation (key = password_hash: a stolen session's planted endpoint
+// must not survive recovery) and VAPID key replacement (subscriptions
+// bound to the retired key are cryptographically dead). Either both
+// commit or neither does.
+func (s *Store) SetSettingAndWipePushSubscriptions(ctx context.Context, key, value string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, err := s.db.ExecContext(ctx, `DELETE FROM push_subscriptions`)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO settings (key, value) VALUES (?, ?)
+		 ON CONFLICT (key) DO UPDATE SET value = excluded.value`, key, value); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM push_subscriptions`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // DeletePushSubscription removes an endpoint; deleting an unknown one is

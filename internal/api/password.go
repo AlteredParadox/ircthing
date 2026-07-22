@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"time"
 
@@ -131,7 +130,13 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hashing failed", http.StatusInternalServerError)
 		return
 	}
-	if err := s.hub.Store().SetSetting(r.Context(), passwordHashKey, string(newHash)); err != nil {
+	// Store the new hash AND wipe every push subscription in ONE
+	// transaction: rotation is the compromise-recovery lever, so the
+	// hash change and the revocation of push grants (a stolen session
+	// may have planted an attacker endpoint) must not be separable — a
+	// deletion failure previously only logged and still returned 204,
+	// leaving the planted endpoint live under the new password.
+	if err := s.hub.Store().SetSettingAndWipePushSubscriptions(r.Context(), passwordHashKey, string(newHash)); err != nil {
 		http.Error(w, "storing failed", http.StatusInternalServerError)
 		return
 	}
@@ -166,20 +171,14 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	for _, cancel := range cancels {
 		cancel()
 	}
-	// Push subscriptions are the OTHER credential-shaped grant a stolen
-	// session can plant: an attacker-registered endpoint would keep
-	// receiving PM/highlight content after every session above was
-	// revoked. Rotation wipes them all; legitimate devices re-register
-	// via the client's on-load resync after logging back in. Detached
-	// context: the rotation is already committed, and a client abort
-	// must not leave the wipe half-done silently.
+	// The subscription wipe committed with the hash above; refresh the
+	// pusher's cached count off the request path so a client abort can't
+	// strand it. (Push subscriptions are the OTHER credential-shaped
+	// grant a stolen session can plant; legitimate devices re-register
+	// via the client's on-load resync after logging back in.)
 	func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := s.hub.Store().DeleteAllPushSubscriptions(ctx); err != nil {
-			log.Printf("password rotation: wiping push subscriptions: %v", err)
-			return
-		}
 		s.hub.RefreshPushCount(ctx)
 	}()
 	// Deletion cookie: same attributes as the session cookie so the browser

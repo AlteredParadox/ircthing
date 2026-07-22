@@ -313,20 +313,33 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 		return
 	}
 
-	if err := s.hub.applyPutNetwork(ctx, nc, d.OldName, prev, renamed, string(canonical)); err != nil {
+	// For a rename, the rename-map update commits IN THE SAME
+	// transaction as the history move (extraSettings): hold
+	// syncedSettingsMu across the store write so the map is computed from
+	// — and committed against — a consistent view, with no concurrent
+	// set_rules/set_filters interleaving. The rules/filters rewrite that
+	// follows is best-effort, made durable by the now-guaranteed map
+	// entry. Effective name (`name`) not nc.Name: "" for an unnamed
+	// network would rewrite scopes to global and corrupt ignore/mute keys.
+	var extraSettings map[string]string
+	if renamed {
+		s.hub.syncedSettingsMu.Lock()
+		extraSettings = s.hub.renameMapWrite(ctx, d.OldName, name)
+	}
+	if err := s.hub.applyPutNetwork(ctx, nc, d.OldName, prev, renamed, string(canonical), extraSettings); err != nil {
+		if renamed {
+			s.hub.syncedSettingsMu.Unlock()
+		}
 		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
 		return
 	}
 	if renamed {
+		s.hub.rewriteRuleFilterRefsLocked(ctx, d.OldName, name)
+		s.hub.syncedSettingsMu.Unlock()
 		s.hub.broadcast(envelope("network_removed", 0, NetworkRef{Network: d.OldName}))
 		// Pending pushes carry the OLD network name in their keys and
 		// payloads; cancel rather than deliver stale names.
 		s.hub.notifyPushCancel(d.OldName, "", "")
-		// Synced rules/ignores/mutes reference the network by name. Use
-		// the EFFECTIVE name (`name`, the stored identity): nc.Name is
-		// "" for an unnamed network — rewriting scopes to "" would turn
-		// them GLOBAL and corrupt ignore/mute keys.
-		s.hub.renameSyncedNetworkRefs(ctx, d.OldName, name)
 		// Tell live clients so they rewrite their LOCAL copies too —
 		// including dirty ones, whose eventual re-push must not carry
 		// the old name back to the server.
@@ -438,7 +451,7 @@ func validStoredNetworkName(name string) bool {
 // old connection, atomically replace the stored definition, start the
 // new one. Both failure points roll back so an error always leaves the
 // previous definition stored and connected. Caller holds netOps.
-func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName string, prev *store.NetworkConfig, renamed bool, canonical string) error {
+func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName string, prev *store.NetworkConfig, renamed bool, canonical string, extraSettings map[string]string) error {
 	name := nc.EffectiveName()
 	// Stop before persisting: a rename moves history, and the running
 	// connection must not append rows under the old name mid-move.
@@ -452,8 +465,11 @@ func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName 
 	}
 	// A rename moves the networks row, so gate it against session
 	// create-on-demand writes for the same reason as delete.
+	// extraSettings (the rename map) commits in the SAME transaction as
+	// the history move: a crash cannot leave the network renamed with no
+	// map entry to heal the old-scoped rules/mutes.
 	h.lifecycleGate.Lock()
-	err := h.store.ReplaceNetworkConfig(ctx, oldForReplace, name, canonical)
+	err := h.store.ReplaceNetworkConfigWithSettings(ctx, oldForReplace, name, canonical, extraSettings)
 	h.lifecycleGate.Unlock()
 	if err != nil {
 		// Atomic replace failed = nothing changed; put the previous

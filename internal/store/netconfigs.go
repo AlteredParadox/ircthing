@@ -278,6 +278,17 @@ func (s *Store) PutNetworkConfig(ctx context.Context, name, config string) error
 // changes nothing. oldName == "" or == name is a plain upsert. Caches
 // are evicted only after commit.
 func (s *Store) ReplaceNetworkConfig(ctx context.Context, oldName, name, config string) error {
+	return s.ReplaceNetworkConfigWithSettings(ctx, oldName, name, config, nil)
+}
+
+// ReplaceNetworkConfigWithSettings is ReplaceNetworkConfig plus a set of
+// settings-table writes committed IN THE SAME TRANSACTION. A rename uses
+// it to write the network-rename map atomically with the history move:
+// if the process dies after the network row moves, the map entry is
+// guaranteed present, so a later client write self-heals the rules/mutes
+// still scoped to the old name (they cannot be orphaned with no healing
+// path). settings may be nil for a plain (non-rename) put.
+func (s *Store) ReplaceNetworkConfigWithSettings(ctx context.Context, oldName, name, config string, settings map[string]string) error {
 	if err := ValidateNetworkConfigRecord(name, config); err != nil {
 		return err
 	}
@@ -303,6 +314,13 @@ func (s *Store) ReplaceNetworkConfig(ctx context.Context, oldName, name, config 
 		ON CONFLICT (name) DO UPDATE SET config = excluded.config`,
 		name, config); err != nil {
 		return err
+	}
+	for k, v := range settings {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO settings (key, value) VALUES (?, ?)
+			 ON CONFLICT (key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err

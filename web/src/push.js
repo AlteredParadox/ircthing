@@ -104,6 +104,22 @@ export async function unsubscribePush() {
 	await postJSON("/api/push/unsubscribe", { endpoint }).catch(() => {});
 }
 
+// unsubscribeForLogout is unsubscribePush for the sign-out path. It uses
+// getRegistration (which resolves PROMPTLY, unlike serviceWorker.ready
+// which never settles if worker activation failed) so logout can neither
+// hang on it nor have a late-resolving cleanup act on the NEXT login's
+// subscription. Returns quickly; caller need not race it.
+export async function unsubscribeForLogout() {
+	if (!("serviceWorker" in navigator)) return;
+	const reg = await navigator.serviceWorker.getRegistration("/").catch(() => null);
+	if (!reg) return;
+	const sub = await reg.pushManager.getSubscription().catch(() => null);
+	if (!sub) return;
+	const endpoint = sub.endpoint;
+	await sub.unsubscribe().catch(() => {});
+	await postJSON("/api/push/unsubscribe", { endpoint }).catch(() => {});
+}
+
 // appServerKeyOf extracts a subscription's server key for comparison
 // (comma-joined bytes; ArrayBuffers don't compare structurally).
 function appServerKeyOf(sub) {

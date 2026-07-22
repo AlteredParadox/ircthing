@@ -119,16 +119,22 @@ globalThis.addEventListener("pushsubscriptionchange", (event) => {
 	if (!opts?.applicationServerKey) return;
 	event.waitUntil(
 		(async () => {
+			let sub = null;
 			try {
-				const sub = await globalThis.registration.pushManager.subscribe(opts);
-				await fetch("/api/push/subscribe", {
+				sub = await globalThis.registration.pushManager.subscribe(opts);
+				const res = await fetch("/api/push/subscribe", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify(sub.toJSON()),
 				});
+				// A 2xx is the ONLY confirmation the server recorded it.
+				// Anything else (auth expired, cap, 5xx) means the fresh
+				// browser subscription is unconfirmed — drop it so it does
+				// not linger as an endpoint the server will never push to,
+				// blocking a clean re-enable. The next app open re-syncs.
+				if (!res.ok) throw new Error("subscribe HTTP " + res.status);
 			} catch {
-				// Unrecoverable here (permission gone, auth expired): the
-				// next app open re-syncs or surfaces the off state.
+				await sub?.unsubscribe().catch(() => {});
 			}
 		})(),
 	);
