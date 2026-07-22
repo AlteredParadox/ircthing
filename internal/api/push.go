@@ -88,7 +88,14 @@ func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 	// across the recheck+insert serializes against rotation's wipe+revoke
 	// (which takes the same barrier), so this runs strictly before (its
 	// insert is wiped) or strictly after (authed() fails, token revoked).
-	s.pushMutationMu.Lock()
+	//
+	// TryLock, not Lock: rotation blocks-acquires the barrier, so a stolen
+	// session cannot pile up serialized inserts ahead of the recovery —
+	// concurrent mutations bounce with 429 while rotation holds it.
+	if !s.pushMutationMu.TryLock() {
+		http.Error(w, "busy, retry later", http.StatusTooManyRequests)
+		return
+	}
 	defer s.pushMutationMu.Unlock()
 	if !s.authed(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -130,11 +137,12 @@ func (s *Server) handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "malformed unsubscribe", http.StatusBadRequest)
 		return
 	}
-	// Same barrier + auth-recheck as subscribe: a stale token must not
-	// mutate the subscription table after a rotation (here the harm is
-	// only a minor DoS — deleting a legit device's endpoint — but the
-	// discipline is uniform).
-	s.pushMutationMu.Lock()
+	// Same barrier + auth-recheck as subscribe (TryLock so rotation is
+	// never queued behind a stale-token flood).
+	if !s.pushMutationMu.TryLock() {
+		http.Error(w, "busy, retry later", http.StatusTooManyRequests)
+		return
+	}
 	defer s.pushMutationMu.Unlock()
 	if !s.authed(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)

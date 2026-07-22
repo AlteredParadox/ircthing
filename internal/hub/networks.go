@@ -544,13 +544,20 @@ func (h *Hub) rollbackPut(_ context.Context, name string, prev *store.NetworkCon
 		err := h.store.ReplaceNetworkConfigWithSettings(ctx, name, prev.Name, prev.Config, rollbackSettings)
 		h.lifecycleGate.Unlock()
 		if err != nil {
-			log.Printf("network %q: rollback failed: %v", name, err)
+			// The restore did NOT commit: storage still holds the new
+			// (unstartable) definition. Do NOT restart the old manager —
+			// that would run the OLD network while storage names the new
+			// one (split state). Leave it stopped; storage is authoritative
+			// and the operator can retry the edit. Loud log for the
+			// degraded state.
+			log.Printf("network %q: rollback restore FAILED (%v) — left stopped; stored definition and runtime now disagree, retry the edit", name, err)
+			return
 		}
 		h.restartNetwork(prev)
 		return
 	}
 	h.lifecycleGate.Lock()
-	err := h.store.DeleteNetwork(ctx, name)
+	err := h.store.DeleteNetworkWithSettings(ctx, name, rollbackSettings)
 	h.lifecycleGate.Unlock()
 	if err != nil {
 		log.Printf("network %q: rollback failed: %v", name, err)

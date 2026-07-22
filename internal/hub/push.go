@@ -114,6 +114,7 @@ type pendingPush struct {
 	newestTS    int64  // newest coalesced highlight (cancel threshold)
 	count       int
 	channelLike bool
+	rulesGen    uint64 // rules generation at admit; a change suppresses an un-re-evaluable (scrubbed) channel job
 }
 
 // pushPayload is the (RFC 8291-encrypted) JSON the service worker
@@ -207,9 +208,41 @@ func (h *Hub) PushPublicKey() string {
 
 // BumpPushEpoch invalidates every in-flight delivery — called
 // synchronously with a subscription wipe (password rotation, VAPID
-// replacement) so a worker mid-delivery on a pre-wipe endpoint slice
-// stops before its next send.
-func (h *Hub) BumpPushEpoch() { h.pushEpoch.Add(1) }
+// replacement). It advances the epoch (so a worker aborts before its
+// next send) AND cancels the current delivery-generation context (so a
+// send already in flight to a now-revoked endpoint aborts instead of
+// running out its timeout).
+func (h *Hub) BumpPushEpoch() {
+	h.pushEpoch.Add(1)
+	h.pushGenMu.Lock()
+	defer h.pushGenMu.Unlock()
+	if h.pushGenCancel != nil {
+		h.pushGenCancel()
+	}
+	if h.pushGenBase != nil {
+		h.pushGenCtx, h.pushGenCancel = context.WithCancel(h.pushGenBase)
+	}
+}
+
+// initPushGen installs the first delivery-generation context, a child of
+// the pusher's root context. Called once from runPusher.
+func (h *Hub) initPushGen(ctx context.Context) {
+	h.pushGenMu.Lock()
+	defer h.pushGenMu.Unlock()
+	h.pushGenBase = ctx
+	h.pushGenCtx, h.pushGenCancel = context.WithCancel(ctx)
+}
+
+// currentPushGen returns the live delivery-generation context. A send
+// uses it so a concurrent wipe (BumpPushEpoch) cancels it mid-flight.
+func (h *Hub) currentPushGen() context.Context {
+	h.pushGenMu.Lock()
+	defer h.pushGenMu.Unlock()
+	if h.pushGenCtx == nil {
+		return context.Background()
+	}
+	return h.pushGenCtx
+}
 
 // RefreshPushCount re-reads the subscription count into the atomic the
 // per-message fast path checks. Called at startup, by the subscribe/
@@ -313,6 +346,7 @@ type pushJob struct {
 // leak goroutines. Every store/sender access from a worker is
 // mutex-guarded, so off-loop delivery is safe.
 func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Duration) {
+	h.initPushGen(ctx)
 	rules, filters, filtersOK := h.reloadPushConfig(ctx, nil, pushFilters{}, false)
 	pending := make(map[string]*pendingPush) // network+"\x00"+buffer
 	timer := time.NewTimer(time.Hour)
@@ -344,7 +378,7 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 			return // pending pushes die with the process: best effort by design
 
 		case c := <-h.pushCandidates:
-			if admitCandidate(pending, c, rules, filters, filtersOK, delay) {
+			if admitCandidate(pending, c, rules, filters, filtersOK, delay, h.pushRulesGen.Load()) {
 				rearmPushTimer(timer, pending)
 			}
 
@@ -362,6 +396,10 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 
 		case <-h.pushConfigDirty:
 			rules, filters, filtersOK = h.reloadPushConfig(ctx, rules, filters, filtersOK)
+			// Advance the rules generation so an already-handed-off channel
+			// job whose headline was scrubbed (can't be re-evaluated
+			// against the new rules) is suppressed at delivery.
+			h.pushRulesGen.Add(1)
 			// Muting a buffer, ignoring its latest pinger, or deleting a
 			// (half-typed) keyword mid-window is exactly when the user
 			// expects silence: re-apply the new config to what is
@@ -475,7 +513,7 @@ func sweepFilteredPending(pending map[string]*pendingPush, rules []Rule, filters
 // admitCandidate applies the filter and highlight policy to one live
 // message and schedules (or coalesces) its push. Reports whether a NEW
 // entry was scheduled, i.e. the timer needs rearming.
-func admitCandidate(pending map[string]*pendingPush, c pushCandidate, rules []Rule, filters pushFilters, filtersOK bool, delay time.Duration) bool {
+func admitCandidate(pending map[string]*pendingPush, c pushCandidate, rules []Rule, filters pushFilters, filtersOK bool, delay time.Duration, rulesGen uint64) bool {
 	// Fail closed while the filter policy is untrustworthy (a corrupt
 	// blob that never loaded): pushing here could leak content the user
 	// suppressed. Recovers on the next successful config reload.
@@ -507,6 +545,7 @@ func admitCandidate(pending map[string]*pendingPush, c pushCandidate, rules []Ru
 		fireAt: time.Now().Add(delay),
 		sender: c.sender, text: c.text, msgid: c.msgid, nick: c.nick,
 		ts: c.ts, newestTS: c.ts, count: 1, channelLike: c.channelLike,
+		rulesGen: rulesGen,
 	}
 	return true
 }
@@ -535,12 +574,15 @@ func rearmPushTimer(timer *time.Timer, pending map[string]*pendingPush) {
 //
 // A key removed here can be re-scheduled (a new pending entry) while its
 // job is still in flight, so two jobs for one buffer can coexist. We do
-// NOT track in-flight keys to coalesce them: the service worker tags
-// notifications by buffer (network+"\n"+buffer), so a second delivery
-// REPLACES the first on the device rather than stacking; the queue is
-// bounded (drops at cap); and per-send revalidation aborts stale sends.
-// A scheduler-owned in-flight set + completion channel would add real
-// complexity for no user-visible gain at single-user scale.
+// NOT track in-flight keys to coalesce them: delivery is BOUNDED
+// BEST-EFFORT — the service worker tags notifications by buffer
+// (network+"\n"+buffer), so a second delivery REPLACES the first on the
+// device rather than stacking; the queue is bounded (drops at cap); and
+// per-send revalidation aborts stale sends. The residual is that an
+// older in-flight notification can replace a newer one for the same
+// buffer, or a slow buffer can occupy a worker slot; a scheduler-owned
+// in-flight set + completion channel would tighten ordering/fairness but
+// adds real complexity for marginal gain at single-user scale.
 func enqueueDuePushes(pending map[string]*pendingPush, jobs chan pushJob) {
 	now := time.Now()
 	for key, p := range pending {
@@ -670,8 +712,11 @@ func (h *Hub) deliverPush(ctx context.Context, sender PushSender, key string, p 
 		log.Printf("push: loading subscriptions for %s/%.60q: %v", network, buffer, err)
 		return
 	}
+	// The generation context (captured once) is canceled by a wipe, so an
+	// in-flight Send to a revoked endpoint aborts rather than completing.
+	genCtx := h.currentPushGen()
 	for _, sub := range subs {
-		if h.pushEpoch.Load() != epoch {
+		if h.pushEpoch.Load() != epoch || genCtx.Err() != nil {
 			return // subscriptions wiped since we loaded the slice
 		}
 		if !h.deliveryStillAllowed(ctx, network, buffer, p) {
@@ -694,7 +739,7 @@ func (h *Hub) deliverPush(ctx context.Context, sender PushSender, key string, p 
 			log.Printf("push: payload for %s/%.60q is %d bytes (limit %d), skipping", network, buffer, len(payload), webpush.MaxPlaintext)
 			return
 		}
-		h.pushToSubscription(ctx, sender, sub, payload)
+		h.pushToSubscription(genCtx, sender, sub, payload, epoch)
 	}
 }
 
@@ -719,9 +764,13 @@ func (h *Hub) deliveryStillAllowed(ctx context.Context, network, buffer string, 
 		return false
 	}
 	// A channel highlight whose keyword was removed while the job waited
-	// must not still send. Re-evaluate against current rules (a PM is
-	// unconditional; a coalesced/scrubbed headline with no text can't be
-	// re-evaluated, so it rides — its siblings matched independently).
+	// must not still send. A scrubbed headline (coalesced then redacted,
+	// text == "") can't be re-evaluated: if the rules changed since it
+	// was admitted, suppress it rather than emit a generic metadata-only
+	// notification for a buffer that may no longer match any rule.
+	if p.channelLike && p.text == "" && p.rulesGen != h.pushRulesGen.Load() {
+		return false
+	}
 	if p.channelLike && p.text != "" {
 		rules, rok := h.loadRulesChecked(ctx)
 		if !rok {
@@ -736,13 +785,22 @@ func (h *Hub) deliveryStillAllowed(ctx context.Context, network, buffer string, 
 
 // pushToSubscription encrypts and sends one payload to one endpoint,
 // pruning subscriptions that can never work again (undecodable keys,
-// push-service 404/410).
-func (h *Hub) pushToSubscription(ctx context.Context, sender PushSender, sub store.PushSubscription, payload []byte) {
+// push-service 404/410). Pruning is GATED on the capture epoch: if a
+// wipe advanced the epoch since the slice was loaded, this row is stale
+// (already deleted, or a replacement re-registered under the same
+// endpoint) — a 410/bad-keys verdict on the stale snapshot must not
+// delete the live row.
+func (h *Hub) pushToSubscription(ctx context.Context, sender PushSender, sub store.PushSubscription, payload []byte, epoch uint64) {
+	prune := func(cause error) {
+		if h.pushEpoch.Load() == epoch {
+			h.prunePushSubscription(ctx, sub.Endpoint, cause)
+		}
+	}
 	p256dh, err1 := base64.RawURLEncoding.DecodeString(sub.P256dh)
 	auth, err2 := base64.RawURLEncoding.DecodeString(sub.Auth)
 	if err1 != nil || err2 != nil {
 		// Unusable keys can never decrypt anything: prune the row.
-		h.prunePushSubscription(ctx, sub.Endpoint, errors.New("stored keys undecodable"))
+		prune(errors.New("stored keys undecodable"))
 		return
 	}
 	body, err := webpush.Encrypt(payload, p256dh, auth)
@@ -751,7 +809,7 @@ func (h *Hub) pushToSubscription(ctx context.Context, sender PushSender, sub sto
 		// oversized payload, however it slipped past the caller's size
 		// guard) must not delete every registration in one pass.
 		if errors.Is(err, webpush.ErrBadKeys) {
-			h.prunePushSubscription(ctx, sub.Endpoint, err)
+			prune(err)
 		} else {
 			log.Printf("push: encrypting for %s: %v", redactEndpoint(sub.Endpoint), err)
 		}
@@ -759,14 +817,15 @@ func (h *Hub) pushToSubscription(ctx context.Context, sender PushSender, sub sto
 	}
 	switch err := sender.Send(ctx, webpush.Subscription{Endpoint: sub.Endpoint, P256dh: p256dh, Auth: auth}, body, pushTTLSeconds); {
 	case err == nil:
-		if err := h.store.TouchPushSuccess(ctx, sub.Endpoint, time.Now()); err != nil {
+		if err := h.store.TouchPushSuccess(context.Background(), sub.Endpoint, time.Now()); err != nil {
 			log.Printf("push: recording success: %v", err)
 		}
 	case errors.Is(err, webpush.ErrGone):
-		h.prunePushSubscription(ctx, sub.Endpoint, err)
+		prune(err)
 	default:
-		// Transient (network, 5xx, 429): no retry — the push service
-		// owns redelivery, and the next highlight tries again.
+		// Transient (network, 5xx, 429, or a generation-cancel abort): no
+		// retry — the push service owns redelivery, and the next highlight
+		// tries again.
 		log.Printf("push: delivering to %s: %s", redactEndpoint(sub.Endpoint), scrubEndpoint(err, sub.Endpoint))
 	}
 }

@@ -116,8 +116,11 @@ function PushControl({ pushKey }) {
 				await unsubscribePush();
 				setState("off");
 			} else {
-				await subscribePush(pushKey);
-				setState("on");
+				// subscribePush returns null if the session boundary was
+				// crossed mid-flow (epoch invalidated) — it did NOT
+				// register, so don't claim "on".
+				const sub = await subscribePush(pushKey);
+				setState(sub ? "on" : "off");
 			}
 		} catch (e) {
 			setState(was);
@@ -496,12 +499,18 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 		// uses getRegistration (prompt), so it can neither hang the logout
 		// nor resolve late and clobber the next login's subscription;
 		// still bounded as belt-and-braces.
-		await Promise.race([
+		const endpoint = await Promise.race([
 			unsubscribeForLogout(),
-			new Promise((resolve) => setTimeout(resolve, 3000)),
-		]).catch(() => {});
+			new Promise((resolve) => setTimeout(() => resolve(""), 3000)),
+		]).catch(() => "");
 		try {
-			const r = await fetch("/api/logout", { method: "POST" });
+			// Send the endpoint so the server deletes the subscription
+			// authoritatively (the browser-side removal above is best-effort).
+			const r = await fetch("/api/logout", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ push_endpoint: endpoint || "" }),
+			});
 			if (!r.ok) throw new Error("logout failed: HTTP " + r.status);
 			onLogout?.();
 		} catch {

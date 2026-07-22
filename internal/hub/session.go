@@ -1468,19 +1468,20 @@ func (h *Hub) loadRulesChecked(ctx context.Context) ([]Rule, bool) {
 	if !present {
 		return nil, true // genuinely never stored: valid empty policy
 	}
-	// A PRESENT row that is empty or non-JSON is corruption/tampering
-	// (handleSetRules only ever writes a JSON blob), not a legitimate
-	// empty policy — fail closed so it can't degrade to "no rules".
+	// A PRESENT row that is not a JSON OBJECT is corruption/tampering
+	// (handleSetRules only ever writes `{"rules":...}`), not a legitimate
+	// empty policy — fail closed. `null`, scalars, and arrays all decode
+	// without error into the zero value, so check the shape explicitly.
 	var d RulesData
-	if v == "" || json.Unmarshal([]byte(v), &d) != nil {
+	if !isJSONObject(v) || json.Unmarshal([]byte(v), &d) != nil {
 		return nil, false
 	}
 	return d.Rules, true
 }
 
-// loadFiltersChecked: same absent-vs-present-empty distinction for the
-// ignore/mute lists, so a present-but-corrupt filter row fails closed
-// rather than becoming "nothing filtered".
+// loadFiltersChecked: same absent-vs-present-corrupt distinction for the
+// ignore/mute lists, so a present-but-corrupt filter row (including the
+// leak-prone `null`) fails closed rather than becoming "nothing filtered".
 func (h *Hub) loadFiltersChecked(ctx context.Context) (FiltersData, bool) {
 	v, present, err := h.store.SettingValue(ctx, filtersKey)
 	if err != nil {
@@ -1490,10 +1491,18 @@ func (h *Hub) loadFiltersChecked(ctx context.Context) (FiltersData, bool) {
 		return FiltersData{}, true
 	}
 	var d FiltersData
-	if v == "" || json.Unmarshal([]byte(v), &d) != nil {
+	if !isJSONObject(v) || json.Unmarshal([]byte(v), &d) != nil {
 		return FiltersData{}, false
 	}
 	return d, true
+}
+
+// isJSONObject reports whether s is a JSON object (`{...}`) — the only
+// valid shape for our stored policy blobs. Rejects "null", arrays, and
+// scalars, which json.Unmarshal would otherwise accept into a zero value.
+func isJSONObject(s string) bool {
+	s = strings.TrimSpace(s)
+	return len(s) > 0 && s[0] == '{'
 }
 
 func (s *Session) handleGetRules(ctx context.Context, env Envelope) {
@@ -1530,8 +1539,14 @@ func (s *Session) handleSetRules(ctx context.Context, env Envelope) {
 	defer s.hub.syncedSettingsMu.Unlock()
 	// A client that was dirty across a network rename re-pushes scopes
 	// under the old name; rewrite them so last-write-wins cannot undo
-	// the rename's blob rewrite.
-	renames := s.hub.loadRenameMap(ctx)
+	// the rename's blob rewrite. A store error reading the map fails the
+	// write closed — storing un-rewritten old-name scopes would silently
+	// bypass the rename.
+	renames, ok := s.hub.loadRenameMapChecked(ctx)
+	if !ok {
+		s.push(errEnvelope(env.Seq, "internal", "reading rename map failed"))
+		return
+	}
 	rewrote := false
 	kept := make([]Rule, 0, len(d.Rules))
 	for _, r := range d.Rules {
@@ -1604,15 +1619,27 @@ const renamesKey = "network_renames"
 const maxNetworkRenames = 128
 
 func (h *Hub) loadRenameMap(ctx context.Context) map[string]string {
-	v, err := h.store.Setting(ctx, renamesKey)
-	if err != nil || v == "" {
-		return map[string]string{}
+	m, _ := h.loadRenameMapChecked(ctx)
+	return m
+}
+
+// loadRenameMapChecked reads the rename map distinguishing a STORE READ
+// ERROR (ok=false — the set path must reject rather than store
+// un-rewritten old-name references, re-introducing the filter bypass the
+// map exists to prevent) from an absent/corrupt map (empty, ok=true).
+func (h *Hub) loadRenameMapChecked(ctx context.Context) (map[string]string, bool) {
+	v, present, err := h.store.SettingValue(ctx, renamesKey)
+	if err != nil {
+		return map[string]string{}, false
+	}
+	if !present || strings.TrimSpace(v) == "" {
+		return map[string]string{}, true
 	}
 	var m map[string]string
-	if err := json.Unmarshal([]byte(v), &m); err != nil || m == nil {
-		return map[string]string{}
+	if !isJSONObject(v) || json.Unmarshal([]byte(v), &m) != nil || m == nil {
+		return map[string]string{}, true // corrupt: best-effort empty, don't block saves
 	}
-	return m
+	return m, true
 }
 
 func (h *Hub) saveRenameMap(ctx context.Context, m map[string]string) {
@@ -1651,11 +1678,11 @@ func (h *Hub) computeNameClearWrites(ctx context.Context, name string) (writes, 
 	if err != nil {
 		return nil, nil, false
 	}
-	if !present || v == "" {
+	if !present || strings.TrimSpace(v) == "" {
 		return nil, nil, true // no map: nothing to clear
 	}
 	m := map[string]string{}
-	if json.Unmarshal([]byte(v), &m) != nil {
+	if !isJSONObject(v) || json.Unmarshal([]byte(v), &m) != nil {
 		return nil, nil, false
 	}
 	if _, has := m[name]; !has {
@@ -1792,7 +1819,11 @@ func (s *Session) handleSetFilters(ctx context.Context, env Envelope) {
 	}
 	s.hub.syncedSettingsMu.Lock()
 	defer s.hub.syncedSettingsMu.Unlock()
-	renames := s.hub.loadRenameMap(ctx)
+	renames, ok := s.hub.loadRenameMapChecked(ctx)
+	if !ok {
+		s.push(errEnvelope(env.Seq, "internal", "reading rename map failed"))
+		return
+	}
 	ignores, problem, rewroteIg := canonicalIgnores(d.Ignores, renames)
 	if problem != "" {
 		s.push(errEnvelope(env.Seq, "bad_request", problem))
@@ -1884,7 +1915,10 @@ func (h *Hub) computeRenameWrites(ctx context.Context, oldName, newName string) 
 		preMap = "{}"
 	}
 	rw.rollback[renamesKey] = preMap
-	newMap := foldRenameMap(mapV, mapPresent, oldName, newName)
+	newMap, mapOK := foldRenameMap(mapV, mapPresent, oldName, newName)
+	if !mapOK {
+		return rw, false // present-but-corrupt map: abort (don't silently reset)
+	}
 	mapBlob, err := json.Marshal(newMap)
 	if err != nil {
 		return rw, false
@@ -1898,7 +1932,7 @@ func (h *Hub) computeRenameWrites(ctx context.Context, oldName, newName string) 
 	}
 	if rulesPresent {
 		var d RulesData
-		if rulesV == "" || json.Unmarshal([]byte(rulesV), &d) != nil {
+		if !isJSONObject(rulesV) || json.Unmarshal([]byte(rulesV), &d) != nil {
 			return rw, false // corrupt: abort rather than rewrite-from-empty
 		}
 		if rewriteRuleRefs(d.Rules, oldName, newName) {
@@ -1919,7 +1953,7 @@ func (h *Hub) computeRenameWrites(ctx context.Context, oldName, newName string) 
 	}
 	if filtersPresent {
 		var d FiltersData
-		if filtersV == "" || json.Unmarshal([]byte(filtersV), &d) != nil {
+		if !isJSONObject(filtersV) || json.Unmarshal([]byte(filtersV), &d) != nil {
 			return rw, false
 		}
 		if rewriteFilterRefs(&d, oldName, newName) {
@@ -1955,12 +1989,14 @@ func (h *Hub) broadcastRenameWrites(rw renameWrites) {
 // become k->new) and records old->new. At saturation it keeps ONLY the
 // current mapping — the most important one, and old entries are
 // best-effort stale-client healing anyway — so the current rename is
-// never silently dropped.
-func foldRenameMap(current string, present bool, oldName, newName string) map[string]string {
+// never silently dropped. ok=false when the present map is corrupt
+// (non-object or bad JSON), so the caller aborts rather than silently
+// resetting it.
+func foldRenameMap(current string, present bool, oldName, newName string) (map[string]string, bool) {
 	m := map[string]string{}
-	if present && current != "" {
-		if err := json.Unmarshal([]byte(current), &m); err != nil || m == nil {
-			m = map[string]string{}
+	if present && strings.TrimSpace(current) != "" {
+		if !isJSONObject(current) || json.Unmarshal([]byte(current), &m) != nil || m == nil {
+			return nil, false
 		}
 	}
 	for k, v := range m {
@@ -1973,7 +2009,7 @@ func foldRenameMap(current string, present bool, oldName, newName string) map[st
 		m = map[string]string{}
 	}
 	m[oldName] = newName
-	return m
+	return m, true
 }
 
 // rewriteRuleRefs rewrites rule scopes from oldName to newName in place;
@@ -1995,9 +2031,25 @@ func rewriteFilterRefs(d *FiltersData, oldName, newName string) bool {
 	changed := false
 	if nicks, ok := d.Ignores[oldName]; ok {
 		delete(d.Ignores, oldName)
-		// Renaming onto a name that already has ignores is exotic;
-		// union keeps both sets.
-		d.Ignores[newName] = append(d.Ignores[newName], nicks...)
+		// Renaming onto a name that already has ignores is exotic; union
+		// the sets, but DEDUP and CAP the result: two valid 512-entry
+		// lists would otherwise merge into an invalid 1024-entry one that
+		// every subsequent set_filters rejects.
+		merged := d.Ignores[newName]
+		seen := make(map[string]bool, len(merged)+len(nicks))
+		for _, n := range merged {
+			seen[n] = true
+		}
+		for _, n := range nicks {
+			if len(merged) >= maxIgnoresPerNetwork {
+				break
+			}
+			if !seen[n] {
+				seen[n] = true
+				merged = append(merged, n)
+			}
+		}
+		d.Ignores[newName] = merged
 		changed = true
 	}
 	prefix := oldName + "\n"

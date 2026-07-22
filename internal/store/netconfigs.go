@@ -387,6 +387,15 @@ func moveNetworkHistory(ctx context.Context, tx *sql.Tx, oldName, name string) e
 // rows, read markers, and monitors follow via cascades) — in one
 // transaction. Caches are evicted only after commit.
 func (s *Store) DeleteNetwork(ctx context.Context, name string) error {
+	return s.DeleteNetworkWithSettings(ctx, name, nil)
+}
+
+// DeleteNetworkWithSettings is DeleteNetwork plus settings writes in the
+// SAME transaction — used to roll back a failed network CREATE: deleting
+// the network and restoring the pre-create rename-map snapshot commit
+// together, so a rolled-back create cannot leave the map cleared for a
+// name that no longer exists. settings may be nil.
+func (s *Store) DeleteNetworkWithSettings(ctx context.Context, name string, settings map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -402,6 +411,13 @@ func (s *Store) DeleteNetwork(ctx context.Context, name string) error {
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM networks WHERE user_id = ? AND name = ?`, defaultUserID, name); err != nil {
 		return err
+	}
+	for k, v := range settings {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO settings (key, value) VALUES (?, ?)
+			 ON CONFLICT (key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err

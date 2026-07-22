@@ -127,16 +127,19 @@ export async function unsubscribePush() {
 // getRegistration (which resolves PROMPTLY, unlike serviceWorker.ready
 // which never settles if worker activation failed) so logout can neither
 // hang on it nor have a late-resolving cleanup act on the NEXT login's
-// subscription. Returns quickly; caller need not race it.
+// subscription. Returns the endpoint (or "") so logout can also delete
+// it server-side authoritatively; browser-side removal here is the
+// best-effort half.
 export async function unsubscribeForLogout() {
-	if (!("serviceWorker" in navigator)) return;
+	if (!("serviceWorker" in navigator)) return "";
 	const reg = await navigator.serviceWorker.getRegistration("/").catch(() => null);
-	if (!reg) return;
+	if (!reg) return "";
 	const sub = await reg.pushManager.getSubscription().catch(() => null);
-	if (!sub) return;
+	if (!sub) return "";
 	const endpoint = sub.endpoint;
 	await sub.unsubscribe().catch(() => {});
 	await postJSON("/api/push/unsubscribe", { endpoint }).catch(() => {});
+	return endpoint;
 }
 
 // appServerKeyOf extracts a subscription's server key for comparison

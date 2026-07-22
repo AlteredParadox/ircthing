@@ -768,6 +768,31 @@ func (s *Server) issueToken(gen uint64) (string, error) {
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	// The client sends this device's push endpoint so logout can delete
+	// its subscription SERVER-SIDE and authoritatively — client-side
+	// browser unsubscribe is best-effort and can fail, leaving a
+	// signed-out (shared) machine still receiving IRC content. Optional:
+	// an empty/absent endpoint just skips the deletion.
+	var body struct {
+		PushEndpoint string `json:"push_endpoint"`
+	}
+	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body)
+	// Only an AUTHENTICATED logout may delete a subscription: logout is
+	// not auth-gated (it must still clear the cookie for an expired
+	// session), so without this check an unauthenticated same-origin
+	// request could delete a subscription by (secret) endpoint.
+	if body.PushEndpoint != "" && s.authed(r) {
+		// Under the same barrier as subscribe/rotation so the delete is
+		// ordered against a concurrent re-plant.
+		s.pushMutationMu.Lock()
+		if err := s.hub.Store().DeletePushSubscription(r.Context(), body.PushEndpoint); err != nil {
+			s.pushMutationMu.Unlock()
+			http.Error(w, "removing subscription failed", http.StatusInternalServerError)
+			return
+		}
+		s.pushMutationMu.Unlock()
+		refreshPushCountDetached(s.hub)
+	}
 	if c, err := r.Cookie(s.cookieName()); err == nil {
 		// deleteTokenLocked tears down this token's live WebSockets NOW — the
 		// write pump's 30 s revalidation ticker would otherwise let an

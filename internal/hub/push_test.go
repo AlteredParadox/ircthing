@@ -506,6 +506,30 @@ func TestRenameMapHealsStaleWrites(t *testing.T) {
 	}
 }
 
+// TestPusherEpochGatesPruning: a 410 Gone on a STALE endpoint (epoch
+// advanced since the slice was loaded) must NOT prune — the row it names
+// is already gone or replaced, and pruning could delete a live row.
+func TestPusherEpochGatesPruning(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	addTestSubscription(t, h, "https://push.example/dev1")
+	seedBuffer(t, h, "libera", "alice")
+	// Sender returns 410 Gone AND bumps the epoch before returning, so
+	// the prune decision sees a changed epoch.
+	f := &fakeSender{err: fmt.Errorf("wrapped: %w", webpush.ErrGone)}
+	f.onSend = func(n int) { h.BumpPushEpoch() }
+	startTestPusher(t, h, f)
+
+	h.pushCandidates <- candidate("alice", "alice", "hi", time.Now().UnixMilli(), false)
+	waitSends(t, f, 1)
+	time.Sleep(5 * testPushDelay)
+	// The subscription is NOT pruned: the epoch changed, so the 410 on
+	// the stale snapshot is ignored.
+	if n, _ := h.store.CountPushSubscriptions(ctx); n != 1 {
+		t.Fatalf("subscriptions after stale 410 = %d, want 1 (prune gated by epoch)", n)
+	}
+}
+
 // TestComputeRenameWritesFailsClosed: a corrupt rules/filters blob
 // aborts the rename (ok=false) rather than rewriting from empty and
 // silently dropping the user's policy.
@@ -528,12 +552,19 @@ func TestFoldRenameMapSaturation(t *testing.T) {
 		full[fmt.Sprintf("n%d", i)] = fmt.Sprintf("m%d", i)
 	}
 	blob, _ := json.Marshal(full)
-	got := foldRenameMap(string(blob), true, "current-old", "current-new")
+	got, ok := foldRenameMap(string(blob), true, "current-old", "current-new")
+	if !ok {
+		t.Fatal("foldRenameMap returned not-ok for a valid map")
+	}
 	if got["current-old"] != "current-new" {
 		t.Fatalf("current mapping dropped at saturation: %+v", got)
 	}
 	if len(got) > maxNetworkRenames {
 		t.Fatalf("map exceeds cap: %d", len(got))
+	}
+	// A present-but-corrupt map aborts (ok=false), not silently reset.
+	if _, ok := foldRenameMap("null", true, "a", "b"); ok {
+		t.Fatal("foldRenameMap should reject a corrupt (null) map")
 	}
 }
 

@@ -435,6 +435,9 @@ export function App() {
 	// Bumped when a load settles, to re-run the load effect (a ref clear
 	// alone would not).
 	const [loadTick, setLoadTick] = useState(0);
+	// Timestamp of the last notification-nav we handled — dedups the same
+	// tap arriving via both the direct postMessage and the pull reply.
+	const handledNavAt = useRef(0);
 
 	// The server is the source of truth for prefs; localStorage is a
 	// write-through cache so the first paint has the right theme. This
@@ -768,6 +771,11 @@ export function App() {
 				// hours after the tap; a stale one must not yank the
 				// session. Same 60s window the worker's pull path uses.
 				if (typeof d.at === "number" && Date.now() - d.at > 60 * 1000) return;
+				// Dedup by `at`: one tap is delivered BOTH by the direct
+				// postMessage and by the pull reply (they share the tap's
+				// timestamp), which would otherwise navigate/remount twice.
+				if (typeof d.at === "number" && handledNavAt.current === d.at) return;
+				if (typeof d.at === "number") handledNavAt.current = d.at;
 				// Route through select(), not a bare hash set: select →
 				// navigate creates a placeholder for a not-yet-discovered
 				// PM AND drops any stale search/history window so the live
@@ -777,6 +785,13 @@ export function App() {
 				// when the tapped buffer is the already-active one the user
 				// had scrolled up in (select alone can't reset that scroll).
 				setTailNav((n) => n + 1);
+				// An explicit tap must reload even a buffer whose initial
+				// history load failed: clear its failed marker and bump
+				// loadTick, since the [activeKey] load effect won't re-run
+				// when the target is already active.
+				const key = bufKey(d.network, d.buffer);
+				failedHistory.current.delete(key);
+				setLoadTick((t) => t + 1);
 				select(d.network, d.buffer);
 				// Consume the worker's pendingNav copy: a tap delivered to
 				// an ALREADY-VISIBLE window fires no visibilitychange, so

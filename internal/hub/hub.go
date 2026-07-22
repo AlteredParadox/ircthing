@@ -175,8 +175,19 @@ type Hub struct {
 	// its subscription slice and aborts if it changes — so a worker that
 	// loaded endpoints BEFORE a rotation cannot keep sending to a
 	// pre-rotation (attacker-planted) endpoint once a new device makes
-	// the cached count positive again.
-	pushEpoch atomic.Uint64
+	// the cached count positive again. pushRulesGen advances on every
+	// rules reload, letting a delivery notice its (scrubbed, un-re-
+	// evaluable) channel headline outlived the rule that admitted it.
+	pushEpoch     atomic.Uint64
+	pushRulesGen  atomic.Uint64
+	// The delivery generation context is canceled by a wipe so an
+	// already-in-flight Send to a now-revoked endpoint aborts rather than
+	// running out its 15s timeout. Guarded by pushGenMu; base is the
+	// pusher's root context, from which each generation is a child.
+	pushGenMu     sync.Mutex
+	pushGenBase   context.Context
+	pushGenCtx    context.Context
+	pushGenCancel context.CancelFunc
 
 	// syncedSettingsMu serializes read-modify-writes of the synced
 	// rules/filters/rename-map settings blobs (set_rules, set_filters,

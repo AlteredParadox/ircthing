@@ -68,8 +68,11 @@ scrollback runs in ~32 MB of RSS.
   deleted message never reaches a notification tray). Per-buffer
   coalescing keeps a busy channel to one notification, and tapping it
   opens the right conversation whether the app was open, suspended, or
-  killed — reopening the app also restores your last-viewed buffer,
-  which iOS otherwise forgets. Payloads are end-to-end encrypted
+  killed (best-effort in the last case: a rare window where the OS
+  terminates the service worker mid-handoff can drop the target,
+  landing you at your last buffer instead) — reopening the app also
+  restores your last-viewed buffer, which iOS otherwise forgets.
+  Payloads are end-to-end encrypted
   (RFC 8291), keys are provisioned automatically (no Apple/Google
   account or configuration needed), and enabling it is a per-device
   toggle in settings. Requires HTTPS (the reverse proxy you already

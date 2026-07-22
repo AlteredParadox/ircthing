@@ -138,6 +138,38 @@ func TestPasswordRotationWipesPushSubscriptions(t *testing.T) {
 	}
 }
 
+// TestLogoutDeletesDeviceSubscription: an authenticated logout carrying
+// this device's endpoint deletes the subscription server-side, so a
+// signed-out (shared) machine stops receiving content even if the
+// browser-side unsubscribe failed.
+func TestLogoutDeletesDeviceSubscription(t *testing.T) {
+	ts, h := newTestServer(t)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	ctx := context.Background()
+
+	if resp := pushPost(t, ts, cookie, "/api/push/subscribe", testSubscriptionJSON(t, "https://push.example/dev")); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("subscribe = %d", resp.StatusCode)
+	}
+	if resp := pushPost(t, ts, cookie, "/api/logout", `{"push_endpoint":"https://push.example/dev"}`); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("logout = %d", resp.StatusCode)
+	}
+	if n, _ := h.Store().CountPushSubscriptions(ctx); n != 0 {
+		t.Fatalf("subscriptions after logout = %d, want 0", n)
+	}
+
+	// An UNAUTHENTICATED logout must not delete by endpoint.
+	cookie2 := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	if resp := pushPost(t, ts, cookie2, "/api/push/subscribe", testSubscriptionJSON(t, "https://push.example/dev2")); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("subscribe2 = %d", resp.StatusCode)
+	}
+	if resp := pushPost(t, ts, nil, "/api/logout", `{"push_endpoint":"https://push.example/dev2"}`); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("unauth logout = %d", resp.StatusCode)
+	}
+	if n, _ := h.Store().CountPushSubscriptions(ctx); n != 1 {
+		t.Fatalf("unauth logout deleted a subscription: count = %d, want 1", n)
+	}
+}
+
 func TestClientConfigCarriesPushKey(t *testing.T) {
 	ts, _ := newTestServer(t)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
