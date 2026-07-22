@@ -17,7 +17,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { ACCENT_RGB, ACCENTS, CLOCKS, MAX_NICK_SEP, MAX_PREFS_BYTES, prefsByteLength } from "./prefs.js";
 import { uuid } from "./irc.js";
-import { currentSubscription, isIOSNeedingInstall, pushSupported, subscribePush, unsubscribePush } from "./push.js";
+import { currentSubscription, isIOSNeedingInstall, isMobileDevice, pushSupported, subscribePush, unsubscribePush } from "./push.js";
 
 // NotifControl renders the notification section for the current
 // permission state: unsupported, not yet granted, or toggleable.
@@ -335,6 +335,24 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 	const [retention, setRetention] = useState(null); // { days, max } | null
 	const [sessionDays, setSessionDays] = useState(null); // login cookie lifetime
 	const [pushKey, setPushKey] = useState(null); // VAPID key; null loading, "" none
+	// The push section is a mobile feature: on desktop-class devices it
+	// appears only when a subscription ALREADY exists (an off-switch for
+	// a device subscribed earlier — hiding it entirely would leave that
+	// browser pushing forever with no visible control).
+	const [showPush, setShowPush] = useState(isMobileDevice);
+	useEffect(() => {
+		if (showPush || !pushSupported()) return undefined;
+		let alive = true;
+		const timeout = new Promise((resolve) => setTimeout(() => resolve(null), 3000));
+		Promise.race([currentSubscription(), timeout])
+			.then((sub) => {
+				if (alive && sub) setShowPush(true);
+			})
+			.catch(() => {});
+		return () => {
+			alive = false;
+		};
+	}, []);
 
 	useEffect(() => {
 		const onKey = (e) => e.key === "Escape" && onClose();
@@ -842,15 +860,17 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 						/>
 					</section>
 
-					<section class="settings-section">
-						<div class="settings-label">Push notifications</div>
-						<div class="settings-note">
-							Sent by the server when a highlight or private message stays
-							unread for ~20 seconds — reaches this device even with the app
-							closed.
-						</div>
-						<PushControl pushKey={pushKey} />
-					</section>
+					{showPush && (
+						<section class="settings-section">
+							<div class="settings-label">Push notifications</div>
+							<div class="settings-note">
+								Sent by the server when a highlight or private message stays
+								unread for ~20 seconds — reaches this device even with the app
+								closed.
+							</div>
+							<PushControl pushKey={pushKey} />
+						</section>
+					)}
 
 					<section class="settings-section">
 						<div class="settings-label">Highlight keywords</div>

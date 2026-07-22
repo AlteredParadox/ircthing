@@ -31,6 +31,19 @@ export function pushSupported() {
 	);
 }
 
+// isMobileDevice: a phone/tablet-class browser — where the push toggle
+// belongs (a desktop with the app open already gets foreground desktop
+// notifications; the settings panel shows push there only when a
+// subscription already exists, as an off-switch). UA-CH first, UA
+// sniff fallback; iPadOS masquerades as macOS but keeps touch.
+export function isMobileDevice() {
+	const uaData = navigator.userAgentData;
+	if (uaData && typeof uaData.mobile === "boolean") return uaData.mobile;
+	const ua = navigator.userAgent || "";
+	return /Android|iPhone|iPad|iPod|Mobile/.test(ua) ||
+		(navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+
 // isIOSNeedingInstall: an iOS browser tab where push WOULD work if the
 // app were added to the home screen (iOS 16.4+ exposes push only to
 // installed web apps). iPadOS masquerades as macOS but keeps touch.
