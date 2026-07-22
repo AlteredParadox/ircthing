@@ -262,6 +262,10 @@ func (s *Session) Handle(ctx context.Context, env Envelope) {
 		s.handleGetPrefs(ctx, env)
 	case "set_prefs":
 		s.handleSetPrefs(ctx, env)
+	case "get_rules":
+		s.handleGetRules(ctx, env)
+	case "set_rules":
+		s.handleSetRules(ctx, env)
 	case "get_networks":
 		s.handleGetNetworks(ctx, env)
 	case "get_network":
@@ -1406,6 +1410,86 @@ func (s *Session) handleSetPrefs(ctx context.Context, env Envelope) {
 	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcastExcept(s, envelope("prefs", 0, d))
+}
+
+// rulesKey is the settings-table key for the synced highlight rules.
+const rulesKey = "highlight_rules"
+
+// Rule-list caps: rules are matched per live message in the pusher, so
+// the list stays small by construction; these are sanity bounds, not
+// expected sizes.
+const (
+	maxRules            = 64
+	maxRulePatternChars = 256
+	maxRuleNetworkChars = 128
+	maxRuleIDChars      = 64
+)
+
+// loadRules parses the stored highlight rules; corrupt or absent data
+// yields an empty list (mentions-only), never an error the caller must
+// distinguish.
+func (h *Hub) loadRules(ctx context.Context) []Rule {
+	v, err := h.store.Setting(ctx, rulesKey)
+	if err != nil || v == "" {
+		return nil
+	}
+	var d RulesData
+	if err := json.Unmarshal([]byte(v), &d); err != nil {
+		return nil
+	}
+	return d.Rules
+}
+
+func (s *Session) handleGetRules(ctx context.Context, env Envelope) {
+	// Reply with rules:[] (not null) when nothing is stored, so the
+	// client's "server has no rules yet → seed from localStorage" branch
+	// has an unambiguous signal.
+	rules := s.hub.loadRules(ctx)
+	if rules == nil {
+		rules = []Rule{}
+	}
+	s.push(envelope("rules", env.Seq, RulesData{Rules: rules}))
+}
+
+// handleSetRules stores the highlight rules and pushes them to the
+// user's other sessions — the same shape as set_prefs, except the server
+// validates the schema because the pusher must parse it back.
+func (s *Session) handleSetRules(ctx context.Context, env Envelope) {
+	var d RulesData
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", "malformed set_rules data"))
+		return
+	}
+	if len(d.Rules) > maxRules {
+		s.push(errEnvelope(env.Seq, "bad_request", "too many rules"))
+		return
+	}
+	kept := make([]Rule, 0, len(d.Rules))
+	for _, r := range d.Rules {
+		if len(r.Pattern) > maxRulePatternChars || len(r.Network) > maxRuleNetworkChars || len(r.ID) > maxRuleIDChars {
+			s.push(errEnvelope(env.Seq, "bad_request", "rule field too long"))
+			return
+		}
+		// The settings UI keeps a row while its pattern is still being
+		// typed; storing it is harmless (matching skips empty patterns)
+		// but dropping it here keeps the synced set canonical.
+		if r.Pattern == "" {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	blob, err := json.Marshal(RulesData{Rules: kept})
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "encoding rules failed"))
+		return
+	}
+	if err := s.hub.store.SetSetting(ctx, rulesKey, string(blob)); err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "storing rules failed"))
+		return
+	}
+	s.push(envelope("ok", env.Seq, nil))
+	s.hub.broadcastExcept(s, envelope("rules", 0, RulesData{Rules: kept}))
+	s.hub.notifyRulesChanged()
 }
 
 // markreadTimeLayout is the server-time format used by MARKREAD

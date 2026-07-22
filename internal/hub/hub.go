@@ -1503,6 +1503,11 @@ func (h *Hub) network(name string) Conn {
 	return h.networks[name]
 }
 
+// notifyRulesChanged tells the Web Push pusher the stored highlight
+// rules changed. No-op until the pusher lands (it will drain a dirty
+// channel); split out now so set_rules is complete.
+func (h *Hub) notifyRulesChanged() {}
+
 func (h *Hub) broadcast(env Envelope) {
 	frame, err := json.Marshal(env)
 	if err != nil {

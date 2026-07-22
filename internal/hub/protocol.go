@@ -336,6 +336,15 @@ type PrefsData struct {
 	Prefs json.RawMessage `json:"prefs,omitempty"`
 }
 
+// RulesData carries the synced highlight-keyword rules ("rules" pushes
+// and responses, and the "set_rules" request). Unlike the opaque prefs
+// blob, the server PARSES these: the Web Push pusher evaluates the same
+// rules the browsers do, so all devices — connected or asleep — agree on
+// what highlights. An absent/empty list means mentions-only.
+type RulesData struct {
+	Rules []Rule `json:"rules"`
+}
+
 // ErrorData is the "error" response.
 type ErrorData struct {
 	Code    string `json:"code"`

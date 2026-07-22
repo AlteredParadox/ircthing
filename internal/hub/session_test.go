@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -1908,6 +1909,67 @@ func TestPrefsFlow(t *testing.T) {
 	a.Handle(ctx, request(t, "get_prefs", 6, nil))
 	if d := decode[PrefsData](t, recv(t, a, "prefs")); string(d.Prefs) != blob {
 		t.Fatalf("prefs after rejected writes = %s", d.Prefs)
+	}
+}
+
+func TestRulesFlow(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	a := h.NewSession()
+	defer a.Close()
+	b := h.NewSession()
+	defer b.Close()
+
+	// Nothing stored yet: an empty list, NOT null — the client's
+	// seed-from-localStorage branch keys off rules being present-but-empty.
+	a.Handle(ctx, request(t, "get_rules", 1, nil))
+	if raw := recv(t, a, "rules"); !strings.Contains(string(raw.Data), `"rules":[]`) {
+		t.Fatalf("initial rules payload = %s", raw.Data)
+	}
+
+	// Setting from A acks A and pushes to B, not A. The in-progress empty
+	// pattern is dropped from the canonical set.
+	rules := []Rule{
+		{Pattern: "deploy", Network: "", ID: "r1"},
+		{Pattern: "", Network: "", ID: "r2"},
+		{Pattern: "release", Network: "libera", ID: "r3"},
+	}
+	a.Handle(ctx, request(t, "set_rules", 2, RulesData{Rules: rules}))
+	recv(t, a, "ok")
+	want := []Rule{rules[0], rules[2]}
+	if d := decode[RulesData](t, recv(t, b, "rules")); !reflect.DeepEqual(d.Rules, want) {
+		t.Fatalf("pushed rules = %+v", d.Rules)
+	}
+
+	// get_rules returns the stored set.
+	b.Handle(ctx, request(t, "get_rules", 3, nil))
+	if d := decode[RulesData](t, recv(t, b, "rules")); !reflect.DeepEqual(d.Rules, want) {
+		t.Fatalf("stored rules = %+v", d.Rules)
+	}
+
+	// Oversized inputs are rejected and do not clobber the stored set.
+	a.Handle(ctx, request(t, "set_rules", 4, RulesData{Rules: make([]Rule, maxRules+1)}))
+	if e := decode[ErrorData](t, recv(t, a, "error")); e.Code != "bad_request" {
+		t.Fatalf("too-many-rules error = %+v", e)
+	}
+	a.Handle(ctx, request(t, "set_rules", 5, RulesData{Rules: []Rule{
+		{Pattern: strings.Repeat("x", maxRulePatternChars+1)},
+	}}))
+	if e := decode[ErrorData](t, recv(t, a, "error")); e.Code != "bad_request" {
+		t.Fatalf("long-pattern error = %+v", e)
+	}
+	a.Handle(ctx, request(t, "get_rules", 6, nil))
+	if d := decode[RulesData](t, recv(t, a, "rules")); !reflect.DeepEqual(d.Rules, want) {
+		t.Fatalf("rules after rejected writes = %+v", d.Rules)
+	}
+
+	// A corrupt stored blob degrades to mentions-only, not an error.
+	if err := h.store.SetSetting(ctx, rulesKey, "{not json"); err != nil {
+		t.Fatal(err)
+	}
+	a.Handle(ctx, request(t, "get_rules", 7, nil))
+	if d := decode[RulesData](t, recv(t, a, "rules")); len(d.Rules) != 0 {
+		t.Fatalf("rules from corrupt blob = %+v", d.Rules)
 	}
 }
 
