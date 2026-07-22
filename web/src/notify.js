@@ -64,6 +64,25 @@ export function loadRules() {
 	}
 }
 
+// sanitizeRulesForSync clamps a rule list to the server's set_rules
+// caps (64 rules; 256-byte patterns; 128-byte network scope — BYTES:
+// the editor's maxLength counts UTF-16 units, and legacy lists predate
+// any cap). Over-cap entries are DROPPED, not truncated — a truncated
+// pattern would silently match different text — so one oversized
+// legacy rule cannot get the whole batch rejected (and, on a first
+// sync with no confirmed baseline, the entire local list rolled back).
+export function sanitizeRulesForSync(rules) {
+	const bytes = (s) => new TextEncoder().encode(s).length;
+	const kept = [];
+	for (const r of rules) {
+		if (kept.length >= 64) break;
+		if (typeof r.pattern !== "string" || bytes(r.pattern) > 256) continue;
+		if (typeof r.network === "string" && bytes(r.network) > 128) continue;
+		kept.push(r);
+	}
+	return kept;
+}
+
 export function saveRules(rules) {
 	localStorage.setItem("highlightRules", JSON.stringify(rules));
 }

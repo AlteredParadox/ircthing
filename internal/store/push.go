@@ -18,6 +18,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"time"
 )
@@ -114,6 +115,34 @@ func (s *Store) CountPushSubscriptions(ctx context.Context) (int, error) {
 	err := s.db.QueryRowContext(ctx,
 		`SELECT count(*) FROM push_subscriptions`).Scan(&n)
 	return n, err
+}
+
+// MessageRedacted reports whether the message with msgid in the buffer
+// has been redacted — the pusher's fire-time re-check, mirroring the
+// read-marker one: the store is authoritative, the cancel channel is
+// best-effort. Unknown buffer or msgid reads as not-redacted.
+func (s *Store) MessageRedacted(ctx context.Context, network, target, msgid string) (bool, error) {
+	if msgid == "" {
+		return false, nil
+	}
+	msgid = ClampMsgID(msgid)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	bufID, err := s.bufferID(ctx, network, target, false)
+	if err != nil || bufID == 0 {
+		return false, err
+	}
+	var redacted int
+	err = s.db.QueryRowContext(ctx,
+		`SELECT redacted FROM messages WHERE buffer_id = ? AND msgid = ?`, bufID, msgid).Scan(&redacted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return redacted != 0, nil
 }
 
 // TouchPushSuccess records a successful delivery so stale rows are

@@ -194,10 +194,14 @@ func (h *Hub) PushPublicKey() string {
 }
 
 // RefreshPushCount re-reads the subscription count into the atomic the
-// per-message fast path checks. Called at startup and by the subscribe/
-// unsubscribe endpoints. A failed refresh keeps the previous value and
-// is LOGGED — a silently stale 0 would disable every push.
+// per-message fast path checks. Called at startup, by the subscribe/
+// unsubscribe endpoints, and by the pusher's prune path. A failed
+// refresh keeps the previous value and is LOGGED — a silently stale 0
+// would disable every push. pushCountMu makes each read+write atomic so
+// a slow refresh cannot overwrite a newer one with its older count.
 func (h *Hub) RefreshPushCount(ctx context.Context) {
+	h.pushCountMu.Lock()
+	defer h.pushCountMu.Unlock()
 	n, err := h.store.CountPushSubscriptions(ctx)
 	if err != nil {
 		log.Printf("push: refreshing subscription count: %v", err)
@@ -497,6 +501,20 @@ func (h *Hub) deliverPush(ctx context.Context, sender PushSender, key string, p 
 	}
 	if !found || name != buffer {
 		return
+	}
+	// Fire-time redaction re-check, mirroring the marker one: the
+	// pushCancel channel is best-effort (non-blocking sends, select
+	// ordering), so ask the authoritative store whether the headlining
+	// message was redacted in the meantime. Sole redacted message:
+	// nothing to say. Coalesced siblings: deliver, scrubbed.
+	if p.msgid != "" {
+		if redacted, err := h.store.MessageRedacted(ctx, network, buffer, p.msgid); err == nil && redacted {
+			if p.count == 1 {
+				return
+			}
+			p.count--
+			p.sender, p.text, p.msgid = "", "", ""
+		}
 	}
 	subs, err := h.store.PushSubscriptions(ctx)
 	if err != nil {

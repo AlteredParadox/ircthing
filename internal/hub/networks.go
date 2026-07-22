@@ -322,6 +322,8 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 		// Pending pushes carry the OLD network name in their keys and
 		// payloads; cancel rather than deliver stale names.
 		s.hub.notifyPushCancel(d.OldName, "", "")
+		// Synced rules/ignores/mutes reference the network by name.
+		s.hub.renameSyncedNetworkRefs(ctx, d.OldName, nc.Name)
 	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcast(envelope("networks_changed", 0, nil))

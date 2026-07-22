@@ -26,6 +26,8 @@ import (
 	"testing"
 	"time"
 
+	"reflect"
+
 	"ircthing/internal/irc"
 	"ircthing/internal/store"
 	"ircthing/internal/webpush"
@@ -372,6 +374,76 @@ func TestPusherRedactionScrubsPending(t *testing.T) {
 	waitDrained(t, h.pushCandidates)
 	h.notifyPushCancel("libera", "alice", "m2")
 	waitSends(t, f, 1)
+}
+
+// TestPusherFireTimeRedactionRecheck: even when the redaction CANCEL is
+// lost (dropped channel send, select ordering), the authoritative store
+// re-check at fire time stops redacted text from reaching a
+// notification tray.
+func TestPusherFireTimeRedactionRecheck(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	addTestSubscription(t, h, "https://push.example/dev1")
+	stored, err := h.store.Append(ctx, "libera", "alice", store.Message{
+		Time: time.Now(), Sender: "alice", Command: "PRIVMSG",
+		Text: "my password is hunter2", MsgID: "m1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.MsgID != "m1" {
+		t.Fatalf("stored msgid = %q", stored.MsgID)
+	}
+	f := &fakeSender{}
+	startTestPusher(t, h, f)
+
+	c := candidate("alice", "alice", "my password is hunter2", stored.Time.UnixMilli(), false)
+	c.msgid = "m1"
+	h.pushCandidates <- c
+	waitDrained(t, h.pushCandidates)
+	// Redact in the STORE only — no pushCancel — simulating a lost send.
+	if ok, err := h.store.SetRedacted(ctx, "libera", "alice", "m1", "oops"); err != nil || !ok {
+		t.Fatalf("SetRedacted = %v, %v", ok, err)
+	}
+	time.Sleep(5 * testPushDelay)
+	if got := f.count(); got != 0 {
+		t.Fatalf("sends for redacted message = %d, want 0", got)
+	}
+}
+
+func TestRenameSyncedNetworkRefs(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	if err := h.store.SetSetting(ctx, rulesKey,
+		`{"rules":[{"pattern":"release","network":"libera","id":"r1"},{"pattern":"deploy","network":"","id":"r2"}]}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.SetSetting(ctx, filtersKey,
+		`{"ignores":{"libera":["troll"],"oftc":["bob"]},"mutes":["libera`+"\\n"+`#noisy","oftc`+"\\n"+`#other"]}`); err != nil {
+		t.Fatal(err)
+	}
+
+	h.renameSyncedNetworkRefs(ctx, "libera", "libera-chat")
+
+	rules := h.loadRules(ctx)
+	if rules[0].Network != "libera-chat" || rules[1].Network != "" {
+		t.Fatalf("rules after rename = %+v", rules)
+	}
+	d := h.loadFilters(ctx)
+	if len(d.Ignores["libera-chat"]) != 1 || d.Ignores["libera-chat"][0] != "troll" || len(d.Ignores["libera"]) != 0 {
+		t.Fatalf("ignores after rename = %+v", d.Ignores)
+	}
+	want := []string{"libera-chat\n#noisy", "oftc\n#other"}
+	if !reflect.DeepEqual(d.Mutes, want) {
+		t.Fatalf("mutes after rename = %+v", d.Mutes)
+	}
+	// A rename that touches nothing writes nothing (no spurious broadcasts).
+	before, _ := h.store.Setting(ctx, filtersKey)
+	h.renameSyncedNetworkRefs(ctx, "nonesuch", "other")
+	after, _ := h.store.Setting(ctx, filtersKey)
+	if before != after {
+		t.Fatal("no-op rename rewrote the filters blob")
+	}
 }
 
 // TestPusherSkipsPurgedBuffer: the fire-time existence check backstops a

@@ -494,7 +494,14 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 		if (rules.length >= 64) return;
 		onRules([...rules, { id: uuid(), pattern: "", network: "" }]);
 	};
-	const updateRule = (i, patch) => onRules(rules.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+	const updateRule = (i, patch) => {
+		// The server caps patterns at 256 BYTES; the input's maxLength
+		// counts UTF-16 units, which CJK/emoji exceed well before 256
+		// characters. Refuse the over-byte edit outright — the field
+		// simply stops accepting input, like maxLength does.
+		if (typeof patch.pattern === "string" && new TextEncoder().encode(patch.pattern).length > 256) return;
+		onRules(rules.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+	};
 	const removeRule = (i) => onRules(rules.filter((_, j) => j !== i));
 
 	return (

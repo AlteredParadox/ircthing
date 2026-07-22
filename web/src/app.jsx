@@ -17,11 +17,11 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
 import { applyTombstones, bufferOrder, bufKey, clearTypingNick, expireTypingState, foldNick, historyHasMore, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, rememberRedaction, renderable, SERVER_BUFFER, stripFormatting, toHash, updateTypingState } from "./irc.js";
-import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
+import { applyBadge, highlightText, loadRules, Notifier, sanitizeRulesForSync, saveRules } from "./notify.js";
 import { syncPushOnLoad } from "./push.js";
 import { Login } from "./login.jsx";
 import { applyPrefs, loadPrefs, MAX_PREFS_BYTES, normalizePrefs, prefsByteLength, resolveTheme, savePrefs } from "./prefs.js";
-import { isIgnored, isMuted, loadActiveBuffer, loadIgnores, loadMutes, saveActiveBuffer, saveIgnores, saveMutes, toggleIgnore, toggleMute } from "./local.js";
+import { isIgnored, isMuted, loadActiveBuffer, loadIgnores, loadMutes, sanitizeFiltersForSync, saveActiveBuffer, saveIgnores, saveMutes, toggleIgnore, toggleMute } from "./local.js";
 import { editableNetwork, networkEditError } from "./networkedit.js";
 import { armPendingJoin, clearPendingJoin, notePendingJoinForward, takePendingJoin } from "./pending.js";
 import { fetchAllMembers } from "./memberlist.js";
@@ -510,11 +510,25 @@ export function App() {
 		if (rulesRef.current !== next) return;
 		const s = sock.current;
 		if (!s) return; // adoptRules re-pushes dirty rules on reconnect
-		s.request("set_rules", { rules: next })
+		// Sync the CLAMPED set: legacy lists can exceed the server caps
+		// (in bytes, which maxLength can't measure), and a whole-batch
+		// bad_request with no confirmed baseline would wipe everything.
+		// Dropping just the offenders loses only what could never sync.
+		const clean = sanitizeRulesForSync(next);
+		s.request("set_rules", { rules: clean })
 			.then(() => {
 				if (sock.current !== s) return;
-				rulesConfirmed.current = next;
-				if (rulesRef.current === next) rulesDirty.current = false;
+				rulesConfirmed.current = clean;
+				if (rulesRef.current === next) {
+					rulesDirty.current = false;
+					if (clean.length !== next.length) {
+						// Adopt the drop locally too: a rule that only
+						// this browser honors is the divergence the sync
+						// exists to prevent.
+						setRules(clean);
+						saveRules(clean);
+					}
+				}
 			})
 			.catch((e) => {
 				if (sock.current !== s || rulesRef.current !== next) return;
@@ -546,11 +560,19 @@ export function App() {
 		if (!s) return; // adoptFilters re-pushes dirty filters on reconnect
 		const ig = ignoresRef.current;
 		const mu = mutesRef.current;
-		s.request("set_filters", { ignores: ig, mutes: mu })
+		// Clamped like persistRules — see sanitizeFiltersForSync.
+		const clean = sanitizeFiltersForSync(ig, mu);
+		// Key order is preserved from the source objects, so stringify
+		// equality is a faithful nothing-was-dropped check.
+		const dropped = JSON.stringify(clean) !== JSON.stringify({ ignores: ig, mutes: mu });
+		s.request("set_filters", clean)
 			.then(() => {
 				if (sock.current !== s) return;
-				filtersConfirmed.current = { ignores: ig, mutes: mu };
-				if (ignoresRef.current === ig && mutesRef.current === mu) filtersDirty.current = false;
+				filtersConfirmed.current = clean;
+				if (ignoresRef.current === ig && mutesRef.current === mu) {
+					filtersDirty.current = false;
+					if (dropped) adoptFilterLists(clean.ignores, clean.mutes);
+				}
 			})
 			.catch((e) => {
 				if (sock.current !== s || ignoresRef.current !== ig || mutesRef.current !== mu) return;

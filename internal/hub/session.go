@@ -1647,6 +1647,64 @@ func (s *Session) handleSetFilters(ctx context.Context, env Envelope) {
 	s.hub.notifyPushConfigChanged()
 }
 
+// renameSyncedNetworkRefs rewrites network-name references inside the
+// synced highlight rules and ignore/mute lists after a network rename.
+// The store moves buffers/markers/monitors with the renamed row, but
+// these blobs reference the network BY NAME — left stale, an ignored
+// harasser or muted channel resumes alerting (and pushing) under the
+// new name, and scoped keywords silently stop, with no hint anywhere.
+// Broadcast to EVERY session (including the renamer's) so clients
+// re-adopt the rewritten lists.
+func (h *Hub) renameSyncedNetworkRefs(ctx context.Context, oldName, newName string) {
+	rules := h.loadRules(ctx)
+	changedRules := false
+	for i := range rules {
+		if rules[i].Network == oldName {
+			rules[i].Network = newName
+			changedRules = true
+		}
+	}
+	if changedRules {
+		if blob, err := json.Marshal(RulesData{Rules: rules}); err == nil {
+			if err := h.store.SetSetting(ctx, rulesKey, string(blob)); err != nil {
+				log.Printf("network %q -> %q: rewriting highlight rules: %v", oldName, newName, err)
+			} else {
+				h.broadcast(envelope("rules", 0, RulesData{Rules: rules, Seeded: true}))
+			}
+		}
+	}
+
+	d := h.loadFilters(ctx)
+	changedFilters := false
+	if nicks, ok := d.Ignores[oldName]; ok {
+		delete(d.Ignores, oldName)
+		// Renaming onto a name that already has ignores is exotic;
+		// union keeps both sets.
+		d.Ignores[newName] = append(d.Ignores[newName], nicks...)
+		changedFilters = true
+	}
+	prefix := oldName + "\n"
+	for i, m := range d.Mutes {
+		if strings.HasPrefix(m, prefix) {
+			d.Mutes[i] = newName + "\n" + strings.TrimPrefix(m, prefix)
+			changedFilters = true
+		}
+	}
+	if changedFilters {
+		if blob, err := json.Marshal(d); err == nil {
+			if err := h.store.SetSetting(ctx, filtersKey, string(blob)); err != nil {
+				log.Printf("network %q -> %q: rewriting filters: %v", oldName, newName, err)
+			} else {
+				d.Seeded = true
+				h.broadcast(envelope("filters", 0, d))
+			}
+		}
+	}
+	if changedRules || changedFilters {
+		h.notifyPushConfigChanged()
+	}
+}
+
 // markreadTimeLayout is the server-time format used by MARKREAD
 // (https://ircv3.net/specs/extensions/read-marker, fetched 2026-07-15).
 const markreadTimeLayout = "2006-01-02T15:04:05.000Z"

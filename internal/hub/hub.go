@@ -162,7 +162,14 @@ type Hub struct {
 	pushCancels     chan pushCancel
 	pushConfigDirty chan struct{}
 	pushSubs        atomic.Int64
-	pushPubKey      string
+	// pushCountMu serializes RefreshPushCount's count-read with its
+	// pushSubs write (callers: HTTP subscribe/unsubscribe handlers AND
+	// the pusher's prune path). Without it, two overlapping refreshes
+	// can commit their stores in the opposite order of their reads and
+	// wedge the cache on a stale 0 — which the zero-subscription fast
+	// path turns into all pushes silently off.
+	pushCountMu sync.Mutex
+	pushPubKey  string
 }
 
 // Store exposes the shared store so the HTTP layer can read/write its own
@@ -1652,6 +1659,13 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 		starBatch = batch
 	}
 	ok, buffer := h.scrubRedaction(ctx, ev, buffer, msgid, reason, retryStar, starBatch)
+	if ok {
+		// Scrub any pending push REGARDLESS of replay: the pending map is
+		// process-local state that survives a reconnect, so a REDACT
+		// arriving via chathistory backfill must cancel it just like a
+		// live one — only the redact broadcast below is live-path-only.
+		h.notifyPushCancel(ev.Network, buffer, store.ClampMsgID(msgid))
+	}
 	if !ok || replay {
 		return
 	}
@@ -1670,9 +1684,6 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 		Network: ev.Network, Buffer: buffer, MsgID: store.ClampMsgID(msgid),
 		By: clampServerInfo(by), Reason: clampServerInfo(reason),
 	}))
-	// The store's redaction is destructive; a pending push holding the
-	// original text is the one copy it cannot reach. Scrub it too.
-	h.notifyPushCancel(ev.Network, buffer, store.ClampMsgID(msgid))
 }
 
 // scrubRedaction marks the message deleted in the store, retrying the server

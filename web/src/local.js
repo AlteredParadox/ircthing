@@ -67,6 +67,31 @@ export function ignoredFor(ignores, network) {
 	return Array.isArray(ignores[network]) ? ignores[network] : [];
 }
 
+// sanitizeFiltersForSync mirrors the server's set_filters caps (128
+// networks / 512 nicks per network / 128-byte nicks / 1024 mutes /
+// 512-byte keys) so one over-cap legacy entry cannot get the whole
+// sync rejected — and, on a first sync with no confirmed baseline, the
+// local lists rolled back to empty. Offenders are dropped.
+export function sanitizeFiltersForSync(ignores, mutes) {
+	const bytes = (s) => new TextEncoder().encode(s).length;
+	const ig = {};
+	let networks = 0;
+	for (const [network, nicks] of Object.entries(ignores || {})) {
+		if (!network || !Array.isArray(nicks) || networks >= 128) continue;
+		const kept = nicks
+			.filter((n) => typeof n === "string" && n && bytes(n) <= 128)
+			.slice(0, 512);
+		if (kept.length) {
+			ig[network] = kept;
+			networks++;
+		}
+	}
+	const mu = (Array.isArray(mutes) ? mutes : [])
+		.filter((m) => typeof m === "string" && m && bytes(m) <= 512)
+		.slice(0, 1024);
+	return { ignores: ig, mutes: mu };
+}
+
 // Last-viewed buffer, restored on a cold start whose URL carries no
 // hash. iOS home-screen apps relaunch at start_url (hashless) whenever
 // the OS evicted the page — which is most reopens — so without this
