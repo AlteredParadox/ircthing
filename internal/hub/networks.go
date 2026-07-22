@@ -330,7 +330,7 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 	// atomically with the create so a later policy write can't be
 	// rewritten onto a vanished target.
 	s.hub.syncedSettingsMu.Lock()
-	var extraSettings, rollbackSettings map[string]string
+	var settings putSettings
 	var renameRW renameWrites
 	if renamed {
 		rw, ok := s.hub.computeRenameWrites(ctx, d.OldName, name)
@@ -340,8 +340,7 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 			return
 		}
 		renameRW = rw
-		extraSettings = rw.settings
-		rollbackSettings = rw.rollback
+		settings = putSettings{extra: rw.settings, rollback: rw.rollback}
 	} else {
 		clr, rb, ok := s.hub.computeNameClearWrites(ctx, name)
 		if !ok {
@@ -349,10 +348,9 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 			s.push(errEnvelope(env.Seq, "internal", "reading synced settings failed"))
 			return
 		}
-		extraSettings = clr
-		rollbackSettings = rb
+		settings = putSettings{extra: clr, rollback: rb}
 	}
-	err = s.hub.applyPutNetwork(ctx, nc, d.OldName, prev, renamed, string(canonical), extraSettings, rollbackSettings)
+	err = s.hub.applyPutNetwork(ctx, nc, d.OldName, prev, renamed, string(canonical), settings)
 	if err != nil {
 		s.hub.syncedSettingsMu.Unlock()
 		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
@@ -472,17 +470,26 @@ func validStoredNetworkName(name string) bool {
 	return store.ValidateNetworkConfigRecord(name, `{}`) == nil
 }
 
+// putSettings carries the settings-table writes that ride a put's
+// network/history transaction: extra commits with the move, rollback is
+// the pre-move snapshot of those keys restored if the put is rolled back.
+type putSettings struct {
+	extra    map[string]string
+	rollback map[string]string
+}
+
 // applyPutNetwork performs the state change of a validated put: stop the
 // old connection, atomically replace the stored definition, start the
 // new one. Both failure points roll back so an error always leaves the
 // previous definition stored and connected. Caller holds netOps.
-// rollbackSettings is the settings snapshot to restore alongside the
-// network config if a rename has to be rolled back — the pre-rename
-// network_renames map. It must ride the SAME transaction as the config
-// restore so the map can never be left pointing at the reverted-away
-// name (which would silently corrupt rule/mute scoping for the live
-// old-named network).
-func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName string, prev *store.NetworkConfig, renamed bool, canonical string, extraSettings, rollbackSettings map[string]string) error {
+//
+// settings.extra commits in the SAME transaction as the config/history
+// move (the rename map + rewritten rules/filters). settings.rollback is
+// the pre-move snapshot of those same keys, restored atomically with the
+// config if a rename has to be rolled back — so the map can never be
+// left pointing at a reverted-away name (which would silently corrupt
+// rule/mute scoping for the live old-named network).
+func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName string, prev *store.NetworkConfig, renamed bool, canonical string, settings putSettings) error {
 	name := nc.EffectiveName()
 	// Stop before persisting: a rename moves history, and the running
 	// connection must not append rows under the old name mid-move.
@@ -500,7 +507,7 @@ func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName 
 	// the history move: a crash cannot leave the network renamed with no
 	// map entry to heal the old-scoped rules/mutes.
 	h.lifecycleGate.Lock()
-	err := h.store.ReplaceNetworkConfigWithSettings(ctx, oldForReplace, name, canonical, extraSettings)
+	err := h.store.ReplaceNetworkConfigWithSettings(ctx, oldForReplace, name, canonical, settings.extra)
 	h.lifecycleGate.Unlock()
 	if err != nil {
 		// Atomic replace failed = nothing changed; put the previous
@@ -516,7 +523,7 @@ func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName 
 		// config. If that restore transaction ITSELF fails, both the
 		// config and the map stay at the committed new-name state, which
 		// is still internally consistent.
-		h.rollbackPut(ctx, name, prev, rollbackSettings)
+		h.rollbackPut(ctx, name, prev, settings.rollback)
 		return err
 	}
 	return nil

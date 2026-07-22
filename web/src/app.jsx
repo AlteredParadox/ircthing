@@ -318,6 +318,49 @@ function mergeHistoryPage(m, key, page, tombstones) {
 	};
 }
 
+// useNotificationNav wires notification-tap navigation. The service
+// worker delivers the tapped buffer BOTH by direct postMessage and,
+// because a message to a suspended/killed iOS page is silently lost, by
+// a pull the page issues on startup and every resume (get_pending_nav).
+// onOpen(network, buffer) performs the actual navigation. Handles the
+// 60s staleness cap and dedups the two delivery paths by the tap's `at`.
+function useNotificationNav({ onOpen }) {
+	const handledAt = useRef(0);
+	// onOpen closes over fresh App state each render; hold it in a ref so
+	// the effect registers listeners ONCE yet always calls the latest.
+	const onOpenRef = useRef(onOpen);
+	onOpenRef.current = onOpen;
+	useEffect(() => {
+		if (!("serviceWorker" in navigator)) return undefined;
+		const ask = () => navigator.serviceWorker.controller?.postMessage({ type: "get_pending_nav" });
+		const onMsg = (e) => {
+			const d = e.data;
+			if (d?.type !== "open_buffer" || typeof d.network !== "string" || typeof d.buffer !== "string") return;
+			if (typeof d.at === "number") {
+				if (Date.now() - d.at > 60 * 1000) return; // stale queued delivery
+				if (handledAt.current === d.at) return; // same tap via both paths
+				handledAt.current = d.at;
+			}
+			onOpenRef.current(d.network, d.buffer);
+			// Consume the worker's pendingNav (a tap to an already-visible
+			// window fires no visibilitychange, so nothing else would).
+			ask();
+		};
+		navigator.serviceWorker.addEventListener("message", onMsg);
+		navigator.serviceWorker.ready.then(ask).catch(() => {});
+		const onResume = () => {
+			if (!document.hidden) ask();
+		};
+		document.addEventListener("visibilitychange", onResume);
+		globalThis.addEventListener("pageshow", onResume);
+		return () => {
+			navigator.serviceWorker.removeEventListener("message", onMsg);
+			document.removeEventListener("visibilitychange", onResume);
+			globalThis.removeEventListener("pageshow", onResume);
+		};
+	}, []);
+}
+
 export function App() {
 	const [phase, setPhase] = useState("checking"); // checking | login | app
 	// Fail closed: previews start OFF until /api/config confirms they are on,
@@ -435,9 +478,6 @@ export function App() {
 	// Bumped when a load settles, to re-run the load effect (a ref clear
 	// alone would not).
 	const [loadTick, setLoadTick] = useState(0);
-	// Timestamp of the last notification-nav we handled — dedups the same
-	// tap arriving via both the direct postMessage and the pull reply.
-	const handledNavAt = useRef(0);
 
 	// The server is the source of truth for prefs; localStorage is a
 	// write-through cache so the first paint has the right theme. This
@@ -754,69 +794,10 @@ export function App() {
 		if (nl > 0) saveActiveBuffer(activeKey.slice(0, nl), activeKey.slice(nl + 1));
 	}, [activeKey]);
 
-	// Notification taps: the service worker posts the target buffer;
-	// adopting it through the hash reuses the normal navigation path (and
-	// no-ops when already there — navigate keeps the hash current).
-	// Delivery is pull-based as well as push-based: a postMessage sent
-	// while iOS had this page suspended (or already killed) is silently
-	// lost, so on startup and on every resume we ASK the worker whether a
-	// notification tap is pending and navigate on the reply.
-	useEffect(() => {
-		if (!("serviceWorker" in navigator)) return undefined;
-		const ask = () => navigator.serviceWorker.controller?.postMessage({ type: "get_pending_nav" });
-		const onMsg = (e) => {
-			const d = e.data;
-			if (d?.type === "open_buffer" && typeof d.network === "string" && typeof d.buffer === "string") {
-				// A postMessage queued against a frozen page (iOS) can fire
-				// hours after the tap; a stale one must not yank the
-				// session. Same 60s window the worker's pull path uses.
-				if (typeof d.at === "number" && Date.now() - d.at > 60 * 1000) return;
-				// Dedup by `at`: one tap is delivered BOTH by the direct
-				// postMessage and by the pull reply (they share the tap's
-				// timestamp), which would otherwise navigate/remount twice.
-				if (typeof d.at === "number" && handledNavAt.current === d.at) return;
-				if (typeof d.at === "number") handledNavAt.current = d.at;
-				// Route through select(), not a bare hash set: select →
-				// navigate creates a placeholder for a not-yet-discovered
-				// PM AND drops any stale search/history window so the live
-				// tail (with the message that was pushed) reloads — a bare
-				// hash set no-ops when the hash already equals the target.
-				// Bump tailNav so the message list re-pins to the tail even
-				// when the tapped buffer is the already-active one the user
-				// had scrolled up in (select alone can't reset that scroll).
-				setTailNav((n) => n + 1);
-				// An explicit tap must reload even a buffer whose initial
-				// history load failed: clear its failed marker and bump
-				// loadTick, since the [activeKey] load effect won't re-run
-				// when the target is already active.
-				const key = bufKey(d.network, d.buffer);
-				failedHistory.current.delete(key);
-				setLoadTick((t) => t + 1);
-				select(d.network, d.buffer);
-				// Consume the worker's pendingNav copy: a tap delivered to
-				// an ALREADY-VISIBLE window fires no visibilitychange, so
-				// without this the stashed target survives and the next
-				// focus within 60s would yank the user back to it. The
-				// consume's own reply names the buffer just navigated to —
-				// a no-op.
-				ask();
-			}
-		};
-		navigator.serviceWorker.addEventListener("message", onMsg);
-		// ready ⇒ the worker is active; controller may still be null on the
-		// very first visit (nothing pending then anyway).
-		navigator.serviceWorker.ready.then(ask).catch(() => {});
-		const onResume = () => {
-			if (!document.hidden) ask();
-		};
-		document.addEventListener("visibilitychange", onResume);
-		globalThis.addEventListener("pageshow", onResume);
-		return () => {
-			navigator.serviceWorker.removeEventListener("message", onMsg);
-			document.removeEventListener("visibilitychange", onResume);
-			globalThis.removeEventListener("pageshow", onResume);
-		};
-	}, []);
+	// Notification taps navigate to the tapped buffer — extracted to a
+	// hook (below) both to keep this component readable and because the
+	// push/pull delivery, staleness, and dedup logic is a cohesive unit.
+	useNotificationNav({ onOpen: openNotificationBuffer });
 
 	// Global shortcuts: Ctrl/Cmd+K channel switcher, Ctrl/Cmd+Shift+F
 	// search, Alt+↑/↓ previous/next buffer, Alt+Shift+↑/↓ previous/next
@@ -1623,6 +1604,22 @@ export function App() {
 	function select(network, buffer) {
 		navigationIntent.current++;
 		navigate(network, buffer);
+	}
+
+	// openNotificationBuffer navigates in response to a notification tap
+	// (called by useNotificationNav). Route through select(), not a bare
+	// hash set: select → navigate creates a placeholder for a not-yet-
+	// discovered PM AND drops any stale search/history window so the live
+	// tail (with the pushed message) reloads. Bump tailNav so the list
+	// re-pins to the tail even when the tapped buffer is already active
+	// and scrolled up. Clear its failed-history marker + bump loadTick so
+	// a buffer whose initial load failed reloads (the [activeKey] effect
+	// won't re-run when the target is already active).
+	function openNotificationBuffer(network, buffer) {
+		setTailNav((n) => n + 1);
+		failedHistory.current.delete(bufKey(network, buffer));
+		setLoadTick((t) => t + 1);
+		select(network, buffer);
 	}
 
 	function beginNavigation() {

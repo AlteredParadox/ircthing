@@ -1763,15 +1763,9 @@ func canonicalIgnores(in map[string][]string, renames map[string]string) (map[st
 			network = resolved
 			rewrote = true
 		}
-		kept := make([]string, 0, len(nicks))
-		for _, n := range nicks {
-			if n == "" {
-				continue
-			}
-			if len(n) > maxIgnoreNickChars {
-				return nil, "ignored nick too long", false
-			}
-			kept = append(kept, strings.ToLower(n))
+		kept, problem := canonicalNicks(nicks)
+		if problem != "" {
+			return nil, problem, false
 		}
 		if len(kept) > 0 {
 			// A stale old-name key can merge into the renamed one.
@@ -1779,6 +1773,22 @@ func canonicalIgnores(in map[string][]string, renames map[string]string) (map[st
 		}
 	}
 	return out, "", rewrote
+}
+
+// canonicalNicks lowercases and drops empties from one network's ignore
+// list; a non-empty problem string reports the first over-long nick.
+func canonicalNicks(nicks []string) ([]string, string) {
+	kept := make([]string, 0, len(nicks))
+	for _, n := range nicks {
+		if n == "" {
+			continue
+		}
+		if len(n) > maxIgnoreNickChars {
+			return nil, "ignored nick too long"
+		}
+		kept = append(kept, strings.ToLower(n))
+	}
+	return kept, ""
 }
 
 // canonicalMutes validates the mute list (client bufKey form), dropping
@@ -1904,69 +1914,87 @@ type renameWrites struct {
 // computes their old->new rewrites. Caller holds syncedSettingsMu.
 func (h *Hub) computeRenameWrites(ctx context.Context, oldName, newName string) (renameWrites, bool) {
 	rw := renameWrites{settings: map[string]string{}, rollback: map[string]string{}}
-
-	// Rename map (always written). Absent restores as "{}".
-	mapV, mapPresent, err := h.store.SettingValue(ctx, renamesKey)
-	if err != nil {
+	if !h.renameMapSetting(ctx, &rw, oldName, newName) ||
+		!h.renameRuleSetting(ctx, &rw, oldName, newName) ||
+		!h.renameFilterSetting(ctx, &rw, oldName, newName) {
 		return rw, false
-	}
-	preMap := mapV
-	if !mapPresent {
-		preMap = "{}"
-	}
-	rw.rollback[renamesKey] = preMap
-	newMap, mapOK := foldRenameMap(mapV, mapPresent, oldName, newName)
-	if !mapOK {
-		return rw, false // present-but-corrupt map: abort (don't silently reset)
-	}
-	mapBlob, err := json.Marshal(newMap)
-	if err != nil {
-		return rw, false
-	}
-	rw.settings[renamesKey] = string(mapBlob)
-
-	// Rules (written only if a scope changed).
-	rulesV, rulesPresent, err := h.store.SettingValue(ctx, rulesKey)
-	if err != nil {
-		return rw, false
-	}
-	if rulesPresent {
-		var d RulesData
-		if !isJSONObject(rulesV) || json.Unmarshal([]byte(rulesV), &d) != nil {
-			return rw, false // corrupt: abort rather than rewrite-from-empty
-		}
-		if rewriteRuleRefs(d.Rules, oldName, newName) {
-			blob, err := json.Marshal(d)
-			if err != nil {
-				return rw, false
-			}
-			rw.settings[rulesKey] = string(blob)
-			rw.rollback[rulesKey] = rulesV
-			rw.rules, rw.rulesChanged = d, true
-		}
-	}
-
-	// Filters (written only if a key changed).
-	filtersV, filtersPresent, err := h.store.SettingValue(ctx, filtersKey)
-	if err != nil {
-		return rw, false
-	}
-	if filtersPresent {
-		var d FiltersData
-		if !isJSONObject(filtersV) || json.Unmarshal([]byte(filtersV), &d) != nil {
-			return rw, false
-		}
-		if rewriteFilterRefs(&d, oldName, newName) {
-			blob, err := json.Marshal(d)
-			if err != nil {
-				return rw, false
-			}
-			rw.settings[filtersKey] = string(blob)
-			rw.rollback[filtersKey] = filtersV
-			rw.filters, rw.filtersChanged = d, true
-		}
 	}
 	return rw, true
+}
+
+// renameMapSetting folds the rename map and records it into rw (always
+// written). Reports ok=false on a store error or a corrupt present map.
+func (h *Hub) renameMapSetting(ctx context.Context, rw *renameWrites, oldName, newName string) bool {
+	v, present, err := h.store.SettingValue(ctx, renamesKey)
+	if err != nil {
+		return false
+	}
+	preMap := v
+	if !present {
+		preMap = "{}" // absent restores as empty
+	}
+	rw.rollback[renamesKey] = preMap
+	newMap, ok := foldRenameMap(v, present, oldName, newName)
+	if !ok {
+		return false // present-but-corrupt: abort, don't silently reset
+	}
+	blob, err := json.Marshal(newMap)
+	if err != nil {
+		return false
+	}
+	rw.settings[renamesKey] = string(blob)
+	return true
+}
+
+// renameRuleSetting rewrites rule scopes and records them into rw only
+// if a scope changed. ok=false on a store error or a corrupt present blob.
+func (h *Hub) renameRuleSetting(ctx context.Context, rw *renameWrites, oldName, newName string) bool {
+	v, present, err := h.store.SettingValue(ctx, rulesKey)
+	if err != nil {
+		return false
+	}
+	if !present {
+		return true
+	}
+	var d RulesData
+	if !isJSONObject(v) || json.Unmarshal([]byte(v), &d) != nil {
+		return false // corrupt: abort rather than rewrite-from-empty
+	}
+	if rewriteRuleRefs(d.Rules, oldName, newName) {
+		blob, err := json.Marshal(d)
+		if err != nil {
+			return false
+		}
+		rw.settings[rulesKey] = string(blob)
+		rw.rollback[rulesKey] = v
+		rw.rules, rw.rulesChanged = d, true
+	}
+	return true
+}
+
+// renameFilterSetting is renameRuleSetting for the ignore/mute lists.
+func (h *Hub) renameFilterSetting(ctx context.Context, rw *renameWrites, oldName, newName string) bool {
+	v, present, err := h.store.SettingValue(ctx, filtersKey)
+	if err != nil {
+		return false
+	}
+	if !present {
+		return true
+	}
+	var d FiltersData
+	if !isJSONObject(v) || json.Unmarshal([]byte(v), &d) != nil {
+		return false
+	}
+	if rewriteFilterRefs(&d, oldName, newName) {
+		blob, err := json.Marshal(d)
+		if err != nil {
+			return false
+		}
+		rw.settings[filtersKey] = string(blob)
+		rw.rollback[filtersKey] = v
+		rw.filters, rw.filtersChanged = d, true
+	}
+	return true
 }
 
 // broadcastRenameWrites announces the rewritten rules/filters to every
