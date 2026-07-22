@@ -195,6 +195,9 @@ func (s *Sender) auth(endpoint string) (string, error) {
 	// https for every validated endpoint; http exists only under the
 	// test-only insecure flag.
 	host := strings.ToLower(u.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]" // Hostname() strips a literal IPv6's brackets
+	}
 	if p := u.Port(); p != "" && !(p == "443" && u.Scheme == "https") && !(p == "80" && u.Scheme == "http") {
 		host += ":" + p
 	}

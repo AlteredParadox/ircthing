@@ -488,7 +488,14 @@ func (h *Hub) deliverPush(ctx context.Context, sender PushSender, key string, p 
 	// effort. A buffer the store no longer knows gets no push (and its
 	// notification would navigate nowhere). Identity fold: `buffer` is
 	// already the canonical stored spelling.
-	if name, found, err := h.store.FindBuffer(ctx, network, buffer, func(s string) string { return s }); err != nil || !found || name != buffer {
+	name, found, err := h.store.FindBuffer(ctx, network, buffer, func(s string) string { return s })
+	if err != nil {
+		// Fail closed (skip the push) but never silently: a transient
+		// store error here eats a notification.
+		log.Printf("push: checking buffer %s/%s: %v", network, buffer, err)
+		return
+	}
+	if !found || name != buffer {
 		return
 	}
 	subs, err := h.store.PushSubscriptions(ctx)
