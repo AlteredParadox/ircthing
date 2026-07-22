@@ -519,11 +519,13 @@ export function App() {
 			.catch((e) => {
 				if (sock.current !== s || rulesRef.current !== next) return;
 				if (e?.code === "bad_request") {
+					// Roll back even with no confirmed baseline (first-ever
+					// sync): keeping the rejected set locally would highlight
+					// on this device but never push — silent divergence.
 					rulesDirty.current = false;
-					if (rulesConfirmed.current) {
-						setRules(rulesConfirmed.current);
-						saveRules(rulesConfirmed.current);
-					}
+					const base = rulesConfirmed.current || [];
+					setRules(base);
+					saveRules(base);
 					return;
 				}
 				if (attempt < 3) {
@@ -553,14 +555,14 @@ export function App() {
 			.catch((e) => {
 				if (sock.current !== s || ignoresRef.current !== ig || mutesRef.current !== mu) return;
 				if (e?.code === "bad_request") {
+					// Roll back even with no confirmed baseline — see the
+					// rules flow's rationale.
 					filtersDirty.current = false;
-					const c = filtersConfirmed.current;
-					if (c) {
-						setIgnores(c.ignores);
-						saveIgnores(c.ignores);
-						setMutes(c.mutes);
-						saveMutes(c.mutes);
-					}
+					const c = filtersConfirmed.current || { ignores: {}, mutes: [] };
+					setIgnores(c.ignores);
+					saveIgnores(c.ignores);
+					setMutes(c.mutes);
+					saveMutes(c.mutes);
 					return;
 				}
 				if (attempt < 3) {
@@ -694,14 +696,21 @@ export function App() {
 	// notification tap is pending and navigate on the reply.
 	useEffect(() => {
 		if (!("serviceWorker" in navigator)) return undefined;
+		const ask = () => navigator.serviceWorker.controller?.postMessage({ type: "get_pending_nav" });
 		const onMsg = (e) => {
 			const d = e.data;
 			if (d?.type === "open_buffer" && typeof d.network === "string" && typeof d.buffer === "string") {
 				location.hash = toHash(d.network, d.buffer);
+				// Consume the worker's pendingNav copy: a tap delivered to
+				// an ALREADY-VISIBLE window fires no visibilitychange, so
+				// without this the stashed target survives and the next
+				// focus within 60s would yank the user back to it. The
+				// consume's own reply names the buffer just navigated to —
+				// a no-op.
+				ask();
 			}
 		};
 		navigator.serviceWorker.addEventListener("message", onMsg);
-		const ask = () => navigator.serviceWorker.controller?.postMessage({ type: "get_pending_nav" });
 		// ready ⇒ the worker is active; controller may still be null on the
 		// very first visit (nothing pending then anyway).
 		navigator.serviceWorker.ready.then(ask).catch(() => {});

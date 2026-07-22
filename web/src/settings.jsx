@@ -51,14 +51,21 @@ function NotifControl({ perm, enabled, onEnable, onToggle }) {
 // applicationServerKey from /api/config (null while loading, "" when the
 // server has none).
 function PushControl({ pushKey }) {
-	// "loading" | "off" | "on" | "busy"
+	// "loading" | "off" | "on" | "busy" | "broken"
 	const [state, setState] = useState("loading");
 	const [err, setErr] = useState("");
 	useEffect(() => {
 		if (!pushSupported()) return undefined;
 		let alive = true;
-		currentSubscription()
-			.then((sub) => alive && setState(sub ? "on" : "off"))
+		// Race a timeout: currentSubscription awaits serviceWorker.ready,
+		// which never settles if registration failed — this section must
+		// not show "Checking…" forever.
+		const timeout = new Promise((resolve) => setTimeout(() => resolve("timeout"), 3000));
+		Promise.race([currentSubscription(), timeout])
+			.then((sub) => {
+				if (!alive) return;
+				setState(sub === "timeout" ? "broken" : sub ? "on" : "off");
+			})
 			.catch(() => alive && setState("off"));
 		return () => {
 			alive = false;
@@ -84,6 +91,13 @@ function PushControl({ pushKey }) {
 	}
 	if (pushKey === "") {
 		return <div class="settings-note">The server has not enabled push yet.</div>;
+	}
+	if (state === "broken") {
+		return (
+			<div class="settings-note">
+				The service worker did not start — reload the app and try again.
+			</div>
+		);
 	}
 	if (state === "loading" || pushKey == null) {
 		return <div class="settings-note">Checking…</div>;
@@ -470,7 +484,12 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 		setEnabled(notifier.enabled);
 	}
 
-	const addRule = () => onRules([...rules, { id: uuid(), pattern: "", network: "" }]);
+	// Cap mirrors the server's set_rules limit (64 rules): what the
+	// editor accepts must be what actually syncs (and pushes).
+	const addRule = () => {
+		if (rules.length >= 64) return;
+		onRules([...rules, { id: uuid(), pattern: "", network: "" }]);
+	};
 	const updateRule = (i, patch) => onRules(rules.map((r, j) => (j === i ? { ...r, ...patch } : r)));
 	const removeRule = (i) => onRules(rules.filter((_, j) => j !== i));
 
@@ -845,6 +864,7 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 									class="rule-input"
 									value={r.pattern}
 									placeholder="keyword"
+									maxLength={256}
 									onInput={(e) => updateRule(i, { pattern: e.currentTarget.value })}
 								/>
 								<select

@@ -195,11 +195,15 @@ func (h *Hub) PushPublicKey() string {
 
 // RefreshPushCount re-reads the subscription count into the atomic the
 // per-message fast path checks. Called at startup and by the subscribe/
-// unsubscribe endpoints.
+// unsubscribe endpoints. A failed refresh keeps the previous value and
+// is LOGGED — a silently stale 0 would disable every push.
 func (h *Hub) RefreshPushCount(ctx context.Context) {
-	if n, err := h.store.CountPushSubscriptions(ctx); err == nil {
-		h.pushSubs.Store(int64(n))
+	n, err := h.store.CountPushSubscriptions(ctx)
+	if err != nil {
+		log.Printf("push: refreshing subscription count: %v", err)
+		return
 	}
+	h.pushSubs.Store(int64(n))
 }
 
 // maybePushCandidate feeds one freshly persisted LIVE message to the
@@ -444,7 +448,15 @@ func buildPushFilters(d FiltersData) pushFilters {
 		set := make(map[string]bool, len(nicks))
 		for _, n := range nicks {
 			// set_filters stores lowercased, but old/hand-edited blobs
-			// must match too.
+			// must match too. Known, accepted divergence: Go's simple
+			// Unicode lowering differs from JS toLowerCase for a few
+			// exotic mappings (Turkish İ gains a combining dot in JS;
+			// Greek final sigma is contextual there), so an ignore on
+			// such a nick can miss server-side while working in the
+			// browser. IRC nicks are overwhelmingly ASCII (many networks
+			// enforce it); a full JS-compatible case mapper is not worth
+			// its weight for this. Same tradeoff family as foldNick's
+			// loose rfc1459 superset.
 			set[strings.ToLower(n)] = true
 		}
 		f.ignores[network] = set

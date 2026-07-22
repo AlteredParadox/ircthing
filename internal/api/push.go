@@ -17,11 +17,14 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
+	"ircthing/internal/hub"
 	"ircthing/internal/store"
 	"ircthing/internal/webpush"
 )
@@ -90,8 +93,19 @@ func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "storing subscription failed", http.StatusInternalServerError)
 		return
 	}
-	s.hub.RefreshPushCount(r.Context())
+	refreshPushCountDetached(s.hub)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// refreshPushCountDetached refreshes the pusher's cached subscription
+// count on a context that survives the request: the row is already
+// committed, and a client abort (a service worker killed mid-fetch)
+// cancelling r.Context() here would strand the cache — at 0, that
+// silently disables every push despite a valid stored subscription.
+func refreshPushCountDetached(h *hub.Hub) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	h.RefreshPushCount(ctx)
 }
 
 func (s *Server) handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
@@ -108,6 +122,6 @@ func (s *Server) handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "removing subscription failed", http.StatusInternalServerError)
 		return
 	}
-	s.hub.RefreshPushCount(r.Context())
+	refreshPushCountDetached(s.hub)
 	w.WriteHeader(http.StatusNoContent)
 }
