@@ -159,7 +159,7 @@ type Hub struct {
 	// HTTP layer serves to clients.
 	pushCandidates chan pushCandidate
 	pushMarkers    chan markerAdvance
-	pushRulesDirty chan struct{}
+	pushConfigDirty chan struct{}
 	pushSubs       atomic.Int64
 	pushPubKey     string
 }
@@ -185,7 +185,7 @@ func New(st *store.Store) *Hub {
 		largeResponseSem:  make(chan struct{}, 4),
 		pushCandidates:    make(chan pushCandidate, 256),
 		pushMarkers:       make(chan markerAdvance, 64),
-		pushRulesDirty:    make(chan struct{}, 1),
+		pushConfigDirty:    make(chan struct{}, 1),
 	}
 }
 

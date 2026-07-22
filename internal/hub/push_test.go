@@ -172,18 +172,52 @@ func TestPusherKeywordRulesApply(t *testing.T) {
 	h.pushCandidates <- candidate("#go", "bob", "time to deploy", time.Now().UnixMilli(), true)
 	waitSends(t, f, 1)
 
-	// Removing the rule (set_rules path pokes notifyRulesChanged)
+	// Removing the rule (set_rules path pokes notifyPushConfigChanged)
 	// reloads the cache: the same text no longer pushes.
 	if err := h.store.SetSetting(ctx, rulesKey, `{"rules":[]}`); err != nil {
 		t.Fatal(err)
 	}
-	h.notifyRulesChanged()
-	waitDrained(t, h.pushRulesDirty)
+	h.notifyPushConfigChanged()
+	waitDrained(t, h.pushConfigDirty)
 	h.pushCandidates <- candidate("#go", "bob", "time to deploy", time.Now().UnixMilli(), true)
 	time.Sleep(5 * testPushDelay)
 	if got := f.count(); got != 1 {
 		t.Fatalf("sends after rule removal = %d, want 1", got)
 	}
+}
+
+func TestPusherHonorsFilters(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	// bob ignored on libera; #noisy muted (client bufKey form).
+	if err := h.store.SetSetting(ctx, filtersKey,
+		`{"ignores":{"libera":["bob"]},"mutes":["libera`+"\\n"+`#noisy"]}`); err != nil {
+		t.Fatal(err)
+	}
+	addTestSubscription(t, h, "https://push.example/dev1")
+	f := &fakeSender{}
+	startTestPusher(t, h, f)
+
+	now := time.Now().UnixMilli()
+	// A PM from an ignored sender: dropped (PMs otherwise always push).
+	h.pushCandidates <- candidate("bob", "Bob", "hi", now, false) // case-insensitive ignore
+	// A mention in a muted buffer: dropped.
+	h.pushCandidates <- candidate("#noisy", "carol", "me: ping", now+1, true)
+	// A mention from the ignored sender in another channel: dropped.
+	h.pushCandidates <- candidate("#go", "bob", "me: ping", now+2, true)
+	// Control: same shape from an unfiltered sender pushes.
+	h.pushCandidates <- candidate("#go", "carol", "me: ping", now+3, true)
+	waitSends(t, f, 1)
+
+	// Clearing the filters (set_filters path pokes the config-dirty
+	// channel) makes the ignored sender push again.
+	if err := h.store.SetSetting(ctx, filtersKey, `{"ignores":{},"mutes":[]}`); err != nil {
+		t.Fatal(err)
+	}
+	h.notifyPushConfigChanged()
+	waitDrained(t, h.pushConfigDirty)
+	h.pushCandidates <- candidate("bob", "bob", "hi again", now+4, false)
+	waitSends(t, f, 2)
 }
 
 func TestPusherCancelOnRead(t *testing.T) {

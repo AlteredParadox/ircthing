@@ -227,11 +227,11 @@ func (h *Hub) notifyMarkerAdvance(network, buffer string, t time.Time) {
 	}
 }
 
-// notifyRulesChanged tells the scheduler the stored highlight rules
+// notifyPushConfigChanged tells the scheduler the stored highlight rules
 // changed; it reloads them on its own goroutine.
-func (h *Hub) notifyRulesChanged() {
+func (h *Hub) notifyPushConfigChanged() {
 	select {
-	case h.pushRulesDirty <- struct{}{}:
+	case h.pushConfigDirty <- struct{}{}:
 	default: // already flagged
 	}
 }
@@ -240,6 +240,7 @@ func (h *Hub) notifyRulesChanged() {
 // the rules cache.
 func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Duration) {
 	rules := h.loadRules(ctx)
+	filters := buildPushFilters(h.loadFilters(ctx))
 	pending := make(map[string]*pendingPush) // network+"\x00"+buffer
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
@@ -263,6 +264,11 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 			return // pending pushes die with the process: best effort by design
 
 		case c := <-h.pushCandidates:
+			// Ignored senders and muted buffers never push — the synced
+			// mirror of the client's alert exclusions (app.jsx event path).
+			if filters.drops(c.network, c.buffer, c.sender) {
+				continue
+			}
 			// PMs always push; channels (and "*") need a mention/keyword.
 			if c.channelLike && !highlightText(c.text, c.nick, rules, c.network) {
 				continue
@@ -293,8 +299,9 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 				rearm()
 			}
 
-		case <-h.pushRulesDirty:
+		case <-h.pushConfigDirty:
 			rules = h.loadRules(ctx)
+			filters = buildPushFilters(h.loadFilters(ctx))
 
 		case <-timer.C:
 			now := time.Now()
@@ -308,6 +315,39 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 			rearm()
 		}
 	}
+}
+
+// pushFilters is the pusher's lookup form of the synced ignore/mute
+// lists: ignores as network -> lowercased-nick set (the client's ASCII
+// fold, local.js isIgnored), mutes as a bufKey set (network+"\n"+buffer,
+// the client's exact-match key).
+type pushFilters struct {
+	ignores map[string]map[string]bool
+	mutes   map[string]bool
+}
+
+func buildPushFilters(d FiltersData) pushFilters {
+	f := pushFilters{ignores: make(map[string]map[string]bool, len(d.Ignores)), mutes: make(map[string]bool, len(d.Mutes))}
+	for network, nicks := range d.Ignores {
+		set := make(map[string]bool, len(nicks))
+		for _, n := range nicks {
+			// set_filters stores lowercased, but old/hand-edited blobs
+			// must match too.
+			set[strings.ToLower(n)] = true
+		}
+		f.ignores[network] = set
+	}
+	for _, m := range d.Mutes {
+		f.mutes[m] = true
+	}
+	return f
+}
+
+func (f pushFilters) drops(network, buffer, sender string) bool {
+	if f.mutes[network+"\n"+buffer] {
+		return true
+	}
+	return sender != "" && f.ignores[network][strings.ToLower(sender)]
 }
 
 // deliverPush sends one due notification to every subscription, after

@@ -14,10 +14,11 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-// Client-side, per-browser lists that shape what you see: ignored nicks
-// (per network) and muted buffers. Persisted in localStorage, like the
-// highlight rules — deliberately not synced to the server, since "who I
-// ignore on this laptop" is a local preference.
+// Ignored nicks (per network) and muted buffers. Synced server-side
+// (the "filters" setting — the Web Push pusher applies the same lists,
+// so an ignored sender or muted buffer never pushes to a sleeping
+// phone); localStorage is the first-paint cache, like the highlight
+// rules. Plus the last-active buffer, which stays purely local.
 
 function load(key, fallback) {
 	try {
@@ -33,6 +34,10 @@ function load(key, fallback) {
 export function loadIgnores() {
 	const v = load("ignores", {});
 	return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+}
+
+export function saveIgnores(ignores) {
+	localStorage.setItem("ignores", JSON.stringify(ignores));
 }
 
 export function isIgnored(ignores, network, nick) {
@@ -52,7 +57,7 @@ export function toggleIgnore(ignores, network, nick) {
 	const next = { ...ignores };
 	if (list.length) next[network] = list;
 	else delete next[network];
-	localStorage.setItem("ignores", JSON.stringify(next));
+	saveIgnores(next);
 	return next;
 }
 
@@ -87,12 +92,16 @@ export function loadMutes() {
 	return Array.isArray(v) ? v : [];
 }
 
+export function saveMutes(mutes) {
+	localStorage.setItem("mutes", JSON.stringify(mutes));
+}
+
 export function isMuted(mutes, key) {
 	return mutes.includes(key);
 }
 
 export function toggleMute(mutes, key) {
 	const next = mutes.includes(key) ? mutes.filter((k) => k !== key) : [...mutes, key];
-	localStorage.setItem("mutes", JSON.stringify(next));
+	saveMutes(next);
 	return next;
 }

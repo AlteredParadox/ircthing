@@ -1973,6 +1973,64 @@ func TestRulesFlow(t *testing.T) {
 	}
 }
 
+func TestFiltersFlow(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	a := h.NewSession()
+	defer a.Close()
+	b := h.NewSession()
+	defer b.Close()
+
+	// Nothing stored: present-but-empty collections, NOT null (the
+	// client's seed branch keys off this).
+	a.Handle(ctx, request(t, "get_filters", 1, nil))
+	if raw := recv(t, a, "filters"); !strings.Contains(string(raw.Data), `"ignores":{}`) ||
+		!strings.Contains(string(raw.Data), `"mutes":[]`) {
+		t.Fatalf("initial filters payload = %s", raw.Data)
+	}
+
+	// Setting from A acks A and pushes the canonical (lowercased,
+	// empties dropped) set to B, not A.
+	a.Handle(ctx, request(t, "set_filters", 2, FiltersData{
+		Ignores: map[string][]string{"libera": {"Bob", ""}, "oftc": {}},
+		Mutes:   []string{"libera\n#noisy", ""},
+	}))
+	recv(t, a, "ok")
+	want := FiltersData{Ignores: map[string][]string{"libera": {"bob"}}, Mutes: []string{"libera\n#noisy"}}
+	if d := decode[FiltersData](t, recv(t, b, "filters")); !reflect.DeepEqual(d, want) {
+		t.Fatalf("pushed filters = %+v", d)
+	}
+	b.Handle(ctx, request(t, "get_filters", 3, nil))
+	if d := decode[FiltersData](t, recv(t, b, "filters")); !reflect.DeepEqual(d, want) {
+		t.Fatalf("stored filters = %+v", d)
+	}
+
+	// Oversized inputs are rejected and do not clobber the stored set.
+	a.Handle(ctx, request(t, "set_filters", 4, FiltersData{Mutes: make([]string, maxMutes+1)}))
+	if e := decode[ErrorData](t, recv(t, a, "error")); e.Code != "bad_request" {
+		t.Fatalf("too-many-mutes error = %+v", e)
+	}
+	a.Handle(ctx, request(t, "set_filters", 5, FiltersData{
+		Ignores: map[string][]string{"libera": {strings.Repeat("x", maxIgnoreNickChars+1)}},
+	}))
+	if e := decode[ErrorData](t, recv(t, a, "error")); e.Code != "bad_request" {
+		t.Fatalf("long-nick error = %+v", e)
+	}
+	a.Handle(ctx, request(t, "get_filters", 6, nil))
+	if d := decode[FiltersData](t, recv(t, a, "filters")); !reflect.DeepEqual(d, want) {
+		t.Fatalf("filters after rejected writes = %+v", d)
+	}
+
+	// A corrupt stored blob degrades to nothing-filtered, not an error.
+	if err := h.store.SetSetting(ctx, filtersKey, "{not json"); err != nil {
+		t.Fatal(err)
+	}
+	a.Handle(ctx, request(t, "get_filters", 7, nil))
+	if d := decode[FiltersData](t, recv(t, a, "filters")); len(d.Ignores) != 0 || len(d.Mutes) != 0 {
+		t.Fatalf("filters from corrupt blob = %+v", d)
+	}
+}
+
 func TestPaginatedBackfill(t *testing.T) {
 	h := newTestHub(t)
 	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox", pageSize: 2}

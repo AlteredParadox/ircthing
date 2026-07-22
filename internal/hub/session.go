@@ -266,6 +266,10 @@ func (s *Session) Handle(ctx context.Context, env Envelope) {
 		s.handleGetRules(ctx, env)
 	case "set_rules":
 		s.handleSetRules(ctx, env)
+	case "get_filters":
+		s.handleGetFilters(ctx, env)
+	case "set_filters":
+		s.handleSetFilters(ctx, env)
 	case "get_networks":
 		s.handleGetNetworks(ctx, env)
 	case "get_network":
@@ -1490,7 +1494,108 @@ func (s *Session) handleSetRules(ctx context.Context, env Envelope) {
 	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcastExcept(s, envelope("rules", 0, RulesData{Rules: kept}))
-	s.hub.notifyRulesChanged()
+	s.hub.notifyPushConfigChanged()
+}
+
+// filtersKey is the settings-table key for the synced ignore/mute lists.
+const filtersKey = "filters"
+
+// Filter caps: like the rule caps, sanity bounds rather than expected
+// sizes — the lists are consulted per live message in the pusher.
+const (
+	maxFilterNetworks    = 128
+	maxIgnoresPerNetwork = 512
+	maxIgnoreNickChars   = 128
+	maxMutes             = 1024
+	maxMuteKeyChars      = 512
+)
+
+// loadFilters parses the stored ignore/mute lists; corrupt or absent
+// data yields empty lists (nothing filtered).
+func (h *Hub) loadFilters(ctx context.Context) FiltersData {
+	var d FiltersData
+	v, err := h.store.Setting(ctx, filtersKey)
+	if err != nil || v == "" {
+		return d
+	}
+	if err := json.Unmarshal([]byte(v), &d); err != nil {
+		return FiltersData{}
+	}
+	return d
+}
+
+func (s *Session) handleGetFilters(ctx context.Context, env Envelope) {
+	// Non-null empties, like get_rules: the client's seed-from-
+	// localStorage branch keys off present-but-empty.
+	d := s.hub.loadFilters(ctx)
+	if d.Ignores == nil {
+		d.Ignores = map[string][]string{}
+	}
+	if d.Mutes == nil {
+		d.Mutes = []string{}
+	}
+	s.push(envelope("filters", env.Seq, d))
+}
+
+// handleSetFilters stores the ignore/mute lists and pushes them to the
+// user's other sessions. Nicks are normalized to the client's ASCII
+// lowercase fold so the pusher's lookup matches regardless of which
+// device wrote the list.
+func (s *Session) handleSetFilters(ctx context.Context, env Envelope) {
+	var d FiltersData
+	if err := json.Unmarshal(env.Data, &d); err != nil {
+		s.push(errEnvelope(env.Seq, "bad_request", "malformed set_filters data"))
+		return
+	}
+	if len(d.Ignores) > maxFilterNetworks || len(d.Mutes) > maxMutes {
+		s.push(errEnvelope(env.Seq, "bad_request", "too many filters"))
+		return
+	}
+	ignores := make(map[string][]string, len(d.Ignores))
+	for network, nicks := range d.Ignores {
+		if network == "" || len(nicks) > maxIgnoresPerNetwork {
+			s.push(errEnvelope(env.Seq, "bad_request", "bad ignore list"))
+			return
+		}
+		kept := make([]string, 0, len(nicks))
+		for _, n := range nicks {
+			if n == "" {
+				continue
+			}
+			if len(n) > maxIgnoreNickChars {
+				s.push(errEnvelope(env.Seq, "bad_request", "ignored nick too long"))
+				return
+			}
+			kept = append(kept, strings.ToLower(n))
+		}
+		if len(kept) > 0 {
+			ignores[network] = kept
+		}
+	}
+	mutes := make([]string, 0, len(d.Mutes))
+	for _, m := range d.Mutes {
+		if m == "" {
+			continue
+		}
+		if len(m) > maxMuteKeyChars {
+			s.push(errEnvelope(env.Seq, "bad_request", "mute key too long"))
+			return
+		}
+		mutes = append(mutes, m)
+	}
+	canonical := FiltersData{Ignores: ignores, Mutes: mutes}
+	blob, err := json.Marshal(canonical)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "encoding filters failed"))
+		return
+	}
+	if err := s.hub.store.SetSetting(ctx, filtersKey, string(blob)); err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "storing filters failed"))
+		return
+	}
+	s.push(envelope("ok", env.Seq, nil))
+	s.hub.broadcastExcept(s, envelope("filters", 0, canonical))
+	s.hub.notifyPushConfigChanged()
 }
 
 // markreadTimeLayout is the server-time format used by MARKREAD

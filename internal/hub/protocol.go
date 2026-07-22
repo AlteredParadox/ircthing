@@ -345,6 +345,18 @@ type RulesData struct {
 	Rules []Rule `json:"rules"`
 }
 
+// FiltersData carries the synced ignore and mute lists ("filters"
+// pushes/responses and the "set_filters" request). Parsed like rules,
+// for the same reason: the Web Push pusher must not notify for an
+// ignored sender or a muted buffer. Ignores map network -> lowercased
+// nicks (the client's ASCII fold — deliberately not the server's
+// casemapping, mirroring web/src/local.js isIgnored); mutes are buffer
+// keys in the client's network+"\n"+buffer form.
+type FiltersData struct {
+	Ignores map[string][]string `json:"ignores"`
+	Mutes   []string            `json:"mutes"`
+}
+
 // ErrorData is the "error" response.
 type ErrorData struct {
 	Code    string `json:"code"`

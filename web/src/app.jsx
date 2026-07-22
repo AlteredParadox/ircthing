@@ -21,7 +21,7 @@ import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./not
 import { syncPushOnLoad } from "./push.js";
 import { Login } from "./login.jsx";
 import { applyPrefs, loadPrefs, MAX_PREFS_BYTES, normalizePrefs, prefsByteLength, resolveTheme, savePrefs } from "./prefs.js";
-import { isIgnored, isMuted, loadActiveBuffer, loadIgnores, loadMutes, saveActiveBuffer, toggleIgnore, toggleMute } from "./local.js";
+import { isIgnored, isMuted, loadActiveBuffer, loadIgnores, loadMutes, saveActiveBuffer, saveIgnores, saveMutes, toggleIgnore, toggleMute } from "./local.js";
 import { editableNetwork, networkEditError } from "./networkedit.js";
 import { armPendingJoin, clearPendingJoin, notePendingJoinForward, takePendingJoin } from "./pending.js";
 import { fetchAllMembers } from "./memberlist.js";
@@ -532,6 +532,68 @@ export function App() {
 			});
 	}
 
+	// Ignore/mute sync, same shape as rules: the pusher applies these
+	// lists server-side so an ignored sender or muted buffer never pushes.
+	// persistFilters reads the refs at send time (the two lists edit
+	// independently but sync as one blob).
+	const filtersPush = useRef(null);
+	const filtersDirty = useRef(false);
+	const filtersConfirmed = useRef(null); // { ignores, mutes } last server-confirmed
+	function persistFilters(attempt = 0) {
+		const s = sock.current;
+		if (!s) return; // adoptFilters re-pushes dirty filters on reconnect
+		const ig = ignoresRef.current;
+		const mu = mutesRef.current;
+		s.request("set_filters", { ignores: ig, mutes: mu })
+			.then(() => {
+				if (sock.current !== s) return;
+				filtersConfirmed.current = { ignores: ig, mutes: mu };
+				if (ignoresRef.current === ig && mutesRef.current === mu) filtersDirty.current = false;
+			})
+			.catch((e) => {
+				if (sock.current !== s || ignoresRef.current !== ig || mutesRef.current !== mu) return;
+				if (e?.code === "bad_request") {
+					filtersDirty.current = false;
+					const c = filtersConfirmed.current;
+					if (c) {
+						setIgnores(c.ignores);
+						saveIgnores(c.ignores);
+						setMutes(c.mutes);
+						saveMutes(c.mutes);
+					}
+					return;
+				}
+				if (attempt < 3) {
+					filtersPush.current = setTimeout(() => persistFilters(attempt + 1), 500 * 2 ** attempt);
+				}
+			});
+	}
+
+	// adoptFilterLists applies a server-confirmed pair to state and cache.
+	function adoptFilterLists(ignores, mutes) {
+		filtersConfirmed.current = { ignores, mutes };
+		setIgnores(ignores);
+		saveIgnores(ignores);
+		setMutes(mutes);
+		saveMutes(mutes);
+	}
+
+	// Local ignore/mute edits (the toggle* helpers persist localStorage
+	// themselves); mark dirty and debounce the server sync.
+	function scheduleFiltersSync() {
+		filtersDirty.current = true;
+		clearTimeout(filtersPush.current);
+		filtersPush.current = setTimeout(() => persistFilters(), 400);
+	}
+	function updateIgnores(next) {
+		setIgnores(next);
+		scheduleFiltersSync();
+	}
+	function updateMutes(next) {
+		setMutes(next);
+		scheduleFiltersSync();
+	}
+
 	// Track the OS theme so the "system" preference follows it live.
 	useEffect(() => {
 		const mq = globalThis.matchMedia("(prefers-color-scheme: dark)");
@@ -565,6 +627,7 @@ export function App() {
 		resetSettingsSession();
 		clearTimeout(prefsPush.current);
 		clearTimeout(rulesPush.current);
+		clearTimeout(filtersPush.current);
 		setBuffersTruncated(false);
 		setNetForm(null);
 		netFormBusyRef.current = false;
@@ -789,6 +852,24 @@ export function App() {
 		}
 	}
 
+	// adoptFilters applies the server's ignore/mute lists; a server with
+	// none stored is seeded from this browser's localStorage — the
+	// one-time migration off per-device lists.
+	function adoptFilters(d) {
+		const has = (Object.keys(d?.ignores || {}).length || 0) > 0 || (d?.mutes?.length || 0) > 0;
+		if (filtersDirty.current) {
+			if (has) filtersConfirmed.current = { ignores: d.ignores, mutes: d.mutes };
+			persistFilters();
+			return;
+		}
+		if (has) {
+			adoptFilterLists(d.ignores, d.mutes);
+		} else if (Object.keys(ignoresRef.current).length || mutesRef.current.length) {
+			filtersDirty.current = true;
+			persistFilters();
+		}
+	}
+
 	// Socket lifecycle, once authed.
 	useEffect(() => {
 		if (phase !== "app") return;
@@ -819,6 +900,9 @@ export function App() {
 				.catch(() => {});
 			s.request("get_rules", null)
 				.then((d) => { if (live()) adoptRules(d); })
+				.catch(() => {});
+			s.request("get_filters", null)
+				.then((d) => { if (live()) adoptFilters(d); })
 				.catch(() => {});
 			// Drop cached pages up front so every open buffer refetches a
 			// fresh tail covering the offline window. This must NOT hang off
@@ -1008,6 +1092,12 @@ export function App() {
 			rulesConfirmed.current = d.rules;
 			setRules(d.rules);
 			saveRules(d.rules);
+		});
+
+		// Same for the ignore/mute lists.
+		on("filters", (d) => {
+			if (filtersDirty.current || !d?.ignores || !d?.mutes) return;
+			adoptFilterLists(d.ignores, d.mutes);
 		});
 
 		// Ephemeral server replies (/list, error numerics): shown as
@@ -1517,7 +1607,7 @@ export function App() {
 			{ label: "Direct message", onClick: () => select(network, nick) },
 			{
 				label: ignored ? "Unignore" : "Ignore", danger: !ignored,
-				onClick: () => setIgnores((ig) => toggleIgnore(ig, network, nick)),
+				onClick: () => updateIgnores(toggleIgnore(ignoresRef.current, network, nick)),
 			},
 			...modItems(network, nick),
 		];
@@ -1606,12 +1696,12 @@ export function App() {
 					{ label: "Whois", onClick: () => sendCommand(network, "WHOIS", [buffer]) },
 					{
 						label: ig ? "Unignore" : "Ignore", danger: !ig,
-						onClick: () => setIgnores((x2) => toggleIgnore(x2, network, buffer)),
+						onClick: () => updateIgnores(toggleIgnore(ignoresRef.current, network, buffer)),
 					},
 				]),
 			{
 				label: muted ? "Unmute" : "Mute",
-				onClick: () => setMutes((m) => toggleMute(m, key)),
+				onClick: () => updateMutes(toggleMute(mutesRef.current, key)),
 			},
 			chan
 				? {

@@ -65,8 +65,9 @@ scrollback runs in ~32 MB of RSS.
   are provisioned automatically (no Apple/Google account or
   configuration needed), and enabling it is a per-device toggle in
   settings. Requires HTTPS (the reverse proxy you already have); on
-  iOS, add the app to the Home Screen first. Known limitation: ignore
-  and mute lists are per-device, so a muted buffer can still push.
+  iOS, add the app to the Home Screen first. Ignore and mute lists sync
+  through the server and are honored for push too — an ignored sender
+  or muted buffer never buzzes your phone.
 - **Theming**: dark/light/system, accent colors, text size, density,
   message font — plus a raw custom-CSS override. Usable at 360 px wide;
   installable as a PWA.
