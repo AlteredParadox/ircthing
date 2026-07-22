@@ -44,8 +44,13 @@ globalThis.addEventListener("push", (event) => {
 		globalThis.registration.showNotification(title, {
 			body,
 			// One notification per buffer: a later push replaces the
-			// earlier one instead of stacking.
-			tag: network && buffer ? `${network}/${buffer}` : "ircthing",
+			// earlier one instead of stacking. The tag matches the
+			// FOREGROUND notifier's (bufKey: network + "\n" + buffer,
+			// see notify.js/app.jsx) — tags are origin-scoped, so with
+			// both notification paths enabled a push REPLACES the
+			// instant alert for the same buffer rather than duplicating
+			// it.
+			tag: network && buffer ? `${network}\n${buffer}` : "ircthing",
 			data: { network, buffer },
 		}),
 	);

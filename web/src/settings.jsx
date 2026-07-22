@@ -17,7 +17,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { ACCENT_RGB, ACCENTS, CLOCKS, MAX_NICK_SEP, MAX_PREFS_BYTES, prefsByteLength } from "./prefs.js";
 import { uuid } from "./irc.js";
-import { currentSubscription, isIOSNeedingInstall, isMobileDevice, pushSupported, subscribePush, unsubscribePush } from "./push.js";
+import { currentSubscription, isIOSNeedingInstall, pushSupported, subscribePush, unsubscribePush } from "./push.js";
 
 // NotifControl renders the notification section for the current
 // permission state: unsupported, not yet granted, or toggleable.
@@ -33,13 +33,13 @@ function NotifControl({ perm, enabled, onEnable, onToggle }) {
 					checked={enabled}
 					onChange={(e) => onToggle(e.currentTarget.checked)}
 				/>
-				<span>Notify on highlights and private messages</span>
+				<span>While the app is open</span>
 			</label>
 		);
 	}
 	return (
 		<button class="btn-accent" onClick={onEnable}>
-			Enable desktop notifications
+			Enable notifications
 		</button>
 	);
 }
@@ -133,7 +133,7 @@ function PushControl({ pushKey }) {
 					disabled={state === "busy"}
 					onChange={toggle}
 				/>
-				<span>Notify this device even when the app is closed</span>
+				<span>When away — push</span>
 			</label>
 			{err && <div class="cmd-error">{err}</div>}
 		</>
@@ -335,24 +335,6 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 	const [retention, setRetention] = useState(null); // { days, max } | null
 	const [sessionDays, setSessionDays] = useState(null); // login cookie lifetime
 	const [pushKey, setPushKey] = useState(null); // VAPID key; null loading, "" none
-	// The push section is a mobile feature: on desktop-class devices it
-	// appears only when a subscription ALREADY exists (an off-switch for
-	// a device subscribed earlier — hiding it entirely would leave that
-	// browser pushing forever with no visible control).
-	const [showPush, setShowPush] = useState(isMobileDevice);
-	useEffect(() => {
-		if (showPush || !pushSupported()) return undefined;
-		let alive = true;
-		const timeout = new Promise((resolve) => setTimeout(() => resolve(null), 3000));
-		Promise.race([currentSubscription(), timeout])
-			.then((sub) => {
-				if (alive && sub) setShowPush(true);
-			})
-			.catch(() => {});
-		return () => {
-			alive = false;
-		};
-	}, []);
 
 	useEffect(() => {
 		const onKey = (e) => e.key === "Escape" && onClose();
@@ -853,24 +835,22 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 					<ChangePassword onRotated={() => setTimeout(() => onLogout?.(), 1200)} />
 
 					<section class="settings-section">
-						<div class="settings-label">Desktop notifications</div>
+						<div class="settings-label">Notifications</div>
 						<NotifControl
 							perm={perm} enabled={enabled}
 							onEnable={enableNotif} onToggle={toggleNotif}
 						/>
+						<div class="settings-note">
+							Instant alerts for highlights and private messages, shown by
+							this tab.
+						</div>
+						<PushControl pushKey={pushKey} />
+						<div class="settings-note">
+							Sent by the server if a highlight or private message stays
+							unread for ~20 seconds — reaches this device even with the app
+							closed. An alert already showing is replaced, not duplicated.
+						</div>
 					</section>
-
-					{showPush && (
-						<section class="settings-section">
-							<div class="settings-label">Push notifications</div>
-							<div class="settings-note">
-								Sent by the server when a highlight or private message stays
-								unread for ~20 seconds — reaches this device even with the app
-								closed.
-							</div>
-							<PushControl pushKey={pushKey} />
-						</section>
-					)}
 
 					<section class="settings-section">
 						<div class="settings-label">Highlight keywords</div>
