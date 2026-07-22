@@ -1435,7 +1435,15 @@ const (
 // distinguish.
 func (h *Hub) loadRules(ctx context.Context) []Rule {
 	v, err := h.store.Setting(ctx, rulesKey)
-	if err != nil || v == "" {
+	if err != nil {
+		return nil
+	}
+	return parseRules(v)
+}
+
+// parseRules decodes a stored rules blob; "" or corrupt yields nil.
+func parseRules(v string) []Rule {
+	if v == "" {
 		return nil
 	}
 	var d RulesData
@@ -1446,14 +1454,20 @@ func (h *Hub) loadRules(ctx context.Context) []Rule {
 }
 
 func (s *Session) handleGetRules(ctx context.Context, env Envelope) {
-	// Reply with rules:[] (not null) when nothing is stored, so the
-	// client's "server has no rules yet → seed from localStorage" branch
-	// has an unambiguous signal.
-	rules := s.hub.loadRules(ctx)
+	// Seeded distinguishes never-stored (client may seed from its
+	// localStorage cache) from stored-but-empty (the user deleted every
+	// rule — seeding would resurrect them). Rules is [] (not null) either
+	// way.
+	v, present, err := s.hub.store.SettingValue(ctx, rulesKey)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "rules query failed"))
+		return
+	}
+	rules := parseRules(v)
 	if rules == nil {
 		rules = []Rule{}
 	}
-	s.push(envelope("rules", env.Seq, RulesData{Rules: rules}))
+	s.push(envelope("rules", env.Seq, RulesData{Rules: rules, Seeded: present}))
 }
 
 // handleSetRules stores the highlight rules and pushes them to the
@@ -1493,7 +1507,7 @@ func (s *Session) handleSetRules(ctx context.Context, env Envelope) {
 		return
 	}
 	s.push(envelope("ok", env.Seq, nil))
-	s.hub.broadcastExcept(s, envelope("rules", 0, RulesData{Rules: kept}))
+	s.hub.broadcastExcept(s, envelope("rules", 0, RulesData{Rules: kept, Seeded: true}))
 	s.hub.notifyPushConfigChanged()
 }
 
@@ -1513,9 +1527,18 @@ const (
 // loadFilters parses the stored ignore/mute lists; corrupt or absent
 // data yields empty lists (nothing filtered).
 func (h *Hub) loadFilters(ctx context.Context) FiltersData {
-	var d FiltersData
 	v, err := h.store.Setting(ctx, filtersKey)
-	if err != nil || v == "" {
+	if err != nil {
+		return FiltersData{}
+	}
+	return parseFilters(v)
+}
+
+// parseFilters decodes a stored filters blob; "" or corrupt yields the
+// zero value.
+func parseFilters(v string) FiltersData {
+	var d FiltersData
+	if v == "" {
 		return d
 	}
 	if err := json.Unmarshal([]byte(v), &d); err != nil {
@@ -1525,9 +1548,15 @@ func (h *Hub) loadFilters(ctx context.Context) FiltersData {
 }
 
 func (s *Session) handleGetFilters(ctx context.Context, env Envelope) {
-	// Non-null empties, like get_rules: the client's seed-from-
-	// localStorage branch keys off present-but-empty.
-	d := s.hub.loadFilters(ctx)
+	// Non-null empties plus the Seeded marker, like get_rules: the
+	// client seeds from localStorage only when never stored.
+	v, present, err := s.hub.store.SettingValue(ctx, filtersKey)
+	if err != nil {
+		s.push(errEnvelope(env.Seq, "internal", "filters query failed"))
+		return
+	}
+	d := parseFilters(v)
+	d.Seeded = present
 	if d.Ignores == nil {
 		d.Ignores = map[string][]string{}
 	}
@@ -1594,6 +1623,7 @@ func (s *Session) handleSetFilters(ctx context.Context, env Envelope) {
 		return
 	}
 	s.push(envelope("ok", env.Seq, nil))
+	canonical.Seeded = true // broadcast only; the stored blob stays Seeded-free
 	s.hub.broadcastExcept(s, envelope("filters", 0, canonical))
 	s.hub.notifyPushConfigChanged()
 }

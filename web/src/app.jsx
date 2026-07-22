@@ -846,6 +846,13 @@ export function App() {
 			rulesConfirmed.current = d.rules;
 			setRules(d.rules);
 			saveRules(d.rules);
+		} else if (d.seeded) {
+			// Stored-but-empty: the user deleted every rule on some
+			// device. Adopt the emptiness — seeding from this browser's
+			// cache would resurrect them.
+			rulesConfirmed.current = [];
+			setRules([]);
+			saveRules([]);
 		} else if (rulesRef.current.length) {
 			rulesDirty.current = true;
 			persistRules(rulesRef.current);
@@ -864,6 +871,9 @@ export function App() {
 		}
 		if (has) {
 			adoptFilterLists(d.ignores, d.mutes);
+		} else if (d?.seeded) {
+			// Deliberately emptied elsewhere: adopt, don't resurrect.
+			adoptFilterLists({}, []);
 		} else if (Object.keys(ignoresRef.current).length || mutesRef.current.length) {
 			filtersDirty.current = true;
 			persistFilters();

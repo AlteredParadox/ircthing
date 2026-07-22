@@ -341,8 +341,14 @@ type PrefsData struct {
 // blob, the server PARSES these: the Web Push pusher evaluates the same
 // rules the browsers do, so all devices — connected or asleep — agree on
 // what highlights. An absent/empty list means mentions-only.
+// Seeded (responses/broadcasts only; ignored on set_rules) reports that
+// a rules blob EXISTS server-side, distinguishing "never stored" from
+// "user deleted every rule": the client seeds from its localStorage
+// cache only in the never-stored case — otherwise a device with a stale
+// cache would resurrect deliberately-deleted rules.
 type RulesData struct {
-	Rules []Rule `json:"rules"`
+	Rules  []Rule `json:"rules"`
+	Seeded bool   `json:"seeded,omitempty"`
 }
 
 // FiltersData carries the synced ignore and mute lists ("filters"
@@ -352,9 +358,11 @@ type RulesData struct {
 // nicks (the client's ASCII fold — deliberately not the server's
 // casemapping, mirroring web/src/local.js isIgnored); mutes are buffer
 // keys in the client's network+"\n"+buffer form.
+// Seeded: same semantics as RulesData.Seeded.
 type FiltersData struct {
 	Ignores map[string][]string `json:"ignores"`
 	Mutes   []string            `json:"mutes"`
+	Seeded  bool                `json:"seeded,omitempty"`
 }
 
 // ErrorData is the "error" response.

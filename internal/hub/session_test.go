@@ -1920,10 +1920,11 @@ func TestRulesFlow(t *testing.T) {
 	b := h.NewSession()
 	defer b.Close()
 
-	// Nothing stored yet: an empty list, NOT null — the client's
-	// seed-from-localStorage branch keys off rules being present-but-empty.
+	// Nothing stored yet: an empty list (NOT null) and NO seeded marker —
+	// the client may seed from its localStorage cache only in this state.
 	a.Handle(ctx, request(t, "get_rules", 1, nil))
-	if raw := recv(t, a, "rules"); !strings.Contains(string(raw.Data), `"rules":[]`) {
+	if raw := recv(t, a, "rules"); !strings.Contains(string(raw.Data), `"rules":[]`) ||
+		strings.Contains(string(raw.Data), `"seeded"`) {
 		t.Fatalf("initial rules payload = %s", raw.Data)
 	}
 
@@ -1937,15 +1938,30 @@ func TestRulesFlow(t *testing.T) {
 	a.Handle(ctx, request(t, "set_rules", 2, RulesData{Rules: rules}))
 	recv(t, a, "ok")
 	want := []Rule{rules[0], rules[2]}
-	if d := decode[RulesData](t, recv(t, b, "rules")); !reflect.DeepEqual(d.Rules, want) {
-		t.Fatalf("pushed rules = %+v", d.Rules)
+	if d := decode[RulesData](t, recv(t, b, "rules")); !reflect.DeepEqual(d.Rules, want) || !d.Seeded {
+		t.Fatalf("pushed rules = %+v", d)
 	}
 
-	// get_rules returns the stored set.
+	// get_rules returns the stored set, now marked seeded.
 	b.Handle(ctx, request(t, "get_rules", 3, nil))
-	if d := decode[RulesData](t, recv(t, b, "rules")); !reflect.DeepEqual(d.Rules, want) {
-		t.Fatalf("stored rules = %+v", d.Rules)
+	if d := decode[RulesData](t, recv(t, b, "rules")); !reflect.DeepEqual(d.Rules, want) || !d.Seeded {
+		t.Fatalf("stored rules = %+v", d)
 	}
+
+	// Emptying the set keeps it SEEDED: "deleted everything" must stay
+	// distinguishable from "never stored", or a stale device's cache
+	// resurrects the deleted rules.
+	a.Handle(ctx, request(t, "set_rules", 10, RulesData{Rules: []Rule{}}))
+	recv(t, a, "ok")
+	recv(t, b, "rules") // drain b's broadcast
+	a.Handle(ctx, request(t, "get_rules", 11, nil))
+	if d := decode[RulesData](t, recv(t, a, "rules")); len(d.Rules) != 0 || !d.Seeded {
+		t.Fatalf("emptied rules = %+v", d)
+	}
+	// Restore the non-empty set for the assertions below.
+	a.Handle(ctx, request(t, "set_rules", 12, RulesData{Rules: rules}))
+	recv(t, a, "ok")
+	recv(t, b, "rules")
 
 	// Oversized inputs are rejected and do not clobber the stored set.
 	a.Handle(ctx, request(t, "set_rules", 4, RulesData{Rules: make([]Rule, maxRules+1)}))
@@ -1981,11 +1997,12 @@ func TestFiltersFlow(t *testing.T) {
 	b := h.NewSession()
 	defer b.Close()
 
-	// Nothing stored: present-but-empty collections, NOT null (the
-	// client's seed branch keys off this).
+	// Nothing stored: present-but-empty collections, NOT null, and no
+	// seeded marker (the client may seed only in this state).
 	a.Handle(ctx, request(t, "get_filters", 1, nil))
 	if raw := recv(t, a, "filters"); !strings.Contains(string(raw.Data), `"ignores":{}`) ||
-		!strings.Contains(string(raw.Data), `"mutes":[]`) {
+		!strings.Contains(string(raw.Data), `"mutes":[]`) ||
+		strings.Contains(string(raw.Data), `"seeded"`) {
 		t.Fatalf("initial filters payload = %s", raw.Data)
 	}
 
@@ -1996,7 +2013,7 @@ func TestFiltersFlow(t *testing.T) {
 		Mutes:   []string{"libera\n#noisy", ""},
 	}))
 	recv(t, a, "ok")
-	want := FiltersData{Ignores: map[string][]string{"libera": {"bob"}}, Mutes: []string{"libera\n#noisy"}}
+	want := FiltersData{Ignores: map[string][]string{"libera": {"bob"}}, Mutes: []string{"libera\n#noisy"}, Seeded: true}
 	if d := decode[FiltersData](t, recv(t, b, "filters")); !reflect.DeepEqual(d, want) {
 		t.Fatalf("pushed filters = %+v", d)
 	}
