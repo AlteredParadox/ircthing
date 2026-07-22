@@ -21,7 +21,7 @@ import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./not
 import { syncPushOnLoad } from "./push.js";
 import { Login } from "./login.jsx";
 import { applyPrefs, loadPrefs, MAX_PREFS_BYTES, normalizePrefs, prefsByteLength, resolveTheme, savePrefs } from "./prefs.js";
-import { isIgnored, isMuted, loadIgnores, loadMutes, toggleIgnore, toggleMute } from "./local.js";
+import { isIgnored, isMuted, loadActiveBuffer, loadIgnores, loadMutes, saveActiveBuffer, toggleIgnore, toggleMute } from "./local.js";
 import { editableNetwork, networkEditError } from "./networkedit.js";
 import { armPendingJoin, clearPendingJoin, notePendingJoinForward, takePendingJoin } from "./pending.js";
 import { fetchAllMembers } from "./memberlist.js";
@@ -349,7 +349,11 @@ export function App() {
 	const topicIntent = useRef(0);
 	const [msgs, setMsgs] = useState({});
 	const [activeKey, setActiveKey] = useState(() => {
-		const h = parseHash(location.hash);
+		// The hash (explicit URL / notification openWindow) wins; a
+		// hashless cold start restores the last-viewed buffer instead of
+		// falling to the default pick. If the restored buffer no longer
+		// exists, the default-pick effect clears and re-picks.
+		const h = parseHash(location.hash) || loadActiveBuffer();
 		return h ? bufKey(h.network, h.buffer) : null;
 	});
 	// Explicit navigation and async actions that intend to navigate share one
@@ -609,10 +613,22 @@ export function App() {
 		return () => globalThis.removeEventListener("hashchange", onHash);
 	}, []);
 
-	// Notification taps on an already-open app: the service worker focuses
-	// this window and posts the target buffer; adopting it through the
-	// hash reuses the normal navigation path (and no-ops when already
-	// there — navigate keeps the hash current).
+	// Remember the active buffer for hashless cold starts (see
+	// loadActiveBuffer). Split the key rather than consulting buffers:
+	// navigation into a not-yet-listed buffer must persist too.
+	useEffect(() => {
+		if (!activeKey) return;
+		const nl = activeKey.indexOf("\n");
+		if (nl > 0) saveActiveBuffer(activeKey.slice(0, nl), activeKey.slice(nl + 1));
+	}, [activeKey]);
+
+	// Notification taps: the service worker posts the target buffer;
+	// adopting it through the hash reuses the normal navigation path (and
+	// no-ops when already there — navigate keeps the hash current).
+	// Delivery is pull-based as well as push-based: a postMessage sent
+	// while iOS had this page suspended (or already killed) is silently
+	// lost, so on startup and on every resume we ASK the worker whether a
+	// notification tap is pending and navigate on the reply.
 	useEffect(() => {
 		if (!("serviceWorker" in navigator)) return undefined;
 		const onMsg = (e) => {
@@ -622,7 +638,20 @@ export function App() {
 			}
 		};
 		navigator.serviceWorker.addEventListener("message", onMsg);
-		return () => navigator.serviceWorker.removeEventListener("message", onMsg);
+		const ask = () => navigator.serviceWorker.controller?.postMessage({ type: "get_pending_nav" });
+		// ready ⇒ the worker is active; controller may still be null on the
+		// very first visit (nothing pending then anyway).
+		navigator.serviceWorker.ready.then(ask).catch(() => {});
+		const onResume = () => {
+			if (!document.hidden) ask();
+		};
+		document.addEventListener("visibilitychange", onResume);
+		globalThis.addEventListener("pageshow", onResume);
+		return () => {
+			navigator.serviceWorker.removeEventListener("message", onMsg);
+			document.removeEventListener("visibilitychange", onResume);
+			globalThis.removeEventListener("pageshow", onResume);
+		};
 	}, []);
 
 	// Global shortcuts: Ctrl/Cmd+K channel switcher, Ctrl/Cmd+Shift+F

@@ -62,6 +62,24 @@ export function ignoredFor(ignores, network) {
 	return Array.isArray(ignores[network]) ? ignores[network] : [];
 }
 
+// Last-viewed buffer, restored on a cold start whose URL carries no
+// hash. iOS home-screen apps relaunch at start_url (hashless) whenever
+// the OS evicted the page — which is most reopens — so without this
+// every relaunch landed on the alphabetically-first buffer, i.e. the
+// "*" server buffer.
+export function loadActiveBuffer() {
+	const v = load("activeBuffer", null);
+	return v && typeof v.network === "string" && typeof v.buffer === "string" ? v : null;
+}
+
+export function saveActiveBuffer(network, buffer) {
+	try {
+		localStorage.setItem("activeBuffer", JSON.stringify({ network, buffer }));
+	} catch {
+		// Private mode / quota: reopening falls back to the default pick.
+	}
+}
+
 // mutes: [bufKey, ...]. A muted buffer still counts unread (dimmed in the
 // sidebar) but never highlights, reddens the favicon, or notifies.
 export function loadMutes() {

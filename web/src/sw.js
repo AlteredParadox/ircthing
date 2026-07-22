@@ -51,24 +51,49 @@ self.addEventListener("push", (event) => {
 	);
 });
 
+// The last tapped notification's target. postMessage to a suspended or
+// OS-killed page is silently lost (iOS evicts aggressively), so the page
+// also PULLS this on startup/resume via get_pending_nav. Worker-global
+// state is enough: the app resumes within moments of the tap, while this
+// worker instance is still alive from handling it.
+let pendingNav = null;
+
 self.addEventListener("notificationclick", (event) => {
 	event.notification.close();
 	const { network, buffer } = event.notification.data || {};
 	// Hash shape mirrors toHash (web/src/irc.js): #/<network>/<buffer>.
 	const hash = network && buffer ? `#/${encodeURIComponent(network)}/${encodeURIComponent(buffer)}` : "";
+	if (network && buffer) pendingNav = { network, buffer, at: Date.now() };
 	event.waitUntil(
 		(async () => {
+			// Focus an existing app window and let it navigate itself — a
+			// client.navigate would reload the whole SPA. matchAll can
+			// return STALE clients whose page the OS already killed; if
+			// none can be focused, fall through to a fresh window.
 			const wins = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-			if (wins.length) {
-				// Focus the existing app and let it navigate itself — a
-				// client.navigate would reload the whole SPA.
-				await wins[0].focus().catch(() => {});
-				if (network && buffer) wins[0].postMessage({ type: "open_buffer", network, buffer });
-				return;
+			for (const w of wins) {
+				try {
+					await w.focus();
+					if (network && buffer) w.postMessage({ type: "open_buffer", network, buffer });
+					return;
+				} catch {
+					// Stale client: try the next.
+				}
 			}
 			await self.clients.openWindow(`/${hash}`);
 		})(),
 	);
+});
+
+self.addEventListener("message", (event) => {
+	if (event.data?.type !== "get_pending_nav") return;
+	const nav = pendingNav;
+	pendingNav = null; // deliver once
+	// Staleness cap: a tap the page never picked up must not yank a
+	// deliberately-opened session to an old target minutes later.
+	if (nav && Date.now() - nav.at < 60 * 1000) {
+		event.source?.postMessage({ type: "open_buffer", network: nav.network, buffer: nav.buffer });
+	}
 });
 
 self.addEventListener("pushsubscriptionchange", (event) => {
