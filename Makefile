@@ -46,6 +46,9 @@ build-debug: frontend
 
 frontend: web/node_modules
 	cd web && $(ESBUILD) $(ESBUILD_FLAGS) src/main.jsx --outfile=dist/app.js
+	# Service worker: separate entry, classic script (iife) — Safari's
+	# module-SW support isn't worth depending on. Counted by the bundle gate.
+	cd web && $(ESBUILD) --bundle --minify --format=iife --target=es2020 src/sw.js --outfile=dist/sw.js
 	cp web/index.html web/manifest.json web/icon.svg web/dist/
 
 web/node_modules: web/package.json web/package-lock.json

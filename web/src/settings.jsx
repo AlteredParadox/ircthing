@@ -17,6 +17,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { ACCENT_RGB, ACCENTS, CLOCKS, MAX_NICK_SEP, MAX_PREFS_BYTES, prefsByteLength } from "./prefs.js";
 import { uuid } from "./irc.js";
+import { currentSubscription, isIOSNeedingInstall, pushSupported, subscribePush, unsubscribePush } from "./push.js";
 
 // NotifControl renders the notification section for the current
 // permission state: unsupported, not yet granted, or toggleable.
@@ -40,6 +41,88 @@ function NotifControl({ perm, enabled, onEnable, onToggle }) {
 		<button class="btn-accent" onClick={onEnable}>
 			Enable desktop notifications
 		</button>
+	);
+}
+
+// PushControl renders the Web Push state for THIS device: unsupported
+// (with add-to-home-screen guidance on iOS, where the Push API only
+// exists inside an installed web app), permission-blocked, or a toggle
+// backed by the browser's real subscription state. pushKey is the VAPID
+// applicationServerKey from /api/config (null while loading, "" when the
+// server has none).
+function PushControl({ pushKey }) {
+	// "loading" | "off" | "on" | "busy"
+	const [state, setState] = useState("loading");
+	const [err, setErr] = useState("");
+	useEffect(() => {
+		if (!pushSupported()) return undefined;
+		let alive = true;
+		currentSubscription()
+			.then((sub) => alive && setState(sub ? "on" : "off"))
+			.catch(() => alive && setState("off"));
+		return () => {
+			alive = false;
+		};
+	}, []);
+
+	if (!pushSupported()) {
+		return (
+			<div class="settings-note">
+				{isIOSNeedingInstall()
+					? "Add ircthing to your Home Screen first (Share → Add to Home Screen), then enable push from the installed app."
+					: "Not supported in this browser."}
+			</div>
+		);
+	}
+	if (globalThis.Notification?.permission === "denied" && state !== "on") {
+		return (
+			<div class="settings-note">
+				Notifications are blocked for this site — allow them in your browser
+				settings, then reopen this panel.
+			</div>
+		);
+	}
+	if (pushKey === "") {
+		return <div class="settings-note">The server has not enabled push yet.</div>;
+	}
+	if (state === "loading" || pushKey == null) {
+		return <div class="settings-note">Checking…</div>;
+	}
+
+	const toggle = async () => {
+		const was = state;
+		setState("busy");
+		setErr("");
+		try {
+			if (was === "on") {
+				await unsubscribePush();
+				setState("off");
+			} else {
+				await subscribePush(pushKey);
+				setState("on");
+			}
+		} catch (e) {
+			setState(was);
+			setErr(
+				e?.code === "denied"
+					? "Permission was denied — allow notifications for this site to use push."
+					: "Could not update push notifications. Check the connection and try again.",
+			);
+		}
+	};
+	return (
+		<>
+			<label class="settings-toggle">
+				<input
+					type="checkbox"
+					checked={state === "on"}
+					disabled={state === "busy"}
+					onChange={toggle}
+				/>
+				<span>Notify this device even when the app is closed</span>
+			</label>
+			{err && <div class="cmd-error">{err}</div>}
+		</>
 	);
 }
 
@@ -226,6 +309,7 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 	const [previewsOn, setPreviewsOn] = useState(null); // null while loading
 	const [retention, setRetention] = useState(null); // { days, max } | null
 	const [sessionDays, setSessionDays] = useState(null); // login cookie lifetime
+	const [pushKey, setPushKey] = useState(null); // VAPID key; null loading, "" none
 
 	useEffect(() => {
 		const onKey = (e) => e.key === "Escape" && onClose();
@@ -272,6 +356,8 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 				sessionSaved.current = sess;
 				if (alive) setSessionDays(sess);
 			}
+			// Read-only (no save path), so no generation guard needed.
+			if (alive) setPushKey(typeof d.push_public_key === "string" ? d.push_public_key : "");
 		});
 		return () => {
 			alive = false;
@@ -730,6 +816,16 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 							perm={perm} enabled={enabled}
 							onEnable={enableNotif} onToggle={toggleNotif}
 						/>
+					</section>
+
+					<section class="settings-section">
+						<div class="settings-label">Push notifications</div>
+						<div class="settings-note">
+							Sent by the server when a highlight or private message stays
+							unread for ~20 seconds — reaches this device even with the app
+							closed.
+						</div>
+						<PushControl pushKey={pushKey} />
 					</section>
 
 					<section class="settings-section">

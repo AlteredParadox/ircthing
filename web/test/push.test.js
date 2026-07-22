@@ -14,15 +14,18 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { render } from "preact";
-import { App } from "./app.jsx";
-import "./style.css";
+import { deepStrictEqual as eq } from "node:assert";
+import { test } from "node:test";
+import { urlB64ToBytes } from "../src/push.js";
 
-// The push-only service worker (sw.js — no fetch handler, no caching).
-// Registration is idempotent; failures leave the app fully functional
-// with push simply unavailable.
-if ("serviceWorker" in navigator) {
-	navigator.serviceWorker.register("/sw.js").catch(() => {});
-}
-
-render(<App />, document.getElementById("app"));
+test("urlB64ToBytes decodes unpadded base64url with URL-safe alphabet", () => {
+	// "BP4" prefix exercises '-'/'_' translation and padding restoration.
+	eq(Array.from(urlB64ToBytes("AQID")), [1, 2, 3]);
+	eq(Array.from(urlB64ToBytes("_v8")), [0xfe, 0xff]); // needs 1 pad char
+	eq(Array.from(urlB64ToBytes("-_8B")), [0xfb, 0xff, 0x01]);
+	eq(Array.from(urlB64ToBytes("")), []);
+	// Round-trip a VAPID-key-sized (65-byte) value.
+	const bytes = Array.from({ length: 65 }, (_, i) => (i * 7) % 256);
+	const b64 = Buffer.from(bytes).toString("base64url");
+	eq(Array.from(urlB64ToBytes(b64)), bytes);
+});

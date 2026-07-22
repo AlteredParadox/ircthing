@@ -18,6 +18,7 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
 import { applyTombstones, bufferOrder, bufKey, clearTypingNick, expireTypingState, foldNick, historyHasMore, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, rememberRedaction, renderable, SERVER_BUFFER, stripFormatting, toHash, updateTypingState } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, saveRules } from "./notify.js";
+import { syncPushOnLoad } from "./push.js";
 import { Login } from "./login.jsx";
 import { applyPrefs, loadPrefs, MAX_PREFS_BYTES, normalizePrefs, prefsByteLength, resolveTheme, savePrefs } from "./prefs.js";
 import { isIgnored, isMuted, loadIgnores, loadMutes, toggleIgnore, toggleMute } from "./local.js";
@@ -581,11 +582,16 @@ export function App() {
 		fetch("/api/config")
 			.then((r) => (r.ok ? r.json() : null))
 			.then((c) => {
-				// Drop the response if this effect was torn down, or the user
-				// already toggled previews while the GET was in flight — the
-				// user's value (and its PUT) is newer than this stale read.
-				if (ignore || previewsPinned.current) return;
-				if (c && typeof c.previews === "boolean") setPreviews(c.previews);
+				if (ignore || !c) return;
+				// Re-upsert this device's push subscription (heals iOS
+				// eviction / a reset server DB) and rebind on key rotation.
+				if (typeof c.push_public_key === "string" && c.push_public_key) {
+					syncPushOnLoad(c.push_public_key).catch(() => {});
+				}
+				// Drop the previews value if the user already toggled while
+				// the GET was in flight — their value (and its PUT) is newer.
+				if (previewsPinned.current) return;
+				if (typeof c.previews === "boolean") setPreviews(c.previews);
 			})
 			.catch(() => {});
 		return () => { ignore = true; };
@@ -601,6 +607,22 @@ export function App() {
 		};
 		globalThis.addEventListener("hashchange", onHash);
 		return () => globalThis.removeEventListener("hashchange", onHash);
+	}, []);
+
+	// Notification taps on an already-open app: the service worker focuses
+	// this window and posts the target buffer; adopting it through the
+	// hash reuses the normal navigation path (and no-ops when already
+	// there — navigate keeps the hash current).
+	useEffect(() => {
+		if (!("serviceWorker" in navigator)) return undefined;
+		const onMsg = (e) => {
+			const d = e.data;
+			if (d?.type === "open_buffer" && typeof d.network === "string" && typeof d.buffer === "string") {
+				location.hash = toHash(d.network, d.buffer);
+			}
+		};
+		navigator.serviceWorker.addEventListener("message", onMsg);
+		return () => navigator.serviceWorker.removeEventListener("message", onMsg);
 	}, []);
 
 	// Global shortcuts: Ctrl/Cmd+K channel switcher, Ctrl/Cmd+Shift+F
