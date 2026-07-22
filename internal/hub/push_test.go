@@ -78,6 +78,19 @@ func addTestSubscription(t *testing.T, h *Hub, endpoint string) {
 	}
 }
 
+// seedBuffer creates the buffer a candidate targets: deliverPush skips
+// buffers the store does not know (they were purged), and every real
+// candidate follows a successful append anyway.
+func seedBuffer(t *testing.T, h *Hub, network, buffer string) {
+	t.Helper()
+	_, err := h.store.Append(context.Background(), network, buffer, store.Message{
+		Time: time.Now(), Sender: "seed", Command: "PRIVMSG", Text: "seed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func startTestPusher(t *testing.T, h *Hub, sender PushSender) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -132,6 +145,7 @@ func waitSends(t *testing.T, f *fakeSender, want int) {
 func TestPusherFiresAndCoalesces(t *testing.T) {
 	h := newTestHub(t)
 	addTestSubscription(t, h, "https://push.example/dev1")
+	seedBuffer(t, h, "libera", "alice")
 	f := &fakeSender{}
 	startTestPusher(t, h, f)
 
@@ -148,6 +162,7 @@ func TestPusherFiresAndCoalesces(t *testing.T) {
 func TestPusherChannelNeedsHighlight(t *testing.T) {
 	h := newTestHub(t)
 	addTestSubscription(t, h, "https://push.example/dev1")
+	seedBuffer(t, h, "libera", "#go")
 	f := &fakeSender{}
 	startTestPusher(t, h, f)
 
@@ -166,6 +181,7 @@ func TestPusherKeywordRulesApply(t *testing.T) {
 		t.Fatal(err)
 	}
 	addTestSubscription(t, h, "https://push.example/dev1")
+	seedBuffer(t, h, "libera", "#go")
 	f := &fakeSender{}
 	startTestPusher(t, h, f)
 
@@ -195,6 +211,9 @@ func TestPusherHonorsFilters(t *testing.T) {
 		t.Fatal(err)
 	}
 	addTestSubscription(t, h, "https://push.example/dev1")
+	seedBuffer(t, h, "libera", "bob")
+	seedBuffer(t, h, "libera", "#noisy")
+	seedBuffer(t, h, "libera", "#go")
 	f := &fakeSender{}
 	startTestPusher(t, h, f)
 
@@ -223,6 +242,7 @@ func TestPusherHonorsFilters(t *testing.T) {
 func TestPusherCancelOnRead(t *testing.T) {
 	h := newTestHub(t)
 	addTestSubscription(t, h, "https://push.example/dev1")
+	seedBuffer(t, h, "libera", "alice")
 	f := &fakeSender{}
 	startTestPusher(t, h, f)
 
@@ -273,6 +293,7 @@ func TestPusherFireTimeRecheck(t *testing.T) {
 func TestPusherPrunesGoneSubscription(t *testing.T) {
 	h := newTestHub(t)
 	addTestSubscription(t, h, "https://push.example/dead")
+	seedBuffer(t, h, "libera", "alice")
 	h.RefreshPushCount(context.Background())
 	if h.pushSubs.Load() != 1 {
 		t.Fatalf("seeded count = %d", h.pushSubs.Load())
@@ -295,6 +316,102 @@ func TestPusherPrunesGoneSubscription(t *testing.T) {
 	}
 }
 
+func TestPusherCancelOnBufferCloseAndNetworkRemoval(t *testing.T) {
+	h := newTestHub(t)
+	addTestSubscription(t, h, "https://push.example/dev1")
+	seedBuffer(t, h, "libera", "alice")
+	seedBuffer(t, h, "libera", "#go")
+	f := &fakeSender{}
+	startTestPusher(t, h, f)
+
+	now := time.Now().UnixMilli()
+	// Buffer close cancels that buffer's pending push.
+	h.pushCandidates <- candidate("alice", "alice", "hi", now, false)
+	waitDrained(t, h.pushCandidates)
+	h.notifyPushCancel("libera", "alice", "")
+	time.Sleep(5 * testPushDelay)
+	if got := f.count(); got != 0 {
+		t.Fatalf("sends after buffer close = %d, want 0", got)
+	}
+
+	// Network removal cancels every pending push on the network.
+	h.pushCandidates <- candidate("alice", "alice", "hi", now+1, false)
+	h.pushCandidates <- candidate("#go", "bob", "me: ping", now+2, true)
+	waitDrained(t, h.pushCandidates)
+	h.notifyPushCancel("libera", "", "")
+	time.Sleep(5 * testPushDelay)
+	if got := f.count(); got != 0 {
+		t.Fatalf("sends after network removal = %d, want 0", got)
+	}
+}
+
+func TestPusherRedactionScrubsPending(t *testing.T) {
+	h := newTestHub(t)
+	addTestSubscription(t, h, "https://push.example/dev1")
+	seedBuffer(t, h, "libera", "alice")
+	f := &fakeSender{}
+	startTestPusher(t, h, f)
+
+	// Sole pending message redacted: the push is dropped entirely.
+	now := time.Now().UnixMilli()
+	c := candidate("alice", "alice", "my password is hunter2", now, false)
+	c.msgid = "m1"
+	h.pushCandidates <- c
+	waitDrained(t, h.pushCandidates)
+	h.notifyPushCancel("libera", "alice", "m1")
+	time.Sleep(5 * testPushDelay)
+	if got := f.count(); got != 0 {
+		t.Fatalf("sends after redaction = %d, want 0", got)
+	}
+
+	// With a coalesced sibling the notification survives (scrubbed).
+	c2 := candidate("alice", "alice", "secret", now+1, false)
+	c2.msgid = "m2"
+	h.pushCandidates <- c2
+	h.pushCandidates <- candidate("alice", "alice", "and a follow-up", now+2, false)
+	waitDrained(t, h.pushCandidates)
+	h.notifyPushCancel("libera", "alice", "m2")
+	waitSends(t, f, 1)
+}
+
+// TestPusherSkipsPurgedBuffer: the fire-time existence check backstops a
+// dropped close/delete cancel — a buffer the store no longer knows gets
+// no push.
+func TestPusherSkipsPurgedBuffer(t *testing.T) {
+	h := newTestHub(t)
+	addTestSubscription(t, h, "https://push.example/dev1")
+	f := &fakeSender{}
+	startTestPusher(t, h, f)
+
+	// Never seeded: the store has no such buffer (as after a purge).
+	h.pushCandidates <- candidate("ghost", "alice", "hi", time.Now().UnixMilli(), false)
+	time.Sleep(5 * testPushDelay)
+	if got := f.count(); got != 0 {
+		t.Fatalf("sends for purged buffer = %d, want 0", got)
+	}
+}
+
+func TestPusherMuteMidWindowCancels(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	addTestSubscription(t, h, "https://push.example/dev1")
+	seedBuffer(t, h, "libera", "#noisy")
+	f := &fakeSender{}
+	startTestPusher(t, h, f)
+
+	h.pushCandidates <- candidate("#noisy", "bob", "me: ping", time.Now().UnixMilli(), true)
+	waitDrained(t, h.pushCandidates)
+	// Muting the buffer during the window sweeps the pending push.
+	if err := h.store.SetSetting(ctx, filtersKey, `{"ignores":{},"mutes":["libera`+"\\n"+`#noisy"]}`); err != nil {
+		t.Fatal(err)
+	}
+	h.notifyPushConfigChanged()
+	time.Sleep(5 * testPushDelay)
+	if got := f.count(); got != 0 {
+		t.Fatalf("sends after mid-window mute = %d, want 0", got)
+	}
+}
+
 // TestNoCandidatesWithoutSubscriptions proves the zero-subscription fast
 // path: persistEvent must not even enqueue a candidate.
 func TestNoCandidatesWithoutSubscriptions(t *testing.T) {
@@ -305,17 +422,20 @@ func TestNoCandidatesWithoutSubscriptions(t *testing.T) {
 		Msg:  ircv4.MustParseMessage(":alice!u@h PRIVMSG me :hello"),
 		Time: time.Now(),
 	}
-	h.maybePushCandidate(c, ev, store.Message{Sender: "alice", Text: "hello", Time: time.Now()}, "alice", false, false)
+	h.maybePushCandidate(c, ev, store.Message{Target: "alice", Sender: "alice", Text: "hello", Time: time.Now()}, false, false)
 	select {
 	case cand := <-h.pushCandidates:
 		t.Fatalf("candidate enqueued with zero subscriptions: %+v", cand)
 	default:
 	}
 
-	// With a subscription counted, the same call enqueues.
+	// With a subscription counted, the same call enqueues — and the
+	// candidate carries the CANONICAL stored spelling (stored.Target),
+	// not the wire casing, so marker cancels / mutes / the fire-time
+	// re-check all key consistently.
 	addTestSubscription(t, h, "https://push.example/dev1")
 	h.RefreshPushCount(context.Background())
-	h.maybePushCandidate(c, ev, store.Message{Sender: "alice", Text: "hello", Time: time.Now()}, "alice", false, false)
+	h.maybePushCandidate(c, ev, store.Message{Target: "alice", Sender: "Alice", Text: "hello", Time: time.Now()}, false, false)
 	select {
 	case cand := <-h.pushCandidates:
 		if cand.buffer != "alice" || cand.channelLike {
@@ -326,9 +446,9 @@ func TestNoCandidatesWithoutSubscriptions(t *testing.T) {
 	}
 
 	// Replayed, own, and textless events never become candidates.
-	h.maybePushCandidate(c, ev, store.Message{Sender: "alice", Text: "hello"}, "alice", true, false)
-	h.maybePushCandidate(c, ev, store.Message{Sender: "me", Text: "hello"}, "alice", false, true)
-	h.maybePushCandidate(c, ev, store.Message{Sender: "alice"}, "alice", false, false)
+	h.maybePushCandidate(c, ev, store.Message{Target: "alice", Sender: "alice", Text: "hello"}, true, false)
+	h.maybePushCandidate(c, ev, store.Message{Target: "alice", Sender: "me", Text: "hello"}, false, true)
+	h.maybePushCandidate(c, ev, store.Message{Target: "alice", Sender: "alice"}, false, false)
 	select {
 	case cand := <-h.pushCandidates:
 		t.Fatalf("filtered event enqueued: %+v", cand)

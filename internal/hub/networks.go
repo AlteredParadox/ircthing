@@ -319,6 +319,9 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 	}
 	if renamed {
 		s.hub.broadcast(envelope("network_removed", 0, NetworkRef{Network: d.OldName}))
+		// Pending pushes carry the OLD network name in their keys and
+		// payloads; cancel rather than deliver stale names.
+		s.hub.notifyPushCancel(d.OldName, "", "")
 	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcast(envelope("networks_changed", 0, nil))
@@ -535,6 +538,7 @@ func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
 		s.push(envelope("ok", env.Seq, nil))
 		s.hub.broadcast(envelope("network_removed", 0, NetworkRef{Network: d.Network}))
 		s.hub.broadcast(envelope("networks_changed", 0, nil))
+		s.hub.notifyPushCancel(d.Network, "", "")
 		return
 	}
 	// A raw invalid legacy name must never bypass the synthetic row-ID path:
@@ -577,6 +581,7 @@ func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcast(envelope("network_removed", 0, NetworkRef{Network: d.Network}))
 	s.hub.broadcast(envelope("networks_changed", 0, nil))
+	s.hub.notifyPushCancel(d.Network, "", "")
 }
 
 // handleJoinChannel joins a channel and adds it to the network's
@@ -694,6 +699,10 @@ func (s *Session) handleCloseBuffer(ctx context.Context, env Envelope) {
 	d.Buffer = canonical
 	s.push(envelope("ok", env.Seq, d))
 	s.hub.broadcast(envelope("buffer_closed", 0, d))
+	// A pending push for a buffer the user just closed (either mode)
+	// must not fire — its tap would navigate into a deleted or hidden
+	// buffer.
+	s.hub.notifyPushCancel(d.Network, canonical, "")
 }
 
 func validCloseBuffer(name string) bool {

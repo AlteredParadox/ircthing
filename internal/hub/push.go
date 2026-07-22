@@ -89,6 +89,16 @@ type markerAdvance struct {
 	ts              int64 // unix ms, authoritative (never-regress) value
 }
 
+// pushCancel invalidates pending pushes when their subject disappears:
+// buffer=="" cancels every pending push on the network (delete/rename);
+// msgid=="" cancels the buffer's push (close/archive); a set msgid is a
+// REDACTION — the matching entry is dropped or its content scrubbed, so
+// destructively-redacted text cannot ride out to a notification tray
+// the redaction machinery can never reach.
+type pushCancel struct {
+	network, buffer, msgid string
+}
+
 // pendingPush is one scheduled notification, coalescing every further
 // highlight in the same buffer until it fires.
 type pendingPush struct {
@@ -195,19 +205,27 @@ func (h *Hub) RefreshPushCount(ctx context.Context) {
 // maybePushCandidate feeds one freshly persisted LIVE message to the
 // scheduler. stored.Text is non-empty exactly for real PRIVMSG/NOTICE
 // content (CTCP ACTION unwrapped) — the same set search indexes.
-func (h *Hub) maybePushCandidate(c Conn, ev irc.Event, stored store.Message, target string, replay, own bool) {
+//
+// Everything is taken from `stored`, NOT the wire event: stored.Target
+// is the CANONICAL buffer spelling (append resolves #Go -> #go etc.)
+// and clients key their buffers and read markers by it, so the pending
+// key, the marker cancels, the fire-time re-check, the mute lookup, and
+// the payload all agree only in that spelling. stored's fields are also
+// store-clamped, which bounds the payload (a hostile server's 64 KiB
+// wire target must not reach Encrypt).
+func (h *Hub) maybePushCandidate(c Conn, ev irc.Event, stored store.Message, replay, own bool) {
 	if replay || own || stored.Text == "" || h.pushSubs.Load() == 0 {
 		return
 	}
 	cand := pushCandidate{
 		network:     ev.Network,
-		buffer:      target,
+		buffer:      stored.Target,
 		sender:      stored.Sender,
 		text:        stored.Text,
 		nick:        c.Nick(),
 		ts:          stored.Time.UnixMilli(),
 		msgid:       stored.MsgID,
-		channelLike: c.IsChannel(target) || isServerBuffer(target),
+		channelLike: c.IsChannel(stored.Target) || isServerBuffer(stored.Target),
 	}
 	select {
 	case h.pushCandidates <- cand:
@@ -236,6 +254,16 @@ func (h *Hub) notifyPushConfigChanged() {
 	}
 }
 
+// notifyPushCancel feeds one cancellation to the scheduler (see
+// pushCancel for the shapes). Non-blocking like every pusher send; the
+// fire-time buffer-existence check backstops a dropped close/delete.
+func (h *Hub) notifyPushCancel(network, buffer, msgid string) {
+	select {
+	case h.pushCancels <- pushCancel{network: network, buffer: buffer, msgid: msgid}:
+	default:
+	}
+}
+
 // runPusher is the scheduler loop; sole owner of pending-push state and
 // the rules cache.
 func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Duration) {
@@ -261,15 +289,83 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 				rearmPushTimer(timer, pending)
 			}
 
+		case cn := <-h.pushCancels:
+			if applyPushCancel(pending, cn) {
+				rearmPushTimer(timer, pending)
+			}
+
 		case <-h.pushConfigDirty:
 			rules = h.loadRules(ctx)
 			filters = buildPushFilters(h.loadFilters(ctx))
+			// Muting a buffer (or ignoring its latest pinger) mid-window
+			// is exactly when the user expects silence: re-apply the new
+			// filters to what is already scheduled, not just to future
+			// candidates.
+			if sweepFilteredPending(pending, filters) {
+				rearmPushTimer(timer, pending)
+			}
 
 		case <-timer.C:
 			h.fireDuePushes(ctx, sender, pending)
 			rearmPushTimer(timer, pending)
 		}
 	}
+}
+
+// applyPushCancel applies one pushCancel to the pending map; reports
+// whether anything changed.
+func applyPushCancel(pending map[string]*pendingPush, cn pushCancel) bool {
+	if cn.buffer == "" { // network deleted or renamed
+		changed := false
+		prefix := cn.network + "\x00"
+		for key := range pending {
+			if strings.HasPrefix(key, prefix) {
+				delete(pending, key)
+				changed = true
+			}
+		}
+		return changed
+	}
+	key := cn.network + "\x00" + cn.buffer
+	p, ok := pending[key]
+	if !ok {
+		return false
+	}
+	if cn.msgid == "" { // buffer closed or archived
+		delete(pending, key)
+		return true
+	}
+	if p.msgid == "" || p.msgid != cn.msgid {
+		// The redacted message is not the one headlining this push
+		// (coalesced siblings keep only the first msgid) — leave it.
+		return false
+	}
+	if p.count == 1 {
+		delete(pending, key)
+		return true
+	}
+	// Coalesced siblings remain: keep the notification but scrub the
+	// redacted headline — the service worker falls back to its generic
+	// title/body when sender/text are absent.
+	p.count--
+	p.sender, p.text, p.msgid = "", "", ""
+	return false
+}
+
+// sweepFilteredPending drops pending pushes the just-reloaded filters
+// now exclude; reports whether anything changed. Only the FIRST
+// coalesced sender is known per entry — good enough: that is the sender
+// the user just reacted to.
+func sweepFilteredPending(pending map[string]*pendingPush, filters pushFilters) bool {
+	changed := false
+	for key, p := range pending {
+		network, buffer, _ := strings.Cut(key, "\x00")
+		if filters.drops(network, buffer, p.sender) {
+			delete(pending, key)
+			changed = true
+		}
+	}
+	return changed
 }
 
 // admitCandidate applies the filter and highlight policy to one live
@@ -375,6 +471,14 @@ func (h *Hub) deliverPush(ctx context.Context, sender PushSender, key string, p 
 	if t, err := h.store.ReadMarker(ctx, network, buffer); err == nil && !t.IsZero() && t.UnixMilli() >= p.newestTS {
 		return
 	}
+	// The buffer may have been purged after scheduling — the close/delete
+	// hooks cancel pending pushes, but their channel sends are best
+	// effort. A buffer the store no longer knows gets no push (and its
+	// notification would navigate nowhere). Identity fold: `buffer` is
+	// already the canonical stored spelling.
+	if name, found, err := h.store.FindBuffer(ctx, network, buffer, func(s string) string { return s }); err != nil || !found || name != buffer {
+		return
+	}
 	subs, err := h.store.PushSubscriptions(ctx)
 	if err != nil {
 		log.Printf("push: loading subscriptions: %v", err)
@@ -389,6 +493,13 @@ func (h *Hub) deliverPush(ctx context.Context, sender PushSender, key string, p 
 		MsgID: p.msgid, Count: p.count, Channel: p.channelLike,
 	})
 	if err != nil {
+		return
+	}
+	// Belt and braces below the per-field clamps: an over-limit payload
+	// must be skipped HERE, once — Encrypt would reject it per
+	// subscription, and that failure must never look prune-worthy.
+	if len(payload) > webpush.MaxPlaintext {
+		log.Printf("push: payload for %s/%s is %d bytes (limit %d), skipping", network, buffer, len(payload), webpush.MaxPlaintext)
 		return
 	}
 	for _, sub := range subs {
@@ -409,7 +520,14 @@ func (h *Hub) pushToSubscription(ctx context.Context, sender PushSender, sub sto
 	}
 	body, err := webpush.Encrypt(payload, p256dh, auth)
 	if err != nil {
-		h.prunePushSubscription(ctx, sub.Endpoint, err)
+		// Prune ONLY key-caused failures: any other Encrypt error (an
+		// oversized payload, however it slipped past the caller's size
+		// guard) must not delete every registration in one pass.
+		if errors.Is(err, webpush.ErrBadKeys) {
+			h.prunePushSubscription(ctx, sub.Endpoint, err)
+		} else {
+			log.Printf("push: encrypting for %s: %v", sub.Endpoint, err)
+		}
 		return
 	}
 	switch err := sender.Send(ctx, webpush.Subscription{Endpoint: sub.Endpoint, P256dh: p256dh, Auth: auth}, body, pushTTLSeconds); {

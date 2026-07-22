@@ -83,7 +83,7 @@ func TestEncryptRejectsBadInputs(t *testing.T) {
 		t.Fatal(err)
 	}
 	auth := make([]byte, authLen)
-	if _, err := Encrypt(make([]byte, maxPlaintext+1), pub, auth); err == nil {
+	if _, err := Encrypt(make([]byte, MaxPlaintext+1), pub, auth); err == nil {
 		t.Error("oversized plaintext accepted")
 	}
 	if _, err := Encrypt([]byte("hi"), pub, auth[:8]); err == nil {
@@ -158,6 +158,66 @@ func TestVapidAuth(t *testing.T) {
 	s := new(big.Int).SetBytes(sig[32:])
 	if !ecdsa.Verify(&priv.PublicKey, digest[:], r, s) {
 		t.Error("signature does not verify")
+	}
+}
+
+// TestEncryptErrorClassification: only key-caused failures carry
+// ErrBadKeys (the prune signal); an oversized payload must NOT — the
+// hub prunes on ErrBadKeys, and a payload problem wiping registrations
+// would be a self-DoS.
+func TestEncryptErrorClassification(t *testing.T) {
+	priv, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := PublicKeyBytes(&priv.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := make([]byte, authLen)
+
+	offCurve := append([]byte{0x04}, make([]byte, 64)...) // right shape, not a point
+	if _, err := Encrypt([]byte("hi"), offCurve, auth); !errors.Is(err, ErrBadKeys) {
+		t.Errorf("off-curve p256dh: err = %v, want ErrBadKeys", err)
+	}
+	if _, err := Encrypt([]byte("hi"), pub, auth[:8]); !errors.Is(err, ErrBadKeys) {
+		t.Errorf("short auth: err = %v, want ErrBadKeys", err)
+	}
+	if _, err := Encrypt(make([]byte, MaxPlaintext+1), pub, auth); err == nil || errors.Is(err, ErrBadKeys) {
+		t.Errorf("oversized plaintext: err = %v, want non-ErrBadKeys error", err)
+	}
+}
+
+// TestVapidAudOriginSerialization: aud must be the RFC 6454 origin —
+// lowercased host, default port omitted (RFC 8292 §2).
+func TestVapidAudOriginSerialization(t *testing.T) {
+	priv, err := GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewSender(priv, "")
+	cases := []struct{ endpoint, wantAud string }{
+		{"https://Push.Example.NET:443/wpush/v2/x", "https://push.example.net"},
+		{"https://push.example.net/wpush/v2/x", "https://push.example.net"},
+		{"https://push.example.net:8443/x", "https://push.example.net:8443"},
+	}
+	for _, tc := range cases {
+		header, err := s.auth(tc.endpoint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jwt := strings.TrimPrefix(header, "vapid t=")
+		jwt, _, _ = strings.Cut(jwt, ", k=")
+		parts := strings.Split(jwt, ".")
+		var claims struct {
+			Aud string `json:"aud"`
+		}
+		if err := json.Unmarshal(b64(t, parts[1]), &claims); err != nil {
+			t.Fatal(err)
+		}
+		if claims.Aud != tc.wantAud {
+			t.Errorf("%s: aud = %q, want %q", tc.endpoint, claims.Aud, tc.wantAud)
+		}
 	}
 }
 

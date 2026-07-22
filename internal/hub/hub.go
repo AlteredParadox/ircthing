@@ -157,11 +157,12 @@ type Hub struct {
 	// caches the subscription count so the per-message fast path is one
 	// atomic load; pushPubKey (under mu) is the VAPID public key the
 	// HTTP layer serves to clients.
-	pushCandidates chan pushCandidate
-	pushMarkers    chan markerAdvance
+	pushCandidates  chan pushCandidate
+	pushMarkers     chan markerAdvance
+	pushCancels     chan pushCancel
 	pushConfigDirty chan struct{}
-	pushSubs       atomic.Int64
-	pushPubKey     string
+	pushSubs        atomic.Int64
+	pushPubKey      string
 }
 
 // Store exposes the shared store so the HTTP layer can read/write its own
@@ -185,7 +186,8 @@ func New(st *store.Store) *Hub {
 		largeResponseSem:  make(chan struct{}, 4),
 		pushCandidates:    make(chan pushCandidate, 256),
 		pushMarkers:       make(chan markerAdvance, 64),
-		pushConfigDirty:    make(chan struct{}, 1),
+		pushCancels:       make(chan pushCancel, 16),
+		pushConfigDirty:   make(chan struct{}, 1),
 	}
 }
 
@@ -766,7 +768,7 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 		return nil
 	}
 	h.publishPersisted(stored, target, replay, batch)
-	h.maybePushCandidate(c, ev, stored, target, replay, own)
+	h.maybePushCandidate(c, ev, stored, replay, own)
 	return nil
 }
 
@@ -1668,6 +1670,9 @@ func (h *Hub) applyRedaction(ctx context.Context, ev irc.Event, c Conn, replay b
 		Network: ev.Network, Buffer: buffer, MsgID: store.ClampMsgID(msgid),
 		By: clampServerInfo(by), Reason: clampServerInfo(reason),
 	}))
+	// The store's redaction is destructive; a pending push holding the
+	// original text is the one copy it cannot reach. Scrub it too.
+	h.notifyPushCancel(ev.Network, buffer, store.ClampMsgID(msgid))
 }
 
 // scrubRedaction marks the message deleted in the store, retrying the server

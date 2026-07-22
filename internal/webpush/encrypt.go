@@ -24,6 +24,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 )
 
@@ -40,10 +41,18 @@ const (
 	authLen = 16
 	keyLen  = 65
 
-	// maxPlaintext keeps header (86) + plaintext + pad delimiter (1) +
-	// GCM tag (16) within the 4096-octet push-service ceiling.
-	maxPlaintext = 4096 - 86 - 1 - 16
+	// MaxPlaintext keeps header (86) + plaintext + pad delimiter (1) +
+	// GCM tag (16) within the 4096-octet push-service ceiling. Exported
+	// so callers can bound payloads BEFORE encrypting per subscription.
+	MaxPlaintext = 4096 - 86 - 1 - 16
 )
+
+// ErrBadKeys marks failures caused by the subscription's OWN keys (a
+// malformed or off-curve p256dh, a short auth secret). These are the
+// only Encrypt errors that justify deleting a subscription — anything
+// else (an oversized payload above all) is the CALLER's problem, and
+// pruning on it would let one bad payload wipe every registration.
+var ErrBadKeys = errors.New("webpush: bad subscription keys")
 
 // Encrypt seals plaintext for a subscription identified by its p256dh
 // public key (65-octet uncompressed point) and 16-octet auth secret,
@@ -64,15 +73,15 @@ func Encrypt(plaintext, p256dh, auth []byte) ([]byte, error) {
 // encrypt is Encrypt with the ephemeral key and salt injected so the
 // RFC 8291 §5 fixed-value test vector can drive the full path.
 func encrypt(plaintext, p256dh, auth []byte, asPriv *ecdh.PrivateKey, salt []byte) ([]byte, error) {
-	if len(plaintext) > maxPlaintext {
-		return nil, fmt.Errorf("webpush: plaintext %d bytes exceeds single-record limit %d", len(plaintext), maxPlaintext)
+	if len(plaintext) > MaxPlaintext {
+		return nil, fmt.Errorf("webpush: plaintext %d bytes exceeds single-record limit %d", len(plaintext), MaxPlaintext)
 	}
 	if len(auth) != authLen {
-		return nil, fmt.Errorf("webpush: auth secret must be %d bytes, got %d", authLen, len(auth))
+		return nil, fmt.Errorf("%w: auth secret must be %d bytes, got %d", ErrBadKeys, authLen, len(auth))
 	}
 	uaPub, err := ecdh.P256().NewPublicKey(p256dh)
 	if err != nil {
-		return nil, fmt.Errorf("webpush: bad p256dh key: %w", err)
+		return nil, fmt.Errorf("%w: bad p256dh point: %v", ErrBadKeys, err)
 	}
 	ecdhSecret, err := asPriv.ECDH(uaPub)
 	if err != nil {

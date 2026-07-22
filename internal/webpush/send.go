@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -186,7 +187,18 @@ func (s *Sender) auth(endpoint string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	origin := u.Scheme + "://" + u.Host
+	// aud must be the RFC 6454 §6.1 origin serialization (RFC 8292 §2):
+	// lowercased host, default port omitted. An endpoint carrying an
+	// explicit :443 would otherwise yield aud="https://host:443", which
+	// strict services (Mozilla autopush) reject with 401 — an error that
+	// never prunes, so that subscription would fail forever. Scheme is
+	// https for every validated endpoint; http exists only under the
+	// test-only insecure flag.
+	host := strings.ToLower(u.Hostname())
+	if p := u.Port(); p != "" && !(p == "443" && u.Scheme == "https") && !(p == "80" && u.Scheme == "http") {
+		host += ":" + p
+	}
+	origin := u.Scheme + "://" + host
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
