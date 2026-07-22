@@ -787,16 +787,27 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 }
 
 // queryOpenFn builds the lazy queryOpen predicate persistBuffer needs: it
-// reports whether a NON-channel query buffer with the given nick is already
-// open, so an incoming private NOTICE from a service or bot files under that
-// conversation instead of the lobby (see noticeTarget). Evaluated lazily —
-// only noticeTarget's addressed-to-us branch calls it, so channel traffic and
-// PMs never pay for the buffer scan. A lookup error yields false (fall back
-// to the lobby), never a misroute.
+// reports whether a NON-channel query buffer with the given nick is
+// currently OPEN, so an incoming private NOTICE from a service or bot files
+// under that conversation instead of the lobby (see noticeTarget).
+// Evaluated lazily — only noticeTarget's addressed-to-us branch calls it,
+// so channel traffic and PMs never pay for the buffer scan. A lookup error
+// yields false (fall back to the lobby), never a misroute.
+//
+// ARCHIVED queries count as closed: FindBuffer sees archived rows, and
+// without the extra check a ChanServ PM the user closed (archive-on-close)
+// would capture every subsequent services NOTICE — each one unarchiving
+// and re-opening the buffer the user keeps closing. Routing to the lobby
+// leaves the archived history untouched. A human's direct PRIVMSG still
+// resurfaces an archived PM; only the notice-redirect heuristic is gated.
 func (h *Hub) queryOpenFn(ctx context.Context, network string, c Conn) func(string) bool {
 	return func(nick string) bool {
 		name, found, err := h.store.FindBuffer(ctx, network, nick, c.Fold)
-		return err == nil && found && !c.IsChannel(name)
+		if err != nil || !found || c.IsChannel(name) {
+			return false
+		}
+		_, archived, err := h.store.BufferState(ctx, network, name)
+		return err == nil && !archived
 	}
 }
 

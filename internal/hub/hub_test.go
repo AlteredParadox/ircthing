@@ -435,6 +435,56 @@ func TestNoticeRoutingWithOpenQuery(t *testing.T) {
 	}
 }
 
+// The user's exact regression: message ChanServ (PM opens), close the PM
+// (archive-on-close), then receive its on-join NOTICEs. An ARCHIVED query
+// is CLOSED for the notice-redirect heuristic — the notices must file in
+// the lobby and the PM must stay archived, not resurface on every join.
+func TestNoticeRoutingSkipsArchivedQuery(t *testing.T) {
+	h := newTestHub(t)
+	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go h.Run(ctx, conn)
+	waitForNetwork(t, h, "libera")
+	ctxb := context.Background()
+
+	ev := func(line string) irc.Event {
+		return irc.Event{Network: "libera", Kind: irc.EventMessage, Msg: ircv4.MustParseMessage(line), Time: time.Now()}
+	}
+	// Open the ChanServ query, then archive it (close_buffer purge:false).
+	conn.ch <- ev(":ChanServ!s@services PRIVMSG AlteredParadox :done")
+	waitFor(t, func() bool {
+		msgs, err := h.store.Latest(ctxb, "libera", "ChanServ", 10)
+		return err == nil && len(msgs) == 1
+	})
+	if _, err := h.store.ArchiveBufferFolded(ctxb, "libera", "ChanServ", foldRFC1459); err != nil {
+		t.Fatal(err)
+	}
+
+	// The on-join services NOTICE: lobby, not the archived query.
+	conn.ch <- ev(":ChanServ!s@services NOTICE AlteredParadox :you are now voiced in #chan")
+	waitFor(t, func() bool {
+		star, err := h.store.Latest(ctxb, "libera", serverBufferTarget, 10)
+		return err == nil && len(star) == 1 && star[0].Sender == "ChanServ"
+	})
+	// The query kept only its original message and stayed archived.
+	msgs, err := h.store.Latest(ctxb, "libera", "ChanServ", 10)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("archived query messages = %d (%v), want 1", len(msgs), err)
+	}
+	if _, archived, err := h.store.BufferState(ctxb, "libera", "ChanServ"); err != nil || !archived {
+		t.Fatalf("BufferState archived = %v (%v), want true", archived, err)
+	}
+
+	// A direct PRIVMSG still resurfaces the archived PM — only the
+	// notice-redirect heuristic is gated.
+	conn.ch <- ev(":ChanServ!s@services PRIVMSG AlteredParadox :direct reply")
+	waitFor(t, func() bool {
+		_, archived, err := h.store.BufferState(ctxb, "libera", "ChanServ")
+		return err == nil && !archived
+	})
+}
+
 // NOTICE analog of TestReplayPMRoutesByBatchTargetAfterNickChange: replayed
 // query NOTICEs must file under the batch target independently of our CURRENT
 // nick. Repro this pins: we sent "/notice bob psst" as AlteredParadox (echoed
