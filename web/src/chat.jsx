@@ -260,7 +260,7 @@ function estimate(ev) {
 // Chat renders the active buffer: virtualized scrollback plus composer.
 // completionNicks feeds tab-completion (channel roster, or the query
 // counterpart).
-export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, statusHost, timeFmt, nickSep, previews, highlightNames, userhosts, nickPrefixes, memberPrefixes, layoutKey, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
+export function Chat({ buf, msgs, selfNick, theme, tailNav, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, statusHost, timeFmt, nickSep, previews, highlightNames, userhosts, nickPrefixes, memberPrefixes, layoutKey, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
 	// Lookup for in-body nick highlighting (Settings toggle): channel roster
 	// minus our own nick. Null when off, so the row renderer skips the scan.
 	const nickHi = useMemo(
@@ -567,7 +567,7 @@ export function Chat({ buf, msgs, selfNick, theme, connected, error, typers, foc
 	return (
 		<>
 			<VirtualList
-				key={buf?.key}
+				key={(buf?.key ?? "") + ":" + (tailNav || 0)}
 				items={shown}
 				estimate={estimate}
 				header={header}

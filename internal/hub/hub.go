@@ -170,6 +170,13 @@ type Hub struct {
 	// path turns into all pushes silently off.
 	pushCountMu sync.Mutex
 	pushPubKey  string
+	// pushEpoch advances whenever every subscription is wiped (password
+	// rotation, VAPID replacement). A delivery captures it when it loads
+	// its subscription slice and aborts if it changes — so a worker that
+	// loaded endpoints BEFORE a rotation cannot keep sending to a
+	// pre-rotation (attacker-planted) endpoint once a new device makes
+	// the cached count positive again.
+	pushEpoch atomic.Uint64
 
 	// syncedSettingsMu serializes read-modify-writes of the synced
 	// rules/filters/rename-map settings blobs (set_rules, set_filters,

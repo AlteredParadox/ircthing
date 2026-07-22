@@ -169,6 +169,15 @@ type Server struct {
 	// doesn't slip a session through the rotation's revoke.
 	passwordMu sync.Mutex
 	credGen    atomic.Uint64
+	// pushMutationMu is the mutation barrier shared by push subscribe/
+	// unsubscribe and password rotation's subscription wipe. Rotation
+	// wipes subscriptions and revokes tokens in two steps; without this
+	// barrier a stolen token could pass the subscribe auth-recheck in the
+	// window between them and re-plant an endpoint that survives recovery.
+	// Held around auth-recheck+store-mutation on both sides, so a
+	// subscribe runs strictly before rotation (its insert is wiped) or
+	// strictly after (its token is already revoked).
+	pushMutationMu sync.Mutex
 
 	// settingsMu serializes the runtime settings writes in handleSetConfig
 	// (retention, session TTL). Retention is a read-modify-write — read the

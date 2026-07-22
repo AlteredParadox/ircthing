@@ -80,12 +80,16 @@ func (s *Server) handlePushSubscribe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad auth secret", http.StatusBadRequest)
 		return
 	}
-	// Re-check auth AFTER the (attacker-pausable) body read: requireAuth
-	// validated the cookie before the body arrived, so a stolen session
-	// could pause its upload past a password rotation — which revokes the
-	// token and wipes subscriptions — then finish and re-plant its
-	// endpoint. authed() revalidates against the live token map, so a
-	// rotation in the gap makes this fail closed.
+	// Re-check auth AFTER the (attacker-pausable) body read, UNDER the
+	// push-mutation barrier: requireAuth validated the cookie before the
+	// body arrived, so a stolen session could pause its upload past a
+	// password rotation — which wipes subscriptions and revokes tokens —
+	// then finish and re-plant its endpoint. Holding pushMutationMu
+	// across the recheck+insert serializes against rotation's wipe+revoke
+	// (which takes the same barrier), so this runs strictly before (its
+	// insert is wiped) or strictly after (authed() fails, token revoked).
+	s.pushMutationMu.Lock()
+	defer s.pushMutationMu.Unlock()
 	if !s.authed(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -124,6 +128,16 @@ func (s *Server) handlePushUnsubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil || body.Endpoint == "" {
 		http.Error(w, "malformed unsubscribe", http.StatusBadRequest)
+		return
+	}
+	// Same barrier + auth-recheck as subscribe: a stale token must not
+	// mutate the subscription table after a rotation (here the harm is
+	// only a minor DoS — deleting a legit device's endpoint — but the
+	// discipline is uniform).
+	s.pushMutationMu.Lock()
+	defer s.pushMutationMu.Unlock()
+	if !s.authed(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	// Idempotent: unsubscribing an unknown endpoint is fine — the browser

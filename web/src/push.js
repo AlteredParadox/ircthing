@@ -19,6 +19,16 @@
 // enable/disable from settings, and the on-load resync that heals iOS
 // subscription eviction and VAPID key rotation.
 
+// pushAuthEpoch guards push lifecycle operations against crossing a
+// logout/login boundary: logout bumps it, and every async push
+// operation captures it up front and bails after each await if it
+// changed — so a resync or unsubscribe in flight when the user signs out
+// (or back in) cannot register/delete against the wrong session.
+let pushAuthEpoch = 0;
+export function invalidatePushAuth() {
+	pushAuthEpoch++;
+}
+
 // pushSupported: Push API present in THIS context. On iOS the API only
 // exists inside an installed (home-screen) web app, so a plain Safari
 // tab reports false — see isIOSNeedingInstall for the guidance case.
@@ -71,6 +81,7 @@ export async function currentSubscription() {
 // gesture (the permission prompt requires one, notably on iOS). Throws
 // with .code = "denied" when the user refused notifications.
 export async function subscribePush(publicKey) {
+	const epoch = pushAuthEpoch;
 	const perm = await Notification.requestPermission();
 	if (perm !== "granted") {
 		const err = new Error("notification permission not granted");
@@ -78,10 +89,18 @@ export async function subscribePush(publicKey) {
 		throw err;
 	}
 	const reg = await navigator.serviceWorker.ready;
+	if (epoch !== pushAuthEpoch) return null; // logged out mid-flow: don't register
 	const sub = await reg.pushManager.subscribe({
 		userVisibleOnly: true, // required; and iOS shows every push anyway
 		applicationServerKey: urlB64ToBytes(publicKey),
 	});
+	if (epoch !== pushAuthEpoch) {
+		// Session changed between subscribe and the server POST: drop the
+		// browser subscription rather than register it against a session
+		// the user has left.
+		await sub.unsubscribe().catch(() => {});
+		return null;
+	}
 	try {
 		await postJSON("/api/push/subscribe", sub.toJSON());
 	} catch (e) {
@@ -133,8 +152,9 @@ function appServerKeyOf(sub) {
 // and rebinds to a rotated VAPID key by re-subscribing.
 export async function syncPushOnLoad(publicKey) {
 	if (!publicKey) return;
+	const epoch = pushAuthEpoch;
 	const sub = await currentSubscription().catch(() => null);
-	if (!sub) return;
+	if (!sub || epoch !== pushAuthEpoch) return;
 	if (appServerKeyOf(sub) !== urlB64ToBytes(publicKey).join(",")) {
 		// Server key rotated (e.g. database reset): the old subscription
 		// can never verify again. Rebind without prompting — permission
@@ -143,11 +163,13 @@ export async function syncPushOnLoad(publicKey) {
 		let fresh = null;
 		try {
 			const reg = await navigator.serviceWorker.ready;
+			if (epoch !== pushAuthEpoch) return;
 			fresh = await reg.pushManager.subscribe({
 				userVisibleOnly: true,
 				applicationServerKey: urlB64ToBytes(publicKey),
 			});
-			await postJSON("/api/push/subscribe", fresh.toJSON());
+			if (epoch !== pushAuthEpoch) throw new Error("session changed");
+			await postSubscribeWithRetry(fresh.toJSON(), epoch);
 		} catch {
 			// The server never learned about the fresh subscription: a
 			// dangling browser-side one would push nowhere but block a
@@ -157,5 +179,24 @@ export async function syncPushOnLoad(publicKey) {
 		}
 		return;
 	}
-	await postJSON("/api/push/subscribe", sub.toJSON()).catch(() => {});
+	// Same key: re-upsert with a couple of bounded retries so a transient
+	// failure self-heals within the session (the subscription is valid;
+	// only the server row is missing) instead of waiting for the next
+	// app load. Silent on final failure — the browser sub stays valid.
+	await postSubscribeWithRetry(sub.toJSON(), epoch).catch(() => {});
+}
+
+// postSubscribeWithRetry POSTs a subscription with bounded backoff,
+// bailing if the auth epoch changed (logout/login) between tries.
+async function postSubscribeWithRetry(body, epoch) {
+	for (let attempt = 0; attempt < 3; attempt++) {
+		if (epoch !== pushAuthEpoch) return;
+		try {
+			await postJSON("/api/push/subscribe", body);
+			return;
+		} catch (e) {
+			if (attempt === 2) throw e;
+			await new Promise((r) => setTimeout(r, 500 * 2 ** attempt));
+		}
+	}
 }

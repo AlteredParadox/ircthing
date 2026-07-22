@@ -130,6 +130,13 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "hashing failed", http.StatusInternalServerError)
 		return
 	}
+	// Hold the push-mutation barrier across BOTH the subscription wipe
+	// and the token revocation below: a concurrent subscribe takes the
+	// same barrier, so it cannot slip an insert into the window between
+	// them (which would survive recovery). Released after the revoke.
+	s.pushMutationMu.Lock()
+	defer s.pushMutationMu.Unlock()
+
 	// Store the new hash AND wipe every push subscription in ONE
 	// transaction: rotation is the compromise-recovery lever, so the
 	// hash change and the revocation of push grants (a stolen session
@@ -142,6 +149,10 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	}
 	nh := string(newHash)
 	s.passwordHash.Store(&nh)
+	// Invalidate any in-flight delivery synchronously with the wipe (and
+	// under the barrier): a worker that loaded its endpoint slice before
+	// this wipe must not keep sending to a pre-rotation endpoint.
+	s.hub.BumpPushEpoch()
 
 	// Bump the generation and revoke EVERY session ATOMICALLY under the same
 	// s.mu that issueToken takes. This closes the login race: a concurrent

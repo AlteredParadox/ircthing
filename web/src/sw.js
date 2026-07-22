@@ -61,6 +61,14 @@ globalThis.addEventListener("push", (event) => {
 // also PULLS this on startup/resume via get_pending_nav. Worker-global
 // state is enough: the app resumes within moments of the tap, while this
 // worker instance is still alive from handling it.
+//
+// Residual (accepted): if the WORKER itself is terminated in the sliver
+// between focusing a frozen client and the page reading the message, the
+// target is lost and the app opens at its last buffer (no crash, no
+// wrong data — just a missed auto-navigation). Persisting it to
+// IndexedDB would close that sliver, but the async IDB dance in a SW is
+// disproportionate to a sub-second worker-death window against an
+// already-focused client.
 let pendingNav = null;
 
 globalThis.addEventListener("notificationclick", (event) => {

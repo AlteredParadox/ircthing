@@ -21,6 +21,7 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -505,6 +506,37 @@ func TestRenameMapHealsStaleWrites(t *testing.T) {
 	}
 }
 
+// TestComputeRenameWritesFailsClosed: a corrupt rules/filters blob
+// aborts the rename (ok=false) rather than rewriting from empty and
+// silently dropping the user's policy.
+func TestComputeRenameWritesFailsClosed(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	if err := h.store.SetSetting(ctx, rulesKey, "{ not json"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := h.computeRenameWrites(ctx, "libera", "libera2"); ok {
+		t.Fatal("computeRenameWrites should fail closed on a corrupt rules blob")
+	}
+}
+
+// TestFoldRenameMapSaturation: at the cap the CURRENT mapping is kept
+// (old entries are dropped) — never silently omitted.
+func TestFoldRenameMapSaturation(t *testing.T) {
+	full := map[string]string{}
+	for i := 0; i < maxNetworkRenames; i++ {
+		full[fmt.Sprintf("n%d", i)] = fmt.Sprintf("m%d", i)
+	}
+	blob, _ := json.Marshal(full)
+	got := foldRenameMap(string(blob), true, "current-old", "current-new")
+	if got["current-old"] != "current-new" {
+		t.Fatalf("current mapping dropped at saturation: %+v", got)
+	}
+	if len(got) > maxNetworkRenames {
+		t.Fatalf("map exceeds cap: %d", len(got))
+	}
+}
+
 // TestPusherSkipsArchivedBuffer: archiving (close_buffer purge:false)
 // keeps the row, so the fire-time check must consult the archived flag,
 // not mere existence.
@@ -624,7 +656,10 @@ func TestVapidKeyReplacementClearsSubscriptions(t *testing.T) {
 func TestPusherFailsClosedOnUnreadableFilters(t *testing.T) {
 	h := newTestHub(t)
 	ctx := context.Background()
-	if err := h.store.SetSetting(ctx, filtersKey, "{ corrupt"); err != nil {
+	// A PRESENT-but-empty filters row is corruption (handleSetFilters
+	// only ever writes a JSON blob), not a legitimate empty policy — it
+	// must fail closed, same as invalid JSON.
+	if err := h.store.SetSetting(ctx, filtersKey, ""); err != nil {
 		t.Fatal(err)
 	}
 	addTestSubscription(t, h, "https://push.example/dev1")
@@ -637,7 +672,7 @@ func TestPusherFailsClosedOnUnreadableFilters(t *testing.T) {
 	h.pushCandidates <- candidate("alice", "alice", "hi", time.Now().UnixMilli(), false)
 	time.Sleep(5 * testPushDelay)
 	if got := f.count(); got != 0 {
-		t.Fatalf("sends with unreadable filters = %d, want 0", got)
+		t.Fatalf("sends with present-empty filters = %d, want 0", got)
 	}
 
 	// Repairing the filters and poking the reload lets pushes resume.
@@ -648,6 +683,75 @@ func TestPusherFailsClosedOnUnreadableFilters(t *testing.T) {
 	waitDrained(t, h.pushConfigDirty)
 	h.pushCandidates <- candidate("alice", "alice", "back", time.Now().UnixMilli(), false)
 	waitSends(t, f, 1)
+}
+
+// TestPusherEpochAbortsStaleDelivery: a subscription wipe (epoch bump)
+// during a multi-endpoint delivery stops the remaining sends — a worker
+// on a pre-wipe slice must not keep sending after credential recovery.
+func TestPusherEpochAbortsStaleDelivery(t *testing.T) {
+	h := newTestHub(t)
+	addTestSubscription(t, h, "https://push.example/dev1")
+	addTestSubscription(t, h, "https://push.example/dev2")
+	seedBuffer(t, h, "libera", "alice")
+	f := &fakeSender{}
+	// After the first send, simulate a rotation: bump the epoch. (A real
+	// wipe also empties the table, but the epoch check must stand on its
+	// own — a new device could repopulate the count.)
+	f.onSend = func(n int) {
+		if n == 1 {
+			h.BumpPushEpoch()
+		}
+	}
+	startTestPusher(t, h, f)
+
+	h.pushCandidates <- candidate("alice", "alice", "hi", time.Now().UnixMilli(), false)
+	deadline := time.After(3 * time.Second)
+	for f.count() < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("no send")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	time.Sleep(10 * testPushDelay)
+	if got := f.count(); got != 1 {
+		t.Fatalf("sends = %d, want 1 (second aborted by epoch bump)", got)
+	}
+}
+
+// TestPusherRuleRemovalStopsHandedOffJob: a channel highlight whose
+// keyword is removed AFTER the job was handed to a worker must not send
+// — deliveryStillAllowed re-evaluates rules per send.
+func TestPusherRuleRemovalStopsHandedOffJob(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	if err := h.store.SetSetting(ctx, rulesKey, `{"rules":[{"pattern":"deploy","network":"","id":"r1"}]}`); err != nil {
+		t.Fatal(err)
+	}
+	addTestSubscription(t, h, "https://push.example/dev1")
+	addTestSubscription(t, h, "https://push.example/dev2")
+	seedBuffer(t, h, "libera", "#go")
+	f := &fakeSender{}
+	f.onSend = func(n int) {
+		if n == 1 {
+			_ = h.store.SetSetting(ctx, rulesKey, `{"rules":[]}`)
+		}
+	}
+	startTestPusher(t, h, f)
+
+	h.pushCandidates <- candidate("#go", "bob", "time to deploy", time.Now().UnixMilli(), true)
+	deadline := time.After(3 * time.Second)
+	for f.count() < 1 {
+		select {
+		case <-deadline:
+			t.Fatal("no send")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	time.Sleep(10 * testPushDelay)
+	if got := f.count(); got != 1 {
+		t.Fatalf("sends = %d, want 1 (second stopped by rule removal)", got)
+	}
 }
 
 // TestPusherRevalidatesBeforeEachSend: a redaction arriving MID-delivery

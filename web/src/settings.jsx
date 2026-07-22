@@ -17,7 +17,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { ACCENT_RGB, ACCENTS, CLOCKS, MAX_NICK_SEP, MAX_PREFS_BYTES, prefsByteLength } from "./prefs.js";
 import { uuid } from "./irc.js";
-import { currentSubscription, isIOSNeedingInstall, pushSupported, subscribePush, unsubscribeForLogout, unsubscribePush } from "./push.js";
+import { currentSubscription, invalidatePushAuth, isIOSNeedingInstall, pushSupported, subscribePush, unsubscribeForLogout, unsubscribePush } from "./push.js";
 
 // NotifControl renders the notification section for the current
 // permission state: unsupported, not yet granted, or toggleable.
@@ -485,6 +485,10 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 	// failure must not show the login screen over a still-valid session.
 	async function logout() {
 		setLogoutErr(false);
+		// Invalidate the push auth epoch FIRST: any resync or subscribe
+		// still in flight bails at its next await instead of registering
+		// against the session being torn down.
+		invalidatePushAuth();
 		// Retire THIS device's push subscription first, while the session
 		// cookie still works: signing out must stop the notification tray
 		// from receiving sender names and message text — a signed-out

@@ -182,6 +182,7 @@ func (h *Hub) loadOrCreateVapidKey(ctx context.Context) (*ecdsa.PrivateKey, erro
 	if err := h.store.SetSettingAndWipePushSubscriptions(ctx, vapidKeyKey, marshaled); err != nil {
 		return nil, err
 	}
+	h.BumpPushEpoch() // no in-flight jobs at startup, but keep the invariant uniform
 	return priv, nil
 }
 
@@ -203,6 +204,12 @@ func (h *Hub) PushPublicKey() string {
 	defer h.mu.Unlock()
 	return h.pushPubKey
 }
+
+// BumpPushEpoch invalidates every in-flight delivery — called
+// synchronously with a subscription wipe (password rotation, VAPID
+// replacement) so a worker mid-delivery on a pre-wipe endpoint slice
+// stops before its next send.
+func (h *Hub) BumpPushEpoch() { h.pushEpoch.Add(1) }
 
 // RefreshPushCount re-reads the subscription count into the atomic the
 // per-message fast path checks. Called at startup, by the subscribe/
@@ -525,6 +532,15 @@ func rearmPushTimer(timer *time.Timer, pending map[string]*pendingPush) {
 // job; the scheduler loop never touches it again. A full queue drops the
 // job (best effort — the queue is already backed up on slow endpoints),
 // logged rather than silent.
+//
+// A key removed here can be re-scheduled (a new pending entry) while its
+// job is still in flight, so two jobs for one buffer can coexist. We do
+// NOT track in-flight keys to coalesce them: the service worker tags
+// notifications by buffer (network+"\n"+buffer), so a second delivery
+// REPLACES the first on the device rather than stacking; the queue is
+// bounded (drops at cap); and per-send revalidation aborts stale sends.
+// A scheduler-owned in-flight set + completion channel would add real
+// complexity for no user-visible gain at single-user scale.
 func enqueueDuePushes(pending map[string]*pendingPush, jobs chan pushJob) {
 	now := time.Now()
 	for key, p := range pending {
@@ -644,12 +660,20 @@ func (h *Hub) pushStillDue(ctx context.Context, network, buffer string, p *pendi
 // loop.
 func (h *Hub) deliverPush(ctx context.Context, sender PushSender, key string, p *pendingPush) {
 	network, buffer, _ := strings.Cut(key, "\x00")
+	// Capture the credential epoch with the subscription slice: if a
+	// rotation wipes subscriptions after this load, the epoch advances
+	// and the per-send check below aborts — so this slice's (now stale,
+	// possibly attacker-planted) endpoints are never sent to.
+	epoch := h.pushEpoch.Load()
 	subs, err := h.store.PushSubscriptions(ctx)
 	if err != nil {
 		log.Printf("push: loading subscriptions for %s/%.60q: %v", network, buffer, err)
 		return
 	}
 	for _, sub := range subs {
+		if h.pushEpoch.Load() != epoch {
+			return // subscriptions wiped since we loaded the slice
+		}
 		if !h.deliveryStillAllowed(ctx, network, buffer, p) {
 			return
 		}
@@ -691,7 +715,23 @@ func (h *Hub) deliveryStillAllowed(ctx context.Context, network, buffer string, 
 	if !ok {
 		return false // indeterminate filter policy: suppress
 	}
-	return !buildPushFilters(f).drops(network, buffer, p.sender)
+	if buildPushFilters(f).drops(network, buffer, p.sender) {
+		return false
+	}
+	// A channel highlight whose keyword was removed while the job waited
+	// must not still send. Re-evaluate against current rules (a PM is
+	// unconditional; a coalesced/scrubbed headline with no text can't be
+	// re-evaluated, so it rides — its siblings matched independently).
+	if p.channelLike && p.text != "" {
+		rules, rok := h.loadRulesChecked(ctx)
+		if !rok {
+			return false // indeterminate rules: suppress
+		}
+		if !highlightText(p.text, p.nick, rules, network) {
+			return false
+		}
+	}
+	return true
 }
 
 // pushToSubscription encrypts and sends one payload to one endpoint,

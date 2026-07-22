@@ -1461,31 +1461,36 @@ func parseRules(v string) []Rule {
 // pusher can keep its last-known-good policy instead of silently
 // adopting an empty one.
 func (h *Hub) loadRulesChecked(ctx context.Context) ([]Rule, bool) {
-	v, err := h.store.Setting(ctx, rulesKey)
+	v, present, err := h.store.SettingValue(ctx, rulesKey)
 	if err != nil {
 		return nil, false
 	}
-	if v == "" {
-		return nil, true
+	if !present {
+		return nil, true // genuinely never stored: valid empty policy
 	}
+	// A PRESENT row that is empty or non-JSON is corruption/tampering
+	// (handleSetRules only ever writes a JSON blob), not a legitimate
+	// empty policy — fail closed so it can't degrade to "no rules".
 	var d RulesData
-	if err := json.Unmarshal([]byte(v), &d); err != nil {
+	if v == "" || json.Unmarshal([]byte(v), &d) != nil {
 		return nil, false
 	}
 	return d.Rules, true
 }
 
-// loadFiltersChecked: same distinction for the ignore/mute lists.
+// loadFiltersChecked: same absent-vs-present-empty distinction for the
+// ignore/mute lists, so a present-but-corrupt filter row fails closed
+// rather than becoming "nothing filtered".
 func (h *Hub) loadFiltersChecked(ctx context.Context) (FiltersData, bool) {
-	v, err := h.store.Setting(ctx, filtersKey)
+	v, present, err := h.store.SettingValue(ctx, filtersKey)
 	if err != nil {
 		return FiltersData{}, false
 	}
-	if v == "" {
+	if !present {
 		return FiltersData{}, true
 	}
 	var d FiltersData
-	if err := json.Unmarshal([]byte(v), &d); err != nil {
+	if v == "" || json.Unmarshal([]byte(v), &d) != nil {
 		return FiltersData{}, false
 	}
 	return d, true
@@ -1622,6 +1627,8 @@ func (h *Hub) saveRenameMap(ctx context.Context, m map[string]string) {
 
 // clearNetworkRename drops name from the map when a network with that
 // name (re)appears — rewriting its references would then be corruption.
+// Standalone form (tests); the put path folds the clear into the create
+// transaction via computeNameClearWrites.
 func (h *Hub) clearNetworkRename(ctx context.Context, name string) {
 	h.syncedSettingsMu.Lock()
 	defer h.syncedSettingsMu.Unlock()
@@ -1631,6 +1638,35 @@ func (h *Hub) clearNetworkRename(ctx context.Context, name string) {
 	}
 	delete(m, name)
 	h.saveRenameMap(ctx, m)
+}
+
+// computeNameClearWrites returns the settings write that drops any
+// rename-map entry for `name` (a re-created network), for the create
+// transaction, plus the pre-value for rollback. Empty writes (ok=true,
+// nil map) when there is nothing to clear. ok=false on a store read
+// error — the put aborts rather than risk a stale mapping. Caller holds
+// syncedSettingsMu.
+func (h *Hub) computeNameClearWrites(ctx context.Context, name string) (writes, rollback map[string]string, ok bool) {
+	v, present, err := h.store.SettingValue(ctx, renamesKey)
+	if err != nil {
+		return nil, nil, false
+	}
+	if !present || v == "" {
+		return nil, nil, true // no map: nothing to clear
+	}
+	m := map[string]string{}
+	if json.Unmarshal([]byte(v), &m) != nil {
+		return nil, nil, false
+	}
+	if _, has := m[name]; !has {
+		return nil, nil, true
+	}
+	delete(m, name)
+	blob, err := json.Marshal(m)
+	if err != nil {
+		return nil, nil, false
+	}
+	return map[string]string{renamesKey: string(blob)}, map[string]string{renamesKey: v}, true
 }
 
 // resolveRenamed maps a possibly-stale network reference to its current
@@ -1791,88 +1827,153 @@ func (s *Session) handleSetFilters(ctx context.Context, env Envelope) {
 // but the synced highlight rules and ignore/mute lists reference the
 // network BY NAME — left stale, an ignored harasser or muted channel
 // resumes alerting (and pushing) under the new name, and scoped keywords
-// silently stop. Production splits the fix so the rename MAP commits in
-// the same transaction as the network move (renameMapWrite, below) and
-// the rules/filters rewrite follows (rewriteRuleFilterRefsLocked); the
-// combined renameSyncedNetworkRefs below is for callers with no network
-// move of their own (tests).
+// silently stop. Production computes the whole settings bundle (rename
+// map + rewritten rules + filters) with computeRenameWrites and commits
+// it IN THE SAME transaction as the network/history move; the combined
+// renameSyncedNetworkRefs below is for callers with no network move of
+// their own (tests).
 
 // renameSyncedNetworkRefs does the whole settings-side rename (map +
-// rules + filters) as one locked operation.
+// rules + filters) as one locked operation. Used where there is no
+// network-move transaction to fold into (tests); the production path
+// threads computeRenameWrites' output through the move tx.
 func (h *Hub) renameSyncedNetworkRefs(ctx context.Context, oldName, newName string) {
 	h.syncedSettingsMu.Lock()
 	defer h.syncedSettingsMu.Unlock()
-	if writes := h.renameMapWrite(ctx, oldName, newName); writes != nil {
-		if err := h.store.SetSettings(ctx, writes); err != nil {
-			log.Printf("network %q -> %q: writing rename map: %v", oldName, newName, err)
-			return
-		}
+	rw, ok := h.computeRenameWrites(ctx, oldName, newName)
+	if !ok {
+		log.Printf("network %q -> %q: reading synced settings failed, skipping rewrite", oldName, newName)
+		return
 	}
-	h.rewriteRuleFilterRefsLocked(ctx, oldName, newName)
+	if err := h.store.SetSettings(ctx, rw.settings); err != nil {
+		log.Printf("network %q -> %q: writing synced settings: %v", oldName, newName, err)
+		return
+	}
+	h.broadcastRenameWrites(rw)
 }
 
-// renameMapWrite computes the updated network-rename map as a settings
-// write for ReplaceNetworkConfigWithSettings's transaction, so the map
-// entry commits ATOMICALLY with the history move — the healing entry can
-// never be orphaned. Caller holds syncedSettingsMu. Returns nil if the
-// map can't be encoded (the rules/filters rewrite still runs).
-func (h *Hub) renameMapWrite(ctx context.Context, oldName, newName string) map[string]string {
-	renames := h.loadRenameMap(ctx)
-	for k, v := range renames {
-		if v == oldName {
-			renames[k] = newName
-		}
-	}
-	delete(renames, newName)
-	if len(renames) < maxNetworkRenames {
-		renames[oldName] = newName
-	}
-	blob, err := json.Marshal(renames)
+// renameWrites is the full settings-side result of a network rename:
+// the settings to commit (map + any changed rules/filters keys) go in
+// the SAME transaction as the history move; rollback holds the
+// pre-rename values of exactly those keys, to restore atomically if the
+// rename is rolled back.
+type renameWrites struct {
+	settings map[string]string
+	rollback map[string]string
+
+	rules          RulesData
+	rulesChanged   bool
+	filters        FiltersData
+	filtersChanged bool
+}
+
+// computeRenameWrites reads the rename map, rules, and filters with
+// FAIL-CLOSED semantics (a store error OR a present-but-corrupt blob
+// aborts the whole rename, ok=false — never silently drops policy) and
+// computes their old->new rewrites. Caller holds syncedSettingsMu.
+func (h *Hub) computeRenameWrites(ctx context.Context, oldName, newName string) (renameWrites, bool) {
+	rw := renameWrites{settings: map[string]string{}, rollback: map[string]string{}}
+
+	// Rename map (always written). Absent restores as "{}".
+	mapV, mapPresent, err := h.store.SettingValue(ctx, renamesKey)
 	if err != nil {
-		return nil
+		return rw, false
 	}
-	return map[string]string{renamesKey: string(blob)}
+	preMap := mapV
+	if !mapPresent {
+		preMap = "{}"
+	}
+	rw.rollback[renamesKey] = preMap
+	newMap := foldRenameMap(mapV, mapPresent, oldName, newName)
+	mapBlob, err := json.Marshal(newMap)
+	if err != nil {
+		return rw, false
+	}
+	rw.settings[renamesKey] = string(mapBlob)
+
+	// Rules (written only if a scope changed).
+	rulesV, rulesPresent, err := h.store.SettingValue(ctx, rulesKey)
+	if err != nil {
+		return rw, false
+	}
+	if rulesPresent {
+		var d RulesData
+		if rulesV == "" || json.Unmarshal([]byte(rulesV), &d) != nil {
+			return rw, false // corrupt: abort rather than rewrite-from-empty
+		}
+		if rewriteRuleRefs(d.Rules, oldName, newName) {
+			blob, err := json.Marshal(d)
+			if err != nil {
+				return rw, false
+			}
+			rw.settings[rulesKey] = string(blob)
+			rw.rollback[rulesKey] = rulesV
+			rw.rules, rw.rulesChanged = d, true
+		}
+	}
+
+	// Filters (written only if a key changed).
+	filtersV, filtersPresent, err := h.store.SettingValue(ctx, filtersKey)
+	if err != nil {
+		return rw, false
+	}
+	if filtersPresent {
+		var d FiltersData
+		if filtersV == "" || json.Unmarshal([]byte(filtersV), &d) != nil {
+			return rw, false
+		}
+		if rewriteFilterRefs(&d, oldName, newName) {
+			blob, err := json.Marshal(d)
+			if err != nil {
+				return rw, false
+			}
+			rw.settings[filtersKey] = string(blob)
+			rw.rollback[filtersKey] = filtersV
+			rw.filters, rw.filtersChanged = d, true
+		}
+	}
+	return rw, true
 }
 
-// rewriteRuleFilterRefsLocked rewrites the rules and ignore/mute lists
-// from oldName to newName and broadcasts the canonical results. Runs
-// AFTER the rename map committed with the network move, so a failure
-// here is self-healing: the guaranteed map entry rewrites any stale
-// old-name reference on its next set_rules/set_filters. Caller holds
+// broadcastRenameWrites announces the rewritten rules/filters to every
+// session (after their commit) and pokes the pusher. Caller holds
 // syncedSettingsMu.
-func (h *Hub) rewriteRuleFilterRefsLocked(ctx context.Context, oldName, newName string) {
-	rules := h.loadRules(ctx)
-	changedRules := rewriteRuleRefs(rules, oldName, newName)
-	filters := h.loadFilters(ctx)
-	changedFilters := rewriteFilterRefs(&filters, oldName, newName)
-
-	writes := map[string]string{}
-	if changedRules {
-		if blob, err := json.Marshal(RulesData{Rules: rules}); err == nil {
-			writes[rulesKey] = string(blob)
-		}
+func (h *Hub) broadcastRenameWrites(rw renameWrites) {
+	if rw.rulesChanged {
+		h.broadcast(envelope("rules", 0, RulesData{Rules: rw.rules.Rules, Seeded: true}))
 	}
-	if changedFilters {
-		if blob, err := json.Marshal(filters); err == nil {
-			writes[filtersKey] = string(blob)
-		}
+	if rw.filtersChanged {
+		rw.filters.Seeded = true
+		h.broadcast(envelope("filters", 0, rw.filters))
 	}
-	if len(writes) > 0 {
-		if err := h.store.SetSettings(ctx, writes); err != nil {
-			log.Printf("network %q -> %q: rewriting synced settings: %v", oldName, newName, err)
-			return
-		}
-	}
-	if changedRules {
-		h.broadcast(envelope("rules", 0, RulesData{Rules: rules, Seeded: true}))
-	}
-	if changedFilters {
-		filters.Seeded = true
-		h.broadcast(envelope("filters", 0, filters))
-	}
-	if changedRules || changedFilters {
+	if rw.rulesChanged || rw.filtersChanged {
 		h.notifyPushConfigChanged()
 	}
+}
+
+// foldRenameMap folds old->new into the current map (existing k->old
+// become k->new) and records old->new. At saturation it keeps ONLY the
+// current mapping — the most important one, and old entries are
+// best-effort stale-client healing anyway — so the current rename is
+// never silently dropped.
+func foldRenameMap(current string, present bool, oldName, newName string) map[string]string {
+	m := map[string]string{}
+	if present && current != "" {
+		if err := json.Unmarshal([]byte(current), &m); err != nil || m == nil {
+			m = map[string]string{}
+		}
+	}
+	for k, v := range m {
+		if v == oldName {
+			m[k] = newName
+		}
+	}
+	delete(m, newName)
+	if len(m) >= maxNetworkRenames {
+		m = map[string]string{}
+	}
+	m[oldName] = newName
+	return m
 }
 
 // rewriteRuleRefs rewrites rule scopes from oldName to newName in place;

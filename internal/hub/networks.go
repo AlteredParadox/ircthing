@@ -321,29 +321,50 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 	// follows is best-effort, made durable by the now-guaranteed map
 	// entry. Effective name (`name`) not nc.Name: "" for an unnamed
 	// network would rewrite scopes to global and corrupt ignore/mute keys.
+	// The network/history move AND the synced-policy writes commit in ONE
+	// transaction (extraSettings). syncedSettingsMu is held across the
+	// compute→move→broadcast so the settings are read from — and
+	// committed against — a consistent view. For a rename: the rename map
+	// + rewritten rules + filters (computeRenameWrites, fail-closed). For
+	// a (re)created name: clearing any stale rename-map entry for it,
+	// atomically with the create so a later policy write can't be
+	// rewritten onto a vanished target.
+	s.hub.syncedSettingsMu.Lock()
 	var extraSettings, rollbackSettings map[string]string
+	var renameRW renameWrites
 	if renamed {
-		s.hub.syncedSettingsMu.Lock()
-		// Snapshot the rename map BEFORE mutating it, so a rolled-back
-		// rename restores exactly the prior map (an absent map restores
-		// as "{}", which loadRenameMap reads as empty — same effect).
-		preMap, _ := s.hub.store.Setting(ctx, renamesKey)
-		if preMap == "" {
-			preMap = "{}"
-		}
-		rollbackSettings = map[string]string{renamesKey: preMap}
-		extraSettings = s.hub.renameMapWrite(ctx, d.OldName, name)
-	}
-	if err := s.hub.applyPutNetwork(ctx, nc, d.OldName, prev, renamed, string(canonical), extraSettings, rollbackSettings); err != nil {
-		if renamed {
+		rw, ok := s.hub.computeRenameWrites(ctx, d.OldName, name)
+		if !ok {
 			s.hub.syncedSettingsMu.Unlock()
+			s.push(errEnvelope(env.Seq, "internal", "reading synced settings failed"))
+			return
 		}
+		renameRW = rw
+		extraSettings = rw.settings
+		rollbackSettings = rw.rollback
+	} else {
+		clr, rb, ok := s.hub.computeNameClearWrites(ctx, name)
+		if !ok {
+			s.hub.syncedSettingsMu.Unlock()
+			s.push(errEnvelope(env.Seq, "internal", "reading synced settings failed"))
+			return
+		}
+		extraSettings = clr
+		rollbackSettings = rb
+	}
+	err = s.hub.applyPutNetwork(ctx, nc, d.OldName, prev, renamed, string(canonical), extraSettings, rollbackSettings)
+	if err != nil {
+		s.hub.syncedSettingsMu.Unlock()
 		s.push(errEnvelope(env.Seq, "bad_request", err.Error()))
 		return
 	}
 	if renamed {
-		s.hub.rewriteRuleFilterRefsLocked(ctx, d.OldName, name)
-		s.hub.syncedSettingsMu.Unlock()
+		// Committed atomically with the move; announce the rewritten
+		// rules/filters to every session.
+		s.hub.broadcastRenameWrites(renameRW)
+	}
+	s.hub.syncedSettingsMu.Unlock()
+	if renamed {
 		s.hub.broadcast(envelope("network_removed", 0, NetworkRef{Network: d.OldName}))
 		// Pending pushes carry the OLD network name in their keys and
 		// payloads; cancel rather than deliver stale names.
@@ -352,10 +373,6 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 		// including dirty ones, whose eventual re-push must not carry
 		// the old name back to the server.
 		s.hub.broadcast(envelope("network_renamed", 0, NetworkRenameData{Old: d.OldName, New: name}))
-	} else {
-		// A (re)created network invalidates any rename-map entry for its
-		// name: rewriting references to it would now be corruption.
-		s.hub.clearNetworkRename(ctx, name)
 	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcast(envelope("networks_changed", 0, nil))
@@ -507,7 +524,16 @@ func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName 
 
 // rollbackPut undoes a persisted-but-unstartable put: an edit restores
 // (and restarts) the previous definition, an add is deleted.
-func (h *Hub) rollbackPut(ctx context.Context, name string, prev *store.NetworkConfig, rollbackSettings map[string]string) {
+//
+// The store writes run on a DETACHED, bounded context, NOT the caller's
+// request context: that request context is the WebSocket handler's, and
+// a client disconnect during the rollback would otherwise cancel the
+// restore mid-flight — leaving storage at the new name while runtime is
+// restarted at the old one. Recovery must complete regardless of the
+// requester.
+func (h *Hub) rollbackPut(_ context.Context, name string, prev *store.NetworkConfig, rollbackSettings map[string]string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	// These networks/network_configs writes must hold the lifecycleGate, like
 	// every other one (put at :197, delete at :319): without it a session's
 	// create-on-demand can interleave and resurrect the orphan the rollback

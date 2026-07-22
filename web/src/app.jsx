@@ -18,7 +18,7 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { Chat } from "./chat.jsx";
 import { applyTombstones, bufferOrder, bufKey, clearTypingNick, expireTypingState, foldNick, historyHasMore, isChannelName, mergeById, mergeServerBuffers, parseHash, parseInput, rememberRedaction, renderable, SERVER_BUFFER, stripFormatting, toHash, updateTypingState } from "./irc.js";
 import { applyBadge, highlightText, loadRules, Notifier, sanitizeRulesForSync, saveRules } from "./notify.js";
-import { syncPushOnLoad } from "./push.js";
+import { invalidatePushAuth, syncPushOnLoad } from "./push.js";
 import { Login } from "./login.jsx";
 import { applyPrefs, loadPrefs, MAX_PREFS_BYTES, normalizePrefs, prefsByteLength, resolveTheme, savePrefs } from "./prefs.js";
 import { isIgnored, isMuted, loadActiveBuffer, loadIgnores, loadMutes, sanitizeFiltersForSync, saveActiveBuffer, saveIgnores, saveMutes, toggleIgnore, toggleMute } from "./local.js";
@@ -348,6 +348,10 @@ export function App() {
 	const chanPromptIntent = useRef(0);
 	const topicIntent = useRef(0);
 	const [msgs, setMsgs] = useState({});
+	// Bumped by a notification tap to force the message list back to its
+	// live tail even when the tapped buffer is already active (see the SW
+	// message handler); joined into the VirtualList key inside Chat.
+	const [tailNav, setTailNav] = useState(0);
 	const [activeKey, setActiveKey] = useState(() => {
 		// The hash (explicit URL / notification openWindow) wins; a
 		// hashless cold start restores the last-viewed buffer instead of
@@ -644,6 +648,10 @@ export function App() {
 		if (phase !== "login") return;
 		previewsPinned.current = false;
 		setPreviews(false);
+		// Fence in-flight push lifecycle ops against the session boundary
+		// (covers an expiry/eviction that flips phase to login without a
+		// deliberate logout, which invalidates it too).
+		invalidatePushAuth();
 		// Invalidate the module-level settings save queue too: a mutation
 		// queued before signing out must not execute against the next
 		// session's cookie, and a delayed previews callback must not re-pin
@@ -765,6 +773,10 @@ export function App() {
 				// PM AND drops any stale search/history window so the live
 				// tail (with the message that was pushed) reloads — a bare
 				// hash set no-ops when the hash already equals the target.
+				// Bump tailNav so the message list re-pins to the tail even
+				// when the tapped buffer is the already-active one the user
+				// had scrolled up in (select alone can't reset that scroll).
+				setTailNav((n) => n + 1);
 				select(d.network, d.buffer);
 				// Consume the worker's pendingNav copy: a tap delivered to
 				// an ALREADY-VISIBLE window fires no visibilitychange, so
@@ -2287,6 +2299,7 @@ export function App() {
 				{activeBuf ? (
 					<Chat
 						buf={activeBuf} msgs={msgs[activeKey]} selfNick={selfNick} theme={theme}
+						tailNav={tailNav}
 						connected={connected && netState === "registered"}
 						error={cmdError}
 						typers={Array.from(typers.get(activeKey)?.keys() || [])}
