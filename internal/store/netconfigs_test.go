@@ -69,6 +69,46 @@ func TestNetworkConfigCRUD(t *testing.T) {
 	}
 }
 
+// TestReplaceNetworkConfigWithSettingsRollback pins the invariant the
+// rename-rollback fix relies on: the config move and the settings write
+// commit (and restore) atomically, so a rolled-back rename cannot leave
+// the network_renames map pointing at the reverted-away name. Mirrors
+// what applyPutNetwork's forward + rollbackPut calls do.
+func TestReplaceNetworkConfigWithSettingsRollback(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	ctx := context.Background()
+
+	// hub's renamesKey (kept in sync with internal/hub/session.go).
+	const renamesKey = "network_renames"
+	if err := s.PutNetworkConfig(ctx, "alpha", `{"addr":"a:1"}`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Forward: rename alpha -> beta AND record the map in one tx.
+	if err := s.ReplaceNetworkConfigWithSettings(ctx, "alpha", "beta", `{"addr":"a:1"}`,
+		map[string]string{renamesKey: `{"alpha":"beta"}`}); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := s.Setting(ctx, renamesKey); v != `{"alpha":"beta"}` {
+		t.Fatalf("map after forward = %q", v)
+	}
+
+	// Rollback: restore beta -> alpha AND the pre-rename (empty) map in
+	// one tx. After this the map must NOT still name the gone "beta".
+	if err := s.ReplaceNetworkConfigWithSettings(ctx, "beta", "alpha", `{"addr":"a:1"}`,
+		map[string]string{renamesKey: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	configs, _ := s.NetworkConfigs(ctx)
+	if len(configs) != 1 || configs[0].Name != "alpha" {
+		t.Fatalf("configs after rollback = %+v", configs)
+	}
+	if v, _ := s.Setting(ctx, renamesKey); v != `{}` {
+		t.Fatalf("map after rollback = %q, want empty (no stale beta entry)", v)
+	}
+}
+
 func TestNetworkConfigBoundsAndPaging(t *testing.T) {
 	s, _ := openTest(t, 10)
 	defer s.Close()

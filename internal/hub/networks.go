@@ -321,12 +321,20 @@ func (s *Session) handlePutNetwork(ctx context.Context, env Envelope) {
 	// follows is best-effort, made durable by the now-guaranteed map
 	// entry. Effective name (`name`) not nc.Name: "" for an unnamed
 	// network would rewrite scopes to global and corrupt ignore/mute keys.
-	var extraSettings map[string]string
+	var extraSettings, rollbackSettings map[string]string
 	if renamed {
 		s.hub.syncedSettingsMu.Lock()
+		// Snapshot the rename map BEFORE mutating it, so a rolled-back
+		// rename restores exactly the prior map (an absent map restores
+		// as "{}", which loadRenameMap reads as empty — same effect).
+		preMap, _ := s.hub.store.Setting(ctx, renamesKey)
+		if preMap == "" {
+			preMap = "{}"
+		}
+		rollbackSettings = map[string]string{renamesKey: preMap}
 		extraSettings = s.hub.renameMapWrite(ctx, d.OldName, name)
 	}
-	if err := s.hub.applyPutNetwork(ctx, nc, d.OldName, prev, renamed, string(canonical), extraSettings); err != nil {
+	if err := s.hub.applyPutNetwork(ctx, nc, d.OldName, prev, renamed, string(canonical), extraSettings, rollbackSettings); err != nil {
 		if renamed {
 			s.hub.syncedSettingsMu.Unlock()
 		}
@@ -451,7 +459,13 @@ func validStoredNetworkName(name string) bool {
 // old connection, atomically replace the stored definition, start the
 // new one. Both failure points roll back so an error always leaves the
 // previous definition stored and connected. Caller holds netOps.
-func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName string, prev *store.NetworkConfig, renamed bool, canonical string, extraSettings map[string]string) error {
+// rollbackSettings is the settings snapshot to restore alongside the
+// network config if a rename has to be rolled back — the pre-rename
+// network_renames map. It must ride the SAME transaction as the config
+// restore so the map can never be left pointing at the reverted-away
+// name (which would silently corrupt rule/mute scoping for the live
+// old-named network).
+func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName string, prev *store.NetworkConfig, renamed bool, canonical string, extraSettings, rollbackSettings map[string]string) error {
 	name := nc.EffectiveName()
 	// Stop before persisting: a rename moves history, and the running
 	// connection must not append rows under the old name mid-move.
@@ -480,8 +494,12 @@ func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName 
 	if err := h.StartNetwork(nc); err != nil {
 		// Validated by the caller, so this is exceptional (e.g. a
 		// certificate file changed on disk since). Restore the previous
-		// definition.
-		h.rollbackPut(ctx, name, prev)
+		// definition — and, for a rename, the pre-rename settings map in
+		// the same transaction, so the map never survives the reverted
+		// config. If that restore transaction ITSELF fails, both the
+		// config and the map stay at the committed new-name state, which
+		// is still internally consistent.
+		h.rollbackPut(ctx, name, prev, rollbackSettings)
 		return err
 	}
 	return nil
@@ -489,7 +507,7 @@ func (h *Hub) applyPutNetwork(ctx context.Context, nc *netconf.Network, oldName 
 
 // rollbackPut undoes a persisted-but-unstartable put: an edit restores
 // (and restarts) the previous definition, an add is deleted.
-func (h *Hub) rollbackPut(ctx context.Context, name string, prev *store.NetworkConfig) {
+func (h *Hub) rollbackPut(ctx context.Context, name string, prev *store.NetworkConfig, rollbackSettings map[string]string) {
 	// These networks/network_configs writes must hold the lifecycleGate, like
 	// every other one (put at :197, delete at :319): without it a session's
 	// create-on-demand can interleave and resurrect the orphan the rollback
@@ -497,7 +515,7 @@ func (h *Hub) rollbackPut(ctx context.Context, name string, prev *store.NetworkC
 	// matches those sites (no deadlock).
 	if prev != nil {
 		h.lifecycleGate.Lock()
-		err := h.store.ReplaceNetworkConfig(ctx, name, prev.Name, prev.Config)
+		err := h.store.ReplaceNetworkConfigWithSettings(ctx, name, prev.Name, prev.Config, rollbackSettings)
 		h.lifecycleGate.Unlock()
 		if err != nil {
 			log.Printf("network %q: rollback failed: %v", name, err)
