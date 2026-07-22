@@ -1760,53 +1760,73 @@ func (h *Hub) renameSyncedNetworkRefs(ctx context.Context, oldName, newName stri
 	// re-pushes old-name references later, and set_rules/set_filters
 	// rewrite them through this map.
 	h.recordNetworkRename(ctx, oldName, newName)
+	changedRules := h.renameRuleRefs(ctx, oldName, newName)
+	changedFilters := h.renameFilterRefs(ctx, oldName, newName)
+	if changedRules || changedFilters {
+		h.notifyPushConfigChanged()
+	}
+}
+
+// renameRuleRefs rewrites rule scopes from oldName to newName, storing
+// and broadcasting the result; reports whether anything changed.
+func (h *Hub) renameRuleRefs(ctx context.Context, oldName, newName string) bool {
 	rules := h.loadRules(ctx)
-	changedRules := false
+	changed := false
 	for i := range rules {
 		if rules[i].Network == oldName {
 			rules[i].Network = newName
-			changedRules = true
+			changed = true
 		}
 	}
-	if changedRules {
-		if blob, err := json.Marshal(RulesData{Rules: rules}); err == nil {
-			if err := h.store.SetSetting(ctx, rulesKey, string(blob)); err != nil {
-				log.Printf("network %q -> %q: rewriting highlight rules: %v", oldName, newName, err)
-			} else {
-				h.broadcast(envelope("rules", 0, RulesData{Rules: rules, Seeded: true}))
-			}
-		}
+	if !changed {
+		return false
 	}
+	blob, err := json.Marshal(RulesData{Rules: rules})
+	if err != nil {
+		return false
+	}
+	if err := h.store.SetSetting(ctx, rulesKey, string(blob)); err != nil {
+		log.Printf("network %q -> %q: rewriting highlight rules: %v", oldName, newName, err)
+		return false
+	}
+	h.broadcast(envelope("rules", 0, RulesData{Rules: rules, Seeded: true}))
+	return true
+}
 
+// renameFilterRefs rewrites the ignore map key and mute bufKey prefixes
+// from oldName to newName, storing and broadcasting the result; reports
+// whether anything changed.
+func (h *Hub) renameFilterRefs(ctx context.Context, oldName, newName string) bool {
 	d := h.loadFilters(ctx)
-	changedFilters := false
+	changed := false
 	if nicks, ok := d.Ignores[oldName]; ok {
 		delete(d.Ignores, oldName)
 		// Renaming onto a name that already has ignores is exotic;
 		// union keeps both sets.
 		d.Ignores[newName] = append(d.Ignores[newName], nicks...)
-		changedFilters = true
+		changed = true
 	}
 	prefix := oldName + "\n"
 	for i, m := range d.Mutes {
 		if strings.HasPrefix(m, prefix) {
 			d.Mutes[i] = newName + "\n" + strings.TrimPrefix(m, prefix)
-			changedFilters = true
+			changed = true
 		}
 	}
-	if changedFilters {
-		if blob, err := json.Marshal(d); err == nil {
-			if err := h.store.SetSetting(ctx, filtersKey, string(blob)); err != nil {
-				log.Printf("network %q -> %q: rewriting filters: %v", oldName, newName, err)
-			} else {
-				d.Seeded = true
-				h.broadcast(envelope("filters", 0, d))
-			}
-		}
+	if !changed {
+		return false
 	}
-	if changedRules || changedFilters {
-		h.notifyPushConfigChanged()
+	blob, err := json.Marshal(d)
+	if err != nil {
+		return false
 	}
+	if err := h.store.SetSetting(ctx, filtersKey, string(blob)); err != nil {
+		log.Printf("network %q -> %q: rewriting filters: %v", oldName, newName, err)
+		return false
+	}
+	d.Seeded = true
+	h.broadcast(envelope("filters", 0, d))
+	return true
 }
 
 // markreadTimeLayout is the server-time format used by MARKREAD

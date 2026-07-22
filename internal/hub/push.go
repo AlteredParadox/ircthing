@@ -490,45 +490,52 @@ func (f pushFilters) drops(network, buffer, sender string) bool {
 	return sender != "" && f.ignores[network][strings.ToLower(sender)]
 }
 
-// deliverPush sends one due notification to every subscription, after
-// the authoritative cancel re-check: the store's read marker covers
-// marker writes whose channel send was dropped AND upstream MARKREAD
-// from other bouncer clients.
-func (h *Hub) deliverPush(ctx context.Context, sender PushSender, key string, p *pendingPush) {
-	network, buffer, _ := strings.Cut(key, "\x00")
+// pushStillDue runs the authoritative fire-time re-checks against the
+// store — the cancel channels are all best-effort, so the store has the
+// final word. It reports whether the push should still go out, and may
+// SCRUB p's headline (coalesced redaction) as a side effect.
+func (h *Hub) pushStillDue(ctx context.Context, network, buffer string, p *pendingPush) bool {
+	// Read marker: covers marker writes whose channel send was dropped
+	// AND upstream MARKREAD from other bouncer clients.
 	if t, err := h.store.ReadMarker(ctx, network, buffer); err == nil && !t.IsZero() && t.UnixMilli() >= p.newestTS {
-		return
+		return false
 	}
-	// The buffer may have been purged OR archived after scheduling — the
-	// close hooks cancel pending pushes for both modes, but their channel
-	// sends are best effort. A buffer the store no longer knows gets no
-	// push (its notification would navigate nowhere); an archived one is
-	// hidden from every sidebar and must stay silent too, mirroring
-	// persistEvent's stillArchived suppression. `buffer` is already the
-	// canonical stored spelling, so the exact-name lookup is faithful.
+	// The buffer may have been purged OR archived after scheduling. A
+	// buffer the store no longer knows gets no push (its notification
+	// would navigate nowhere); an archived one is hidden from every
+	// sidebar and must stay silent too, mirroring persistEvent's
+	// stillArchived suppression. `buffer` is already the canonical
+	// stored spelling, so the exact-name lookup is faithful.
 	found, archived, err := h.store.BufferState(ctx, network, buffer)
 	if err != nil {
 		// Fail closed (skip the push) but never silently: a transient
 		// store error here eats a notification.
 		log.Printf("push: checking buffer %s/%s: %v", network, buffer, err)
-		return
+		return false
 	}
 	if !found || archived {
-		return
+		return false
 	}
-	// Fire-time redaction re-check, mirroring the marker one: the
-	// pushCancel channel is best-effort (non-blocking sends, select
-	// ordering), so ask the authoritative store whether the headlining
-	// message was redacted in the meantime. Sole redacted message:
-	// nothing to say. Coalesced siblings: deliver, scrubbed.
+	// Redaction of the headlining message: a sole redacted message has
+	// nothing left to say; coalesced siblings deliver, scrubbed.
 	if p.msgid != "" {
 		if redacted, err := h.store.MessageRedacted(ctx, network, buffer, p.msgid); err == nil && redacted {
 			if p.count == 1 {
-				return
+				return false
 			}
 			p.count--
 			p.sender, p.text, p.msgid = "", "", ""
 		}
+	}
+	return true
+}
+
+// deliverPush sends one due notification to every subscription, after
+// the authoritative fire-time re-checks (pushStillDue).
+func (h *Hub) deliverPush(ctx context.Context, sender PushSender, key string, p *pendingPush) {
+	network, buffer, _ := strings.Cut(key, "\x00")
+	if !h.pushStillDue(ctx, network, buffer, p) {
+		return
 	}
 	subs, err := h.store.PushSubscriptions(ctx)
 	if err != nil {

@@ -150,7 +150,7 @@ export function Sidebar({ networks, buffers, activeKey, monitors, truncated, mut
 				    headers — one wide settings affordance instead. */}
 				<button class="foot-settings" onClick={onSettings}>
 					<span class="foot-settings-gear" aria-hidden="true">⚙</span>
-					Settings
+					<span>Settings</span>
 				</button>
 			</div>
 		</div>

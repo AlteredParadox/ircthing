@@ -357,42 +357,51 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 		// applying any field the user re-edited while the GET itself was running.
 		let alive = true;
 		enqueue(async (stale) => {
-			const genD = retentionGens.days.current;
-			const genM = retentionGens.max.current;
-			const genS = sessionGen.current;
-			const genP = previewsGen.current;
+			// Generations captured BEFORE the fetch: a field the user
+			// re-edits while the GET runs keeps the newer local value.
+			const gens = {
+				days: retentionGens.days.current,
+				max: retentionGens.max.current,
+				session: sessionGen.current,
+				previews: previewsGen.current,
+			};
 			const d = await fetchConfig();
 			if (!d || stale()) return; // logged out while the GET ran: drop it
-			// Not `|0`: that wraps values above 2^31-1 negative, corrupting
-			// the display and making every later retention save a 400.
-			const num = (v) => Math.max(0, Math.floor(Number(v) || 0));
-			if (previewsGen.current === genP) {
-				previewsSaved.current = !!d.previews; // seed the confirmed baseline
-				if (alive) setPreviewsOn(!!d.previews);
-			}
-			if (retentionGens.days.current === genD && retentionGens.max.current === genM) {
-				const ret = { days: num(d.retention_days), max: num(d.retention_max_messages) };
-				retentionSaved.current = ret;
-				if (alive) setRetention(ret);
-			}
-			if (sessionGen.current === genS) {
-				const sess = num(d.session_ttl_days);
-				sessionSaved.current = sess;
-				if (alive) setSessionDays(sess);
-			}
-			// Read-only (no save path), so no generation guard needed.
-			if (alive) setPushKey(typeof d.push_public_key === "string" ? d.push_public_key : "");
-			if (alive) {
-				setAbout({
-					version: typeof d.version === "string" ? d.version : "",
-					rss: typeof d.memory_rss_bytes === "number" ? d.memory_rss_bytes : 0,
-				});
-			}
+			applyServerConfig(d, gens, () => alive);
 		});
 		return () => {
 			alive = false;
 		};
 	}, []);
+
+	// applyServerConfig adopts one /api/config snapshot under the per-
+	// field generation guards captured before its fetch.
+	function applyServerConfig(d, gens, alive) {
+		// Not `|0`: that wraps values above 2^31-1 negative, corrupting
+		// the display and making every later retention save a 400.
+		const num = (v) => Math.max(0, Math.floor(Number(v) || 0));
+		if (previewsGen.current === gens.previews) {
+			previewsSaved.current = !!d.previews; // seed the confirmed baseline
+			if (alive()) setPreviewsOn(!!d.previews);
+		}
+		if (retentionGens.days.current === gens.days && retentionGens.max.current === gens.max) {
+			const ret = { days: num(d.retention_days), max: num(d.retention_max_messages) };
+			retentionSaved.current = ret;
+			if (alive()) setRetention(ret);
+		}
+		if (sessionGen.current === gens.session) {
+			const sess = num(d.session_ttl_days);
+			sessionSaved.current = sess;
+			if (alive()) setSessionDays(sess);
+		}
+		if (!alive()) return;
+		// Read-only fields (no save path): no generation guards needed.
+		setPushKey(typeof d.push_public_key === "string" ? d.push_public_key : "");
+		setAbout({
+			version: typeof d.version === "string" ? d.version : "",
+			rss: typeof d.memory_rss_bytes === "number" ? d.memory_rss_bytes : 0,
+		});
+	}
 
 	// Saves are serialized through the module-level saveQueue and versioned by
 	// the module-level generation guards — see the block above saveConfig.
