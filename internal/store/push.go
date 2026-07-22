@@ -72,6 +72,19 @@ func (s *Store) UpsertPushSubscription(ctx context.Context, sub PushSubscription
 	return tx.Commit()
 }
 
+// DeleteAllPushSubscriptions removes every registered endpoint — the
+// credential-rotation hammer: any endpoint registered under retired
+// trust (a stolen session's plant, or subscriptions bound to a replaced
+// VAPID key) dies with it. Legitimate devices re-register automatically
+// via the client's on-load resync after their next authenticated open.
+func (s *Store) DeleteAllPushSubscriptions(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.ExecContext(ctx, `DELETE FROM push_subscriptions`)
+	return err
+}
+
 // DeletePushSubscription removes an endpoint; deleting an unknown one is
 // a no-op (unsubscribe must be idempotent).
 func (s *Store) DeletePushSubscription(ctx context.Context, endpoint string) error {

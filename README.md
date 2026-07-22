@@ -73,7 +73,13 @@ scrollback runs in ~32 MB of RSS.
   (RFC 8291), keys are provisioned automatically (no Apple/Google
   account or configuration needed), and enabling it is a per-device
   toggle in settings. Requires HTTPS (the reverse proxy you already
-  have); on iOS, add the app to the Home Screen first.
+  have); on iOS, add the app to the Home Screen first. One deliberate
+  metadata tradeoff: push delivery always uses the server's DIRECT
+  egress, even for messages from networks configured with a
+  SOCKS5/WireGuard proxy — payloads are end-to-end encrypted, but the
+  push provider (Apple/Google/Mozilla) sees your server's IP and the
+  notification timing. If that correlation matters for a network you
+  tunnel, leave push off.
 - **Theming**: dark/light/system, accent colors, text size, density,
   message font — plus a raw custom-CSS override. Usable at 360 px wide;
   installable as a PWA.

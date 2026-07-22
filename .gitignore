@@ -42,3 +42,4 @@ __pycache__/
 # Design-tool runtime (Claude Design output, unclear redistribution license for the
 # bundled dc-runtime). Kept locally so design/*.dc.html renders; not published.
 design/support.js
+*.pid

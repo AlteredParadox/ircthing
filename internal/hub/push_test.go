@@ -463,6 +463,11 @@ func TestRenameMapHealsStaleWrites(t *testing.T) {
 		{Pattern: "release", Network: "libera", ID: "r1"},
 	}}))
 	recv(t, a, "ok")
+	// The WRITER gets the canonical set echoed back (its local copy still
+	// carries the old name; the ok cleared its dirty flag so it adopts).
+	if d := decode[RulesData](t, recv(t, a, "rules")); len(d.Rules) != 1 || d.Rules[0].Network != "libera2" {
+		t.Fatalf("writer echo = %+v", d.Rules)
+	}
 	if rules := h.loadRules(ctx); rules[0].Network != "libera2" {
 		t.Fatalf("stale rule scope not rewritten: %+v", rules)
 	}
@@ -471,6 +476,9 @@ func TestRenameMapHealsStaleWrites(t *testing.T) {
 		Mutes:   []string{"libera\n#noisy"},
 	}))
 	recv(t, a, "ok")
+	if d := decode[FiltersData](t, recv(t, a, "filters")); len(d.Ignores["libera2"]) != 1 {
+		t.Fatalf("writer filters echo = %+v", d)
+	}
 	d := h.loadFilters(ctx)
 	if len(d.Ignores["libera2"]) != 1 || len(d.Ignores["libera"]) != 0 {
 		t.Fatalf("stale ignore key not rewritten: %+v", d.Ignores)
@@ -575,6 +583,32 @@ func TestPusherMuteMidWindowCancels(t *testing.T) {
 	time.Sleep(5 * testPushDelay)
 	if got := f.count(); got != 0 {
 		t.Fatalf("sends after mid-window mute = %d, want 0", got)
+	}
+}
+
+// TestVapidKeyReplacementClearsSubscriptions: subscriptions bound to a
+// replaced key would fail with 401/403 forever (never pruned — only
+// 404/410 prune) and squat the cap; regeneration must wipe them.
+func TestVapidKeyReplacementClearsSubscriptions(t *testing.T) {
+	h := newTestHub(t)
+	ctx := context.Background()
+	addTestSubscription(t, h, "https://push.example/orphan")
+	if err := h.store.SetSetting(ctx, vapidKeyKey, "not a key"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.loadOrCreateVapidKey(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := h.store.CountPushSubscriptions(ctx); n != 0 {
+		t.Fatalf("subscriptions after key replacement = %d, want 0", n)
+	}
+	// The regenerated key parses on the next load and does NOT wipe again.
+	addTestSubscription(t, h, "https://push.example/fresh")
+	if _, err := h.loadOrCreateVapidKey(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := h.store.CountPushSubscriptions(ctx); n != 1 {
+		t.Fatalf("subscriptions after clean reload = %d, want 1", n)
 	}
 }
 

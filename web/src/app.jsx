@@ -693,7 +693,14 @@ export function App() {
 			const h = parseHash(location.hash);
 			if (h) {
 				navigationIntent.current++;
-				setActiveKey(bufKey(h.network, h.buffer));
+				const key = bufKey(h.network, h.buffer);
+				// A hash target not in the sidebar yet — a notification tap
+				// racing reconnect discovery of a brand-new PM — gets a
+				// placeholder like navigate() makes, or the default-pick
+				// effect would discard the selection before get_buffers
+				// finds the real buffer.
+				setBuffers((b) => (b[key] ? b : { ...b, [key]: makeBuffer(h.network, h.buffer) }));
+				setActiveKey(key);
 			}
 		};
 		globalThis.addEventListener("hashchange", onHash);

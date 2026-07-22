@@ -212,6 +212,16 @@ func (s *Sender) auth(endpoint string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Bound the cache: origins accumulate across register/prune cycles
+	// (the live-subscription cap does not retire dead origins' entries).
+	// Reset-when-full beats LRU bookkeeping here — regeneration costs one
+	// ECDSA sign, and real deployments see a handful of vendor origins.
+	if len(s.tokens) >= maxCachedOrigins {
+		s.tokens = make(map[string]cachedToken, 4)
+	}
 	s.tokens[origin] = cachedToken{header: header, refresh: now.Add(vapidTokenTTL - time.Hour)}
 	return header, nil
 }
+
+// maxCachedOrigins bounds the VAPID token cache.
+const maxCachedOrigins = 32

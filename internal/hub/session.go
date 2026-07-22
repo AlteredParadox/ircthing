@@ -1456,6 +1456,41 @@ func parseRules(v string) []Rule {
 	return d.Rules
 }
 
+// loadRulesChecked is loadRules distinguishing UNREADABLE (store error
+// or corrupt blob — ok=false) from legitimately absent/empty, so the
+// pusher can keep its last-known-good policy instead of silently
+// adopting an empty one.
+func (h *Hub) loadRulesChecked(ctx context.Context) ([]Rule, bool) {
+	v, err := h.store.Setting(ctx, rulesKey)
+	if err != nil {
+		return nil, false
+	}
+	if v == "" {
+		return nil, true
+	}
+	var d RulesData
+	if err := json.Unmarshal([]byte(v), &d); err != nil {
+		return nil, false
+	}
+	return d.Rules, true
+}
+
+// loadFiltersChecked: same distinction for the ignore/mute lists.
+func (h *Hub) loadFiltersChecked(ctx context.Context) (FiltersData, bool) {
+	v, err := h.store.Setting(ctx, filtersKey)
+	if err != nil {
+		return FiltersData{}, false
+	}
+	if v == "" {
+		return FiltersData{}, true
+	}
+	var d FiltersData
+	if err := json.Unmarshal([]byte(v), &d); err != nil {
+		return FiltersData{}, false
+	}
+	return d, true
+}
+
 func (s *Session) handleGetRules(ctx context.Context, env Envelope) {
 	// Seeded distinguishes never-stored (client may seed from its
 	// localStorage cache) from stored-but-empty (the user deleted every
@@ -1492,6 +1527,7 @@ func (s *Session) handleSetRules(ctx context.Context, env Envelope) {
 	// under the old name; rewrite them so last-write-wins cannot undo
 	// the rename's blob rewrite.
 	renames := s.hub.loadRenameMap(ctx)
+	rewrote := false
 	kept := make([]Rule, 0, len(d.Rules))
 	for _, r := range d.Rules {
 		if len(r.Pattern) > maxRulePatternChars || len(r.Network) > maxRuleNetworkChars || len(r.ID) > maxRuleIDChars {
@@ -1504,7 +1540,10 @@ func (s *Session) handleSetRules(ctx context.Context, env Envelope) {
 		if r.Pattern == "" {
 			continue
 		}
-		r.Network = resolveRenamed(renames, r.Network)
+		if resolved := resolveRenamed(renames, r.Network); resolved != r.Network {
+			r.Network = resolved
+			rewrote = true
+		}
 		kept = append(kept, r)
 	}
 	blob, err := json.Marshal(RulesData{Rules: kept})
@@ -1518,6 +1557,15 @@ func (s *Session) handleSetRules(ctx context.Context, env Envelope) {
 	}
 	s.push(envelope("ok", env.Seq, nil))
 	s.hub.broadcastExcept(s, envelope("rules", 0, RulesData{Rules: kept, Seeded: true}))
+	// The rename map rewrote stale references the WRITER still holds
+	// locally: echo the canonical set back so it re-adopts (its dirty
+	// flag clears on the ok above, so the adopt is not suppressed) —
+	// otherwise this device keeps an obsolete policy until its next
+	// connect. Echoed only when something was rewritten, so a routine
+	// save cannot clobber an editor row mid-typing.
+	if rewrote {
+		s.push(envelope("rules", 0, RulesData{Rules: kept, Seeded: true}))
+	}
 	s.hub.notifyPushConfigChanged()
 }
 
@@ -1570,24 +1618,6 @@ func (h *Hub) saveRenameMap(ctx context.Context, m map[string]string) {
 	if err := h.store.SetSetting(ctx, renamesKey, string(blob)); err != nil {
 		log.Printf("push: storing network rename map: %v", err)
 	}
-}
-
-// recordNetworkRename folds old->new into the map, keeping it
-// flattened (existing entries pointing at old now point at new) and
-// dropping new as a key (that name exists again). Caller holds
-// syncedSettingsMu.
-func (h *Hub) recordNetworkRename(ctx context.Context, oldName, newName string) {
-	m := h.loadRenameMap(ctx)
-	for k, v := range m {
-		if v == oldName {
-			m[k] = newName
-		}
-	}
-	delete(m, newName)
-	if len(m) < maxNetworkRenames {
-		m[oldName] = newName
-	}
-	h.saveRenameMap(ctx, m)
 }
 
 // clearNetworkRename drops name from the map when a network with that
@@ -1659,20 +1689,24 @@ func (s *Session) handleGetFilters(ctx context.Context, env Envelope) {
 // regardless of which device wrote the list), empties dropped, and
 // network keys mapped through the rename map (see renamesKey). A
 // non-empty problem string reports the first violation.
-func canonicalIgnores(in map[string][]string, renames map[string]string) (map[string][]string, string) {
+func canonicalIgnores(in map[string][]string, renames map[string]string) (map[string][]string, string, bool) {
+	rewrote := false
 	out := make(map[string][]string, len(in))
 	for network, nicks := range in {
 		if network == "" || len(nicks) > maxIgnoresPerNetwork {
-			return nil, "bad ignore list"
+			return nil, "bad ignore list", false
 		}
-		network = resolveRenamed(renames, network)
+		if resolved := resolveRenamed(renames, network); resolved != network {
+			network = resolved
+			rewrote = true
+		}
 		kept := make([]string, 0, len(nicks))
 		for _, n := range nicks {
 			if n == "" {
 				continue
 			}
 			if len(n) > maxIgnoreNickChars {
-				return nil, "ignored nick too long"
+				return nil, "ignored nick too long", false
 			}
 			kept = append(kept, strings.ToLower(n))
 		}
@@ -1681,27 +1715,31 @@ func canonicalIgnores(in map[string][]string, renames map[string]string) (map[st
 			out[network] = append(out[network], kept...)
 		}
 	}
-	return out, ""
+	return out, "", rewrote
 }
 
 // canonicalMutes validates the mute list (client bufKey form), dropping
 // empties and mapping the network part through the rename map; a
 // non-empty problem string reports the first violation.
-func canonicalMutes(in []string, renames map[string]string) ([]string, string) {
+func canonicalMutes(in []string, renames map[string]string) ([]string, string, bool) {
+	rewrote := false
 	out := make([]string, 0, len(in))
 	for _, m := range in {
 		if m == "" {
 			continue
 		}
 		if len(m) > maxMuteKeyChars {
-			return nil, "mute key too long"
+			return nil, "mute key too long", false
 		}
 		if network, buffer, ok := strings.Cut(m, "\n"); ok {
-			m = resolveRenamed(renames, network) + "\n" + buffer
+			if resolved := resolveRenamed(renames, network); resolved != network {
+				m = resolved + "\n" + buffer
+				rewrote = true
+			}
 		}
 		out = append(out, m)
 	}
-	return out, ""
+	return out, "", rewrote
 }
 
 // handleSetFilters stores the ignore/mute lists and pushes them to the
@@ -1719,12 +1757,12 @@ func (s *Session) handleSetFilters(ctx context.Context, env Envelope) {
 	s.hub.syncedSettingsMu.Lock()
 	defer s.hub.syncedSettingsMu.Unlock()
 	renames := s.hub.loadRenameMap(ctx)
-	ignores, problem := canonicalIgnores(d.Ignores, renames)
+	ignores, problem, rewroteIg := canonicalIgnores(d.Ignores, renames)
 	if problem != "" {
 		s.push(errEnvelope(env.Seq, "bad_request", problem))
 		return
 	}
-	mutes, problem := canonicalMutes(d.Mutes, renames)
+	mutes, problem, rewroteMu := canonicalMutes(d.Mutes, renames)
 	if problem != "" {
 		s.push(errEnvelope(env.Seq, "bad_request", problem))
 		return
@@ -1742,6 +1780,10 @@ func (s *Session) handleSetFilters(ctx context.Context, env Envelope) {
 	s.push(envelope("ok", env.Seq, nil))
 	canonical.Seeded = true // broadcast only; the stored blob stays Seeded-free
 	s.hub.broadcastExcept(s, envelope("filters", 0, canonical))
+	// Writer echo on rename rewrites — see handleSetRules' rationale.
+	if rewroteIg || rewroteMu {
+		s.push(envelope("filters", 0, canonical))
+	}
 	s.hub.notifyPushConfigChanged()
 }
 
@@ -1756,21 +1798,64 @@ func (s *Session) handleSetFilters(ctx context.Context, env Envelope) {
 func (h *Hub) renameSyncedNetworkRefs(ctx context.Context, oldName, newName string) {
 	h.syncedSettingsMu.Lock()
 	defer h.syncedSettingsMu.Unlock()
-	// Record old->new first: a client that was dirty across this rename
-	// re-pushes old-name references later, and set_rules/set_filters
-	// rewrite them through this map.
-	h.recordNetworkRename(ctx, oldName, newName)
-	changedRules := h.renameRuleRefs(ctx, oldName, newName)
-	changedFilters := h.renameFilterRefs(ctx, oldName, newName)
+	// ALL settings mutations commit in ONE SetSettings transaction: the
+	// rename map (which heals stale writes from dirty clients), the
+	// rewritten rules, and the rewritten filters go together or not at
+	// all — a partial commit could leave rewritten blobs with no healing
+	// map, or vice versa. (The network rename itself commits separately
+	// in ReplaceNetworkConfig before this runs; if the process dies in
+	// the gap, the next stale-client write still heals through the map
+	// once this retries via that client's set_* — the accepted residual.)
+	writes := map[string]string{}
+	renames := h.loadRenameMap(ctx)
+	for k, v := range renames {
+		if v == oldName {
+			renames[k] = newName
+		}
+	}
+	delete(renames, newName)
+	if len(renames) < maxNetworkRenames {
+		renames[oldName] = newName
+	}
+	if blob, err := json.Marshal(renames); err == nil {
+		writes[renamesKey] = string(blob)
+	}
+
+	rules := h.loadRules(ctx)
+	changedRules := rewriteRuleRefs(rules, oldName, newName)
+	if changedRules {
+		if blob, err := json.Marshal(RulesData{Rules: rules}); err == nil {
+			writes[rulesKey] = string(blob)
+		}
+	}
+
+	filters := h.loadFilters(ctx)
+	changedFilters := rewriteFilterRefs(&filters, oldName, newName)
+	if changedFilters {
+		if blob, err := json.Marshal(filters); err == nil {
+			writes[filtersKey] = string(blob)
+		}
+	}
+
+	if err := h.store.SetSettings(ctx, writes); err != nil {
+		log.Printf("network %q -> %q: rewriting synced settings: %v", oldName, newName, err)
+		return
+	}
+	if changedRules {
+		h.broadcast(envelope("rules", 0, RulesData{Rules: rules, Seeded: true}))
+	}
+	if changedFilters {
+		filters.Seeded = true
+		h.broadcast(envelope("filters", 0, filters))
+	}
 	if changedRules || changedFilters {
 		h.notifyPushConfigChanged()
 	}
 }
 
-// renameRuleRefs rewrites rule scopes from oldName to newName, storing
-// and broadcasting the result; reports whether anything changed.
-func (h *Hub) renameRuleRefs(ctx context.Context, oldName, newName string) bool {
-	rules := h.loadRules(ctx)
+// rewriteRuleRefs rewrites rule scopes from oldName to newName in place;
+// reports whether anything changed.
+func rewriteRuleRefs(rules []Rule, oldName, newName string) bool {
 	changed := false
 	for i := range rules {
 		if rules[i].Network == oldName {
@@ -1778,26 +1863,12 @@ func (h *Hub) renameRuleRefs(ctx context.Context, oldName, newName string) bool 
 			changed = true
 		}
 	}
-	if !changed {
-		return false
-	}
-	blob, err := json.Marshal(RulesData{Rules: rules})
-	if err != nil {
-		return false
-	}
-	if err := h.store.SetSetting(ctx, rulesKey, string(blob)); err != nil {
-		log.Printf("network %q -> %q: rewriting highlight rules: %v", oldName, newName, err)
-		return false
-	}
-	h.broadcast(envelope("rules", 0, RulesData{Rules: rules, Seeded: true}))
-	return true
+	return changed
 }
 
-// renameFilterRefs rewrites the ignore map key and mute bufKey prefixes
-// from oldName to newName, storing and broadcasting the result; reports
-// whether anything changed.
-func (h *Hub) renameFilterRefs(ctx context.Context, oldName, newName string) bool {
-	d := h.loadFilters(ctx)
+// rewriteFilterRefs rewrites the ignore map key and mute bufKey prefixes
+// from oldName to newName in place; reports whether anything changed.
+func rewriteFilterRefs(d *FiltersData, oldName, newName string) bool {
 	changed := false
 	if nicks, ok := d.Ignores[oldName]; ok {
 		delete(d.Ignores, oldName)
@@ -1813,20 +1884,7 @@ func (h *Hub) renameFilterRefs(ctx context.Context, oldName, newName string) boo
 			changed = true
 		}
 	}
-	if !changed {
-		return false
-	}
-	blob, err := json.Marshal(d)
-	if err != nil {
-		return false
-	}
-	if err := h.store.SetSetting(ctx, filtersKey, string(blob)); err != nil {
-		log.Printf("network %q -> %q: rewriting filters: %v", oldName, newName, err)
-		return false
-	}
-	d.Seeded = true
-	h.broadcast(envelope("filters", 0, d))
-	return true
+	return changed
 }
 
 // markreadTimeLayout is the server-time format used by MARKREAD

@@ -124,15 +124,20 @@ export async function syncPushOnLoad(publicKey) {
 		// can never verify again. Rebind without prompting — permission
 		// is already granted.
 		await sub.unsubscribe().catch(() => {});
+		let fresh = null;
 		try {
 			const reg = await navigator.serviceWorker.ready;
-			const fresh = await reg.pushManager.subscribe({
+			fresh = await reg.pushManager.subscribe({
 				userVisibleOnly: true,
 				applicationServerKey: urlB64ToBytes(publicKey),
 			});
 			await postJSON("/api/push/subscribe", fresh.toJSON());
 		} catch {
-			// Re-enable from settings if this fails; push stays off.
+			// The server never learned about the fresh subscription: a
+			// dangling browser-side one would push nowhere but block a
+			// clean re-enable from settings. Re-enable if wanted; push
+			// stays off meanwhile.
+			await fresh?.unsubscribe().catch(() => {});
 		}
 		return;
 	}

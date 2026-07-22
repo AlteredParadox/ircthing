@@ -113,6 +113,31 @@ func TestPushSubscribeFlow(t *testing.T) {
 	}
 }
 
+// TestPasswordRotationWipesPushSubscriptions: rotation is the
+// compromise-recovery action, and a stolen session may have planted an
+// attacker-controlled endpoint — every subscription dies with the
+// sessions. Legitimate devices re-register on their next
+// (re-authenticated) app open via the client's on-load resync.
+func TestPasswordRotationWipesPushSubscriptions(t *testing.T) {
+	ts, h := newTestServer(t)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	ctx := context.Background()
+
+	if resp := pushPost(t, ts, cookie, "/api/push/subscribe", testSubscriptionJSON(t, "https://push.example/planted")); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("subscribe = %d", resp.StatusCode)
+	}
+	if n, _ := h.Store().CountPushSubscriptions(ctx); n != 1 {
+		t.Fatalf("subscriptions before rotation = %d", n)
+	}
+
+	if resp := pushPost(t, ts, cookie, "/api/password", `{"current":"hunter2","new":"correct horse battery"}`); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("password change = %d", resp.StatusCode)
+	}
+	if n, _ := h.Store().CountPushSubscriptions(ctx); n != 0 {
+		t.Fatalf("subscriptions after rotation = %d, want 0", n)
+	}
+}
+
 func TestClientConfigCarriesPushKey(t *testing.T) {
 	ts, _ := newTestServer(t)
 	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))

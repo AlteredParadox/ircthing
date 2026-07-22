@@ -488,11 +488,14 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 		// Retire THIS device's push subscription first, while the session
 		// cookie still works: signing out must stop the notification tray
 		// from receiving sender names and message text — a signed-out
-		// shared machine kept getting PMs otherwise. Best effort: browser-
-		// side removal wins even if the server POST fails (the dead
-		// endpoint 404/410s and prunes on the next delivery), and an
-		// unsubscribe failure must not block signing out.
-		await unsubscribePush().catch(() => {});
+		// shared machine kept getting PMs otherwise. Best effort AND
+		// time-bounded: unsubscribePush awaits serviceWorker.ready, which
+		// never settles when registration failed — logout must reach the
+		// server regardless.
+		await Promise.race([
+			unsubscribePush(),
+			new Promise((resolve) => setTimeout(resolve, 3000)),
+		]).catch(() => {});
 		try {
 			const r = await fetch("/api/logout", { method: "POST" });
 			if (!r.ok) throw new Error("logout failed: HTTP " + r.status);

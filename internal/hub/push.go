@@ -19,10 +19,13 @@ package hub
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -172,6 +175,18 @@ func (h *Hub) loadOrCreateVapidKey(ctx context.Context) (*ecdsa.PrivateKey, erro
 	if err := h.store.SetSetting(ctx, vapidKeyKey, marshaled); err != nil {
 		return nil, err
 	}
+	// Subscriptions bound to a replaced key are cryptographically dead:
+	// the push service rejects the new VAPID signature with 401/403 —
+	// which never prunes (only 404/410 do) — so they would fail forever
+	// AND squat the subscription cap. Wipe them; devices re-subscribe on
+	// next load (the client detects the applicationServerKey change).
+	if n, cerr := h.store.CountPushSubscriptions(ctx); cerr == nil && n > 0 {
+		if derr := h.store.DeleteAllPushSubscriptions(ctx); derr != nil {
+			log.Printf("push: clearing subscriptions for replaced VAPID key: %v", derr)
+		} else {
+			log.Printf("push: cleared %d subscription(s) bound to the replaced VAPID key", n)
+		}
+	}
 	return priv, nil
 }
 
@@ -275,12 +290,25 @@ func (h *Hub) notifyPushCancel(network, buffer, msgid string) {
 
 // runPusher is the scheduler loop; sole owner of pending-push state and
 // the rules cache.
+// maxConcurrentDeliveries bounds the delivery goroutines fireDuePushes
+// spawns: enough to keep one slow push service (15s client timeout) from
+// serializing everything behind it, small enough to stay irrelevant
+// under GOMEMLIMIT.
+const maxConcurrentDeliveries = 4
+
 func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Duration) {
-	rules := h.loadRules(ctx)
-	filters := buildPushFilters(h.loadFilters(ctx))
+	rules, filters := h.reloadPushConfig(ctx, nil, pushFilters{})
 	pending := make(map[string]*pendingPush) // network+"\x00"+buffer
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
+	// Deliveries run OFF this goroutine (an entry removed from pending is
+	// exclusively owned, and store/sender accesses are all mutex-guarded),
+	// so a slow push service cannot stall marker cancels, redaction
+	// scrubs, or mute sweeps for the other buffers. Bounded by sem;
+	// drained before returning so shutdown still beats store close.
+	var deliveries sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrentDeliveries)
+	defer deliveries.Wait()
 	for {
 		select {
 		case <-ctx.Done():
@@ -304,8 +332,7 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 			}
 
 		case <-h.pushConfigDirty:
-			rules = h.loadRules(ctx)
-			filters = buildPushFilters(h.loadFilters(ctx))
+			rules, filters = h.reloadPushConfig(ctx, rules, filters)
 			// Muting a buffer, ignoring its latest pinger, or deleting a
 			// (half-typed) keyword mid-window is exactly when the user
 			// expects silence: re-apply the new config to what is
@@ -315,10 +342,31 @@ func (h *Hub) runPusher(ctx context.Context, sender PushSender, delay time.Durat
 			}
 
 		case <-timer.C:
-			h.fireDuePushes(ctx, sender, pending)
+			h.fireDuePushes(ctx, sender, pending, &deliveries, sem)
 			rearmPushTimer(timer, pending)
 		}
 	}
+}
+
+// reloadPushConfig loads the rules and filters, KEEPING the previous
+// values when a stored blob is unreadable: a corrupt filters blob
+// silently becoming "nothing filtered" would push exactly the content
+// the user suppressed. prev may be nil/zero on first load (nothing to
+// keep — absent settings legitimately mean empty).
+func (h *Hub) reloadPushConfig(ctx context.Context, prevRules []Rule, prevFilters pushFilters) ([]Rule, pushFilters) {
+	rules := prevRules
+	if r, ok := h.loadRulesChecked(ctx); ok {
+		rules = r
+	} else {
+		log.Printf("push: keeping previous highlight rules (stored blob unreadable)")
+	}
+	filters := prevFilters
+	if f, ok := h.loadFiltersChecked(ctx); ok {
+		filters = buildPushFilters(f)
+	} else {
+		log.Printf("push: keeping previous ignore/mute filters (stored blob unreadable)")
+	}
+	return rules, filters
 }
 
 // applyPushCancel applies one pushCancel to the pending map; reports
@@ -410,7 +458,7 @@ func admitCandidate(pending map[string]*pendingPush, c pushCandidate, rules []Ru
 		return false
 	}
 	if len(pending) >= maxPendingPushes {
-		log.Printf("push: pending cap reached, dropping highlight in %s/%s", c.network, c.buffer)
+		log.Printf("push: pending cap reached, dropping highlight in %s/%.60q", c.network, c.buffer)
 		return false
 	}
 	pending[key] = &pendingPush{
@@ -437,15 +485,27 @@ func rearmPushTimer(timer *time.Timer, pending map[string]*pendingPush) {
 	}
 }
 
-// fireDuePushes delivers every pending push whose deadline has passed.
-func (h *Hub) fireDuePushes(ctx context.Context, sender PushSender, pending map[string]*pendingPush) {
+// fireDuePushes hands every due pending push to a bounded delivery
+// goroutine. Deleting the entry FIRST transfers exclusive ownership of
+// *p to its delivery; the scheduler loop never touches it again.
+func (h *Hub) fireDuePushes(ctx context.Context, sender PushSender, pending map[string]*pendingPush, deliveries *sync.WaitGroup, sem chan struct{}) {
 	now := time.Now()
 	for key, p := range pending {
 		if p.fireAt.After(now) {
 			continue
 		}
 		delete(pending, key)
-		h.deliverPush(ctx, sender, key, p)
+		deliveries.Add(1)
+		go func(key string, p *pendingPush) {
+			defer deliveries.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			h.deliverPush(ctx, sender, key, p)
+		}(key, p)
 	}
 }
 
@@ -496,8 +556,12 @@ func (f pushFilters) drops(network, buffer, sender string) bool {
 // SCRUB p's headline (coalesced redaction) as a side effect.
 func (h *Hub) pushStillDue(ctx context.Context, network, buffer string, p *pendingPush) bool {
 	// Read marker: covers marker writes whose channel send was dropped
-	// AND upstream MARKREAD from other bouncer clients.
-	if t, err := h.store.ReadMarker(ctx, network, buffer); err == nil && !t.IsZero() && t.UnixMilli() >= p.newestTS {
+	// AND upstream MARKREAD from other bouncer clients. A read ERROR
+	// fails open (deliver): a possibly-already-read notification is an
+	// annoyance, an eaten one defeats the feature — but log it.
+	if t, err := h.store.ReadMarker(ctx, network, buffer); err != nil {
+		log.Printf("push: read-marker re-check for %.60q: %v", buffer, err)
+	} else if !t.IsZero() && t.UnixMilli() >= p.newestTS {
 		return false
 	}
 	// The buffer may have been purged OR archived after scheduling. A
@@ -510,16 +574,25 @@ func (h *Hub) pushStillDue(ctx context.Context, network, buffer string, p *pendi
 	if err != nil {
 		// Fail closed (skip the push) but never silently: a transient
 		// store error here eats a notification.
-		log.Printf("push: checking buffer %s/%s: %v", network, buffer, err)
+		log.Printf("push: checking buffer %s/%.60q: %v", network, buffer, err)
 		return false
 	}
 	if !found || archived {
 		return false
 	}
 	// Redaction of the headlining message: a sole redacted message has
-	// nothing left to say; coalesced siblings deliver, scrubbed.
+	// nothing left to say; coalesced siblings deliver, scrubbed. Unlike
+	// the marker check this fails CLOSED on error — indeterminate
+	// redaction state must not leak content the store may have
+	// destroyed; the cost is one eaten notification on a transient
+	// store error.
 	if p.msgid != "" {
-		if redacted, err := h.store.MessageRedacted(ctx, network, buffer, p.msgid); err == nil && redacted {
+		redacted, err := h.store.MessageRedacted(ctx, network, buffer, p.msgid)
+		if err != nil {
+			log.Printf("push: redaction re-check for %.60q: %v (suppressing)", buffer, err)
+			return false
+		}
+		if redacted {
 			if p.count == 1 {
 				return false
 			}
@@ -557,7 +630,7 @@ func (h *Hub) deliverPush(ctx context.Context, sender PushSender, key string, p 
 	// must be skipped HERE, once — Encrypt would reject it per
 	// subscription, and that failure must never look prune-worthy.
 	if len(payload) > webpush.MaxPlaintext {
-		log.Printf("push: payload for %s/%s is %d bytes (limit %d), skipping", network, buffer, len(payload), webpush.MaxPlaintext)
+		log.Printf("push: payload for %s/%.60q is %d bytes (limit %d), skipping", network, buffer, len(payload), webpush.MaxPlaintext)
 		return
 	}
 	for _, sub := range subs {
@@ -584,7 +657,7 @@ func (h *Hub) pushToSubscription(ctx context.Context, sender PushSender, sub sto
 		if errors.Is(err, webpush.ErrBadKeys) {
 			h.prunePushSubscription(ctx, sub.Endpoint, err)
 		} else {
-			log.Printf("push: encrypting for %s: %v", sub.Endpoint, err)
+			log.Printf("push: encrypting for %s: %v", redactEndpoint(sub.Endpoint), err)
 		}
 		return
 	}
@@ -598,12 +671,31 @@ func (h *Hub) pushToSubscription(ctx context.Context, sender PushSender, sub sto
 	default:
 		// Transient (network, 5xx, 429): no retry — the push service
 		// owns redelivery, and the next highlight tries again.
-		log.Printf("push: delivering to %s: %v", sub.Endpoint, err)
+		log.Printf("push: delivering to %s: %s", redactEndpoint(sub.Endpoint), scrubEndpoint(err, sub.Endpoint))
 	}
 }
 
+// redactEndpoint reduces a push endpoint to origin + a short digest for
+// logging: the path is a capability URL (holding it plus the VAPID key
+// delivers to the device), and full endpoints also ride inside wrapped
+// url.Error strings — scrub those too via scrubEndpoint.
+func redactEndpoint(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "endpoint(unparseable)"
+	}
+	sum := sha256.Sum256([]byte(endpoint))
+	return u.Scheme + "://" + u.Host + "/#" + hex.EncodeToString(sum[:4])
+}
+
+// scrubEndpoint removes the raw endpoint from an error's text (url.Error
+// embeds the full request URL).
+func scrubEndpoint(err error, endpoint string) string {
+	return strings.ReplaceAll(err.Error(), endpoint, "<endpoint>")
+}
+
 func (h *Hub) prunePushSubscription(ctx context.Context, endpoint string, cause error) {
-	log.Printf("push: dropping subscription %s: %v", endpoint, cause)
+	log.Printf("push: dropping subscription %s: %s", redactEndpoint(endpoint), scrubEndpoint(cause, endpoint))
 	if err := h.store.DeletePushSubscription(ctx, endpoint); err != nil {
 		log.Printf("push: dropping subscription: %v", err)
 		return
