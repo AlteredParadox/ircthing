@@ -54,20 +54,26 @@ scrollback runs in ~32 MB of RSS.
   activity or a rejoin); a settings toggle makes closing delete
   instead, behind a confirmation.
 - **Multi-device**: read markers, unread counts, appearance
-  preferences, and highlight keywords sync through the server;
-  `draft/read-marker` bridges read state to other bouncer clients.
+  preferences, highlight keywords, and ignore/mute lists sync through
+  the server; `draft/read-marker` bridges read state to other bouncer
+  clients. Deleting a rule or un-ignoring someone propagates too — a
+  device that was asleep adopts the deletion instead of resurrecting
+  its stale copy.
 - **Web Push**: the server notifies your devices about highlights and
   private messages even with the app closed — including iOS home-screen
   PWAs (iOS 16.4+, delivered via APNs), where a backgrounded WebSocket
-  cannot survive. A push waits ~20 s and is cancelled if any device
-  reads the buffer first; per-buffer coalescing keeps a busy channel to
-  one notification. Payloads are end-to-end encrypted (RFC 8291), keys
-  are provisioned automatically (no Apple/Google account or
-  configuration needed), and enabling it is a per-device toggle in
-  settings. Requires HTTPS (the reverse proxy you already have); on
-  iOS, add the app to the Home Screen first. Ignore and mute lists sync
-  through the server and are honored for push too — an ignored sender
-  or muted buffer never buzzes your phone.
+  cannot survive. A push waits ~20 s and is cancelled by anything that
+  makes it moot: any device reading the buffer, muting it or ignoring
+  the sender, closing the buffer, or the message being redacted (a
+  deleted message never reaches a notification tray). Per-buffer
+  coalescing keeps a busy channel to one notification, and tapping it
+  opens the right conversation whether the app was open, suspended, or
+  killed — reopening the app also restores your last-viewed buffer,
+  which iOS otherwise forgets. Payloads are end-to-end encrypted
+  (RFC 8291), keys are provisioned automatically (no Apple/Google
+  account or configuration needed), and enabling it is a per-device
+  toggle in settings. Requires HTTPS (the reverse proxy you already
+  have); on iOS, add the app to the Home Screen first.
 - **Theming**: dark/light/system, accent colors, text size, density,
   message font — plus a raw custom-CSS override. Usable at 360 px wide;
   installable as a PWA.
