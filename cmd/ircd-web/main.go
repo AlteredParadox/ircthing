@@ -34,6 +34,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -97,6 +98,43 @@ func flagPassed(name string) bool {
 	return set
 }
 
+// version is stamped by the Makefile (-X main.version=git describe);
+// empty when built without make (go install, go build).
+var version string
+
+// effectiveVersion prefers the Makefile stamp and falls back to the
+// buildinfo VCS revision — the same source /source pins to — so the
+// settings About line always shows SOMETHING attributable. A dirty
+// unstamped build says so rather than claiming a commit.
+func effectiveVersion() string {
+	if version != "" {
+		return version
+	}
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	rev, dirty := "", false
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if rev == "" {
+		return "unknown"
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	if dirty {
+		rev += "-dirty"
+	}
+	return rev
+}
+
 // logStartupWarnings surfaces misconfiguration that is worth a log line
 // but not a refusal to start. Retention warns on the EFFECTIVE value,
 // not the config file: the settings table (runtime-set via the UI) is
@@ -152,6 +190,7 @@ func run(cfg *config) error {
 		SecureCookies:       cfg.SecureCookies,
 		PreviewsDefault:     cfg.previewsDefault(),
 		TrustProxyForwarded: cfg.BehindProxy,
+		Version:             effectiveVersion(),
 	}, h, assets)
 	if err != nil {
 		return err

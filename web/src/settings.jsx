@@ -339,6 +339,7 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 	const [retention, setRetention] = useState(null); // { days, max } | null
 	const [sessionDays, setSessionDays] = useState(null); // login cookie lifetime
 	const [pushKey, setPushKey] = useState(null); // VAPID key; null loading, "" none
+	const [about, setAbout] = useState(null); // { version, rss } from /api/config
 
 	useEffect(() => {
 		const onKey = (e) => e.key === "Escape" && onClose();
@@ -381,6 +382,12 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 			}
 			// Read-only (no save path), so no generation guard needed.
 			if (alive) setPushKey(typeof d.push_public_key === "string" ? d.push_public_key : "");
+			if (alive) {
+				setAbout({
+					version: typeof d.version === "string" ? d.version : "",
+					rss: typeof d.memory_rss_bytes === "number" ? d.memory_rss_bytes : 0,
+				});
+			}
 		});
 		return () => {
 			alive = false;
@@ -910,6 +917,13 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 
 					<section class="settings-section">
 						<div class="settings-label">About</div>
+						{about && (about.version || about.rss > 0) && (
+							<div class="settings-note about-build">
+								{about.version && <span>ircthing {about.version}</span>}
+								{about.version && about.rss > 0 && <span> · </span>}
+								{about.rss > 0 && <span>{(about.rss / (1024 * 1024)).toFixed(1)} MB memory in use</span>}
+							</div>
+						)}
 						<div class="settings-note">
 							ircthing is free software, licensed under the{" "}
 							<a href="/license" target="_blank" rel="noopener noreferrer">

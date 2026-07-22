@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"ircthing/internal/proxydial"
@@ -107,6 +109,8 @@ func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
 		RetentionMaxMessages int    `json:"retention_max_messages"`
 		SessionTTLDays       int    `json:"session_ttl_days"`
 		PushPublicKey        string `json:"push_public_key"`
+		Version              string `json:"version"`
+		MemoryRSSBytes       int64  `json:"memory_rss_bytes"`
 	}{
 		Previews:             s.previewsEnabled(),
 		RetentionDays:        days,
@@ -115,7 +119,38 @@ func (s *Server) handleClientConfig(w http.ResponseWriter, r *http.Request) {
 		// The VAPID applicationServerKey; "" until the pusher has
 		// provisioned one (client treats that as push-unavailable).
 		PushPublicKey: s.hub.PushPublicKey(),
+		Version:       s.cfg.Version,
+		// Sampled per request: the settings panel fetches this on every
+		// open, so the About line shows a current number. 0 (unreadable
+		// /proc, non-linux) hides the line client-side.
+		MemoryRSSBytes: currentRSSBytes(),
 	})
+}
+
+// currentRSSBytes reads the process's resident set from /proc/self/status
+// (VmRSS, in kB). Linux-only by design — that is the deployment target
+// and the platform the 72 MB RSS budget is defined on; elsewhere (or on
+// any parse failure) it reports 0 and the UI omits the line.
+func currentRSSBytes() int64 {
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "VmRSS:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		kb, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return 0
+		}
+		return kb * 1024
+	}
+	return 0
 }
 
 // configPatch is a PUT /api/config body. Pointer fields so a PUT can update

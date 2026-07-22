@@ -2226,7 +2226,7 @@ export function App() {
 				<Sidebar
 					networks={networks} buffers={buffers} activeKey={activeKey}
 					monitors={monitors} truncated={buffersTruncated}
-					theme={theme} mutedSet={mutedSet} onSelect={select}
+					mutedSet={mutedSet} onSelect={select}
 					onSettings={() => setSettingsOpen(true)}
 					onBufferMenu={openBufferMenu} onNetworkMenu={openNetworkMenu}
 					onAddNetwork={openNewNetwork}

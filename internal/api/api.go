@@ -76,6 +76,9 @@ type Config struct {
 	// media fetches) unless the config explicitly enables them. Editable at
 	// runtime via /api/config, which then wins.
 	PreviewsDefault bool
+	// Version is the build identity shown in the settings About section
+	// (Makefile git-describe stamp, or the VCS revision fallback).
+	Version string
 	// TrustProxyForwarded makes the login backoff key on the X-Real-IP /
 	// X-Forwarded-For client address instead of the (shared) proxy RemoteAddr.
 	// Enable ONLY behind a trusted reverse proxy that sets those headers — a

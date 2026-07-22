@@ -522,53 +522,30 @@ input::placeholder {
 	gap: 10px;
 }
 
-.avatar-wrap {
-	position: relative;
-	flex: 0 0 auto;
-}
-
-.avatar {
-	width: 30px;
-	height: 30px;
-	border-radius: 8px;
+.foot-settings {
+	flex: 1;
 	display: flex;
 	align-items: center;
 	justify-content: center;
-	color: #0e1015;
-	font-family: var(--mono-font);
-	font-weight: 700;
-	font-size: 0.9286rem;
-}
-
-.foot-dot {
-	position: absolute;
-	right: -2px;
-	bottom: -2px;
-	width: 11px;
-	height: 11px;
-	border-radius: 50%;
-	border: 2px solid var(--panel);
-}
-
-.foot-dot.online { background: var(--online); }
-.foot-dot.offline { background: var(--offline); }
-
-.foot-id {
-	min-width: 0;
-}
-
-.foot-nick {
-	font-weight: 600;
-	font-size: 0.9286rem;
-	white-space: nowrap;
-	overflow: hidden;
-	text-overflow: ellipsis;
-}
-
-.foot-state {
-	font-family: var(--mono-font);
-	font-size: 0.7857rem;
+	gap: 8px;
+	padding: 8px 10px;
+	border: 1px solid var(--border);
+	background: var(--panel-2);
+	border-radius: 8px;
 	color: var(--text-dim);
+	font-size: 0.9286rem;
+	font-weight: 600;
+	cursor: pointer;
+}
+
+.foot-settings:hover {
+	color: var(--text);
+	border-color: var(--accent);
+}
+
+.foot-settings-gear {
+	font-size: 1.071rem;
+	line-height: 1;
 }
 
 /* ---- topbar ---- */
@@ -1984,21 +1961,6 @@ input::placeholder {
 	border-color: var(--text-faint);
 }
 
-.foot-gear {
-	margin-left: auto;
-	border: none;
-	background: transparent;
-	color: var(--text-faint);
-	font-size: 1.143rem;
-	cursor: pointer;
-	padding: 4px;
-	line-height: 1;
-}
-
-.foot-gear:hover {
-	color: var(--text);
-}
-
 /* Flash a jumped-to message briefly. */
 .msg-row.flash,
 .sys-row.flash {
@@ -2206,7 +2168,7 @@ input::placeholder {
 	}
 
 	.monitor-addbtn,
-	.foot-gear,
+	.foot-settings,
 	.msg-redact,
 	.monitor-remove,
 	.rule-remove {

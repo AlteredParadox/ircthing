@@ -17,7 +17,7 @@
 import { useRef, useState } from "preact/hooks";
 import { pressable } from "./a11y.js";
 import { longPress } from "./menu.jsx";
-import { bufKey, nickColor, SERVER_BUFFER } from "./irc.js";
+import { bufKey, SERVER_BUFFER } from "./irc.js";
 import { BufIcon } from "./icons.jsx";
 
 function stateDot(state) {
@@ -26,7 +26,7 @@ function stateDot(state) {
 	return "offline";
 }
 
-export function Sidebar({ networks, buffers, activeKey, monitors, truncated, theme, mutedSet, onSelect, onSettings, onBufferMenu, onNetworkMenu, onAddNetwork, onAddMonitor, onRemoveMonitor }) {
+export function Sidebar({ networks, buffers, activeKey, monitors, truncated, mutedSet, onSelect, onSettings, onBufferMenu, onNetworkMenu, onAddNetwork, onAddMonitor, onRemoveMonitor }) {
 	// One shared flag: a long-press that opened a menu suppresses the tap
 	// that follows it. pressTimer holds the pending hold timer across
 	// re-renders (see longPress) so a mid-hold re-render can't orphan it.
@@ -47,8 +47,6 @@ export function Sidebar({ networks, buffers, activeKey, monitors, truncated, the
 			.sort((a, b) => a.buffer.localeCompare(b.buffer)),
 		server: buffers[bufKey(name, SERVER_BUFFER)],
 	}));
-	const me = sections.map((s) => s.nick).find(Boolean) || "";
-	const online = Object.values(networks).some((n) => n.state === "registered");
 
 	return (
 		<div class="side-inner">
@@ -147,17 +145,13 @@ export function Sidebar({ networks, buffers, activeKey, monitors, truncated, the
 				))}
 			</div>
 			<div class="side-foot">
-				<div class="avatar-wrap">
-					<div class="avatar" style={{ background: me ? nickColor(me, theme) : "var(--elev)" }}>
-						{(me[0] || "?").toUpperCase()}
-					</div>
-					<span class={"foot-dot " + (online ? "online" : "offline")} />
-				</div>
-				<div class="foot-id">
-					<div class="foot-nick">{me || "—"}</div>
-					<div class="foot-state">{online ? "online" : "offline"}</div>
-				</div>
-				<button class="foot-gear" title="Settings" onClick={onSettings}>⚙</button>
+				{/* No avatar/nick/status chip: the composer already shows the
+				    current nick, and per-network state lives on the network
+				    headers — one wide settings affordance instead. */}
+				<button class="foot-settings" onClick={onSettings}>
+					<span class="foot-settings-gear" aria-hidden="true">⚙</span>
+					Settings
+				</button>
 			</div>
 		</div>
 	);

@@ -3,7 +3,12 @@
 
 GO            ?= go
 BIN           := bin/ircd-web
-GOFLAGS       := -trimpath -ldflags="-s -w"
+# VERSION stamps the binary (settings About + /api/config): the nearest
+# tag with distance/hash when past it, and -dirty on an unclean tree.
+# Falls back to the VCS buildinfo revision (main.effectiveVersion) when
+# built without make.
+VERSION       := $(shell git describe --tags --always --dirty 2>/dev/null)
+GOFLAGS       := -trimpath -ldflags="-s -w -X main.version=$(VERSION)"
 # staticcheck is run via `go run` (pinned) so it needs no global install
 # and stays out of go.mod. GOTOOLCHAIN pins its build to the same Go
 # version the module resolves, or it refuses to analyze the module.
