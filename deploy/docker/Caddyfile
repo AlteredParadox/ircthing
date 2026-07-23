@@ -1,15 +1,18 @@
 # Caddy config for the ircthing compose stack.
 #
-# {$IRCTHING_DOMAIN} and {$ACME_EMAIL} come from the environment (see the
-# compose file / .env). With a real public domain and ports 80+443 reachable,
-# Caddy obtains and renews a Let's Encrypt certificate automatically.
+# {$IRCTHING_DOMAIN} comes from the environment (see the compose file / .env).
+# With a real public domain and ports 80+443 reachable, Caddy obtains and
+# renews a Let's Encrypt certificate automatically — no email required (you
+# just won't get expiry-notice mail). To register a contact address for those
+# notices, uncomment the global block below and set ACME_EMAIL in .env. Do NOT
+# leave a bare `email` directive with an empty value — Caddy refuses to start.
 #
 # For a LAN / no-public-DNS test, set IRCTHING_DOMAIN=localhost — Caddy then
 # serves its own internal CA cert (your browser will warn; that's expected).
 
-{
-	email {$ACME_EMAIL}
-}
+# {
+# 	email {$ACME_EMAIL}
+# }
 
 {$IRCTHING_DOMAIN} {
 	encode zstd gzip
