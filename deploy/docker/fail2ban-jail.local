@@ -23,11 +23,6 @@ filter   = ircthing
 # Match only ircthing's container log stream in the journal.
 journalmatch = CONTAINER_NAME=ircthing
 
-# Ban TCP *and* UDP: Caddy publishes 443/udp for HTTP/3 (QUIC), so a TCP-only
-# ban (fail2ban's default) would leave a banned client free to continue over
-# QUIC. (If you disable HTTP/3 by dropping the 443/udp publish, tcp suffices.)
-protocol = all
-
 maxretry = 5
 findtime = 10m
 bantime  = 1h
@@ -39,6 +34,13 @@ bantime.maxtime   = 1w
 # DOCKER-USER chain, bypassing INPUT — so fail2ban's default INPUT rules would
 # never block them. Inserting into DOCKER-USER (which Docker guarantees is
 # evaluated before its own forwarding rules) makes the ban actually take.
-# On a pure-nftables host without iptables-nft compat, swap this for the
-# nftables action and add an equivalent hook; see the README.
-action = iptables-allports[name=ircthing, chain=DOCKER-USER, protocol=all]
+#
+# One allports action per protocol. allports (unlike the distro-default
+# multiport banaction) takes no port list, so an explicit single protocol is
+# valid — `-p all -m multiport` is NOT, so a single protocol=all action fails
+# at ban time. TCP covers HTTPS; UDP covers Caddy's 443/udp HTTP/3 (QUIC) — a
+# TCP-only ban would leave a banned client free over QUIC (drop the udp line if
+# you disable HTTP/3). On a pure-nftables host without iptables-nft compat,
+# swap iptables-allports -> nftables-allports; see the README.
+action = iptables-allports[name=ircthing, chain=DOCKER-USER, protocol=tcp]
+         iptables-allports[name=ircthing-udp, chain=DOCKER-USER, protocol=udp]

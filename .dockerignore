@@ -13,13 +13,14 @@ bin/
 # Secrets and local runtime state — never bake these into an image. Recursive
 # (**/) so nested copies (e.g. deploy/docker/config.json, deploy/docker/.env)
 # are excluded too, not just the ones at the context root.
-**/config.json
+**/config.json*
 **/.env
 **/*.db
 **/*.db-wal
 **/*.db-shm
 **/*.key
 **/*.pem
+**/*.bak
 *.log
 *.pid
 

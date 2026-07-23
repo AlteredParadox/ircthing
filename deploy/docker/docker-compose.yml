@@ -45,7 +45,7 @@ services:
       - ALL
     read_only: true
     tmpfs:
-      - /tmp
+      - /tmp:noexec,nosuid,nodev
     mem_limit: 128m
     pids_limit: 256
     volumes:
@@ -62,9 +62,14 @@ services:
     depends_on:
       - ircthing
     ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"   # HTTP/3 (QUIC)
+      # Bind IPv4 explicitly. Docker's default (no host IP) ALSO binds ::, but
+      # the bridge is IPv4-only, so an IPv6 client would be relayed through the
+      # userland proxy and arrive as the docker gateway address — masking the
+      # real client and breaking per-source rate-limiting and fail2ban bans. To
+      # serve real IPv6, enable ip6 on the bridge and re-verify source logging.
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+      - "0.0.0.0:443:443/udp"   # HTTP/3 (QUIC)
     environment:
       - IRCTHING_DOMAIN=${IRCTHING_DOMAIN:?set IRCTHING_DOMAIN in .env}
       - ACME_EMAIL=${ACME_EMAIL:-}
@@ -76,6 +81,12 @@ services:
       - ALL
     cap_add:
       - NET_BIND_SERVICE
+    # Read-only root: the official Caddy image runs as root with no USER, so a
+    # compromise could otherwise rewrite the image filesystem until restart.
+    # /data and /config are writable volumes; /tmp is a bounded tmpfs.
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,nodev
     mem_limit: 128m
     pids_limit: 256
     volumes:

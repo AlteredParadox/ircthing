@@ -29,17 +29,21 @@ From this directory:
 cp .env.example .env                 # set IRCTHING_DOMAIN + ACME_EMAIL
 cp config.example.json config.json   # your networks live here
 
-# The config holds credentials (SASL, proxy, WireGuard keys). Restrict it to
-# root + the container user (uid 10001) so other host users cannot read it —
-# the read-only bind mount needs it readable by 10001, not world:
-sudo chown 10001:10001 config.json && chmod 600 config.json
-
 # Generate the login password hash with the image itself (-it: the prompt
 # reads from an interactive terminal — without it stdin is closed and the
 # read fails):
 docker compose build ircthing
 docker run --rm -it ircthing:local -hash-password
-# paste the hash into config.json -> user.password_hash
+# paste the hash into config.json -> user.password_hash, and finish editing
+# your networks now, WHILE you still own the file.
+
+# The config holds credentials (SASL, proxy, WireGuard keys). Once editing is
+# done, restrict it to root + the container user (uid 10001) so other host
+# users cannot read it. Both commands need sudo — after the chown you no
+# longer own the file. (The read-only bind mount needs it readable by uid
+# 10001, not world, hence 0600 owned by that uid; to edit it again later,
+# `sudo` the editor or chown it back to yourself first.)
+sudo chown 10001:10001 config.json && sudo chmod 0600 config.json
 
 docker compose up -d
 docker compose logs -f ircthing
@@ -99,13 +103,16 @@ Three named volumes hold everything stateful:
 The database runs in **WAL mode**, so copying the `.db` file alone can miss
 committed data still in the `-wal` sidecar or race a checkpoint. Take a
 consistent snapshot by stopping ircthing (a clean shutdown quiesces SQLite),
-copying the whole directory including sidecars, then restarting:
+copying the whole directory including sidecars, then restarting. Keep backups
+**outside this checkout** (they contain credentials — a `config.json.bak` in
+the repo could be committed or sent to a builder) in a root-only directory:
 
 ```sh
+sudo mkdir -p /var/backups/ircthing && sudo chmod 700 /var/backups/ircthing
 docker compose stop ircthing
-docker compose cp ircthing:/var/lib/ircthing ./ircthing-backup   # db + -wal + -shm
+docker compose cp ircthing:/var/lib/ircthing /var/backups/ircthing/data  # db + -wal + -shm
 docker compose start ircthing
-cp config.json config.json.bak                                    # back up credentials too
+sudo cp config.json /var/backups/ircthing/config.json.bak                # credentials (needs sudo: 0600 / uid 10001)
 ```
 
 **Disk:** the DB is not memory-bounded and grows with scrollback. Set

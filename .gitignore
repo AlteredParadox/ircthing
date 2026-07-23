@@ -6,8 +6,9 @@
 # Local config (contains credentials); config.example.json is the template
 /config.json
 # Docker compose local config + env (credentials / domain); the *.example
-# files are the templates. Never commit the real ones.
-/deploy/docker/config.json
+# files are the templates. Never commit the real ones. The glob also catches
+# config.json.bak and similar so a stray credential backup can't slip in.
+/deploy/docker/config.json*
 /deploy/docker/.env
 
 # Runtime logs

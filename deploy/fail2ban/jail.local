@@ -10,14 +10,18 @@
 enabled  = true
 backend  = systemd
 filter   = ircthing
-
-# Ban TCP *and* UDP. If your reverse proxy serves HTTP/3 (QUIC over UDP/443),
-# a TCP-only ban (fail2ban's default) lets a banned client keep connecting
-# over QUIC. `all` covers both; harmless if you don't run HTTP/3.
-protocol = all
 # Scope journal matching to ircthing's unit so unrelated lines that happen
 # to contain "login:" never match. Change to your actual unit name.
 journalmatch = _SYSTEMD_UNIT=ircthing.service
+
+# Ban all ports on TCP, and on UDP too if your reverse proxy serves HTTP/3
+# (QUIC over UDP/443) — a TCP-only ban would let a banned client keep
+# connecting over QUIC. One allports action per protocol: allports takes no
+# port list, so an explicit protocol is valid, whereas the distro-default
+# multiport banaction rejects `-p all`. Drop the udp line if you don't run
+# HTTP/3; on a pure-nftables host swap iptables-allports -> nftables-allports.
+action = iptables-allports[name=ircthing, protocol=tcp]
+         iptables-allports[name=ircthing-udp, protocol=udp]
 
 # ircthing already applies per-source backoff after the first failure, so
 # a real attacker produces a steady trickle of failed-auth + rate-limited
