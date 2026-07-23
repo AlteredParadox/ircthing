@@ -1778,15 +1778,15 @@ func canonicalIgnores(in map[string][]string, renames map[string]string) (map[st
 			set = make(map[string]bool, len(kept))
 			seen[network] = set
 		}
-		for _, n := range kept {
-			if set[n] {
-				continue
-			}
-			set[n] = true
-			out[network] = append(out[network], n)
-		}
-		if len(out[network]) > maxIgnoresPerNetwork {
+		merged := appendUnseen(out[network], set, kept)
+		if len(merged) > maxIgnoresPerNetwork {
 			return nil, "bad ignore list", false
+		}
+		// Only record a key when something survived, so a network whose
+		// entire list folded away (all empty/duplicate) stays absent
+		// rather than appearing as an empty entry.
+		if len(merged) > 0 {
+			out[network] = merged
 		}
 	}
 	return out, "", rewrote
@@ -1806,6 +1806,20 @@ func canonicalNicks(nicks []string) ([]string, string) {
 		kept = append(kept, strings.ToLower(n))
 	}
 	return kept, ""
+}
+
+// appendUnseen appends each item of src not already present in seen to
+// dst, marking it seen; returns the grown slice. Callers cap the result
+// afterwards — the shared dedup step for merging ignore lists that fold
+// to one network (see canonicalIgnores, rewriteFilterRefs).
+func appendUnseen(dst []string, seen map[string]bool, src []string) []string {
+	for _, n := range src {
+		if !seen[n] {
+			seen[n] = true
+			dst = append(dst, n)
+		}
+	}
+	return dst
 }
 
 // canonicalMutes validates the mute list (client bufKey form), dropping
@@ -2090,18 +2104,8 @@ func rewriteFilterRefs(d *FiltersData, oldName, newName string) (changed, ok boo
 		// spuriously reject a rename whose true unique union fits.
 		merged := make([]string, 0, len(d.Ignores[newName])+len(nicks))
 		seen := make(map[string]bool, len(d.Ignores[newName])+len(nicks))
-		for _, n := range d.Ignores[newName] {
-			if !seen[n] {
-				seen[n] = true
-				merged = append(merged, n)
-			}
-		}
-		for _, n := range nicks {
-			if !seen[n] {
-				seen[n] = true
-				merged = append(merged, n)
-			}
-		}
+		merged = appendUnseen(merged, seen, d.Ignores[newName])
+		merged = appendUnseen(merged, seen, nicks)
 		if len(merged) > maxIgnoresPerNetwork {
 			return false, false // unique union over cap: abort the rename
 		}
