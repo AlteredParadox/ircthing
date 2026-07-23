@@ -12,7 +12,7 @@ database it creates. The binary is ~16 MB; the web bundle inside it is
 ~55 KB gzipped; a working setup with 5 networks and 10k messages of hot
 scrollback runs in ~32 MB of RSS.
 
-<img src="docs/screenshots/main_dark.png" alt="ircthing in dark mode: channel view with an image thumbnail and an inline audio player, member list on the right">
+<img src="docs/screenshots/main_dark.png" alt="ircthing in dark mode: channel view with a link-preview card and an inline audio player, member list on the right">
 
 <img src="docs/screenshots/main_light.png" alt="The same channel view in light mode">
 
@@ -100,12 +100,18 @@ scrollback runs in ~32 MB of RSS.
 | `Ctrl+B` / `Ctrl+I` / `Ctrl+U` | bold / italic / underline (mIRC codes); `Alt+F` opens the full style + color panel |
 | `↑` / `↓` | recall previously sent messages (from the draft's first/last line); `↓` while typing clears the box |
 
-### Appearance
+### Settings
 
-Theme, accent, text size, density, sidebar width, message font, and
-join/part display are all live-editable:
+Everything is live-editable and, where it makes sense, synced across your
+devices — from appearance through privacy, retention, and notifications:
 
-<img src="docs/screenshots/settings_preview.png" width="380" alt="Settings: theme, accent, density, sidebar width, message font, join/part display, timestamps">
+<p>
+<img src="docs/screenshots/settings_1.png" width="240" alt="Appearance: theme, accent, text size, density, sidebar width, message font, joins &amp; parts, plus timestamp and clock formatting">
+<img src="docs/screenshots/settings_2.png" width="240" alt="Nick highlighting and mode symbols, tab-title contents, typing indicators, and synced custom CSS">
+<img src="docs/screenshots/settings_3.png" width="240" alt="Link previews and inline audio/video players, history retention limits, and close-conversation behaviour">
+<img src="docs/screenshots/settings_4.png" width="240" alt="Session lifetime and sign-out, change password, and the notifications section">
+<img src="docs/screenshots/settings_5.png" width="240" alt="Web Push when away, highlight keywords, and the About panel with live memory use and license links">
+</p>
 
 ## Quick start
 
