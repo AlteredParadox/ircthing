@@ -56,8 +56,11 @@ build-debug: frontend
 # native build so the About panel matches. The frontend is built inside the
 # image; this needs only Docker, not node/go on the host.
 # DOCKER_REVISION pins /source to the exact commit — but only when the tree is
-# clean, so a dirty local image never claims a commit that doesn't reflect it.
-DOCKER_REVISION := $(shell git describe --always --dirty 2>/dev/null | grep -q -- '-dirty' || git rev-parse HEAD 2>/dev/null)
+# FULLY clean, so a dirty local image never claims a commit that doesn't reflect
+# it. `git describe --dirty` ignores untracked files (which the explicit COPYs
+# in the Dockerfile would still pull in), so gate on `git status --porcelain
+# --untracked-files=normal` being empty instead.
+DOCKER_REVISION := $(shell test -z "$$(git status --porcelain --untracked-files=normal 2>/dev/null)" && git rev-parse HEAD 2>/dev/null)
 docker:
 	docker build -t ircthing:local \
 	  --build-arg VERSION=$(VERSION) \

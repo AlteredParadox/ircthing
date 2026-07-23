@@ -1755,6 +1755,12 @@ func (s *Session) handleGetFilters(ctx context.Context, env Envelope) {
 func canonicalIgnores(in map[string][]string, renames map[string]string) (map[string][]string, string, bool) {
 	rewrote := false
 	out := make(map[string][]string, len(in))
+	// Track which nicks are already present per RESOLVED network so a stale
+	// old-name key merging into the renamed one (or repeats within a single
+	// list) fold to a set — and the cap applies to the final unique UNION,
+	// not each input list. Without this two valid 512-entry lists that
+	// resolve to the same network would produce a 1024-entry list.
+	seen := make(map[string]map[string]bool, len(in))
 	for network, nicks := range in {
 		if network == "" || len(nicks) > maxIgnoresPerNetwork {
 			return nil, "bad ignore list", false
@@ -1767,9 +1773,20 @@ func canonicalIgnores(in map[string][]string, renames map[string]string) (map[st
 		if problem != "" {
 			return nil, problem, false
 		}
-		if len(kept) > 0 {
-			// A stale old-name key can merge into the renamed one.
-			out[network] = append(out[network], kept...)
+		set := seen[network]
+		if set == nil {
+			set = make(map[string]bool, len(kept))
+			seen[network] = set
+		}
+		for _, n := range kept {
+			if set[n] {
+				continue
+			}
+			set[n] = true
+			out[network] = append(out[network], n)
+		}
+		if len(out[network]) > maxIgnoresPerNetwork {
+			return nil, "bad ignore list", false
 		}
 	}
 	return out, "", rewrote
@@ -2066,12 +2083,18 @@ func rewriteRuleRefs(rules []Rule, oldName, newName string) bool {
 func rewriteFilterRefs(d *FiltersData, oldName, newName string) (changed, ok bool) {
 	if nicks, has := d.Ignores[oldName]; has {
 		delete(d.Ignores, oldName)
-		// Renaming onto a name that already has ignores is exotic; build
-		// the full deduplicated union (never truncated).
-		merged := d.Ignores[newName]
-		seen := make(map[string]bool, len(merged)+len(nicks))
-		for _, n := range merged {
-			seen[n] = true
+		// Renaming onto a name that already has ignores is exotic; build the
+		// full deduplicated union (never truncated). Dedup the DESTINATION
+		// too, not just the incoming list — a pre-existing stored list may
+		// carry duplicates, and counting those toward the cap could
+		// spuriously reject a rename whose true unique union fits.
+		merged := make([]string, 0, len(d.Ignores[newName])+len(nicks))
+		seen := make(map[string]bool, len(d.Ignores[newName])+len(nicks))
+		for _, n := range d.Ignores[newName] {
+			if !seen[n] {
+				seen[n] = true
+				merged = append(merged, n)
+			}
 		}
 		for _, n := range nicks {
 			if !seen[n] {
@@ -2080,7 +2103,7 @@ func rewriteFilterRefs(d *FiltersData, oldName, newName string) (changed, ok boo
 			}
 		}
 		if len(merged) > maxIgnoresPerNetwork {
-			return false, false // union over cap: abort the rename
+			return false, false // unique union over cap: abort the rename
 		}
 		d.Ignores[newName] = merged
 		changed = true

@@ -579,6 +579,54 @@ func TestRewriteFilterRefsUnionOverCapAborts(t *testing.T) {
 	}
 }
 
+// TestCanonicalIgnoresRenameMergeDedupAndCap: the set_filters normalizer must
+// fold repeats and rename-merged keys to a set and apply the cap to the final
+// unique UNION — two 512-entry lists resolving to one network must not yield a
+// 1024-entry list, and duplicates within a list must collapse.
+func TestCanonicalIgnoresRenameMergeDedupAndCap(t *testing.T) {
+	mk := func(prefix string, n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("%s%d", prefix, i)
+		}
+		return out
+	}
+	renames := map[string]string{"old": "new"}
+
+	// Two keys renaming onto the same network, disjoint and near-full: the
+	// union exceeds the cap and must be rejected, not merged into 1024.
+	if _, problem, _ := canonicalIgnores(map[string][]string{
+		"old": mk("a", maxIgnoresPerNetwork),
+		"new": mk("b", maxIgnoresPerNetwork),
+	}, renames); problem == "" {
+		t.Fatal("expected rejection for over-cap rename-merge union")
+	}
+
+	// Overlapping lists whose deduplicated union fits: kept, deduplicated.
+	shared := mk("s", maxIgnoresPerNetwork-1)
+	out, problem, _ := canonicalIgnores(map[string][]string{
+		"old": append([]string{"extra"}, shared...),
+		"new": shared,
+	}, renames)
+	if problem != "" {
+		t.Fatalf("deduped union under cap rejected: %q", problem)
+	}
+	if got := len(out["new"]); got != maxIgnoresPerNetwork {
+		t.Fatalf("union size = %d, want %d", got, maxIgnoresPerNetwork)
+	}
+
+	// Duplicates within one list (incl. case-folds) collapse to a set.
+	out2, problem, _ := canonicalIgnores(map[string][]string{
+		"n": {"Alice", "alice", "BOB", "bob"},
+	}, nil)
+	if problem != "" {
+		t.Fatalf("unexpected rejection: %q", problem)
+	}
+	if got := len(out2["n"]); got != 2 {
+		t.Fatalf("within-list dedup = %v, want 2 unique", out2["n"])
+	}
+}
+
 // TestFoldRenameMapSaturation: at the cap the CURRENT mapping is kept
 // (old entries are dropped) — never silently omitted.
 func TestFoldRenameMapSaturation(t *testing.T) {
