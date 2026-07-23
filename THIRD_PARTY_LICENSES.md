@@ -1099,7 +1099,7 @@ Some files carry the following license, noted at the top of each file:
 ### Copyright (from source headers)
 
 ```
-Copyright 2022 The gVisor Authors.
+Copyright 2018 The gVisor Authors.
 ```
 
 ---

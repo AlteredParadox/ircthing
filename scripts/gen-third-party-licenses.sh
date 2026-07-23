@@ -15,6 +15,9 @@
 #   Default output THIRD_PARTY_LICENSES.md. `make notices-check` runs it to a
 #   temp file and diffs, so a stale committed copy fails the build.
 set -euo pipefail
+# Byte-order sorting/grep everywhere so the output is identical regardless of
+# the runner's locale (a UTF-8 collation would order some inputs differently).
+export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 
 OUT=${1:-THIRD_PARTY_LICENSES.md}
@@ -69,7 +72,14 @@ emit_module() {
 	# headers (WireGuard). Surface the first such line so attribution is complete.
 	if [ "$has_copyright" = 0 ]; then
 		local cline
-		cline=$(grep -rhi copyright "$dir" --include='*.go' 2>/dev/null | grep -m1 -E '[12][0-9]{3}' | sed 's#^[[:space:]/*]*##' || true)
+		# Walk the .go files in SORTED order (not grep -r's filesystem/readdir
+		# order) so the "first copyright line" is deterministic across
+		# environments. Modules like gvisor carry many different copyright
+		# headers (varying years/authors), so an unsorted first-match would
+		# differ between machines and break the notices-check gate.
+		cline=$(find "$dir" -name '*.go' -type f 2>/dev/null | sort \
+			| xargs -r grep -hi copyright 2>/dev/null \
+			| grep -m1 -E '[12][0-9]{3}' | sed 's#^[[:space:]/*]*##' || true)
 		if [ -n "$cline" ]; then
 			echo
 			echo "### Copyright (from source headers)"
