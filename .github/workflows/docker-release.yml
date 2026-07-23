@@ -14,9 +14,11 @@
 # malicious code); the trailing comment records the tag each SHA was. Bump via
 # Dependabot or by re-resolving the tag.
 #
-# First-run note: a freshly created GHCR package is PRIVATE. To let others pull
-# it, open the package on GitHub → Package settings → change visibility to
-# Public (and, optionally, link it to this repo). Nothing here can flip that.
+# Package visibility: the metadata OCI source label links the package to this
+# repo, so a package for a PUBLIC repo publishes public automatically (verified
+# for v0.2.4 — no manual step). If your account/org happens to default a new
+# package to private, make it public once via the package's settings on GitHub
+# (Package settings → change visibility). Nothing here can flip that.
 
 name: docker-release
 
