@@ -29,9 +29,16 @@ From this directory:
 cp .env.example .env                 # set IRCTHING_DOMAIN + ACME_EMAIL
 cp config.example.json config.json   # your networks live here
 
-# Generate the login password hash with the image itself:
+# The config holds credentials (SASL, proxy, WireGuard keys). Restrict it to
+# root + the container user (uid 10001) so other host users cannot read it —
+# the read-only bind mount needs it readable by 10001, not world:
+sudo chown 10001:10001 config.json && chmod 600 config.json
+
+# Generate the login password hash with the image itself (-it: the prompt
+# reads from an interactive terminal — without it stdin is closed and the
+# read fails):
 docker compose build ircthing
-docker run --rm ircthing:local -hash-password
+docker run --rm -it ircthing:local -hash-password
 # paste the hash into config.json -> user.password_hash
 
 docker compose up -d
@@ -59,7 +66,7 @@ To use it instead of building locally, edit `docker-compose.yml`:
 then `docker compose pull && docker compose up -d`. Or run it directly:
 
 ```sh
-docker run --rm ghcr.io/alteredparadox/ircthing:latest -hash-password
+docker run --rm -it ghcr.io/alteredparadox/ircthing:latest -hash-password
 ```
 
 ## How it fits together
@@ -81,20 +88,30 @@ client ───────────────▶ Caddy ──────
 
 ## Data & backups
 
-Two named volumes hold everything stateful:
+Three named volumes hold everything stateful:
 
 - `ircthing_data` → `/var/lib/ircthing` — the SQLite database (scrollback,
   networks, read markers, push subscriptions).
 - `caddy_data` → `/data` — the ACME account key and issued certificates.
   **Persist this** so you don't hit Let's Encrypt rate limits on every redeploy.
+- `caddy_config` → `/config` — Caddy's autosaved runtime config.
 
-Back up the SQLite DB with a consistent snapshot:
+The database runs in **WAL mode**, so copying the `.db` file alone can miss
+committed data still in the `-wal` sidecar or race a checkpoint. Take a
+consistent snapshot by stopping ircthing (a clean shutdown quiesces SQLite),
+copying the whole directory including sidecars, then restarting:
 
 ```sh
-docker compose exec ircthing sh -c \
-  'cd /var/lib/ircthing && cp ircthing.db /var/lib/ircthing/backup.db'
-docker compose cp ircthing:/var/lib/ircthing/backup.db ./ircthing-backup.db
+docker compose stop ircthing
+docker compose cp ircthing:/var/lib/ircthing ./ircthing-backup   # db + -wal + -shm
+docker compose start ircthing
+cp config.json config.json.bak                                    # back up credentials too
 ```
+
+**Disk:** the DB is not memory-bounded and grows with scrollback. Set
+`retention_days` / `retention_max_messages` in `config.json`, and remember the
+volume lives under Docker's data root (`/var/lib/docker` by default) — monitor
+that filesystem or put it on one with a quota.
 
 ## Upgrading
 
@@ -145,6 +162,6 @@ Verify the whole path end-to-end after starting the stack: attempt a few bad
 logins, then
 
 ```sh
-journalctl CONTAINER_NAME=ircthing --no-pager | grep '^login:'
+journalctl -o cat CONTAINER_NAME=ircthing --no-pager | grep '^login:'
 sudo fail2ban-client status ircthing-docker
 ```

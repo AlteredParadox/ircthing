@@ -3,7 +3,7 @@
   "database": "/var/lib/ircthing/ircthing.db",
   "user": {
     "username": "AlteredParadox",
-    "password_hash": "<output of: docker run --rm ircthing:local -hash-password>"
+    "password_hash": "<output of: docker run --rm -it ircthing:local -hash-password>"
   },
   "networks": [
     {
