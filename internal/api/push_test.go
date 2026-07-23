@@ -150,11 +150,17 @@ func TestLogoutDeletesDeviceSubscription(t *testing.T) {
 	if resp := pushPost(t, ts, cookie, "/api/push/subscribe", testSubscriptionJSON(t, "https://push.example/dev")); resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("subscribe = %d", resp.StatusCode)
 	}
+	epochBefore := h.PushEpoch()
 	if resp := pushPost(t, ts, cookie, "/api/logout", `{"push_endpoint":"https://push.example/dev"}`); resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("logout = %d", resp.StatusCode)
 	}
 	if n, _ := h.Store().CountPushSubscriptions(ctx); n != 0 {
 		t.Fatalf("subscriptions after logout = %d, want 0", n)
+	}
+	// Logout bumped the delivery epoch so any in-flight send to the
+	// deleted endpoint aborts.
+	if h.PushEpoch() == epochBefore {
+		t.Fatal("logout did not bump the push delivery epoch after deleting the subscription")
 	}
 
 	// An UNAUTHENTICATED logout must not delete by endpoint.

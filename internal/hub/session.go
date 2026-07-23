@@ -1985,7 +1985,11 @@ func (h *Hub) renameFilterSetting(ctx context.Context, rw *renameWrites, oldName
 	if !isJSONObject(v) || json.Unmarshal([]byte(v), &d) != nil {
 		return false
 	}
-	if rewriteFilterRefs(&d, oldName, newName) {
+	changed, ok := rewriteFilterRefs(&d, oldName, newName)
+	if !ok {
+		return false // deduplicated ignore union over cap: abort the rename
+	}
+	if changed {
 		blob, err := json.Marshal(d)
 		if err != nil {
 			return false
@@ -2054,28 +2058,29 @@ func rewriteRuleRefs(rules []Rule, oldName, newName string) bool {
 }
 
 // rewriteFilterRefs rewrites the ignore map key and mute bufKey prefixes
-// from oldName to newName in place; reports whether anything changed.
-func rewriteFilterRefs(d *FiltersData, oldName, newName string) bool {
-	changed := false
-	if nicks, ok := d.Ignores[oldName]; ok {
+// from oldName to newName in place; reports whether anything changed and
+// whether the result is valid. ok=false means the DEDUPLICATED union of
+// the old- and new-name ignore lists still exceeds maxIgnoresPerNetwork:
+// the caller aborts the rename rather than TRUNCATE a privacy policy
+// (silently dropping ignores is worse than a rejected rename).
+func rewriteFilterRefs(d *FiltersData, oldName, newName string) (changed, ok bool) {
+	if nicks, has := d.Ignores[oldName]; has {
 		delete(d.Ignores, oldName)
-		// Renaming onto a name that already has ignores is exotic; union
-		// the sets, but DEDUP and CAP the result: two valid 512-entry
-		// lists would otherwise merge into an invalid 1024-entry one that
-		// every subsequent set_filters rejects.
+		// Renaming onto a name that already has ignores is exotic; build
+		// the full deduplicated union (never truncated).
 		merged := d.Ignores[newName]
 		seen := make(map[string]bool, len(merged)+len(nicks))
 		for _, n := range merged {
 			seen[n] = true
 		}
 		for _, n := range nicks {
-			if len(merged) >= maxIgnoresPerNetwork {
-				break
-			}
 			if !seen[n] {
 				seen[n] = true
 				merged = append(merged, n)
 			}
+		}
+		if len(merged) > maxIgnoresPerNetwork {
+			return false, false // union over cap: abort the rename
 		}
 		d.Ignores[newName] = merged
 		changed = true
@@ -2087,7 +2092,7 @@ func rewriteFilterRefs(d *FiltersData, oldName, newName string) bool {
 			changed = true
 		}
 	}
-	return changed
+	return changed, true
 }
 
 // markreadTimeLayout is the server-time format used by MARKREAD

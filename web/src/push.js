@@ -132,12 +132,17 @@ export async function unsubscribePush() {
 // best-effort half.
 export async function unsubscribeForLogout() {
 	if (!("serviceWorker" in navigator)) return "";
+	// Epoch-guard every await: if the user logs back in (bumping the
+	// epoch) while this cleanup is still resolving, bail rather than
+	// unsubscribe/delete the NEW session's subscription.
+	const epoch = pushAuthEpoch;
 	const reg = await navigator.serviceWorker.getRegistration("/").catch(() => null);
-	if (!reg) return "";
+	if (!reg || epoch !== pushAuthEpoch) return "";
 	const sub = await reg.pushManager.getSubscription().catch(() => null);
-	if (!sub) return "";
+	if (!sub || epoch !== pushAuthEpoch) return "";
 	const endpoint = sub.endpoint;
 	await sub.unsubscribe().catch(() => {});
+	if (epoch !== pushAuthEpoch) return endpoint;
 	await postJSON("/api/push/unsubscribe", { endpoint }).catch(() => {});
 	return endpoint;
 }

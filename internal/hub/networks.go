@@ -554,10 +554,13 @@ func (h *Hub) rollbackPut(_ context.Context, name string, prev *store.NetworkCon
 			// The restore did NOT commit: storage still holds the new
 			// (unstartable) definition. Do NOT restart the old manager —
 			// that would run the OLD network while storage names the new
-			// one (split state). Leave it stopped; storage is authoritative
-			// and the operator can retry the edit. Loud log for the
-			// degraded state.
+			// one (split state). Surface the stored name as a STOPPED
+			// network and broadcast a refresh so it stays visible/editable
+			// in the sidebar instead of vanishing from live state; storage
+			// is authoritative and the operator can retry or delete it.
 			log.Printf("network %q: rollback restore FAILED (%v) — left stopped; stored definition and runtime now disagree, retry the edit", name, err)
+			h.NoteStoppedNetwork(name)
+			h.broadcast(envelope("networks_changed", 0, nil))
 			return
 		}
 		h.restartNetwork(prev)

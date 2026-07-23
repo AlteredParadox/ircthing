@@ -76,7 +76,12 @@ globalThis.addEventListener("notificationclick", (event) => {
 	const { network, buffer } = event.notification.data || {};
 	// Hash shape mirrors toHash (web/src/irc.js): #/<network>/<buffer>.
 	const hash = network && buffer ? `#/${encodeURIComponent(network)}/${encodeURIComponent(buffer)}` : "";
-	if (network && buffer) pendingNav = { network, buffer, at: Date.now() };
+	// ONE timestamp identifies this tap across BOTH delivery paths (the
+	// direct postMessage below and the pull reply via pendingNav): the
+	// page dedups by `at`, so the two paths must carry the SAME value or
+	// one tap looks like two and navigates twice.
+	const at = Date.now();
+	if (network && buffer) pendingNav = { network, buffer, at };
 	event.waitUntil(
 		(async () => {
 			// Focus an existing app window and let it navigate itself — a
@@ -90,7 +95,7 @@ globalThis.addEventListener("notificationclick", (event) => {
 					// `at` lets the page drop a stale delivery: a message
 					// posted to a frozen-but-alive client (iOS) queues and
 					// can fire hours later when the page finally resumes.
-					if (network && buffer) w.postMessage({ type: "open_buffer", network, buffer, at: Date.now() });
+					if (network && buffer) w.postMessage({ type: "open_buffer", network, buffer, at });
 					return;
 				} catch {
 					// Stale client: try the next.

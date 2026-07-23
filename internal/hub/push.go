@@ -206,6 +206,10 @@ func (h *Hub) PushPublicKey() string {
 	return h.pushPubKey
 }
 
+// PushEpoch returns the current delivery-credential epoch — exported so
+// tests can assert a rotation or logout advanced it.
+func (h *Hub) PushEpoch() uint64 { return h.pushEpoch.Load() }
+
 // BumpPushEpoch invalidates every in-flight delivery — called
 // synchronously with a subscription wipe (password rotation, VAPID
 // replacement). It advances the epoch (so a worker aborts before its

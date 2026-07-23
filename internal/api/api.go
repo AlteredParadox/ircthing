@@ -781,29 +781,37 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// not auth-gated (it must still clear the cookie for an expired
 	// session), so without this check an unauthenticated same-origin
 	// request could delete a subscription by (secret) endpoint.
-	if body.PushEndpoint != "" && s.authed(r) {
-		// Under the same barrier as subscribe/rotation so the delete is
-		// ordered against a concurrent re-plant.
-		s.pushMutationMu.Lock()
+	deletePush := body.PushEndpoint != "" && s.authed(r)
+
+	// Hold the push-mutation barrier across BOTH the subscription delete
+	// AND the token revocation, so a concurrent registration cannot land
+	// between them with the about-to-be-revoked token.
+	s.pushMutationMu.Lock()
+	if deletePush {
 		if err := s.hub.Store().DeletePushSubscription(r.Context(), body.PushEndpoint); err != nil {
 			s.pushMutationMu.Unlock()
 			http.Error(w, "removing subscription failed", http.StatusInternalServerError)
 			return
 		}
-		s.pushMutationMu.Unlock()
-		refreshPushCountDetached(s.hub)
+		// Abort any in-flight delivery to the just-deleted endpoint.
+		s.hub.BumpPushEpoch()
 	}
+	var cancels []context.CancelFunc
 	if c, err := r.Cookie(s.cookieName()); err == nil {
 		// deleteTokenLocked tears down this token's live WebSockets NOW — the
 		// write pump's 30 s revalidation ticker would otherwise let an
 		// already-open (possibly stolen) socket keep receiving and sending
 		// IRC traffic after logout.
 		s.mu.Lock()
-		cancels := s.deleteTokenLocked(c.Value)
+		cancels = s.deleteTokenLocked(c.Value)
 		s.mu.Unlock()
-		for _, cancel := range cancels {
-			cancel()
-		}
+	}
+	s.pushMutationMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	if deletePush {
+		refreshPushCountDetached(s.hub)
 	}
 	// The deletion cookie carries the same attributes as the session
 	// cookie so every browser treats it as the same cookie.

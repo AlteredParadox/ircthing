@@ -544,6 +544,41 @@ func TestComputeRenameWritesFailsClosed(t *testing.T) {
 	}
 }
 
+// TestRewriteFilterRefsUnionOverCapAborts: a rename whose deduplicated
+// ignore union exceeds the cap aborts (ok=false) rather than truncating
+// the privacy policy.
+func TestRewriteFilterRefsUnionOverCapAborts(t *testing.T) {
+	mk := func(prefix string, n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("%s%d", prefix, i)
+		}
+		return out
+	}
+	// Two disjoint near-full lists: union > cap.
+	d := &FiltersData{Ignores: map[string][]string{
+		"old": mk("a", maxIgnoresPerNetwork),
+		"new": mk("b", maxIgnoresPerNetwork),
+	}}
+	if _, ok := rewriteFilterRefs(d, "old", "new"); ok {
+		t.Fatal("expected abort (ok=false) for an over-cap union")
+	}
+
+	// Overlapping lists whose DEDUPED union fits: succeeds, no truncation.
+	shared := mk("s", maxIgnoresPerNetwork-1)
+	d2 := &FiltersData{Ignores: map[string][]string{
+		"old": append([]string{"extra"}, shared...),
+		"new": shared,
+	}}
+	changed, ok := rewriteFilterRefs(d2, "old", "new")
+	if !ok || !changed {
+		t.Fatalf("deduped union under cap: changed=%v ok=%v", changed, ok)
+	}
+	if len(d2.Ignores["new"]) != maxIgnoresPerNetwork {
+		t.Fatalf("deduped union size = %d, want %d", len(d2.Ignores["new"]), maxIgnoresPerNetwork)
+	}
+}
+
 // TestFoldRenameMapSaturation: at the cap the CURRENT mapping is kept
 // (old entries are dropped) — never silently omitted.
 func TestFoldRenameMapSaturation(t *testing.T) {
