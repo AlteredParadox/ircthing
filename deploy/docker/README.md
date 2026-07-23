@@ -172,9 +172,15 @@ firewall.
 inserts into `INPUT`, so a ban would silently fail to block anything. The jail
 here overrides the action to insert into `DOCKER-USER`
 (`iptables-allports[chain=DOCKER-USER]`), which Docker guarantees is evaluated
-before its own forwarding rules — so the ban actually takes effect. On a
-pure-nftables host without the iptables-nft shim, use the `nftables-allports`
-action and add a hook into Docker's forward path instead.
+before its own forwarding rules — so the ban actually takes effect.
+
+**Why this jail uses iptables while the non-Docker jail uses nftables:** Debian
+13 is nftables-native and ships no iptables, so `deploy/fail2ban/jail.local`
+uses the native `nftables-allports` action. But Docker *requires* the iptables
+package (iptables-nft on Debian 13) and programs `DOCKER-USER` there, so the
+Docker jail must ban in that same ruleset — a native nftables table wouldn't
+sit in Docker's forward path. iptables is therefore always available on a
+Docker host, and this jail is correct as written.
 
 Verify the whole path end-to-end after starting the stack: attempt a few bad
 logins, then

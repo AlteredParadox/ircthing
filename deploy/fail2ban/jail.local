@@ -14,14 +14,19 @@ filter   = ircthing
 # to contain "login:" never match. Change to your actual unit name.
 journalmatch = _SYSTEMD_UNIT=ircthing.service
 
-# Ban all ports on TCP, and on UDP too if your reverse proxy serves HTTP/3
-# (QUIC over UDP/443) — a TCP-only ban would let a banned client keep
-# connecting over QUIC. One allports action per protocol: allports takes no
-# port list, so an explicit protocol is valid, whereas the distro-default
-# multiport banaction rejects `-p all`. Drop the udp line if you don't run
-# HTTP/3; on a pure-nftables host swap iptables-allports -> nftables-allports.
-action = iptables-allports[name=ircthing, protocol=tcp]
-         iptables-allports[name=ircthing-udp, protocol=udp]
+# Ban with the NATIVE nftables backend. Debian 13 is nftables-based and ships
+# NO iptables by default, so the distro-default iptables banaction would fail
+# at ban time on a plain host — nft is always present. nftables-allports drops
+# the source in its own `inet f2b-table`, coexisting with any existing nftables
+# ruleset. protocol=tcp,udp becomes a single `meta l4proto {tcp,udp}` match (an
+# nftables set — iptables multiport cannot express this), so a banned client is
+# blocked over HTTP/3 (QUIC/UDP) as well as TCP. Verify with a real ban:
+#   fail2ban-client set ircthing banip 203.0.113.7
+#   nft list table inet f2b-table
+# If you deliberately run the iptables backend instead, use two actions:
+#   iptables-allports[name=ircthing, protocol=tcp] / [name=ircthing-udp, protocol=udp]
+banaction = nftables-allports
+protocol  = tcp,udp
 
 # ircthing already applies per-source backoff after the first failure, so
 # a real attacker produces a steady trickle of failed-auth + rate-limited

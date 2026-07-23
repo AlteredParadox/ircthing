@@ -35,12 +35,16 @@ bantime.maxtime   = 1w
 # never block them. Inserting into DOCKER-USER (which Docker guarantees is
 # evaluated before its own forwarding rules) makes the ban actually take.
 #
-# One allports action per protocol. allports (unlike the distro-default
+# This jail uses IPTABLES on purpose — unlike the non-Docker jail, which uses
+# native nftables. Docker requires the iptables package (iptables-nft on Debian
+# 13) and programs its NAT/forward filtering, including DOCKER-USER, in that
+# ruleset, so a ban must go there too. A native nftables action would live in a
+# separate table and wouldn't sit in Docker's forward path.
+#
+# One allports action per protocol: allports (unlike the distro-default
 # multiport banaction) takes no port list, so an explicit single protocol is
-# valid — `-p all -m multiport` is NOT, so a single protocol=all action fails
-# at ban time. TCP covers HTTPS; UDP covers Caddy's 443/udp HTTP/3 (QUIC) — a
-# TCP-only ban would leave a banned client free over QUIC (drop the udp line if
-# you disable HTTP/3). On a pure-nftables host without iptables-nft compat,
-# swap iptables-allports -> nftables-allports; see the README.
+# valid — `-p all -m multiport` is NOT. TCP covers HTTPS; UDP covers Caddy's
+# 443/udp HTTP/3 (QUIC) — a TCP-only ban would leave a banned client free over
+# QUIC (drop the udp line if you disable HTTP/3).
 action = iptables-allports[name=ircthing, chain=DOCKER-USER, protocol=tcp]
          iptables-allports[name=ircthing-udp, chain=DOCKER-USER, protocol=udp]

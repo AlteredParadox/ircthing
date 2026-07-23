@@ -334,10 +334,14 @@ sudo systemctl reload fail2ban
 
 The jail reads the journal (`backend = systemd`) and matches both the
 failed-auth and rate-limited lines, so a source is banned whether it is
-still guessing or already in the app's own backoff. Because the client
-reaches ircthing *through* the proxy, the ban (an nftables/iptables rule
-on the real client IP) blocks it at the box's firewall before the proxy —
-which is exactly where the traffic enters.
+still guessing or already in the app's own backoff. It bans with the
+native `nftables-allports` action (Debian 13 is nftables-based and ships
+no iptables by default) over TCP and UDP, so HTTP/3 is covered too. Because
+the client reaches ircthing *through* the proxy, that firewall rule on the
+real client IP blocks it at the box's edge before the proxy — which is
+exactly where the traffic enters. (The Docker deployment bans via iptables
+instead — Docker manages `DOCKER-USER` there; see
+[`deploy/docker/README.md`](deploy/docker/README.md).)
 
 ## Development
 
