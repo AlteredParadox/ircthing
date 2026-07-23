@@ -236,7 +236,11 @@ through the proxy too (Caddy: automatic; nginx: `proxy_http_version 1.1;`
 plus `proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection
 "upgrade";` on that location). Rate-limiting `/api/login` at the proxy is
 also recommended as defense-in-depth (the binary itself enforces a global
-attempt-rate cap plus per-source backoff). The proxy must **forward the
+attempt-rate cap plus per-source backoff). Login attempts are logged to
+stderr (the systemd journal) in a fail2ban-friendly form — a ready-made
+filter and jail ship in [`deploy/fail2ban/`](deploy/fail2ban); see
+[Banning brute-force sources](#banning-brute-force-sources-fail2ban) below.
+The proxy must **forward the
 `Origin` and `Sec-Fetch-Site` request headers unchanged** — the
 state-changing/media endpoints use them as a CSRF defense and fail closed
 without them (a proxy that strips both would make those endpoints refuse
@@ -278,6 +282,38 @@ runs its own in-process gVisor netstack; one tunnel measured ~35 MB idle /
 **several** simultaneous WireGuard networks under `MemoryMax=128M` are
 uncharacterized — budget headroom (or raise the limit) if you run more than
 one or two.
+
+### Banning brute-force sources (fail2ban)
+
+ircthing logs every login outcome to stderr (captured by the systemd
+journal under the unit above):
+
+```
+login: failed authentication from 203.0.113.7 (user "admin")
+login: rate-limited from 203.0.113.7
+login: authenticated from 198.51.100.4 (user "you")
+```
+
+The IP is the same address the login rate-limiter keys on, so **behind a
+reverse proxy it is the real client** only when `behind_proxy` is `true`
+and the proxy appends the client to `X-Forwarded-For` (see the config
+table) — otherwise it is the proxy's own address and a ban would be
+useless. The attempted username is `%q`-escaped, so a crafted value can't
+forge or wrap a log line. A drop-in filter and jail live in
+[`deploy/fail2ban/`](deploy/fail2ban):
+
+```sh
+sudo cp deploy/fail2ban/ircthing.conf /etc/fail2ban/filter.d/
+sudo cp deploy/fail2ban/jail.local    /etc/fail2ban/jail.d/ircthing.conf
+sudo systemctl reload fail2ban
+```
+
+The jail reads the journal (`backend = systemd`) and matches both the
+failed-auth and rate-limited lines, so a source is banned whether it is
+still guessing or already in the app's own backoff. Because the client
+reaches ircthing *through* the proxy, the ban (an nftables/iptables rule
+on the real client IP) blocks it at the box's firewall before the proxy —
+which is exactly where the traffic enters.
 
 ## Development
 

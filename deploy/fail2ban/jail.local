@@ -1,0 +1,28 @@
+# fail2ban jail for ircthing.
+#
+# Install:  /etc/fail2ban/jail.d/ircthing.conf
+# Requires: deploy/fail2ban/ircthing.conf in /etc/fail2ban/filter.d/
+#
+# Reads the systemd journal for the ircthing.service unit — no log file to
+# configure. Adjust `_ircthing_unit` if your unit is named differently.
+
+[ircthing]
+enabled  = true
+backend  = systemd
+filter   = ircthing
+# Scope journal matching to ircthing's unit so unrelated lines that happen
+# to contain "login:" never match. Change to your actual unit name.
+journalmatch = _SYSTEMD_UNIT=ircthing.service
+
+# ircthing already applies per-source backoff after the first failure, so
+# a real attacker produces a steady trickle of failed-auth + rate-limited
+# lines. A low threshold over a short window bans them quickly.
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+
+# The bantime grows for repeat offenders. Remove this block for a fixed
+# bantime.
+bantime.increment = true
+bantime.factor    = 2
+bantime.maxtime   = 1w

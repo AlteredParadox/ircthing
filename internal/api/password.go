@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -116,6 +117,10 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	s.login.release()
 	if verifyErr != nil {
 		s.login.fail(source, time.Now())
+		// Same brute-force class as a failed login (a stolen session
+		// guessing the current password to rotate it): logged with the
+		// proxy-aware source so the same fail2ban filter catches it.
+		log.Printf("login: failed password-change verification from %s", source)
 		http.Error(w, "current password is incorrect", http.StatusForbidden)
 		return
 	}

@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -634,6 +635,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// from being a cheap exhaustion vector.
 	source := s.loginSourceKey(r)
 	if wait := s.login.retryAfter(source, time.Now()); wait > 0 {
+		// The source is already in per-IP backoff — a sustained attempt.
+		// Logged (like the credential failure below) so a fail2ban-style
+		// watcher sees continued abuse even while the app stalls it.
+		log.Printf("login: rate-limited from %s", source)
 		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds()+1)))
 		http.Error(w, msgTooManyAttempts, http.StatusTooManyRequests)
 		return
@@ -681,6 +686,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// binary (the recommended deployment), off for plain loopback.
 		Secure: s.cfg.SecureCookies,
 	})
+	// Audit the successful login (proxy-aware source, like the failures)
+	// so an operator can distinguish "owner signed in" from an attack in
+	// the same log stream.
+	log.Printf("login: authenticated from %s (user %s)", source, quoteAuthField(req.Username))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -698,10 +707,28 @@ func (s *Server) authenticate(ctx context.Context, source, username, password st
 	s.login.release()
 	if !userOK || passErr != nil {
 		s.login.fail(source, time.Now())
+		// A failed credential attempt. `source` is the rate-limiter's
+		// key, which honors behind_proxy (the real client IP behind a
+		// trusted reverse proxy, else the socket peer) — so a fail2ban
+		// filter bans the right address. The attempted username is
+		// attacker-controlled: %q escapes control chars, and it is
+		// AFTER the IP so a crafted value can't shift the <HOST> capture.
+		log.Printf("login: failed authentication from %s (user %s)", source, quoteAuthField(username))
 		return false, false
 	}
 	s.login.ok(source)
 	return true, false
+}
+
+// quoteAuthField renders an attacker-controlled credential field for a
+// log line: length-clamped and %q-escaped so control characters and
+// newlines can't inject or wrap log lines.
+func quoteAuthField(v string) string {
+	const max = 96
+	if len(v) > max {
+		v = v[:max] + "…"
+	}
+	return fmt.Sprintf("%q", v)
 }
 
 // issueToken mints a session token, pruning expired sessions and

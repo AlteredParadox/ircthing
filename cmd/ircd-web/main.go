@@ -51,6 +51,13 @@ import (
 )
 
 func main() {
+	// Drop the log package's own date/time prefix: the service runs under
+	// systemd/journald (or another supervisor) which timestamps every
+	// line, so the Go prefix is redundant — and its absence lets the
+	// fail2ban filter (deploy/fail2ban/) anchor cleanly on "^login:"
+	// instead of a fragile leading-timestamp pattern.
+	log.SetFlags(0)
+
 	configFlag := flag.String("config", "config.json", "path to the JSON config file")
 	hashPassword := flag.Bool("hash-password", false,
 		"read a password from stdin, print its bcrypt hash for user.password_hash, and exit")
