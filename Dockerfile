@@ -37,9 +37,15 @@ WORKDIR /src
 # Module download is its own cached layer keyed on go.mod/go.sum only.
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
-# Bring in the built frontend (web/dist is .dockerignore'd out of the context
-# copy above) so //go:embed all:dist has real assets to embed.
+# Copy only what the build compiles or embeds — explicit paths (rather than a
+# recursive `COPY . .`) keep unrelated and potentially sensitive files out of
+# the build. Embedded assets: LICENSE + THIRD_PARTY_LICENSES.md (notices.go),
+# internal/store/migrations/*.sql, and web/dist (from the frontend stage).
+COPY notices.go LICENSE THIRD_PARTY_LICENSES.md ./
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+COPY web/embed.go ./web/
+# Bring in the built frontend so //go:embed all:dist has real assets to embed.
 COPY --from=frontend /src/web/dist ./web/dist
 # TARGETOS/TARGETARCH are set automatically by buildx (default to the host on
 # a plain `docker build`). VERSION defaults to a placeholder; pass
