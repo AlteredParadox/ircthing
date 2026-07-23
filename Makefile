@@ -55,8 +55,13 @@ build-debug: frontend
 # Build the container image (deploy/docker/). Stamps the same VERSION as the
 # native build so the About panel matches. The frontend is built inside the
 # image; this needs only Docker, not node/go on the host.
+# DOCKER_REVISION pins /source to the exact commit — but only when the tree is
+# clean, so a dirty local image never claims a commit that doesn't reflect it.
+DOCKER_REVISION := $(shell git describe --always --dirty 2>/dev/null | grep -q -- '-dirty' || git rev-parse HEAD 2>/dev/null)
 docker:
-	docker build -t ircthing:local --build-arg VERSION=$(VERSION) .
+	docker build -t ircthing:local \
+	  --build-arg VERSION=$(VERSION) \
+	  --build-arg REVISION=$(DOCKER_REVISION) .
 
 frontend: web/node_modules
 	cd web && $(ESBUILD) $(ESBUILD_FLAGS) src/main.jsx --outfile=dist/app.js

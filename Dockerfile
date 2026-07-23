@@ -50,9 +50,12 @@ COPY --from=frontend /src/web/dist ./web/dist
 # TARGETOS/TARGETARCH are set automatically by buildx (default to the host on
 # a plain `docker build`). VERSION defaults to a placeholder; pass
 # --build-arg VERSION=$(git describe ...) to stamp the About panel / /api/config.
-ARG TARGETOS TARGETARCH VERSION=docker
+# REVISION (the exact commit) is stamped into main.revision so /source can pin
+# it — buildinfo has none here (-trimpath, no .git in the context). Pass it only
+# for a CLEAN build; leaving it empty makes /source fall back to the repo root.
+ARG TARGETOS TARGETARCH VERSION=docker REVISION=
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
-      -ldflags="-s -w -X main.version=${VERSION}" \
+      -ldflags="-s -w -X main.version=${VERSION} -X main.revision=${REVISION}" \
       -o /out/ircd-web ./cmd/ircd-web
 
 # ---- final: minimal runtime ----

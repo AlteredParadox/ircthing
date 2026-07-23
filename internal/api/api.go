@@ -80,6 +80,12 @@ type Config struct {
 	// Version is the build identity shown in the settings About section
 	// (Makefile git-describe stamp, or the VCS revision fallback).
 	Version string
+	// Revision is the exact commit /source pins to when the build embeds no
+	// VCS info of its own — the Docker image builds with -trimpath and no
+	// .git, so buildinfo carries no vcs.revision. The release/Docker build
+	// stamps it (clean by construction); native `make build` leaves it empty
+	// and relies on buildinfo. See sourceURL.
+	Revision string
 	// TrustProxyForwarded makes the login backoff key on the X-Real-IP /
 	// X-Forwarded-For client address instead of the (shared) proxy RemoteAddr.
 	// Enable ONLY behind a trusted reverse proxy that sets those headers — a
@@ -348,7 +354,7 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 	s.mux.HandleFunc("GET /license", serveText(ircthing.License))
 	s.mux.HandleFunc("GET /third-party-licenses", serveText(ircthing.ThirdPartyLicenses))
 	s.mux.HandleFunc("GET /source", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, sourceURL(), http.StatusFound)
+		http.Redirect(w, r, s.sourceURL(), http.StatusFound)
 	})
 	if assets != nil {
 		s.mux.Handle("/", http.FileServerFS(assets))
@@ -363,29 +369,46 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 const sourceBaseURL = "https://github.com/AlteredParadox/ircthing"
 
 // sourceURL returns the Corresponding Source location, pinned to the built
-// commit ONLY for a clean, VCS-stamped build. A dirty build (vcs.modified=true)
-// runs code that no commit reflects, and a build with no stamp (-buildvcs=false)
-// has no commit to point at — in both cases pinning would MISLEAD, so fall back
-// to the repository root. Release builds should be clean and VCS-stamped so
-// users get the exact revision; the fallback keeps §13 honest otherwise.
-func sourceURL() string {
-	bi, ok := debug.ReadBuildInfo()
-	if !ok {
-		return sourceBaseURL
-	}
-	var revision string
-	for _, s := range bi.Settings {
-		switch s.Key {
-		case "vcs.revision":
-			revision = s.Value
-		case "vcs.modified":
-			if s.Value == "true" {
-				return sourceBaseURL // dirty tree: no commit reflects what's running
+// commit ONLY for a clean build with a known commit. A dirty build
+// (vcs.modified=true) runs code that no commit reflects, so pinning would
+// MISLEAD — fall back to the repository root. Release builds should be clean
+// and stamped so users get the exact revision; the fallback keeps §13 honest.
+//
+// buildinfo VCS settings are authoritative (native builds). When they carry no
+// revision — a -trimpath build from a context without .git, i.e. the Docker
+// image — fall back to Config.Revision, which the release/Docker build stamps
+// with the exact (clean) commit.
+func (s *Server) sourceURL() string {
+	var biRevision string
+	var dirty bool
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range bi.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				biRevision = setting.Value
+			case "vcs.modified":
+				dirty = setting.Value == "true"
 			}
 		}
 	}
-	if revision != "" {
-		return sourceBaseURL + "/tree/" + revision
+	return resolveSourceURL(biRevision, dirty, s.cfg.Revision)
+}
+
+// resolveSourceURL picks the Corresponding Source location. buildinfo VCS wins
+// (native builds); a dirty tree pins nothing (no commit reflects it); when
+// buildinfo carries no revision — a -trimpath build from a context without
+// .git, i.e. the Docker image — fall back to the build-time-stamped
+// cfgRevision. Split out from sourceURL so the choice is unit-testable
+// without controlling the test binary's own buildinfo.
+func resolveSourceURL(biRevision string, dirty bool, cfgRevision string) string {
+	if dirty {
+		return sourceBaseURL
+	}
+	if biRevision != "" {
+		return sourceBaseURL + "/tree/" + biRevision
+	}
+	if cfgRevision != "" {
+		return sourceBaseURL + "/tree/" + cfgRevision
 	}
 	return sourceBaseURL
 }
@@ -634,11 +657,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// per-source failure backoff plus a bounded hashing semaphore keep it
 	// from being a cheap exhaustion vector.
 	source := s.loginSourceKey(r)
-	if wait := s.login.retryAfter(source, time.Now()); wait > 0 {
+	if wait, logBlock := s.login.retryAfterLogged(source, time.Now()); wait > 0 {
 		// The source is already in per-IP backoff — a sustained attempt.
 		// Logged (like the credential failure below) so a fail2ban-style
-		// watcher sees continued abuse even while the app stalls it.
-		log.Printf("login: rate-limited from %s", source)
+		// watcher sees continued abuse even while the app stalls it — but
+		// only ONCE per backoff window, so a flood of blocked requests
+		// (refused before the bcrypt verify) cannot amplify into unbounded
+		// journald writes.
+		if logBlock {
+			log.Printf("login: rate-limited from %s", source)
+		}
 		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds()+1)))
 		http.Error(w, msgTooManyAttempts, http.StatusTooManyRequests)
 		return
@@ -804,16 +832,20 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		PushEndpoint string `json:"push_endpoint"`
 	}
 	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body)
-	// Only an AUTHENTICATED logout may delete a subscription: logout is
-	// not auth-gated (it must still clear the cookie for an expired
-	// session), so without this check an unauthenticated same-origin
-	// request could delete a subscription by (secret) endpoint.
-	deletePush := body.PushEndpoint != "" && s.authed(r)
 
 	// Hold the push-mutation barrier across BOTH the subscription delete
 	// AND the token revocation, so a concurrent registration cannot land
 	// between them with the about-to-be-revoked token.
 	s.pushMutationMu.Lock()
+	// Evaluate auth WHILE holding the barrier, immediately before the delete.
+	// Only an AUTHENTICATED logout may delete a subscription: logout is not
+	// auth-gated (it must still clear the cookie for an expired session), so
+	// without this an unauthenticated same-origin request could delete a
+	// subscription by (secret) endpoint. Checking under the lock also closes
+	// a TOCTOU: a request validated just before a concurrent logout/rotation
+	// must not resume after it and delete an endpoint a NEW session
+	// re-registered under the same string.
+	deletePush := body.PushEndpoint != "" && s.authed(r)
 	if deletePush {
 		if err := s.hub.Store().DeletePushSubscription(r.Context(), body.PushEndpoint); err != nil {
 			s.pushMutationMu.Unlock()

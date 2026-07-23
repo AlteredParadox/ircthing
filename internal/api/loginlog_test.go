@@ -85,7 +85,7 @@ func TestLoginLoggingUsernameCannotInject(t *testing.T) {
 func TestLoginLoggingRateLimited(t *testing.T) {
 	ts, _ := newTestServer(t)
 	buf := captureLog(t)
-	// The first failure installs per-source backoff; the second is
+	// The first failure installs per-source backoff; the next request is
 	// rejected before the credential check and logged distinctly, so a
 	// fail2ban filter still sees the continued abuse.
 	login(t, ts, "AlteredParadox", "wrong")
@@ -93,6 +93,16 @@ func TestLoginLoggingRateLimited(t *testing.T) {
 	login(t, ts, "AlteredParadox", "wrong-again")
 	if got := buf.String(); !strings.Contains(got, "login: rate-limited from 127.0.0.1") {
 		t.Fatalf("rate-limited log missing/wrong: %q", got)
+	}
+	// Amplification guard: further blocked requests in the SAME backoff
+	// window must NOT each emit a line — one failure must not let an
+	// attacker flood the journal.
+	buf.Reset()
+	for i := 0; i < 5; i++ {
+		login(t, ts, "AlteredParadox", "still-wrong")
+	}
+	if got := buf.String(); strings.Contains(got, "rate-limited") {
+		t.Fatalf("rate-limited log not deduped within a window: %q", got)
 	}
 }
 
@@ -105,5 +115,28 @@ func TestLoginLoggingSuccess(t *testing.T) {
 	}
 	if got := buf.String(); !strings.Contains(got, "login: authenticated from 127.0.0.1") {
 		t.Fatalf("success audit log missing: %q", got)
+	}
+}
+
+func TestLoginLoggingPasswordChanged(t *testing.T) {
+	ts, _ := newTestServer(t)
+	// Authenticate, then rotate the password; the successful rotation must
+	// be audited (it revokes every other session).
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+	buf := captureLog(t)
+	req, _ := http.NewRequest("POST", ts.URL+"/api/password",
+		strings.NewReader(`{"current":"hunter2","new":"new-passphrase-123"}`))
+	req.AddCookie(cookie)
+	req.Header.Set("Origin", ts.URL)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("change password = %d, want 204", resp.StatusCode)
+	}
+	if got := buf.String(); !strings.Contains(got, "login: password changed from 127.0.0.1") {
+		t.Fatalf("password-change audit log missing: %q", got)
 	}
 }

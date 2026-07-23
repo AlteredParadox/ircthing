@@ -197,6 +197,10 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 		s.hub.RefreshPushCount(ctx)
 	}()
+	// Audit the rotation (a security-relevant event: it revokes every other
+	// session). Distinct wording from the login lines and NOT matched by the
+	// fail2ban failregex — a successful change is not an attack.
+	log.Printf("login: password changed from %s", source)
 	// Deletion cookie: same attributes as the session cookie so the browser
 	// treats it as the same cookie and drops it.
 	http.SetCookie(w, &http.Cookie{

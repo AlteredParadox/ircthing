@@ -570,7 +570,14 @@ func (h *Hub) rollbackPut(_ context.Context, name string, prev *store.NetworkCon
 	err := h.store.DeleteNetworkWithSettings(ctx, name, rollbackSettings)
 	h.lifecycleGate.Unlock()
 	if err != nil {
-		log.Printf("network %q: rollback failed: %v", name, err)
+		// The delete did NOT commit: storage still holds the committed but
+		// unstartable add. Surface it as a STOPPED network and broadcast a
+		// refresh — same as the edit-restore-failed path above — so it stays
+		// visible/editable in the sidebar instead of existing in storage yet
+		// absent from live state. The operator can retry or delete it.
+		log.Printf("network %q: rollback delete FAILED (%v) — left stopped; stored but not running, retry or delete it", name, err)
+		h.NoteStoppedNetwork(name)
+		h.broadcast(envelope("networks_changed", 0, nil))
 	}
 }
 

@@ -50,6 +50,13 @@ type loginLimiter struct {
 type loginSource struct {
 	failures     int
 	blockedUntil time.Time
+	// blockLogged bounds the rate-limited audit line to one per backoff
+	// window: without it a single failure installs backoff and every
+	// subsequent blocked request — which an attacker can flood, since they
+	// are refused BEFORE the bcrypt verify — would emit its own log line,
+	// amplifying one cheap failure into unbounded journald/disk writes.
+	// Reset each time fail() extends the window (see retryAfterLogged).
+	blockLogged bool
 }
 
 const (
@@ -104,6 +111,22 @@ func (l *loginLimiter) retryAfter(source string, now time.Time) time.Duration {
 	return 0
 }
 
+// retryAfterLogged is retryAfter plus a one-shot "should log this block"
+// signal: it reports true only for the first blocked attempt since the
+// current backoff window was installed, so a caller can emit a single
+// rate-limited audit line per window instead of one per (floodable) request.
+func (l *loginLimiter) retryAfterLogged(source string, now time.Time) (wait time.Duration, firstThisWindow bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	s := l.sources[source]
+	if s == nil || !now.Before(s.blockedUntil) {
+		return 0, false
+	}
+	first := !s.blockLogged
+	s.blockLogged = true
+	return s.blockedUntil.Sub(now), first
+}
+
 // fail records a failed attempt: the next one is allowed only after an
 // exponentially growing delay.
 func (l *loginLimiter) fail(source string, now time.Time) {
@@ -129,6 +152,8 @@ func (l *loginLimiter) fail(source string, now time.Time) {
 	shift := min(s.failures, 6) // 1s .. 64s, clamped below
 	s.failures++
 	s.blockedUntil = now.Add(min(loginBackoffBase<<shift, loginBackoffMax))
+	// New window: re-arm the once-per-window rate-limited log.
+	s.blockLogged = false
 }
 
 // ok clears a source after a successful login.

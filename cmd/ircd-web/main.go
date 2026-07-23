@@ -109,6 +109,13 @@ func flagPassed(name string) bool {
 // empty when built without make (go install, go build).
 var version string
 
+// revision is the exact commit, stamped by the release/Docker build
+// (-X main.revision=<sha>) so /source can pin it even when the build embeds
+// no VCS info — the Docker image builds with -trimpath and no .git, so
+// buildinfo carries no vcs.revision. Native `make build` leaves this empty
+// and /source relies on buildinfo instead. See api.Server.sourceURL.
+var revision string
+
 // effectiveVersion prefers the Makefile stamp and falls back to the
 // buildinfo VCS revision — the same source /source pins to — so the
 // settings About line always shows SOMETHING attributable. A dirty
@@ -198,6 +205,7 @@ func run(cfg *config) error {
 		PreviewsDefault:     cfg.previewsDefault(),
 		TrustProxyForwarded: cfg.BehindProxy,
 		Version:             effectiveVersion(),
+		Revision:            revision,
 	}, h, assets)
 	if err != nil {
 		return err
