@@ -301,7 +301,10 @@ docker compose up -d --build
 Caddy fetches a Let's Encrypt certificate for `IRCTHING_DOMAIN` on first
 request and reverse-proxies to ircthing; the container-flavored
 `config.example.json` already sets `behind_proxy: true` (required — every
-request arrives via Caddy). Because ircthing runs in a container, fail2ban
+request arrives via Caddy). Prefer not to build? Each release publishes a
+multi-arch image to `ghcr.io/alteredparadox/ircthing` (via
+[`.github/workflows/docker-release.yml`](.github/workflows/docker-release.yml)) —
+point the compose `image:` at it and drop the `build:` block. Because ircthing runs in a container, fail2ban
 belongs on the **host** watching the container journal, and its ban must
 target the `DOCKER-USER` chain to actually block published ports — the
 Docker jail and the full walkthrough are in

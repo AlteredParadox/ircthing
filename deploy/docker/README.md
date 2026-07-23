@@ -43,6 +43,25 @@ from the internet, and Caddy fetches a Let's Encrypt certificate on first
 request. For a purely local test, set `IRCTHING_DOMAIN=localhost` — Caddy then
 serves its own internal CA cert (the browser warning is expected).
 
+## Prebuilt image (GHCR)
+
+Every `vX.Y.Z` release publishes a multi-arch (amd64 + arm64) image to
+`ghcr.io/alteredparadox/ircthing` (built by
+[`.github/workflows/docker-release.yml`](../../.github/workflows/docker-release.yml)).
+To use it instead of building locally, edit `docker-compose.yml`:
+
+```yaml
+  ircthing:
+    image: ghcr.io/alteredparadox/ircthing:latest   # or pin :0.2.4
+    # delete the `build:` block
+```
+
+then `docker compose pull && docker compose up -d`. Or run it directly:
+
+```sh
+docker run --rm ghcr.io/alteredparadox/ircthing:latest -hash-password
+```
+
 ## How it fits together
 
 ```

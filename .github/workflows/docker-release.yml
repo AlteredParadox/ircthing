@@ -1,0 +1,84 @@
+# Build the multi-arch Docker image and publish it to GitHub Container
+# Registry (GHCR) on every version tag.
+#
+# Trigger: pushing a `vX.Y.Z` tag (the existing release flow). The image is
+# published as ghcr.io/alteredparadox/ircthing with tags {X.Y.Z, X.Y, latest}.
+# A manual `workflow_dispatch` run builds both arches WITHOUT pushing — a cheap
+# "does it still build" check.
+#
+# First-run note: a freshly created GHCR package is PRIVATE. To let others pull
+# it, open the package on GitHub → Package settings → change visibility to
+# Public (and, optionally, link it to this repo). Nothing here can flip that.
+
+name: docker-release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags available for the git-describe fallback below
+
+      # Stamp the same version string the native release binaries use: the tag
+      # itself (vX.Y.Z) on a tag build, else a git-describe for manual runs.
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Image tags/labels. `type=semver` strips the leading v (0.2.4, 0.2) and,
+      # via the default latest=auto flavor, also tags `latest` for a non-
+      # prerelease version tag. OCI labels link the package back to this repo.
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/alteredparadox/ircthing
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          # Push only for real tag builds; a manual dispatch just validates.
+          push: ${{ github.ref_type == 'tag' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+          # Clean two-arch manifest (no unknown/unknown attestation entries).
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

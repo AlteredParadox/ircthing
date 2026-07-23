@@ -11,7 +11,9 @@
 # Or just `make docker`.
 
 # ---- frontend: build web/dist with esbuild ----
-FROM node:22-alpine AS frontend
+# Pinned to the build platform: esbuild's output is architecture-independent
+# JS/CSS, so this stage runs once and is reused for every target arch.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend
 WORKDIR /src
 # make keeps the esbuild invocation identical to a local `make frontend`,
 # so the image can never drift from the committed build.
@@ -27,7 +29,10 @@ COPY web ./web
 RUN touch web/node_modules && make frontend
 
 # ---- builder: compile the static binary ----
-FROM golang:1.25-alpine AS builder
+# Runs on the build platform and cross-compiles to the target arch. modernc
+# SQLite is pure Go and CGO is off, so cross-compilation is a trivial GOARCH
+# switch — no QEMU emulation of the (slow) Go compile for arm64 builds.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 WORKDIR /src
 # Module download is its own cached layer keyed on go.mod/go.sum only.
 COPY go.mod go.sum ./
@@ -36,10 +41,11 @@ COPY . .
 # Bring in the built frontend (web/dist is .dockerignore'd out of the context
 # copy above) so //go:embed all:dist has real assets to embed.
 COPY --from=frontend /src/web/dist ./web/dist
-# Default is a placeholder; pass --build-arg VERSION=$(git describe ...) to
-# stamp a real version into the About panel / GET /api/config.
-ARG VERSION=docker
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+# TARGETOS/TARGETARCH are set automatically by buildx (default to the host on
+# a plain `docker build`). VERSION defaults to a placeholder; pass
+# --build-arg VERSION=$(git describe ...) to stamp the About panel / /api/config.
+ARG TARGETOS TARGETARCH VERSION=docker
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION}" \
       -o /out/ircd-web ./cmd/ircd-web
 
