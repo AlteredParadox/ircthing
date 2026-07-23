@@ -1,0 +1,67 @@
+# Turnkey ircthing + Caddy (automatic HTTPS) stack.
+#
+# Quick start (from this directory):
+#   cp .env.example .env               # set IRCTHING_DOMAIN + ACME email
+#   cp config.example.json config.json # your networks + password_hash
+#   docker compose up -d --build
+#
+# Caddy terminates TLS on 80/443 and reverse-proxies to ircthing over the
+# private "internal" network. ircthing itself is NOT published to the host —
+# the only way in is through Caddy — so behind_proxy=true in config.json is
+# correct and required (Caddy appends the real client to X-Forwarded-For).
+#
+# fail2ban is intentionally NOT a service here: it belongs on the host, where
+# it can touch the real firewall. See fail2ban-jail.local and the README.
+
+services:
+  ircthing:
+    build:
+      # Repo root — the Dockerfile lives there.
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        # Overridden by `make docker`; a plain compose build gets this literal.
+        VERSION: ${IRCTHING_VERSION:-docker}
+    image: ircthing:local
+    container_name: ircthing
+    restart: unless-stopped
+    # Stable identity in the journal so host fail2ban can match on it.
+    logging:
+      driver: journald
+      options:
+        tag: ircthing
+    volumes:
+      - ./config.json:/etc/ircthing/config.json:ro
+      - ircthing_data:/var/lib/ircthing
+    networks:
+      - internal
+    # No `ports:` — reachable only via Caddy on the internal network.
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: ircthing-caddy
+    restart: unless-stopped
+    depends_on:
+      - ircthing
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3 (QUIC)
+    environment:
+      - IRCTHING_DOMAIN=${IRCTHING_DOMAIN:?set IRCTHING_DOMAIN in .env}
+      - ACME_EMAIL=${ACME_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # ACME certs + account key — persist this!
+      - caddy_config:/config
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  ircthing_data:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,21 @@
+# Caddy config for the ircthing compose stack.
+#
+# {$IRCTHING_DOMAIN} and {$ACME_EMAIL} come from the environment (see the
+# compose file / .env). With a real public domain and ports 80+443 reachable,
+# Caddy obtains and renews a Let's Encrypt certificate automatically.
+#
+# For a LAN / no-public-DNS test, set IRCTHING_DOMAIN=localhost — Caddy then
+# serves its own internal CA cert (your browser will warn; that's expected).
+
+{
+	email {$ACME_EMAIL}
+}
+
+{$IRCTHING_DOMAIN} {
+	encode zstd gzip
+
+	# reverse_proxy transparently forwards the WebSocket upgrade for /api/ws
+	# and appends X-Forwarded-For / X-Forwarded-Proto, which ircthing reads
+	# because config.json sets behind_proxy=true.
+	reverse_proxy ircthing:8067
+}

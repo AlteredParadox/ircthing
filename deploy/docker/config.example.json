@@ -1,0 +1,28 @@
+{
+  "listen": "0.0.0.0:8067",
+  "database": "/var/lib/ircthing/ircthing.db",
+  "user": {
+    "username": "AlteredParadox",
+    "password_hash": "<output of: docker run --rm ircthing:local -hash-password>"
+  },
+  "networks": [
+    {
+      "name": "libera",
+      "addr": "irc.libera.chat:6697",
+      "tls": true,
+      "nick": "mynick",
+      "realname": "My Name",
+      "sasl": {
+        "mechanism": "PLAIN",
+        "login": "mynick",
+        "password": "my-nickserv-password"
+      },
+      "channels": ["#go-nuts", "#linux"]
+    }
+  ],
+  "session_ttl_days": 30,
+  "secure_cookies": true,
+  "behind_proxy": true,
+  "retention_days": 365,
+  "retention_max_messages": 100000
+}

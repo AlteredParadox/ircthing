@@ -1,0 +1,32 @@
+# Keep the build context small and reproducible: exclude local build output,
+# secrets, and anything the image rebuilds itself.
+
+.git
+.gitignore
+
+# Rebuilt inside the image (frontend stage / go build)
+web/node_modules
+web/dist
+bin/
+/ircd-web
+
+# Secrets and local runtime state — never bake these into an image
+config.json
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.pid
+
+# Not needed to build the binary
+design/
+docs/
+integration/
+.cache/
+sonar-issues.md
+
+# Editor / OS cruft
+*.swp
+*.swo
+*~
+.DS_Store

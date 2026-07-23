@@ -1,0 +1,39 @@
+# fail2ban jail for the Docker/compose deployment.
+#
+# fail2ban runs on the HOST, not in a container: it needs to touch the real
+# firewall, and a ban applied inside a container's network namespace does not
+# protect the host. (This is why the compose file ships no fail2ban service.)
+#
+# Install:
+#   deploy/fail2ban/ircthing.conf  -> /etc/fail2ban/filter.d/ircthing.conf   (shared filter)
+#   this file                      -> /etc/fail2ban/jail.d/ircthing-docker.conf
+#   systemctl restart fail2ban
+#
+# Prereqs:
+#   * The ircthing service logs to journald with a stable identity — the
+#     provided docker-compose.yml sets `container_name: ircthing` and the
+#     journald log driver, so CONTAINER_NAME=ircthing below matches.
+#   * config.json sets behind_proxy=true so the logged IP is the real client
+#     from X-Forwarded-For (Caddy appends it), not Caddy's container address.
+
+[ircthing-docker]
+enabled  = true
+backend  = systemd
+filter   = ircthing
+# Match only ircthing's container log stream in the journal.
+journalmatch = CONTAINER_NAME=ircthing
+
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+bantime.increment = true
+bantime.factor    = 2
+bantime.maxtime   = 1w
+
+# CRITICAL for Docker: published container ports are DNAT'd and traverse the
+# DOCKER-USER chain, bypassing INPUT — so fail2ban's default INPUT rules would
+# never block them. Inserting into DOCKER-USER (which Docker guarantees is
+# evaluated before its own forwarding rules) makes the ban actually take.
+# On a pure-nftables host without iptables-nft compat, swap this for the
+# nftables action and add an equivalent hook; see the README.
+action = iptables-allports[name=ircthing, chain=DOCKER-USER]

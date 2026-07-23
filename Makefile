@@ -29,7 +29,7 @@ ESBUILD_FLAGS := --bundle --minify --format=esm \
 	--jsx=automatic --jsx-import-source=preact \
 	--target=es2022
 
-.PHONY: build build-debug frontend check vet staticcheck test binary-size-gate bundle-size-gate go-version-gate notices-check integration irctest memcheck clean
+.PHONY: build build-debug frontend check vet staticcheck test binary-size-gate bundle-size-gate go-version-gate notices-check integration irctest memcheck clean docker
 
 # The go.mod toolchain directive is the minimum Go patch level a release may
 # be built with (stdlib CVE fixes ship in patch releases; an older toolchain
@@ -51,6 +51,12 @@ build: go-version-gate frontend
 # size-gated; the release gate measures the stripped build above.
 build-debug: frontend
 	$(GO) build -race -o bin/ircd-web-debug ./cmd/ircd-web
+
+# Build the container image (deploy/docker/). Stamps the same VERSION as the
+# native build so the About panel matches. The frontend is built inside the
+# image; this needs only Docker, not node/go on the host.
+docker:
+	docker build -t ircthing:local --build-arg VERSION=$(VERSION) .
 
 frontend: web/node_modules
 	cd web && $(ESBUILD) $(ESBUILD_FLAGS) src/main.jsx --outfile=dist/app.js
