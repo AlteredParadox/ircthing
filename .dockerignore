@@ -10,11 +10,16 @@ web/dist
 bin/
 /ircd-web
 
-# Secrets and local runtime state — never bake these into an image
-config.json
-*.db
-*.db-wal
-*.db-shm
+# Secrets and local runtime state — never bake these into an image. Recursive
+# (**/) so nested copies (e.g. deploy/docker/config.json, deploy/docker/.env)
+# are excluded too, not just the ones at the context root.
+**/config.json
+**/.env
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.key
+**/*.pem
 *.log
 *.pid
 

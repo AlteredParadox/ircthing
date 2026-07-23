@@ -17,6 +17,13 @@
 {$IRCTHING_DOMAIN} {
 	encode zstd gzip
 
+	# HSTS: refuse plaintext downgrades once a browser has seen HTTPS. One
+	# year, conservatively scoped — no includeSubDomains (this cert covers
+	# only IRCTHING_DOMAIN) and no preload (hard to undo). Add those only if
+	# you control every subdomain and are committed to HTTPS-only. Harmless
+	# for the localhost test — browsers do not apply HSTS to localhost.
+	header Strict-Transport-Security "max-age=31536000"
+
 	# reverse_proxy transparently forwards the WebSocket upgrade for /api/ws
 	# and appends X-Forwarded-For / X-Forwarded-Proto, which ircthing reads
 	# because config.json sets behind_proxy=true.

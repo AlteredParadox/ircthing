@@ -10,6 +10,11 @@
 enabled  = true
 backend  = systemd
 filter   = ircthing
+
+# Ban TCP *and* UDP. If your reverse proxy serves HTTP/3 (QUIC over UDP/443),
+# a TCP-only ban (fail2ban's default) lets a banned client keep connecting
+# over QUIC. `all` covers both; harmless if you don't run HTTP/3.
+protocol = all
 # Scope journal matching to ircthing's unit so unrelated lines that happen
 # to contain "login:" never match. Change to your actual unit name.
 journalmatch = _SYSTEMD_UNIT=ircthing.service

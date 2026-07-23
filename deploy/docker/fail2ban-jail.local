@@ -23,6 +23,11 @@ filter   = ircthing
 # Match only ircthing's container log stream in the journal.
 journalmatch = CONTAINER_NAME=ircthing
 
+# Ban TCP *and* UDP: Caddy publishes 443/udp for HTTP/3 (QUIC), so a TCP-only
+# ban (fail2ban's default) would leave a banned client free to continue over
+# QUIC. (If you disable HTTP/3 by dropping the 443/udp publish, tcp suffices.)
+protocol = all
+
 maxretry = 5
 findtime = 10m
 bantime  = 1h
@@ -36,4 +41,4 @@ bantime.maxtime   = 1w
 # evaluated before its own forwarding rules) makes the ban actually take.
 # On a pure-nftables host without iptables-nft compat, swap this for the
 # nftables action and add an equivalent hook; see the README.
-action = iptables-allports[name=ircthing, chain=DOCKER-USER]
+action = iptables-allports[name=ircthing, chain=DOCKER-USER, protocol=all]

@@ -20,8 +20,9 @@ services:
       context: ../..
       dockerfile: Dockerfile
       args:
-        # Overridden by `make docker`; a plain compose build gets this literal.
+        # Overridden by `make docker`; a plain compose build gets these literals.
         VERSION: ${IRCTHING_VERSION:-docker}
+        REVISION: ${IRCTHING_REVISION:-}
     image: ircthing:local
     container_name: ircthing
     restart: unless-stopped
@@ -30,6 +31,23 @@ services:
       driver: journald
       options:
         tag: ircthing
+    environment:
+      # Keep the Go heap inside the project's 72 MB RSS target (parity with the
+      # systemd unit); mem_limit below is the hard ceiling that OOM-kills a
+      # runaway. Raise both together on a larger host.
+      - GOMEMLIMIT=64MiB
+    # Hardening: the app already runs as non-root uid 10001, needs no Linux
+    # capabilities (binds 8067, writes only the data volume) and never
+    # escalates. read_only root + a tmpfs /tmp leave nothing else writable.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 128m
+    pids_limit: 256
     volumes:
       - ./config.json:/etc/ircthing/config.json:ro
       - ircthing_data:/var/lib/ircthing
@@ -50,6 +68,16 @@ services:
     environment:
       - IRCTHING_DOMAIN=${IRCTHING_DOMAIN:?set IRCTHING_DOMAIN in .env}
       - ACME_EMAIL=${ACME_EMAIL:-}
+    # Hardening. Caddy needs exactly one capability — binding privileged ports
+    # 80/443 — and no privilege escalation; it writes certs to the /data volume.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    mem_limit: 128m
+    pids_limit: 256
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data      # ACME certs + account key — persist this!
