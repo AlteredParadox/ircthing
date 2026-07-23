@@ -288,27 +288,24 @@ one or two.
 A turnkey **ircthing + Caddy** stack (automatic HTTPS, ircthing kept on a
 private network) lives in [`deploy/docker/`](deploy/docker). A multi-stage
 `Dockerfile` at the repo root builds the frontend, compiles the static
-binary, and ships it on a minimal Alpine image (non-root, HTTP only — TLS
-terminates at Caddy):
+binary, and ships it on a minimal Alpine image (non-root, read-only root
+filesystem, HTTP only — TLS terminates at Caddy).
 
-```sh
-cd deploy/docker
-cp .env.example .env                 # set IRCTHING_DOMAIN + ACME_EMAIL
-cp config.example.json config.json   # your networks + password_hash
-docker compose up -d --build
-```
+**Follow the complete walkthrough in
+[`deploy/docker/README.md`](deploy/docker/README.md)** — don't just copy the
+examples and `up -d`. It covers generating the password hash, editing the
+config *before* locking it to `0600`/uid 10001, and the IPv4-only
+A-record-only (no AAAA) requirement. Skipping those can leave real
+credentials in a world-readable file or advertise an unreachable address.
 
-Caddy fetches a Let's Encrypt certificate for `IRCTHING_DOMAIN` on first
-request and reverse-proxies to ircthing; the container-flavored
-`config.example.json` already sets `behind_proxy: true` (required — every
-request arrives via Caddy). Prefer not to build? Each release publishes a
-multi-arch image to `ghcr.io/alteredparadox/ircthing` (via
+The container config sets `behind_proxy: true` (required — every request
+arrives via Caddy). Prefer not to build? Each release publishes a multi-arch
+image to `ghcr.io/alteredparadox/ircthing` (via
 [`.github/workflows/docker-release.yml`](.github/workflows/docker-release.yml)) —
-point the compose `image:` at it and drop the `build:` block. Because ircthing runs in a container, fail2ban
-belongs on the **host** watching the container journal, and its ban must
-target the `DOCKER-USER` chain to actually block published ports — the
-Docker jail and the full walkthrough are in
-[`deploy/docker/README.md`](deploy/docker/README.md).
+point the compose `image:` at it and drop the `build:` block. Because ircthing
+runs in a container, fail2ban belongs on the **host** watching the container
+journal, and its ban must target the `DOCKER-USER` chain to actually block
+published ports.
 
 ### Banning brute-force sources (fail2ban)
 

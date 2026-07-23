@@ -110,16 +110,20 @@ Three named volumes hold everything stateful:
 The database runs in **WAL mode**, so copying the `.db` file alone can miss
 committed data still in the `-wal` sidecar or race a checkpoint. Take a
 consistent snapshot by stopping ircthing (a clean shutdown quiesces SQLite),
-copying the whole directory including sidecars, then restarting. Keep backups
-**outside this checkout** (they contain credentials — a `config.json.bak` in
-the repo could be committed or sent to a builder) in a root-only directory:
+copying the whole directory including sidecars into a **fresh timestamped
+directory**, then restarting. Keep backups **outside this checkout** (they
+contain credentials — a `config.json.bak` in the repo could be committed or
+sent to a builder) in a root-only directory. Use a new directory each run:
+`docker cp` copies a directory *into* an existing destination, so reusing one
+would nest the new copy under the old and strand the previous database.
 
 ```sh
-sudo mkdir -p /var/backups/ircthing && sudo chmod 700 /var/backups/ircthing
+snap=/var/backups/ircthing/$(date +%Y%m%d-%H%M%S)   # fresh dir per snapshot
+sudo mkdir -p "$snap" && sudo chmod 700 "$snap"
 docker compose stop ircthing
-sudo docker compose cp ircthing:/var/lib/ircthing /var/backups/ircthing/data  # db + -wal + -shm; sudo to write the root-only dir
+sudo docker compose cp ircthing:/var/lib/ircthing/. "$snap/data"  # db + -wal + -shm (trailing /. copies contents)
 docker compose start ircthing
-sudo cp config.json /var/backups/ircthing/config.json.bak                     # credentials (needs sudo: 0600 / uid 10001)
+sudo cp config.json "$snap/config.json.bak"                       # credentials (needs sudo: 0600 / uid 10001)
 ```
 
 **Disk:** the DB is not memory-bounded and grows with scrollback. Set
