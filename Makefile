@@ -59,8 +59,10 @@ build-debug: frontend
 # FULLY clean, so a dirty local image never claims a commit that doesn't reflect
 # it. `git describe --dirty` ignores untracked files (which the explicit COPYs
 # in the Dockerfile would still pull in), so gate on `git status --porcelain
-# --untracked-files=normal` being empty instead.
-DOCKER_REVISION := $(shell test -z "$$(git status --porcelain --untracked-files=normal 2>/dev/null)" && git rev-parse HEAD 2>/dev/null)
+# --untracked-files=normal` being empty instead. Capture status into a var and
+# require the command to SUCCEED before the emptiness test — otherwise a git
+# error (empty stdout) would read as "clean" and wrongly stamp HEAD.
+DOCKER_REVISION := $(shell s=$$(git status --porcelain --untracked-files=normal 2>/dev/null) && test -z "$$s" && git rev-parse HEAD 2>/dev/null)
 docker:
 	docker build -t ircthing:local \
 	  --build-arg VERSION=$(VERSION) \

@@ -50,9 +50,11 @@ jobs:
         run: make check
 
   # Manual dispatch only: prove the multi-arch image still builds, WITHOUT any
-  # registry access (read-only permissions, no login, no push).
+  # registry access (read-only permissions, no login, no push). Keyed on the
+  # EVENT, not the ref: a workflow_dispatch can target a tag, and keying on
+  # ref_type alone would route a manual run into the package-write publish job.
   build:
-    if: github.ref_type != 'tag'
+    if: github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: ubuntu-latest
     permissions:
@@ -76,9 +78,11 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Tag only: build and publish. This is the ONLY job granted packages: write.
+  # Tag PUSH only: build and publish. This is the ONLY job granted packages:
+  # write. Requiring event_name == 'push' keeps a manual dispatch (even one
+  # targeting a tag) out of the publish path.
   publish:
-    if: github.ref_type == 'tag'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: test
     runs-on: ubuntu-latest
     permissions:

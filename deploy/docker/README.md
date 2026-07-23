@@ -54,6 +54,13 @@ from the internet, and Caddy fetches a Let's Encrypt certificate on first
 request. For a purely local test, set `IRCTHING_DOMAIN=localhost` — Caddy then
 serves its own internal CA cert (the browser warning is expected).
 
+> **IPv4 only.** The published ports bind `0.0.0.0` (IPv4) deliberately — see
+> [How it fits together](#how-it-fits-together) for why. Give the domain an
+> **A record only, no AAAA**: an AAAA record would advertise an address the
+> stack doesn't serve (breaking IPv6 clients, and ACME may prefer IPv6). Add
+> AAAA only after enabling IPv6 on the bridge and verifying real-client source
+> logging and fail2ban bans over IPv6.
+
 ## Prebuilt image (GHCR)
 
 Every `vX.Y.Z` release publishes a multi-arch (amd64 + arm64) image to
@@ -110,9 +117,9 @@ the repo could be committed or sent to a builder) in a root-only directory:
 ```sh
 sudo mkdir -p /var/backups/ircthing && sudo chmod 700 /var/backups/ircthing
 docker compose stop ircthing
-docker compose cp ircthing:/var/lib/ircthing /var/backups/ircthing/data  # db + -wal + -shm
+sudo docker compose cp ircthing:/var/lib/ircthing /var/backups/ircthing/data  # db + -wal + -shm; sudo to write the root-only dir
 docker compose start ircthing
-sudo cp config.json /var/backups/ircthing/config.json.bak                # credentials (needs sudo: 0600 / uid 10001)
+sudo cp config.json /var/backups/ircthing/config.json.bak                     # credentials (needs sudo: 0600 / uid 10001)
 ```
 
 **Disk:** the DB is not memory-bounded and grows with scrollback. Set
