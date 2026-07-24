@@ -821,7 +821,7 @@ func (h *Hub) pushToSubscription(ctx context.Context, sender PushSender, sub sto
 	}
 	switch err := sender.Send(ctx, webpush.Subscription{Endpoint: sub.Endpoint, P256dh: p256dh, Auth: auth}, body, pushTTLSeconds); {
 	case err == nil:
-		if err := h.store.TouchPushSuccess(context.Background(), sub.Endpoint, time.Now()); err != nil {
+		if err := h.store.TouchPushSuccess(ctx, sub.Endpoint, time.Now()); err != nil {
 			log.Printf("push: recording success: %v", err)
 		}
 	case errors.Is(err, webpush.ErrGone):
