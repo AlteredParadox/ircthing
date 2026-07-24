@@ -54,7 +54,7 @@ export function Sidebar({ networks, buffers, activeKey, monitors, truncated, mem
 				<div class="logo">λ</div>
 				<div class="side-title">ircthing</div>
 				<div class="side-meta">{sections.length} net{sections.length === 1 ? "" : "s"}</div>
-				<button class="monitor-addbtn" title="Add network" onClick={onAddNetwork}>+</button>
+				<button type="button" class="monitor-addbtn" title="Add network" onClick={onAddNetwork}>+</button>
 			</div>
 			{truncated && (
 				<output class="data-warning" title="The server response reached its safety limit.">
@@ -153,7 +153,7 @@ export function Sidebar({ networks, buffers, activeKey, monitors, truncated, mem
 						Memory: {(memRSS / (1024 * 1024)).toFixed(1)} MB
 					</div>
 				)}
-				<button class="foot-settings" onClick={onSettings}>
+				<button type="button" class="foot-settings" onClick={onSettings}>
 					<span class="foot-settings-gear" aria-hidden="true">⚙</span>
 					<span>Settings</span>
 				</button>
@@ -180,7 +180,7 @@ function MonitorSection({ network, list, onOpen, onAdd, onRemove }) {
 		<div class="monitor-section">
 			<div class="monitor-head">
 				<span>monitor</span>
-				<button class="monitor-addbtn" title="Add buddy" onClick={() => setAdding((a) => !a)}>+</button>
+				<button type="button" class="monitor-addbtn" title="Add buddy" onClick={() => setAdding((a) => !a)}>+</button>
 			</div>
 			{adding && (
 				<form class="monitor-add" onSubmit={submit}>
@@ -199,6 +199,7 @@ function MonitorSection({ network, list, onOpen, onAdd, onRemove }) {
 					<span class={"dot " + (m.online ? "online" : "offline")} />
 					<span class={"monitor-nick" + (m.online ? "" : " off")}>{m.nick}</span>
 					<button
+						type="button"
 						class="monitor-remove"
 						title="Stop monitoring"
 						onClick={(e) => {

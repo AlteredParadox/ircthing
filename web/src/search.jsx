@@ -156,7 +156,7 @@ export function SearchOverlay({ sock, onJump, onClose, timeFmt, nickSep, redacte
 						onInput={(e) => setQuery(e.currentTarget.value)}
 						placeholder="Search all messages…"
 					/>
-					<button class="search-close" onClick={onClose} title="Close (Esc)">✕</button>
+					<button type="button" class="search-close" onClick={onClose} title="Close (Esc)">✕</button>
 				</div>
 				<div class="search-results scroll">
 					{state === "loading" && results.length === 0 && <div class="search-note">searching…</div>}

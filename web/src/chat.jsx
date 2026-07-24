@@ -241,7 +241,7 @@ function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick
 			<RowNick sender={ev.sender} color={color} label={nickLabel} sep={sep} onNick={onNick} userhost={userhosts?.get(ev.sender?.toLowerCase())} prefix={modePrefix} />
 			<RowBody r={r} color={color} sender={ev.sender} onNick={onNick} nicks={nicks} theme={theme} />
 			{canRedact && (
-				<button class="msg-redact" title="Delete message" onClick={() => onRedact(ev.msgid)}>⌫</button>
+				<button type="button" class="msg-redact" title="Delete message" onClick={() => onRedact(ev.msgid)}>⌫</button>
 			)}
 			{/* Previews wrap to their own full-width line, left-aligned under
 			    the timestamp rather than indented into the body column.

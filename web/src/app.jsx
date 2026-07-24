@@ -112,6 +112,7 @@ function TopBar({ activeBuf, isChan, topicText, sideOpen, rightOpen, theme, onSi
 	return (
 		<div class="topbar">
 			<button
+				type="button"
 				class={"icon-btn" + (sideOpen ? " active" : "")}
 				title="Toggle channels"
 				onClick={onSide}
@@ -124,12 +125,13 @@ function TopBar({ activeBuf, isChan, topicText, sideOpen, rightOpen, theme, onSi
 			)}
 			<div class="topic-sep" />
 			<div class="topic-text" title={topicText}>{topicText}</div>
-			<button class="icon-btn" title="Search (Ctrl+Shift+F)" onClick={onSearch}>⌕</button>
-			<button class="icon-btn" title="Toggle theme" onClick={onTheme}>
+			<button type="button" class="icon-btn" title="Search (Ctrl+Shift+F)" onClick={onSearch}>⌕</button>
+			<button type="button" class="icon-btn" title="Toggle theme" onClick={onTheme}>
 				{theme === "dark" ? "☀" : "☾"}
 			</button>
 			{isChan && (
 				<button
+					type="button"
 					class={"icon-btn" + (rightOpen ? " active" : "")}
 					title="Toggle members"
 					onClick={onRight}
