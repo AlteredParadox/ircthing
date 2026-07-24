@@ -37,13 +37,14 @@ emit_file() {
 	echo
 	echo '```'
 	cat "$path"
-	[ -n "$(tail -c1 "$path")" ] && echo # add a newline only if the file lacks one
+	[[ -n "$(tail -c1 "$path")" ]] && echo # add a newline only if the file lacks one
 	echo '```'
 }
 
 # license_files <dir>: every top-level license/notice/authors file, sorted.
 license_files() {
-	find "$1" -maxdepth 1 -type f \( \
+	local dir=$1
+	find "$dir" -maxdepth 1 -type f \( \
 		-iname 'LICENSE*' -o -iname 'COPYING*' -o -iname 'NOTICE*' \
 		-o -iname 'PATENTS*' -o -iname 'AUTHORS*' -o -iname '*-LICENSE' \
 		\) | sort
@@ -57,20 +58,20 @@ emit_module() {
 	echo "## $title"
 	local found=0 has_copyright=0 f
 	while IFS= read -r f; do
-		[ -z "$f" ] && continue
+		[[ -z "$f" ]] && continue
 		found=1
 		emit_file "$f" "$(basename "$f")"
 		# A real copyright LINE carries a year — the MIT boilerplate phrase "the
 		# above copyright notice" does not, so don't let it mask a missing notice.
 		if grep -qiE 'copyright.*[12][0-9]{3}' "$f"; then has_copyright=1; fi
 	done < <(license_files "$dir")
-	if [ "$found" = 0 ]; then
+	if [[ "$found" = 0 ]]; then
 		echo "ERROR: no license file found in $dir" >&2
 		exit 1
 	fi
 	# MIT/BSD require the copyright notice; a few modules keep it only in source
 	# headers (WireGuard). Surface the first such line so attribution is complete.
-	if [ "$has_copyright" = 0 ]; then
+	if [[ "$has_copyright" = 0 ]]; then
 		local cline
 		# Walk the .go files in SORTED order (not grep -r's filesystem/readdir
 		# order) so the "first copyright line" is deterministic across
@@ -80,7 +81,7 @@ emit_module() {
 		cline=$(find "$dir" -name '*.go' -type f 2>/dev/null | sort \
 			| xargs -r grep -hi copyright 2>/dev/null \
 			| grep -m1 -E '[12][0-9]{3}' | sed 's#^[[:space:]/*]*##' || true)
-		if [ -n "$cline" ]; then
+		if [[ -n "$cline" ]]; then
 			echo
 			echo "### Copyright (from source headers)"
 			echo
