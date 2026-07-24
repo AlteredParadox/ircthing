@@ -10,8 +10,11 @@
 # enforcing the size budgets and race safety that only ran locally.
 name: ci
 
+# push only on main; branch pushes are covered by their pull_request run,
+# so PRs (including Dependabot's) don't run this twice.
 on:
   push:
+    branches: [main]
   pull_request:
 
 # Least privilege: this job only reads the repo (no releases, no PR writes).

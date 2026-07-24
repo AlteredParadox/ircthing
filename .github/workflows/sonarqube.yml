@@ -13,8 +13,11 @@
 
 name: sonarqube
 
+# push only on main; branch pushes are covered by their pull_request run,
+# so PRs (including Dependabot's) don't run this twice.
 on:
   push:
+    branches: [main]
   pull_request:
 
 # Least privilege: read-only. This job hands SONAR_TOKEN to a third-party
@@ -26,6 +29,10 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
+    # Dependabot's event token can't read SONAR_TOKEN (GitHub scopes it to a
+    # separate dependabot secret store), so a scan on its PRs would only fail
+    # on auth. ci.yml still runs make check on those PRs — that's the gate.
+    if: github.actor != 'dependabot[bot]'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
