@@ -13,7 +13,7 @@
 # ---- frontend: build web/dist with esbuild ----
 # Pinned to the build platform: esbuild's output is architecture-independent
 # JS/CSS, so this stage runs once and is reused for every target arch.
-FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend
+FROM --platform=$BUILDPLATFORM node:26-alpine AS frontend
 WORKDIR /src
 # make keeps the esbuild invocation identical to a local `make frontend`,
 # so the image can never drift from the committed build.
