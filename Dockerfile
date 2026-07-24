@@ -32,7 +32,7 @@ RUN touch web/node_modules && make frontend
 # Runs on the build platform and cross-compiles to the target arch. modernc
 # SQLite is pure Go and CGO is off, so cross-compilation is a trivial GOARCH
 # switch — no QEMU emulation of the (slow) Go compile for arm64 builds.
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 WORKDIR /src
 # Module download is its own cached layer keyed on go.mod/go.sum only.
 COPY go.mod go.sum ./
