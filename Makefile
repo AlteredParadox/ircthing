@@ -29,7 +29,7 @@ ESBUILD_FLAGS := --bundle --minify --format=esm \
 	--jsx=automatic --jsx-import-source=preact \
 	--target=es2022
 
-.PHONY: build build-debug frontend check vet staticcheck test binary-size-gate bundle-size-gate go-version-gate notices-check integration irctest memcheck clean docker
+.PHONY: build build-debug frontend check vet gofmt-check staticcheck test binary-size-gate bundle-size-gate go-version-gate notices-check integration irctest memcheck clean docker
 
 # The go.mod toolchain directive is the minimum Go patch level a release may
 # be built with (stdlib CVE fixes ship in patch releases; an older toolchain
@@ -79,7 +79,7 @@ web/node_modules: web/package.json web/package-lock.json
 	cd web && npm ci --no-fund --no-audit
 	touch web/node_modules
 
-check: vet staticcheck test frontend-test build binary-size-gate bundle-size-gate notices-check
+check: vet gofmt-check staticcheck test frontend-test build binary-size-gate bundle-size-gate notices-check
 	@echo "check: OK"
 
 # THIRD_PARTY_LICENSES.md is embedded in the binary and must stay in step with
@@ -101,6 +101,16 @@ frontend-test:
 
 vet:
 	$(GO) vet ./...
+
+# Formatting gate: fail if any tracked .go file isn't gofmt-clean. Scoped
+# to git-tracked files so the vendored checkouts under .cache/ (gitignored)
+# are never scanned. Simplifications (gofmt -s) are left to staticcheck.
+gofmt-check:
+	@bad=$$(gofmt -l $$(git ls-files '*.go')); \
+	if [ -n "$$bad" ]; then \
+		echo "gofmt: these files need formatting (run: gofmt -w <file>):"; \
+		echo "$$bad"; exit 1; \
+	fi
 
 staticcheck:
 	$(STATICCHECK) ./...

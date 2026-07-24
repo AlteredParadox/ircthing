@@ -178,8 +178,8 @@ type Hub struct {
 	// the cached count positive again. pushRulesGen advances on every
 	// rules reload, letting a delivery notice its (scrubbed, un-re-
 	// evaluable) channel headline outlived the rule that admitted it.
-	pushEpoch     atomic.Uint64
-	pushRulesGen  atomic.Uint64
+	pushEpoch    atomic.Uint64
+	pushRulesGen atomic.Uint64
 	// The delivery generation context is canceled by a wipe so an
 	// already-in-flight Send to a now-revoked endpoint aborts rather than
 	// running out its 15s timeout. Guarded by pushGenMu; base is the

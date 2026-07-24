@@ -198,7 +198,7 @@ func TestValidateNetworkName(t *testing.T) {
 		"libera",
 		"Libera Chat", // interior space: pre-hardening databases hold such names
 		"Libera  Chat (backup)",
-		"ネット ワーク", // printable non-ASCII with a space
+		"ネット ワーク",                                // printable non-ASCII with a space
 		strings.Repeat("n", MaxNetworkNameBytes), // exactly at the cap
 	}
 	for _, name := range valid {
