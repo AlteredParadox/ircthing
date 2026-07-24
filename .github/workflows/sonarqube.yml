@@ -1,0 +1,52 @@
+# SonarQube Cloud analysis on every push and pull request.
+#
+# Cloud, not the old self-hosted server: the repo is public, so SonarQube
+# Cloud is free and needs no self-hosted scanner/runner. Only SONAR_TOKEN
+# is required (no SONAR_HOST_URL — the action defaults to sonarcloud.io);
+# add it as a repository secret. The organization/project keys live in
+# sonar-project.properties (sonar.organization / sonar.projectKey).
+#
+# IMPORTANT: this job imports Go coverage (coverage.out), which requires
+# CI-based analysis — so Automatic Analysis MUST be turned off for the
+# project in SonarQube Cloud (Administration -> Analysis Method), or the
+# scan is rejected as a conflicting analysis.
+
+name: sonarqube
+
+on:
+  push:
+  pull_request:
+
+# Least privilege: read-only. This job hands SONAR_TOKEN to a third-party
+# action, so it (and the others) are pinned to full commit SHAs so a
+# retagged action can't exfiltrate the secret.
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Full history: SonarQube needs blame data for new-code periods.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+
+      - name: Go tests with coverage
+        run: go test -covermode=atomic -coverprofile=coverage.out ./...
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Frontend tests
+        run: cd web && node --test
+
+      - name: SonarQube Cloud scan
+        uses: sonarsource/sonarqube-scan-action@c7ee0f9df90b7aa20e8dcf9695dcfe2e7da5b4f2 # v7.2.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

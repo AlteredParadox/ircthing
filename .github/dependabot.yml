@@ -1,0 +1,40 @@
+# Dependabot keeps dependencies current across the four ecosystems this
+# repo uses. Updates land as PRs (never auto-merged), each gated by the
+# ci.yml `make check` run — which enforces the size budgets — so nothing
+# lands without passing the same bar as any hand-written change.
+#
+# github-actions is the standout: it understands the "pinned SHA + # vN"
+# pattern in the workflows and bumps both together, replacing the manual
+# tag re-resolution the workflow comments call out.
+#
+# Go and npm updates are grouped so a routine bump arrives as one PR per
+# ecosystem per week rather than a swarm.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      go:
+        patterns:
+          - "*"
+
+  - package-ecosystem: npm
+    directory: "/web"
+    schedule:
+      interval: weekly
+    groups:
+      frontend:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
