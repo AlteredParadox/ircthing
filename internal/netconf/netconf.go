@@ -112,8 +112,8 @@ func (n *Network) EffectiveName() string {
 // each name to internal/hub.maxPersistedChannelLen for the same reason: a name
 // the persist path would skip must not be storable in the first place.
 const (
-	maxChannels         = 4096
-	maxChannelLen       = 200
+	maxChannels   = 4096
+	maxChannelLen = 200
 	// maxNetworkNameBytes is mirrored by store.MaxNetworkNameBytes: sized so
 	// any addr proxydial.ValidHostPort accepts (255-byte host + ":65535",
 	// ~262 bytes) can serve as the EffectiveName fallback.

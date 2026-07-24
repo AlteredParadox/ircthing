@@ -731,4 +731,3 @@ func (f *fetcher) get(ctx context.Context, rawURL string) (contentType, finalURL
 	}
 	return resp.Header.Get("Content-Type"), finalURL, body, nil
 }
-
