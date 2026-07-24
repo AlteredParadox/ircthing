@@ -335,7 +335,7 @@ func (s *Server) handleMediaStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if enc := nonIdentityEncoding(resp); enc != "" {
+	if nonIdentityEncoding(resp) != "" {
 		// We asked for identity; an encoded body would relay as mislabeled
 		// bytes (writeStreamHeaders forwards no Content-Encoding). Fail with a
 		// diagnosable 502 instead, no body bytes.

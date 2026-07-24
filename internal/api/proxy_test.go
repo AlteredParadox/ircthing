@@ -62,15 +62,15 @@ func TestMediaTargetIDIsKeyedAndStable(t *testing.T) {
 	if again := key.id(target); again != id {
 		t.Fatalf("same target and key produced different IDs: %q, %q", id, again)
 	}
-	if other := key.id("https://other.example.test/private"); other == id {
+	if key.id("https://other.example.test/private") == id {
 		t.Fatalf("different targets produced the same ID %q", id)
 	}
-	if other := otherKey.id(target); other == id {
+	if otherKey.id(target) == id {
 		t.Fatalf("different keys produced the same ID %q", id)
 	}
 
 	raw := sha256.Sum256([]byte(target))
-	if rawID := fmt.Sprintf("%x", raw[:8]); id == rawID {
+	if id == fmt.Sprintf("%x", raw[:8]) {
 		t.Fatalf("keyed ID equals raw SHA-256 prefix %q", id)
 	}
 	for _, secret := range []string{target, "alice", "secret", "example.test", "private", "hunter2"} {

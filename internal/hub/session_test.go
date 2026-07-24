@@ -2557,7 +2557,7 @@ func TestHubSessionCap(t *testing.T) {
 		}
 		sessions = append(sessions, s)
 	}
-	if over := h.NewSession(); over != nil {
+	if h.NewSession() != nil {
 		t.Fatal("NewSession over the cap returned a session, want nil")
 	}
 	// Closing one frees a slot.

@@ -286,7 +286,7 @@ func Parse(raw []byte) (*Network, error) {
 		return nil, err
 	}
 	// Strict means one document; see loadConfig.
-	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+	if dec.Decode(new(json.RawMessage)) != io.EOF {
 		return nil, errors.New("trailing data after the network object")
 	}
 	if err := n.Validate(); err != nil {

@@ -622,7 +622,7 @@ func TestCanonicalIgnoresRenameMergeDedupAndCap(t *testing.T) {
 	if problem != "" {
 		t.Fatalf("unexpected rejection: %q", problem)
 	}
-	if got := len(out2["n"]); got != 2 {
+	if len(out2["n"]) != 2 {
 		t.Fatalf("within-list dedup = %v, want 2 unique", out2["n"])
 	}
 }
