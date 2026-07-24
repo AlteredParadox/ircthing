@@ -123,7 +123,7 @@ func loadConfig(path string) (*config, error) {
 	}
 	// Strict means one document: trailing JSON would be silently ignored
 	// otherwise, hiding merge/templating mistakes.
-	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+	if dec.Decode(new(json.RawMessage)) != io.EOF {
 		return nil, fmt.Errorf("%s: trailing data after the config object", path)
 	}
 	if cfg.Listen == "" {

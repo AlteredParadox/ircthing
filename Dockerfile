@@ -21,7 +21,7 @@ RUN apk add --no-cache make
 # Install deps first for layer caching; the source copy below invalidates
 # less often than a dependency change would.
 COPY web/package.json web/package-lock.json ./web/
-RUN cd web && npm ci --no-fund --no-audit
+RUN cd web && npm ci --no-fund --no-audit --ignore-scripts
 COPY Makefile ./
 COPY web ./web
 # node_modules is restored from the npm ci layer (excluded by .dockerignore);
@@ -54,7 +54,7 @@ COPY --from=frontend /src/web/dist ./web/dist
 # it — buildinfo has none here (-trimpath, no .git in the context). Pass it only
 # for a CLEAN build; leaving it empty makes /source fall back to the repo root.
 ARG TARGETOS TARGETARCH VERSION=docker REVISION=
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
+RUN CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" go build -trimpath \
       -ldflags="-s -w -X main.version=${VERSION} -X main.revision=${REVISION}" \
       -o /out/ircd-web ./cmd/ircd-web
 

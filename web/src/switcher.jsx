@@ -64,7 +64,7 @@ export function Switcher({ buffers, networks, onSelect, onClose }) {
 						}}
 						onKeyDown={onKeyDown}
 					/>
-					<button class="search-close" onClick={onClose} title="Close (Esc)">✕</button>
+					<button type="button" class="search-close" onClick={onClose} title="Close (Esc)">✕</button>
 				</div>
 				<div class="search-results scroll">
 					{list.length === 0 && <div class="search-note">no matching buffers</div>}

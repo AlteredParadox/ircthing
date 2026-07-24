@@ -20,6 +20,8 @@
 // see scripts/gen-third-party-licenses.sh).
 package ircthing
 
+// Blank import for its side effect: registers the //go:embed directives
+// below (the embed package need not be referenced by name).
 import _ "embed"
 
 // License is the project's own license (GNU AGPL-3.0-or-later).

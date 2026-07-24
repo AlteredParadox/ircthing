@@ -611,7 +611,9 @@ func TestEgressForNetwork(t *testing.T) {
 	if f := srv.htmlFetcherForNetwork(ctx, "tornet"); f == nil || !f.proxied {
 		t.Fatalf("tornet html fetcher = %v; want proxied", f)
 	}
-	if f := srv.htmlFetcherForNetwork(ctx, "tornet"); f != srv.htmlFetcherForNetwork(ctx, "tornet") {
+	first := srv.htmlFetcherForNetwork(ctx, "tornet")
+	second := srv.htmlFetcherForNetwork(ctx, "tornet")
+	if first != second {
 		t.Fatal("per-proxy fetcher not cached/reused")
 	}
 	if f := srv.htmlFetcherForNetwork(ctx, "direct"); f == nil || f.proxied {
@@ -1073,7 +1075,7 @@ func TestLoginGlobalBucket(t *testing.T) {
 		t.Fatalf("refilled attempt blocked (wait %v)", wait)
 	}
 	// …but only one — the very next is dry again.
-	if wait := l.globalAllow(later); wait <= 0 {
+	if l.globalAllow(later) <= 0 {
 		t.Fatal("second attempt after single refill should be blocked")
 	}
 	// A long idle period refills at most to the burst cap.
@@ -1083,7 +1085,7 @@ func TestLoginGlobalBucket(t *testing.T) {
 			t.Fatalf("post-idle attempt %d blocked (wait %v)", i, wait)
 		}
 	}
-	if wait := l.globalAllow(idle); wait <= 0 {
+	if l.globalAllow(idle) <= 0 {
 		t.Fatal("burst cap not enforced after idle refill")
 	}
 }

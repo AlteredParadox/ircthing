@@ -1475,7 +1475,7 @@ input::placeholder {
 	margin: 0;
 	font-size: 0.9286rem;
 	color: var(--text);
-	word-break: break-word;
+	overflow-wrap: break-word;
 }
 
 /* ---- context menu ---- */

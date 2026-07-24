@@ -62,7 +62,7 @@ export function Login({ onLogin }) {
 					value={password} onInput={(e) => setPassword(e.currentTarget.value)}
 				/>
 				{error && <div class="login-error">{error}</div>}
-				<button class="btn-accent login-btn" disabled={busy}>
+				<button type="submit" class="btn-accent login-btn" disabled={busy}>
 					{busy ? "signing in…" : "sign in"}
 				</button>
 			</form>

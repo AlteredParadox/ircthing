@@ -38,7 +38,7 @@ function NotifControl({ perm, enabled, onEnable, onToggle }) {
 		);
 	}
 	return (
-		<button class="btn-accent" onClick={onEnable}>
+		<button type="button" class="btn-accent" onClick={onEnable}>
 			Enable notifications
 		</button>
 	);
@@ -153,6 +153,7 @@ function Seg({ value, options, labels, onPick }) {
 		<div class="seg">
 			{options.map((o, i) => (
 				<button
+					type="button"
 					key={o}
 					class={o === value ? "on" : ""}
 					onClick={() => onPick(o)}
@@ -542,7 +543,7 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 			<div class="settings-panel">
 				<div class="settings-head">
 					<div class="settings-title">Settings</div>
-					<button class="search-close" onClick={onClose} title="Close (Esc)">✕</button>
+					<button type="button" class="search-close" onClick={onClose} title="Close (Esc)">✕</button>
 				</div>
 				<div class="settings-body scroll">
 					<section class="settings-section">
@@ -561,6 +562,7 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 							<div class="swatches">
 								{ACCENTS.map((a) => (
 									<button
+										type="button"
 										key={a}
 										class={"swatch" + (a === prefs.accent ? " on" : "")}
 										style={{ background: `rgb(${ACCENT_RGB[a]})` }}
@@ -873,7 +875,7 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 							devices stay signed in).
 						</div>
 						{logoutErr && <div class="cmd-error">Sign out failed — try again.</div>}
-						<button class="btn-accent" onClick={logout}>Sign out</button>
+						<button type="button" class="btn-accent" onClick={logout}>Sign out</button>
 					</section>
 
 					<ChangePassword onRotated={() => setTimeout(() => onLogout?.(), 1200)} />
@@ -934,10 +936,10 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 										<option value={n} key={n}>{n}</option>
 									))}
 								</select>
-								<button class="rule-remove" onClick={() => removeRule(i)} title="Remove">✕</button>
+								<button type="button" class="rule-remove" onClick={() => removeRule(i)} title="Remove">✕</button>
 							</div>
 						))}
-						<button class="settings-add" onClick={addRule}>+ Add keyword</button>
+						<button type="button" class="settings-add" onClick={addRule}>+ Add keyword</button>
 					</section>
 
 					<section class="settings-section">
