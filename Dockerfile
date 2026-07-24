@@ -61,7 +61,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
 # ---- final: minimal runtime ----
 # Track a current, supported Alpine branch (3.21 reaches EOL 2026-11); the
 # minor tag auto-picks up patch releases with CVE fixes.
-FROM alpine:3.23
+FROM alpine:3.24
 # ca-certificates: the binary makes outbound TLS to IRC servers, the media
 # proxy, and the push services — without the roots those all fail.
 # tzdata: correct local-time rendering. wget (busybox): the HEALTHCHECK.
