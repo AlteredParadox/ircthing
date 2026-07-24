@@ -34,7 +34,7 @@ jobs:
     # on auth. ci.yml still runs make check on those PRs — that's the gate.
     if: github.actor != 'dependabot[bot]'
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           # Full history: SonarQube needs blame data for new-code periods.
           fetch-depth: 0
