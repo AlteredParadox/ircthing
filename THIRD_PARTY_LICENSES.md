@@ -1104,7 +1104,7 @@ Copyright 2018 The gVisor Authors.
 
 ---
 
-## modernc.org/libc@v1.73.4
+## modernc.org/libc@v1.74.1
 
 ### AUTHORS
 
@@ -1126,6 +1126,7 @@ Fabrice Colliot <f.colliot@gmail.com>
 Jan Mercl <0xjnml@gmail.com>
 Jason DeBettencourt <jasond17@gmail.com>
 Jasper Siepkes <jasper@siepkes.nl>
+Kieran Klukas <kieran@dunkirk.sh>
 Koichi Shiraishi <zchee.io@gmail.com>
 Marius Orcsik <marius@federated.id>
 Olivier Mengué <dolmen@cpan.org>
@@ -1656,7 +1657,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-## modernc.org/sqlite@v1.53.0
+## modernc.org/sqlite@v1.54.0
 
 ### AUTHORS
 
