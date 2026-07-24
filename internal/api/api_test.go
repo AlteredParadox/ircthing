@@ -611,7 +611,9 @@ func TestEgressForNetwork(t *testing.T) {
 	if f := srv.htmlFetcherForNetwork(ctx, "tornet"); f == nil || !f.proxied {
 		t.Fatalf("tornet html fetcher = %v; want proxied", f)
 	}
-	if srv.htmlFetcherForNetwork(ctx, "tornet") != srv.htmlFetcherForNetwork(ctx, "tornet") {
+	first := srv.htmlFetcherForNetwork(ctx, "tornet")
+	second := srv.htmlFetcherForNetwork(ctx, "tornet")
+	if first != second {
 		t.Fatal("per-proxy fetcher not cached/reused")
 	}
 	if f := srv.htmlFetcherForNetwork(ctx, "direct"); f == nil || f.proxied {
