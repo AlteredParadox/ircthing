@@ -251,10 +251,43 @@ function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick
 	);
 }
 
-function estimate(ev) {
-	if (ev.whois) return 200;
-	if (ev.collapse) return 28;
-	return estimateMsgHeight(ev.raw);
+// The height estimate has to be based on the text the row RENDERS. ev.raw is
+// the full IRC line — tags, source mask, command, target — and for a typical
+// message it runs 4-5x longer than the body that ends up on screen, so
+// estimating from it made every row tens of pixels too tall. Compounded over a
+// prepended page that pushed the rendered window clean off the bottom of the
+// viewport, leaving the lower half of the screen blank while scrolling.
+//
+// Memoized per event object: Geometry rebuilds its offset table by walking
+// EVERY loaded row (50k+), so this must be O(1) on repeat. Events are
+// immutable — a redaction or an edit produces a new object — so identity is a
+// sound cache key, and a WeakMap lets trimmed-away rows be collected.
+// One cache per statusHost setting: the "full join/part details" pref appends
+// "(~ident@host)" to every presence line, which is a whole extra rendered line
+// on a phone. Both forms stay reachable across a toggle, so they can't share
+// one slot.
+const renderedText = [new WeakMap(), new WeakMap()];
+function displayText(ev, statusHost) {
+	const cache = renderedText[statusHost ? 1 : 0];
+	let t = cache.get(ev);
+	if (t === undefined) {
+		t = renderable(ev, statusHost).text || "";
+		cache.set(ev, t);
+	}
+	return t;
+}
+
+// makeEstimate builds the row-height estimator for the current preferences.
+// `metrics` is the row geometry the list measured off the live stylesheet
+// (width, line height, padding, glyph advance, prefix width), so the estimate
+// tracks the viewport and the font/text-size/density settings rather than one
+// hard-coded desktop guess.
+function makeEstimate(statusHost) {
+	return (ev, metrics) => {
+		if (ev.whois) return 200;
+		if (ev.collapse) return 28;
+		return estimateMsgHeight(displayText(ev, statusHost), metrics);
+	};
 }
 
 // Chat renders the active buffer: virtualized scrollback plus composer.
@@ -267,6 +300,11 @@ export function Chat({ buf, msgs, selfNick, theme, tailNav, connected, error, ty
 		() => (highlightNames ? nickSet(completionNicks, selfNick) : null),
 		[highlightNames, completionNicks, selfNick],
 	);
+	// statusHost changes what a presence line renders, so it changes how tall
+	// the row is. It is part of layoutKey too, which drops the now-stale
+	// measurements; this keeps the ESTIMATES for everything not on screen
+	// honest at the same time.
+	const rowEstimate = useMemo(() => makeEstimate(statusHost), [statusHost]);
 	// Per-buffer drafts: keep half-typed text with its own buffer so a
 	// switch swaps the composer contents instead of carrying text into —
 	// and letting Enter send it to — the wrong channel.
@@ -569,7 +607,7 @@ export function Chat({ buf, msgs, selfNick, theme, tailNav, connected, error, ty
 			<VirtualList
 				key={(buf?.key ?? "") + ":" + (tailNav || 0)}
 				items={shown}
-				estimate={estimate}
+				estimate={rowEstimate}
 				header={header}
 				focusId={focusId}
 				layoutKey={layoutKey}
