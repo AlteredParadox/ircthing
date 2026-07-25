@@ -154,7 +154,7 @@ function SysRow({ ev, r, focused, timeFmt }) {
 			<span class={"sys-mark " + r.markClass}>{r.mark}</span>
 			{/* System rows (part/quit/kick reasons, TOPIC) are never colour-
 			    rendered, so strip mIRC codes rather than leak their digits. */}
-			<span>{stripFormatting(r.text)}</span>
+			<span class="sys-text">{stripFormatting(r.text)}</span>
 		</div>
 	);
 }
