@@ -118,7 +118,7 @@ function anchorPrepended(sc, position, geo, items, rowEls, k) {
 // Callers should key the component by buffer so switching buffers
 // remounts with fresh state.
 export function VirtualList({
-	items,
+	items: incomingItems,
 	renderItem,
 	estimate,
 	header,
@@ -162,6 +162,28 @@ export function VirtualList({
 	const touchGesture = useRef(false);
 	const deferredMeasure = useRef(new Map()); // id -> px, applied at gesture settle
 	const lastWindow = useRef(null); // { start, end } rendered by the last commit
+
+	// The third deferral, alongside deferred measurements and the latched tail
+	// restore: a whole history page withheld until the gesture settles.
+	//
+	// A near-top load only FIRES once a gesture has settled, but the WebSocket
+	// round-trip and the SQLite read finish whenever they finish — routinely
+	// after the next swipe has already begun. Committing the page then would
+	// run applyPrependCommit's scrollTop compensation mid-pan, and on iOS
+	// WebKit that write cancels the pan and its momentum outright: the list
+	// stops dead under the finger, and the swipe after that hits the same wall.
+	// That is the hesitant, jerking feel of paging back on a phone. Everything
+	// withheld is older history above the viewport (plus any live tail rows),
+	// so nothing already on screen goes stale while the finger is down.
+	const heldItems = useRef(null);
+	heldItems.current = touchGesture.current &&
+			prependedCount(prevFirstId.current, incomingItems) > 0
+		? incomingItems
+		: null;
+	const items = heldItems.current === null
+		? incomingItems
+		: (prevItems.current ?? incomingItems);
+
 	const el = scroller.current;
 	const origin = el ? contentOrigin(el, headerEl.current) : 0;
 	const actualViewTop = el ? Math.max(0, el.scrollTop - origin) : 0;
@@ -468,6 +490,10 @@ export function VirtualList({
 		const sc = scroller.current;
 		if (!sc) return;
 		applyDeferredMeasurements(sc);
+		// Commit any history page withheld during the gesture. The next render
+		// sees touchGesture false, detects the prepend, and anchors it — now
+		// that a scrollTop write can no longer cancel a pan.
+		if (heldItems.current) bump();
 		if (pinned.current && tailNeedsRestore.current) {
 			if (canRestoreTail(
 				sc, position, pinned, tailNeedsRestore, onPinnedRef.current,
@@ -667,6 +693,14 @@ export function VirtualList({
 
 	// applyPrependCommit compensates scrollTop for rows prepended (and a header
 	// height change) in this commit.
+	//
+	// The prepend itself cannot land mid-gesture — heldItems withholds it — so
+	// these writes are safe by the time they run. The header delta is the one
+	// residual: a "beginning of history" note appearing with a final page of
+	// ZERO messages changes the header height without a prepend to hold, so its
+	// compensation can still cancel an iOS pan. It is one-shot per buffer and
+	// deferring it would trade one write for two visible shifts (content moves
+	// at commit, moves back at settle), so it stays immediate.
 	function applyPrependCommit(sc, headerDelta) {
 		if (pendingPrepend.current > 0) {
 			if (pinned.current) {
