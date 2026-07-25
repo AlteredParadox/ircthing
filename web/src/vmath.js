@@ -43,6 +43,23 @@ export class Geometry {
 		this.index = new Map(); // item id -> index
 		this.offsets = new Float64Array(1);
 		this.dirty = true;
+		// Container geometry handed to `estimate` for unmeasured rows. Null
+		// until the scroller has been laid out; estimators fall back to their
+		// own defaults.
+		this.metrics = null;
+	}
+
+	// setMetrics installs the container geometry the estimate function needs
+	// (see estimateMsgHeight). Reports whether it changed, so the caller can
+	// re-render with the corrected spacers.
+	setMetrics(m) {
+		const cur = this.metrics;
+		if (cur && cur.width === m.width && cur.fontPx === m.fontPx && cur.padY === m.padY) {
+			return false;
+		}
+		this.metrics = m;
+		this.dirty = true;
+		return true;
 	}
 
 	setItems(items, forceRebuild = false) {
@@ -97,7 +114,7 @@ export class Geometry {
 	heightAt(i) {
 		const it = this.items[i];
 		const m = this.measured.get(it.id);
-		return m === undefined ? this.estimate(it) : m;
+		return m === undefined ? this.estimate(it, this.metrics) : m;
 	}
 
 	// measure records a row's real height and returns the delta against
@@ -107,7 +124,7 @@ export class Geometry {
 	measure(id, px) {
 		const i = this.index.get(id);
 		if (i === undefined) return 0; // trimmed away meanwhile
-		const prev = this.measured.get(id) ?? this.estimate(this.items[i]);
+		const prev = this.measured.get(id) ?? this.estimate(this.items[i], this.metrics);
 		if (px === prev) return 0;
 		this.measured.set(id, px);
 		this.dirty = true;
@@ -453,9 +470,44 @@ export function prependedCount(prevAnchor, items) {
 	return 0;
 }
 
-// estimateMsgHeight: one 21px line plus 6px row padding, plus wrapped
-// lines guessed from length (~90 chars/line at typical widths). Only a
-// starting point — real heights arrive from ResizeObserver.
-export function estimateMsgHeight(text) {
-	return 27 + 21 * Math.floor((text ? text.length : 0) / 90);
+// Fallback row geometry: a desktop-width message column at the 14px base font
+// in the default sans. Used only until the list has measured the real thing
+// (first render, unit tests, the component harness) — see listMetrics in
+// vlist.jsx, which reads every one of these off a probe row built from the
+// live stylesheet instead of guessing.
+//   width    px available to the row's inline flow
+//   lineH    px per rendered line (.msg-row line-height)
+//   padY     px of row padding, top + bottom combined
+//   charW    mean glyph advance of the message font
+//   prefixPx px the timestamp + nick consume on the FIRST line
+const DEFAULT_METRICS = { width: 804, lineH: 18, padY: 6, charW: 6.5, prefixPx: 98 };
+
+// estimateMsgHeight guesses a message row's height BEFORE ResizeObserver
+// reports the real one.
+//
+// Accuracy matters most on the history-prepend path. A 100-row page whose
+// estimated heights are collectively off by hundreds of pixels makes the list
+// correct scrollTop again and again as the true heights arrive — and on iOS
+// WebKit every one of those writes cancels the touch pan and its momentum. Get
+// it wrong in the other direction and the rendered window stops short of the
+// viewport, leaving the bottom of the screen blank until the geometry settles.
+//
+// `text` must be the text the row RENDERS, not the raw IRC line: the wire form
+// carries tags and the source mask and routinely runs 4-5x longer, which is
+// tens of pixels of over-estimate on every single row.
+//
+// Embedded newlines (draft/multiline) each start a fresh line, and only the
+// first line pays for the timestamp/nick prefix that leads the inline flow.
+export function estimateMsgHeight(text, metrics) {
+	const m = { ...DEFAULT_METRICS, ...(metrics || {}) };
+	const perLine = Math.max(1, Math.floor(m.width / m.charW));
+	const firstLine = Math.max(1, Math.floor((m.width - m.prefixPx) / m.charW));
+	const segments = text ? String(text).split("\n") : [""];
+	let lines = 0;
+	for (let i = 0; i < segments.length; i++) {
+		const cap = i === 0 ? firstLine : perLine;
+		const len = segments[i].length;
+		lines += len <= cap ? 1 : 1 + Math.ceil((len - cap) / perLine);
+	}
+	return Math.round(m.padY + lines * m.lineH);
 }

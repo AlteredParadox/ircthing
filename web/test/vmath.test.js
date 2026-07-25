@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { deepStrictEqual as eq, strictEqual as is } from "node:assert";
+import { deepStrictEqual as eq, ok, strictEqual as is } from "node:assert";
 import { test } from "node:test";
 import {
 	computeWindow,
@@ -589,11 +589,100 @@ test("prependedCount anchors on collapsed-run identity", () => {
 });
 
 test("estimateMsgHeight grows with wrapped length", () => {
-	is(estimateMsgHeight(""), 27);
-	is(estimateMsgHeight("x".repeat(89)), 27);
-	is(estimateMsgHeight("x".repeat(90)), 48);
-	is(estimateMsgHeight("x".repeat(300)), 27 + 3 * 21);
-	is(estimateMsgHeight(null), 27);
+	const one = estimateMsgHeight("");
+	is(estimateMsgHeight(null), one, "no text is a single line");
+	is(estimateMsgHeight("x".repeat(40)), one, "short line does not wrap");
+	// Monotonic in length, and unbounded — a wall of text keeps growing rather
+	// than saturating at some clamp.
+	let prev = one;
+	for (const len of [200, 300, 400, 600, 900, 4000]) {
+		const h = estimateMsgHeight("x".repeat(len));
+		ok(h > prev, `${len} chars is taller than ${prev}px`);
+		prev = h;
+	}
+});
+
+// Measured off the live stylesheet by listMetrics (vlist.jsx); these are the
+// shapes it produces for a desktop column and a 402px phone in the mono
+// message font.
+const DESKTOP = { width: 804, lineH: 18, padY: 6, charW: 6.5, prefixPx: 98 };
+const PHONE = { width: 378, lineH: 18, padY: 6, charW: 8.04, prefixPx: 110 };
+
+test("estimateMsgHeight is width-aware: a phone wraps sooner than a desktop", () => {
+	// A width-blind constant said "90 chars per line", tuned for a desktop
+	// column. A very common 80-char message is one line there and two on a
+	// phone; being wrong per row compounds across a prepended page.
+	ok(
+		estimateMsgHeight("x".repeat(80), PHONE) > estimateMsgHeight("x".repeat(20), PHONE),
+		"80 chars wraps on a phone",
+	);
+	is(
+		estimateMsgHeight("x".repeat(80), DESKTOP),
+		estimateMsgHeight("x".repeat(20), DESKTOP),
+		"80 chars still fits one desktop line",
+	);
+	for (const len of [80, 160, 300, 600]) {
+		ok(
+			estimateMsgHeight("x".repeat(len), PHONE) >
+				estimateMsgHeight("x".repeat(len), DESKTOP),
+			`${len} chars is taller on a phone`,
+		);
+	}
+});
+
+test("estimateMsgHeight follows the measured font, padding and prefix", () => {
+	// The message font is a preference: mono runs ~25% wider than the sans, so
+	// the same text needs more lines. A constant advance got this wrong for
+	// whichever font it was not tuned against.
+	ok(
+		estimateMsgHeight("x".repeat(300), { ...DESKTOP, charW: 8.04 }) >
+			estimateMsgHeight("x".repeat(300), DESKTOP),
+		"a wider glyph advance means more lines",
+	);
+	is(
+		estimateMsgHeight("x", { ...DESKTOP, padY: 10 }) - estimateMsgHeight("x", DESKTOP),
+		4,
+		"row padding passes straight through",
+	);
+	// The timestamp and nick lead the first line inline, so they cost first-line
+	// capacity only — never the wrapped lines below.
+	const wide = { ...DESKTOP, prefixPx: 400 };
+	ok(
+		estimateMsgHeight("x".repeat(80), wide) > estimateMsgHeight("x".repeat(80), DESKTOP),
+		"a bigger prefix wraps a short message sooner",
+	);
+	is(
+		estimateMsgHeight("x".repeat(4000), wide) - estimateMsgHeight("x".repeat(4000), DESKTOP),
+		DESKTOP.lineH,
+		"but costs at most one extra line on a long message",
+	);
+});
+
+test("estimateMsgHeight counts embedded newlines (draft/multiline)", () => {
+	const one = estimateMsgHeight("a", DESKTOP);
+	is(estimateMsgHeight("a\nb", DESKTOP), one + DESKTOP.lineH, "two short lines");
+	is(estimateMsgHeight("a\nb\nc", DESKTOP), one + 2 * DESKTOP.lineH, "three short lines");
+	// Only the first line pays the timestamp/nick prefix.
+	const cap = Math.floor((DESKTOP.width - DESKTOP.prefixPx) / DESKTOP.charW);
+	is(
+		estimateMsgHeight("x".repeat(cap) + "\n" + "x".repeat(cap), DESKTOP),
+		one + DESKTOP.lineH,
+		"a full first line plus a short second stays two lines",
+	);
+});
+
+test("Geometry.setMetrics re-estimates unmeasured rows and reports change", () => {
+	const g = new Geometry((it, m) => (m ? m.width / 10 : 100));
+	const list = items(3);
+	g.setItems(list);
+	is(g.total(), 300, "fallback estimate before any container is measured");
+	ok(g.setMetrics({ width: 400, fontPx: 14, padY: 6 }), "first metrics are a change");
+	is(g.total(), 120, "offsets rebuilt from the new estimates");
+	ok(!g.setMetrics({ width: 400, fontPx: 14, padY: 6 }), "identical metrics are not");
+	// A measured row keeps its real height; only estimates follow the metrics.
+	g.measure(list[0].id, 55);
+	ok(g.setMetrics({ width: 800, fontPx: 14, padY: 6 }));
+	is(g.total(), 55 + 80 + 80);
 });
 
 test("Geometry: measured is pruned for removed rows (no unbounded growth)", () => {

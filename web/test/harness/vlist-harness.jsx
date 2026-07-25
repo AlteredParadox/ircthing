@@ -57,7 +57,7 @@ function App() {
 		<VirtualList
 			items={items}
 			layoutKey={layoutKey}
-			estimate={(m) => estimateMsgHeight(m.raw)}
+			estimate={(m, metrics) => estimateMsgHeight(m.raw, metrics)}
 			header={<div class="top-note">top of harness</div>}
 			onNearTop={() => {
 				window.__nearTops = (window.__nearTops || 0) + 1;

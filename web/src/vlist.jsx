@@ -81,6 +81,83 @@ function contentOrigin(sc, header) {
 	return paddingTop + (header?.offsetHeight || 0);
 }
 
+// PROBE_TEXT is a representative mix of glyph widths; its rendered width
+// divided by its length is the message font's mean advance. Long enough that
+// sub-pixel rounding on the total does not matter.
+const PROBE_TEXT =
+	"the quick brown fox jumps over a lazy dog, 0123456789 and again it goes";
+
+// listMetrics MEASURES what the estimate function needs — line height, row
+// padding, mean glyph advance, and how much of the first line the timestamp
+// and nick consume — instead of hard-coding them.
+//
+// Measuring rather than guessing matters because every one of those is a
+// preference: the message font can be sans or mono (mono runs ~25% wider,
+// which is a whole extra line per row on a phone), text size has four
+// settings, and density changes the row padding. A constant tuned for one
+// combination is wrong for the rest, and on the prepend path a per-row error
+// of a few pixels compounds across a whole page into a visibly broken
+// viewport. The probe is built from the real class names, so it picks up the
+// live stylesheet — including preference overrides on :root — automatically.
+//
+// Off-screen and synchronous: one forced layout per width change, never per
+// frame. Attached to <body>, not to the scroller, so it can never collide
+// with Preact's diffing of the row list.
+function listMetrics(sc) {
+	// Mirror the real nesting — .msgs > .msg-row > spans — at the real width,
+	// so every inherited and preference-scoped rule resolves exactly as it
+	// does in the live list.
+	const host = document.createElement("div");
+	host.className = "msgs";
+	host.style.cssText = "position:absolute;visibility:hidden;pointer-events:none;" +
+		`left:-9999px;top:0;width:${sc.clientWidth}px`;
+	const row = document.createElement("div");
+	row.className = "msg-row";
+	const time = document.createElement("span");
+	time.className = "msg-time";
+	time.textContent = "88:88:88 AM";
+	const nick = document.createElement("span");
+	nick.className = "msg-nick";
+	nick.textContent = "SomeNickname:";
+	const body = document.createElement("span");
+	body.className = "msg-body";
+	// nowrap: an inline span that WRAPS reports its container's width, not the
+	// text's advance. One unbroken line is what makes the division meaningful.
+	body.style.whiteSpace = "pre";
+	body.textContent = PROBE_TEXT;
+	row.append(time, nick, body);
+	host.append(row);
+	document.body.append(host);
+	try {
+		const rs = getComputedStyle(row);
+		const rowPadX = (Number.parseFloat(rs.paddingLeft) || 0) +
+			(Number.parseFloat(rs.paddingRight) || 0);
+		const lineH = Number.parseFloat(rs.lineHeight) ||
+			DEFAULT_LINE_RATIO * (Number.parseFloat(rs.fontSize) || 14);
+		const padY = (Number.parseFloat(rs.paddingTop) || 0) +
+			(Number.parseFloat(rs.paddingBottom) || 0);
+		const charW = body.getBoundingClientRect().width / PROBE_TEXT.length;
+		// The row is a block, so its own rect is the container width — measure
+		// the prefix from the inline pieces that actually lead the first line.
+		const advance = (el) =>
+			el.getBoundingClientRect().width +
+			(Number.parseFloat(getComputedStyle(el).marginRight) || 0);
+		return {
+			width: Math.max(1, row.clientWidth - rowPadX),
+			lineH,
+			padY,
+			charW: charW > 0 ? charW : DEFAULT_CHAR_W,
+			prefixPx: advance(time) + advance(nick),
+		};
+	} finally {
+		host.remove();
+	}
+}
+
+// Only reached if the probe has no usable layout box (detached/zero-size).
+const DEFAULT_LINE_RATIO = 1.4;
+const DEFAULT_CHAR_W = 6.5;
+
 // centerRow scrolls so row `idx` sits centered in the viewport (used for a
 // search-jump focus).
 function centerRow(sc, position, geo, origin, idx) {
@@ -118,7 +195,7 @@ function anchorPrepended(sc, position, geo, items, rowEls, k) {
 // Callers should key the component by buffer so switching buffers
 // remounts with fresh state.
 export function VirtualList({
-	items,
+	items: incomingItems,
 	renderItem,
 	estimate,
 	header,
@@ -162,6 +239,28 @@ export function VirtualList({
 	const touchGesture = useRef(false);
 	const deferredMeasure = useRef(new Map()); // id -> px, applied at gesture settle
 	const lastWindow = useRef(null); // { start, end } rendered by the last commit
+
+	// The third deferral, alongside deferred measurements and the latched tail
+	// restore: a whole history page withheld until the gesture settles.
+	//
+	// A near-top load only FIRES once a gesture has settled, but the WebSocket
+	// round-trip and the SQLite read finish whenever they finish — routinely
+	// after the next swipe has already begun. Committing the page then would
+	// run applyPrependCommit's scrollTop compensation mid-pan, and on iOS
+	// WebKit that write cancels the pan and its momentum outright: the list
+	// stops dead under the finger, and the swipe after that hits the same wall.
+	// That is the hesitant, jerking feel of paging back on a phone. Everything
+	// withheld is older history above the viewport (plus any live tail rows),
+	// so nothing already on screen goes stale while the finger is down.
+	const heldItems = useRef(null);
+	heldItems.current = touchGesture.current &&
+			prependedCount(prevFirstId.current, incomingItems) > 0
+		? incomingItems
+		: null;
+	const items = heldItems.current === null
+		? incomingItems
+		: (prevItems.current ?? incomingItems);
+
 	const el = scroller.current;
 	const origin = el ? contentOrigin(el, headerEl.current) : 0;
 	const actualViewTop = el ? Math.max(0, el.scrollTop - origin) : 0;
@@ -225,6 +324,13 @@ export function VirtualList({
 		}
 	}
 
+	// The estimator can close over preferences that change a row's height
+	// without remounting this list (whether presence lines carry the full
+	// ident@host, for one). Geometry is constructed once, so keep its
+	// estimator current — any such preference also changes layoutKey, and
+	// syncLayoutKey below drops the stale measurements so the offsets are
+	// rebuilt with this function.
+	geo.estimate = estimate;
 	syncLayoutKey();
 	geo.setItems(items, syncItems());
 
@@ -330,6 +436,9 @@ export function VirtualList({
 						Math.max(0, sc.scrollTop - contentOrigin(sc, headerEl.current)),
 					);
 				}
+				// Estimates are width-derived, so they go stale with the
+				// measurements. Refresh both before anything re-renders.
+				geo.setMetrics(listMetrics(sc));
 				geo.clearMeasured();
 			}
 			if (pinned.current) {
@@ -344,6 +453,10 @@ export function VirtualList({
 			bump();
 		});
 		observer.observe(sc);
+		// First render had no container to measure, so it sized every spacer
+		// from the estimator's fallback geometry. Correct that now, before the
+		// user can scroll into a badly-sized region.
+		if (geo.setMetrics(listMetrics(sc))) bump();
 		return () => observer.disconnect();
 	}, []);
 
@@ -468,6 +581,10 @@ export function VirtualList({
 		const sc = scroller.current;
 		if (!sc) return;
 		applyDeferredMeasurements(sc);
+		// Commit any history page withheld during the gesture. The next render
+		// sees touchGesture false, detects the prepend, and anchors it — now
+		// that a scrollTop write can no longer cancel a pan.
+		if (heldItems.current) bump();
 		if (pinned.current && tailNeedsRestore.current) {
 			if (canRestoreTail(
 				sc, position, pinned, tailNeedsRestore, onPinnedRef.current,
@@ -667,6 +784,14 @@ export function VirtualList({
 
 	// applyPrependCommit compensates scrollTop for rows prepended (and a header
 	// height change) in this commit.
+	//
+	// The prepend itself cannot land mid-gesture — heldItems withholds it — so
+	// these writes are safe by the time they run. The header delta is the one
+	// residual: a "beginning of history" note appearing with a final page of
+	// ZERO messages changes the header height without a prepend to hold, so its
+	// compensation can still cancel an iOS pan. It is one-shot per buffer and
+	// deferring it would trade one write for two visible shifts (content moves
+	// at commit, moves back at settle), so it stays immediate.
 	function applyPrependCommit(sc, headerDelta) {
 		if (pendingPrepend.current > 0) {
 			if (pinned.current) {

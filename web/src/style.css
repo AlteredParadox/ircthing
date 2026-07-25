@@ -667,6 +667,23 @@ input::placeholder {
 	font-size: 0.8929rem;
 }
 
+/* The text of a status line, and the collapsed rollup's label, are flex items
+   in .sys-row. A flex item's default min-width:auto refuses to shrink below
+   its MIN-CONTENT width, and with the "full join/part details" pref a presence
+   line carries a hostmask — "nick (~ident@some.long.reverse.dns)" — that holds
+   no wrap opportunity at all. So the row stayed as wide as that one token,
+   pushing .msgs (overflow-y:auto, which computes overflow-x to auto) into
+   sideways scrolling on a phone.
+
+   min-width:0 lets the item shrink; overflow-wrap:anywhere gives the hostmask
+   somewhere to break AND, unlike break-word, is accounted for in min-content
+   so the flex floor drops with it. Both are required. */
+.sys-text,
+.sys-toggle {
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+
 /* The collapsed rollup sits flush-left, at the same left edge as every
    message timestamp (no extra indent past the time gutter). */
 .collapse-row {
