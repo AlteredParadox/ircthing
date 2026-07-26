@@ -59,7 +59,7 @@ export function NickColorPrompt({ nick, theme, value, onSave, onClose }) {
 				<div class="settings-body">
 					<div class="nc-preview">
 						<span class="nc-sample" style={{ color: preview }}>{nick}</span>
-						<span class="pref-hint">{hex ? hex : "default (hashed from the nick)"}</span>
+						<span class="pref-hint">{hex || "default (hashed from the nick)"}</span>
 					</div>
 					<div class="swatches nc-swatches">
 						{NICK_SWATCHES.map((c) => (
