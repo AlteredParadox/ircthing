@@ -41,7 +41,7 @@ function memberTitle(m, ignored) {
 	return t;
 }
 
-function MemberRow({ m, group, theme, ignored, onNick }) {
+function MemberRow({ m, group, theme, nickColors, ignored, onNick }) {
 	const isIgnored = ignored.has(m.nick.toLowerCase());
 	return (
 		<div
@@ -54,7 +54,7 @@ function MemberRow({ m, group, theme, ignored, onNick }) {
 			<span class={"member-glyph" + (group === "Ops" ? " op" : " voice")}>
 				{(m.prefix || "")[0] || ""}
 			</span>
-			<span class="member-nick" style={{ color: nickColor(m.nick, theme) }}>
+			<span class="member-nick" style={{ color: nickColor(m.nick, theme, nickColors) }}>
 				{m.nick}
 			</span>
 			{m.bot && <span class="bot-chip">bot</span>}
@@ -62,7 +62,7 @@ function MemberRow({ m, group, theme, ignored, onNick }) {
 	);
 }
 
-export function Members({ info, theme, ignoredNicks, onNick }) {
+export function Members({ info, theme, nickColors, ignoredNicks, onNick }) {
 	const members = info?.members || [];
 	const ignored = new Set(ignoredNicks || []);
 	// Live filter: the header doubles as a filter field (placeholder "Members"),
@@ -136,7 +136,7 @@ export function Members({ info, theme, ignoredNicks, onNick }) {
 				{r.label} — {r.count}
 			</div>
 		) : (
-			<MemberRow key={r.m.nick} m={r.m} group={r.group} theme={theme} ignored={ignored} onNick={onNick} />
+			<MemberRow key={r.m.nick} m={r.m} group={r.group} theme={theme} nickColors={nickColors} ignored={ignored} onNick={onNick} />
 		);
 	return (
 		<div class="right-inner">
@@ -177,7 +177,7 @@ export function Members({ info, theme, ignoredNicks, onNick }) {
 								{g.label} — {g.members.length}
 							</div>
 							{g.members.map((m) => (
-								<MemberRow key={m.nick} m={m} group={g.label} theme={theme} ignored={ignored} onNick={onNick} />
+								<MemberRow key={m.nick} m={m} group={g.label} theme={theme} nickColors={nickColors} ignored={ignored} onNick={onNick} />
 							))}
 						</div>
 					))

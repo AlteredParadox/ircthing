@@ -28,6 +28,7 @@ import { fetchAllMembers } from "./memberlist.js";
 import { ContextMenu } from "./menu.jsx";
 import { Members } from "./members.jsx";
 import { ChannelPrompt, NetworkForm } from "./netform.jsx";
+import { NickColorPrompt } from "./nickcolor.jsx";
 import { SearchOverlay } from "./search.jsx";
 import { Settings, resetSettingsSession } from "./settings.jsx";
 import { Sidebar } from "./sidebar.jsx";
@@ -418,6 +419,8 @@ export function App() {
 	const [netFormError, setNetFormError] = useState("");
 	const [netFormBusy, setNetFormBusy] = useState(false);
 	const netFormBusyRef = useRef(false);
+	// Nick whose color is being edited (the picker dialog), or null.
+	const [colorPrompt, setColorPrompt] = useState(null);
 	const [chanPrompt, setChanPrompt] = useState(null);
 	const [chanPromptError, setChanPromptError] = useState("");
 	const [chanPromptBusy, setChanPromptBusy] = useState(false);
@@ -580,6 +583,21 @@ export function App() {
 		prefsPush.current = setTimeout(() => {
 			persistPrefs(next);
 		}, 400);
+	}
+
+	// setNickColor stores (hex) or clears ("") one nick's color override.
+	// Keyed by the lowercased nick and global across networks — see
+	// normalizeNickColors. The edited entry goes in FIRST so that, at the
+	// MAX_NICK_COLORS cap, normalization drops a stale entry rather than the
+	// choice the user just made.
+	function setNickColor(nick, hex) {
+		const key = nick.toLowerCase();
+		const rest = { ...prefsRef.current.nickColors };
+		delete rest[key];
+		updatePrefs({
+			...prefsRef.current,
+			nickColors: hex ? { [key]: hex, ...rest } : rest,
+		});
 	}
 
 	// Highlight rules sync mirrors the prefs machinery: the server is the
@@ -1760,6 +1778,7 @@ export function App() {
 		const items = [
 			{ label: "Whois", onClick: () => sendCommand(network, "WHOIS", [nick]) },
 			{ label: "Direct message", onClick: () => select(network, nick) },
+			{ label: "Set color…", onClick: () => setColorPrompt(nick) },
 			{
 				label: ignored ? "Unignore" : "Ignore", danger: !ignored,
 				onClick: () => updateIgnores(toggleIgnore(ignoresRef.current, network, nick)),
@@ -1849,6 +1868,9 @@ export function App() {
 				? [{ label: "Edit topic", onClick: () => editTopic(network, buffer) }]
 				: [
 					{ label: "Whois", onClick: () => sendCommand(network, "WHOIS", [buffer]) },
+					// A query buffer IS a nick, so it gets the color picker too —
+					// same menu entry as the roster and message-list nicks.
+					{ label: "Set color…", onClick: () => setColorPrompt(buffer) },
 					{
 						label: ig ? "Unignore" : "Ignore", danger: !ig,
 						onClick: () => updateIgnores(toggleIgnore(ignoresRef.current, network, buffer)),
@@ -2326,6 +2348,7 @@ export function App() {
 				{activeBuf ? (
 					<Chat
 						buf={activeBuf} msgs={msgs[activeKey]} selfNick={selfNick} theme={theme}
+						nickColors={prefs.nickColors}
 						tailNav={tailNav}
 						connected={connected && netState === "registered"}
 						error={cmdError}
@@ -2373,7 +2396,7 @@ export function App() {
 			{isChan && (
 				<div class={"rightbar" + (rightOpen ? " open" : "")}>
 					<Members
-							info={activeChanInfo} theme={theme} ignoredNicks={ignoredHere}
+							info={activeChanInfo} theme={theme} nickColors={prefs.nickColors} ignoredNicks={ignoredHere}
 							onNick={(nick, x, y) => openUserMenu(activeBuf.network, nick, x, y)}
 						/>
 				</div>
@@ -2414,6 +2437,18 @@ export function App() {
 					busy={chanPromptBusy}
 					chantypes={networks[chanPrompt.network]?.chantypes}
 					onJoin={joinChannel} onClose={closeJoinPrompt}
+				/>
+			)}
+			{colorPrompt && (
+				<NickColorPrompt
+					key={colorPrompt}
+					nick={colorPrompt} theme={theme}
+					value={prefs.nickColors[colorPrompt.toLowerCase()] || ""}
+					onSave={(hex) => {
+						setNickColor(colorPrompt, hex);
+						setColorPrompt(null);
+					}}
+					onClose={() => setColorPrompt(null)}
 				/>
 			)}
 			<ContextMenu menu={menu} onClose={() => setMenu(null)} />

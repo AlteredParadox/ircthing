@@ -327,6 +327,40 @@ export function resetSettingsSession() {
 	previewsSaved.current = null;
 }
 
+// NickColorsRow surfaces the per-nick color overrides, which are otherwise
+// only reachable from a nick's context menu — without it, a color set on
+// someone you never see again is invisible state that still counts against
+// the prefs byte budget. Individual colors are still cleared from that menu
+// ("Use default"); this is just the count and the bulk escape hatch, with
+// the same click-to-confirm as the network form's Remove.
+function NickColorsRow({ prefs, onPrefs }) {
+	const [confirm, setConfirm] = useState(false);
+	const n = Object.keys(prefs.nickColors || {}).length;
+	return (
+		<div class="pref-row">
+			<span class="pref-name">Nick colors</span>
+			<div class="nc-manage">
+				<span class="pref-hint">
+					{n ? `${n} custom` : "none — right-click a nick to set one"}
+				</span>
+				{n > 0 && (
+					<button
+						type="button"
+						class={"nf-danger" + (confirm ? " confirm" : "")}
+						onClick={() => {
+							if (!confirm) return setConfirm(true);
+							setConfirm(false);
+							onPrefs({ ...prefs, nickColors: {} });
+						}}
+					>
+						{confirm ? "Really reset all?" : "Reset all"}
+					</button>
+				)}
+			</div>
+		</div>
+	);
+}
+
 // Settings modal: appearance preferences, desktop-notification
 // permission, and per-network highlight rules. Everything is edited live
 // and persisted by the parent.
@@ -572,6 +606,7 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 								))}
 							</div>
 						</div>
+						<NickColorsRow prefs={prefs} onPrefs={onPrefs} />
 						<div class="pref-row">
 							<span class="pref-name">Text size</span>
 							<Seg
