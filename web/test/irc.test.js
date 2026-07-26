@@ -18,7 +18,7 @@ import { deepStrictEqual as eq, strictEqual as is } from "node:assert";
 import { test } from "node:test";
 import {
 	bufKey, firstURL, fmtTime, hostOf, linkify, looksLikeImageURL,
-	bufferOrder, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash, applyStatusMode, mergeById, mergeServerBuffers,
+	bufferOrder, customNickColor, isChannelName, mentionsMe, nickColor, parseHash, parseLine, rankBuffers, renderable, sameGroup, toHash, applyStatusMode, mergeById, mergeServerBuffers,
 	applyTombstones, rememberRedaction, nickSet, highlightNicks, proxyCredsExposed, foldNick,
 	parseFormatting, stripFormatting, historyHasMore,
 } from "../src/irc.js";
@@ -331,6 +331,27 @@ test("nickColor is deterministic and theme-aware", () => {
 	is(nickColor("alice", "light").startsWith("oklch(0.5 0.15 "), true);
 	// Different nicks should usually differ.
 	is(nickColor("alice", "dark") !== nickColor("bob", "dark"), true);
+});
+
+test("customNickColor: case-insensitive lookup, absent otherwise", () => {
+	const colors = { alice: "#ff0000" };
+	is(customNickColor("alice", colors), "#ff0000");
+	is(customNickColor("ALICE", colors), "#ff0000", "the map is keyed by the lowercased nick");
+	is(customNickColor("bob", colors), "");
+	is(customNickColor("alice", null), "", "no map -> no override");
+	is(customNickColor("", colors), "");
+	is(customNickColor(undefined, colors), "");
+	// A hand-edited localStorage blob must not put a non-string into a style.
+	is(customNickColor("alice", { alice: { evil: true } }), "");
+});
+
+test("nickColor: a custom color overrides the hash under either theme", () => {
+	const colors = { alice: "#123456" };
+	is(nickColor("alice", "dark", colors), "#123456");
+	is(nickColor("alice", "light", colors), "#123456");
+	is(nickColor("ALICE", "dark", colors), "#123456");
+	// Everyone else still gets the hash, and the 2-arg form is unchanged.
+	is(nickColor("bob", "dark", colors), nickColor("bob", "dark"));
 });
 
 test("sameGroup", () => {

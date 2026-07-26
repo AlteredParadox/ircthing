@@ -186,10 +186,26 @@ export function applyStatusMode(list, mode, expanded) {
 	return out;
 }
 
+// customNickColor returns the user's chosen color for a nick, or "" when
+// there is none. `colors` is prefs.nickColors — a global map keyed by the
+// lowercased nick, synced across devices with the rest of the prefs blob.
+// Values are already canonical "#rrggbb" (normalizeNickColors), but the
+// typeof guard keeps a hand-edited localStorage entry from putting a
+// non-string into an inline style.
+export function customNickColor(nick, colors) {
+	if (!nick || !colors) return "";
+	const c = colors[nick.toLowerCase()];
+	return typeof c === "string" ? c : "";
+}
+
 // nickColor implements the mockup's deterministic hash:
 // h = (h*31 + charCode) % 360 folded into an oklch color, with lightness/
-// chroma per theme.
-export function nickColor(nick, theme) {
+// chroma per theme. A user-chosen override (optional `colors` map) wins over
+// the hash and is used verbatim under either theme — the picker only offers
+// swatches that read well on both.
+export function nickColor(nick, theme, colors) {
+	const custom = customNickColor(nick, colors);
+	if (custom) return custom;
 	let h = 0;
 	for (const c of nick) h = (h * 31 + c.codePointAt(0)) % 360;
 	const light = theme === "light";
