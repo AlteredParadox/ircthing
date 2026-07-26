@@ -160,7 +160,10 @@ export function touchRelease(page) {
 // and lets the list catch up between samples.
 export function panBack(page, { steps = 40, px = 300 } = {}) {
 	return page.evaluate(async ({ steps, px }) => {
-		const frame = () => new Promise((r) => requestAnimationFrame(() => r()));
+		// rAF resolves the promise directly — wrapping it in `() => r()` only
+		// discards the timestamp nobody reads, at the cost of a fifth level of
+		// nesting.
+		const frame = () => new Promise((r) => requestAnimationFrame(r));
 		const dispatchTouch = (el, type) => {
 			const t = new Touch({ identifier: 1, target: el, clientX: 200, clientY: 400 });
 			const empty = type === "touchend";
