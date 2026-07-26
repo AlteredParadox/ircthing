@@ -1,0 +1,21 @@
+<!doctype html>
+<!-- Page shell for the browser tests. Mirrors web/index.html: the same <html>
+     data attributes applyPrefs stamps, and the real bundled stylesheet. The
+     viewport meta is REQUIRED — without it the layout viewport defaults to
+     980px and every narrow-screen assertion silently passes. -->
+<html data-theme="dark" data-accent="blue" data-textsize="md" data-density="cozy" data-msgfont="sans" data-sidebar="comfortable">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<link rel="stylesheet" href="app.css">
+	<style>
+		/* The app shell is normally sized by the sidebar/topbar grid; the
+		   harness mounts <Chat> alone, so give it a real viewport to fill. */
+		html, body, #app, .app, .main { height: 100%; margin: 0; }
+	</style>
+</head>
+<body>
+	<div id="app"></div>
+	<script src="chat-harness.js"></script>
+</body>
+</html>

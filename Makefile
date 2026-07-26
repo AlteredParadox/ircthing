@@ -29,7 +29,7 @@ ESBUILD_FLAGS := --bundle --minify --format=esm \
 	--jsx=automatic --jsx-import-source=preact \
 	--target=es2022
 
-.PHONY: build build-debug frontend check vet gofmt-check staticcheck test binary-size-gate bundle-size-gate go-version-gate notices-check integration irctest memcheck clean docker
+.PHONY: build build-debug frontend check vet gofmt-check staticcheck test frontend-test browser-test binary-size-gate bundle-size-gate go-version-gate notices-check integration irctest memcheck clean docker
 
 # The go.mod toolchain directive is the minimum Go patch level a release may
 # be built with (stdlib CVE fixes ship in patch releases; an older toolchain
@@ -186,6 +186,32 @@ irctest: build .cache/irctest-src .cache/irctest-venv
 # GOMEMLIMIT=64MiB, asserted against the 72 MB RSS target. Run before
 # releases and after changes to buffering, caching, or the store — not
 # part of `make check` (RSS is too noisy for CI pass/fail).
+# Browser layout tests (web/browser-test/): the real <Chat> in a real
+# Chromium against the real stylesheet. Deliberately NOT part of `make check`
+# — it needs a ~260 MB browser download, and `check` must stay runnable on a
+# fresh clone. Run in CI as its own job, and locally after touching the
+# virtualized list, row markup, or the stylesheet.
+#
+# Output goes to web/browser-test/.build, never web/dist: the bundle size gate
+# globs web/dist/*.js and would count the harness against the 100 KB budget.
+BROWSER_BUILD := web/browser-test/.build
+
+browser-test: frontend
+	@command -v node >/dev/null || { echo "FAIL: node required"; exit 1; }
+	@cd web && node -e "require.resolve('playwright')" 2>/dev/null || { \
+		echo "FAIL: playwright not installed — run: cd web && npm ci && npx playwright install --with-deps chromium"; \
+		exit 1; \
+	}
+	mkdir -p $(BROWSER_BUILD)
+	cd web && $(ESBUILD) --bundle --format=iife --target=es2022 \
+		--jsx=automatic --jsx-import-source=preact \
+		test/harness/chat-harness.jsx --outfile=browser-test/.build/chat-harness.js
+	cp web/dist/app.css $(BROWSER_BUILD)/
+	cp web/test/harness/chat-harness.html $(BROWSER_BUILD)/
+	# Explicit glob: these are named *.browser.js precisely so `node --test`'s
+	# default discovery (which sweeps **/*.test.js) leaves them to this target.
+	cd web && node --test browser-test/*.browser.js
+
 memcheck: build
 	IRCTHING_BIN=$(CURDIR)/$(BIN) \
 	go test -tags memcheck -count=1 -v -timeout 300s -run TestMemoryScenario ./integration/

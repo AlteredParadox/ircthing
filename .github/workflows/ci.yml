@@ -44,3 +44,45 @@ jobs:
 
       - name: Race tests
         run: go test -race ./internal/...
+
+  # Layout regressions for the virtualized message list, in a real Chromium
+  # against the real stylesheet (web/browser-test/). Its own job because it
+  # needs a ~260 MB browser: keeping it out of `make check` means a fresh
+  # clone still runs the full gate offline, and a browser download can never
+  # make the authoritative gate flaky.
+  #
+  # This exists because three layout bugs shipped to a phone that neither the
+  # DOM-less unit suite nor review could see. All three fail this job.
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Install frontend deps
+        run: cd web && npm ci --no-fund --no-audit
+
+      # Cache the browser by the resolved Playwright version: a mismatched
+      # cache is worse than none (Playwright refuses a browser build it did
+      # not pin), so the version goes in the key.
+      - name: Resolve Playwright version
+        id: pw
+        run: echo "v=$(cd web && node -p "require('playwright/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        id: pw-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.v }}
+
+      # Chromium only — the suite asserts layout geometry, not cross-browser
+      # rendering. --with-deps installs the system libraries it needs.
+      - name: Install Chromium
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: cd web && npx playwright install --with-deps chromium
+
+      - name: make browser-test
+        run: make browser-test

@@ -48,3 +48,7 @@ __pycache__/
 # bundled dc-runtime). Kept locally so design/*.dc.html renders; not published.
 design/support.js
 *.pid
+
+# Browser-test build output (harness bundle + a copy of the stylesheet).
+# Deliberately NOT under web/dist — the bundle size gate globs that directory.
+web/browser-test/.build/
