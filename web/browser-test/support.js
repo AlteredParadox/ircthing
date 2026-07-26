@@ -113,7 +113,7 @@ export function midRowID(page) {
 		const mid = sc.getBoundingClientRect().top + sc.clientHeight / 2;
 		for (const el of sc.querySelectorAll("[data-vid]")) {
 			const r = el.getBoundingClientRect();
-			if (r.bottom >= mid) return el.getAttribute("data-vid");
+			if (r.bottom >= mid) return el.dataset.vid;
 		}
 		return null;
 	});
@@ -160,16 +160,18 @@ export function touchRelease(page) {
 // and lets the list catch up between samples.
 export function panBack(page, { steps = 40, px = 300 } = {}) {
 	return page.evaluate(async ({ steps, px }) => {
-		const sc = document.querySelector(".msgs");
 		const frame = () => new Promise((r) => requestAnimationFrame(() => r()));
-		const touch = (type) => {
-			const t = new Touch({ identifier: 1, target: sc, clientX: 200, clientY: 400 });
+		const dispatchTouch = (el, type) => {
+			const t = new Touch({ identifier: 1, target: el, clientX: 200, clientY: 400 });
 			const empty = type === "touchend";
-			sc.dispatchEvent(new TouchEvent(type, {
+			el.dispatchEvent(new TouchEvent(type, {
 				bubbles: true, cancelable: true,
 				touches: empty ? [] : [t], targetTouches: empty ? [] : [t], changedTouches: [t],
 			}));
 		};
+
+		const sc = document.querySelector(".msgs");
+		const touch = (type) => dispatchTouch(sc, type);
 
 		sc.scrollTop = sc.scrollHeight;
 		await frame(); await frame();

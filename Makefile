@@ -75,8 +75,12 @@ frontend: web/node_modules
 	cd web && $(ESBUILD) --bundle --minify --format=iife --target=es2022 src/sw.js --outfile=dist/sw.js
 	cp web/index.html web/manifest.json web/icon.svg web/dist/
 
+# --ignore-scripts: dependency lifecycle scripts are arbitrary code run at
+# install time, and nothing in this tree needs them (esbuild ships its
+# platform binary as an optionalDependency; Playwright's browsers come from an
+# explicit `playwright install`, not a postinstall hook). Matches CI.
 web/node_modules: web/package.json web/package-lock.json
-	cd web && npm ci --no-fund --no-audit
+	cd web && npm ci --no-fund --no-audit --ignore-scripts
 	touch web/node_modules
 
 check: vet gofmt-check staticcheck test frontend-test build binary-size-gate bundle-size-gate notices-check

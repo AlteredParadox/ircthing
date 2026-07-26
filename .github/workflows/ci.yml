@@ -62,8 +62,12 @@ jobs:
         with:
           node-version: 22
 
+      # --ignore-scripts: dependency lifecycle scripts are arbitrary code run
+      # at install time. Nothing here needs them — esbuild ships its platform
+      # binary as an optionalDependency, and Playwright's browsers come from
+      # the explicit `playwright install` below, not a postinstall hook.
       - name: Install frontend deps
-        run: cd web && npm ci --no-fund --no-audit
+        run: cd web && npm ci --no-fund --no-audit --ignore-scripts
 
       # Cache the browser by the resolved Playwright version: a mismatched
       # cache is worse than none (Playwright refuses a browser build it did
@@ -80,9 +84,14 @@ jobs:
 
       # Chromium only — the suite asserts layout geometry, not cross-browser
       # rendering. --with-deps installs the system libraries it needs.
+      #
+      # The local binary, NOT `npx`: npx will fetch and execute a package from
+      # the registry when the name doesn't resolve locally, so a typo or a
+      # dropped devDependency turns into running unpinned code. This path can
+      # only ever run the version in package-lock.json.
       - name: Install Chromium
         if: steps.pw-cache.outputs.cache-hit != 'true'
-        run: cd web && npx playwright install --with-deps chromium
+        run: cd web && ./node_modules/.bin/playwright install --with-deps chromium
 
       - name: make browser-test
         run: make browser-test
