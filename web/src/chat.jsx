@@ -21,7 +21,7 @@ import { menuTrigger } from "./menu.jsx";
 import { applyFormat, BOLD, ITALIC, UNDERLINE } from "./format.js";
 import { FormatPanel } from "./formatpanel.jsx";
 import { InputHistory, isFirstLine, isLastLine } from "./inputhistory.js";
-import { applyStatusMode, firstURL, fmtTime, highlightNicks, linkify, nickColor, nickSet, parseFormatting, renderable, SERVER_BUFFER, stripFormatting, TypingSender, typingText } from "./irc.js";
+import { applyStatusMode, customNickColor, firstURL, fmtTime, highlightNicks, linkify, nickColor, nickSet, parseFormatting, renderable, SERVER_BUFFER, stripFormatting, TypingSender, typingText } from "./irc.js";
 import { LinkPreview } from "./preview.jsx";
 import { VirtualList } from "./vlist.jsx";
 import { WhoisCard } from "./whois.jsx";
@@ -43,7 +43,7 @@ const MAX_BODY_NODES = 4000;
 // mentioned in the text become colored, clickable spans with the user menu.
 // It decrements the shared node budget; when the budget runs out mid-segment
 // the untouched tail is appended as one plain string (never dropped).
-function pushBodyText(out, budget, text, nicks, theme, onNick, keyBase) {
+function pushBodyText(out, budget, text, nicks, colorOf, onNick, keyBase) {
 	if (!nicks) {
 		out.push(text);
 		budget.n--;
@@ -61,7 +61,7 @@ function pushBodyText(out, budget, text, nicks, theme, onNick, keyBase) {
 				<span
 					key={keyBase + "n" + i}
 					class="body-nick has-menu"
-					style={{ color: nickColor(p.nick, theme) }}
+					style={{ color: colorOf(p.nick) }}
 					{...menuTrigger((x, y) => onNick(p.nick, x, y))}
 				>{p.text}</span>
 			)
@@ -98,7 +98,7 @@ function fmtWrap(run, inner, key) {
 // segment. Returns { inner, truncated }: truncated means the budget ran out
 // partway, so the caller drops the partial and re-emits the whole run as plain
 // text (no styling, but no text lost).
-function renderRun(run, ri, budget, nicks, theme, onNick) {
+function renderRun(run, ri, budget, nicks, colorOf, onNick) {
 	const inner = [];
 	const lines = run.text.split("\n");
 	for (let pi = 0; pi < lines.length; pi++) {
@@ -114,14 +114,14 @@ function renderRun(run, ri, budget, nicks, theme, onNick) {
 				inner.push(<a key={kp} href={seg.text} target="_blank" rel="noopener noreferrer">{seg.text}</a>);
 				budget.n--;
 			} else {
-				pushBodyText(inner, budget, seg.text, nicks, theme, onNick, kp + "-");
+				pushBodyText(inner, budget, seg.text, nicks, colorOf, onNick, kp + "-");
 			}
 		}
 	}
 	return { inner, truncated: false };
 }
 
-function Body({ text, nicks, theme, onNick }) {
+function Body({ text, nicks, colorOf, onNick }) {
 	// Parse mIRC formatting ONCE across the WHOLE message so the styled-run cap
 	// (MAX_FMT_RUNS) bounds the entire body — splitting per line first would let a
 	// hostile many-line body multiply the cap by the line count. draft/multiline
@@ -132,7 +132,7 @@ function Body({ text, nicks, theme, onNick }) {
 	const out = [];
 	let ri = 0;
 	for (; ri < runs.length && budget.n > 0; ri++) {
-		const { inner, truncated } = renderRun(runs[ri], ri, budget, nicks, theme, onNick);
+		const { inner, truncated } = renderRun(runs[ri], ri, budget, nicks, colorOf, onNick);
 		// On truncation, leave ri ON this run (no push, no advance): the plain-text
 		// tail below re-includes it whole (unstyled but complete) — nothing dropped
 		// or duplicated.
@@ -173,7 +173,7 @@ function CollapsedRow({ ev, onToggle }) {
 }
 
 // Row dispatches by event kind; a real message renders via MsgRow.
-function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onToggle, nicks, userhosts, statusHost, memberPrefixes, timeFmt, nickSep, previews }) {
+function Row({ ev, selfNick, colorOf, focused, isHighlight, onRedact, onNick, onToggle, nicks, userhosts, statusHost, memberPrefixes, timeFmt, nickSep, previews }) {
 	if (ev.whois) return <WhoisCard whois={ev.whois} focused={focused} />;
 	if (ev.collapse) return <CollapsedRow ev={ev} onToggle={onToggle} />;
 	const r = renderable(ev, statusHost);
@@ -182,7 +182,7 @@ function Row({ ev, selfNick, theme, focused, isHighlight, onRedact, onNick, onTo
 	}
 	return (
 		<MsgRow
-			ev={ev} r={r} selfNick={selfNick} theme={theme} focused={focused}
+			ev={ev} r={r} selfNick={selfNick} colorOf={colorOf} focused={focused}
 			isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} nicks={nicks} userhosts={userhosts}
 			memberPrefixes={memberPrefixes}
 			timeFmt={timeFmt} nickSep={nickSep} previews={previews}
@@ -206,24 +206,26 @@ function RowNick({ sender, color, label, sep, onNick, userhost, prefix }) {
 
 // RowBody is the message text column: an action leads with the sender, a
 // bot chip, then the (multiline-aware) body.
-function RowBody({ r, color, sender, onNick, nicks, theme }) {
+function RowBody({ r, color, sender, onNick, nicks, colorOf }) {
 	return (
 		<div class={"msg-body" + (r.kind === "action" ? " action" : "") + (r.kind === "notice" ? " notice" : "")}>
 			{r.kind === "action" && (
 				<span class="has-menu" style={{ color, fontWeight: 600 }} {...menuTrigger((x, y) => onNick(sender, x, y))}>{sender} </span>
 			)}
 			{r.bot && <span class="bot-chip" title="flagged as a bot">bot</span>}
-			<Body text={r.text} nicks={nicks} theme={theme} onNick={onNick} />
+			<Body text={r.text} nicks={nicks} colorOf={colorOf} onNick={onNick} />
 		</div>
 	);
 }
 
-function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick, nicks, userhosts, memberPrefixes, timeFmt, nickSep, previews }) {
+function MsgRow({ ev, r, selfNick, colorOf, focused, isHighlight, onRedact, onNick, nicks, userhosts, memberPrefixes, timeFmt, nickSep, previews }) {
 	const self = selfNick && ev.sender === selfNick;
 	const mention = !self && isHighlight(r.text);
 	// One preview per message (the first link), only for real messages.
 	const link = r.kind === "msg" || r.kind === "action" ? firstURL(r.text) : "";
-	const color = self ? "var(--accent)" : nickColor(ev.sender, theme);
+	// Own messages wear the accent unless the user picked a color for their
+	// own nick — an explicit choice outranks the "this one is me" default.
+	const color = colorOf(ev.sender, self ? "var(--accent)" : "");
 	// Own messages can be deleted (server decides authorization).
 	const canRedact = self && ev.msgid && onRedact;
 	// Actions show "*" in the nick column (the sender leads the body); a
@@ -239,7 +241,7 @@ function MsgRow({ ev, r, selfNick, theme, focused, isHighlight, onRedact, onNick
 		<div class={"msg-row" + (mention ? " mention" : "") + (focused ? " flash" : "")}>
 			<span class="msg-time">{fmtTime(ev.time, timeFmt)}</span>
 			<RowNick sender={ev.sender} color={color} label={nickLabel} sep={sep} onNick={onNick} userhost={userhosts?.get(ev.sender?.toLowerCase())} prefix={modePrefix} />
-			<RowBody r={r} color={color} sender={ev.sender} onNick={onNick} nicks={nicks} theme={theme} />
+			<RowBody r={r} color={color} sender={ev.sender} onNick={onNick} nicks={nicks} colorOf={colorOf} />
 			{canRedact && (
 				<button type="button" class="msg-redact" title="Delete message" onClick={() => onRedact(ev.msgid)}>⌫</button>
 			)}
@@ -293,7 +295,16 @@ function makeEstimate(statusHost) {
 // Chat renders the active buffer: virtualized scrollback plus composer.
 // completionNicks feeds tab-completion (channel roster, or the query
 // counterpart).
-export function Chat({ buf, msgs, selfNick, theme, tailNav, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, statusHost, timeFmt, nickSep, previews, highlightNames, userhosts, nickPrefixes, memberPrefixes, layoutKey, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
+export function Chat({ buf, msgs, selfNick, theme, nickColors, tailNav, connected, error, typers, focusId, completionNicks, ignoredNicks, statusMode, statusHost, timeFmt, nickSep, previews, highlightNames, userhosts, nickPrefixes, memberPrefixes, layoutKey, composerApi, isHighlight, onSend, onLoadOlder, onReloadTail, onRead, onTyping, onRedact, onNick }) {
+	// colorOf(nick, fallback) resolves a nick to the color it renders in:
+	// the user's per-nick override if there is one, else `fallback` when the
+	// caller has a special case (own messages use the accent), else the
+	// deterministic hash. Threaded down the row tree in place of the raw
+	// theme, which is all the tree ever used it for.
+	const colorOf = useMemo(
+		() => (nick, fallback) => customNickColor(nick, nickColors) || fallback || nickColor(nick, theme),
+		[theme, nickColors],
+	);
 	// Lookup for in-body nick highlighting (Settings toggle): channel roster
 	// minus our own nick. Null when off, so the row renderer skips the scan.
 	const nickHi = useMemo(
@@ -624,7 +635,7 @@ export function Chat({ buf, msgs, selfNick, theme, tailNav, connected, error, ty
 					else markRead();
 				}}
 				renderItem={(ev, i) => (
-					<Row ev={ev} selfNick={selfNick} theme={theme} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} nicks={nickHi} userhosts={userhosts} statusHost={statusHost} memberPrefixes={nickPrefixes ? memberPrefixes : null} timeFmt={timeFmt} nickSep={nickSep} previews={previews} />
+					<Row ev={ev} selfNick={selfNick} colorOf={colorOf} focused={ev.id === focusId} isHighlight={isHighlight} onRedact={onRedact} onNick={onNick} onToggle={toggleRun} nicks={nickHi} userhosts={userhosts} statusHost={statusHost} memberPrefixes={nickPrefixes ? memberPrefixes : null} timeFmt={timeFmt} nickSep={nickSep} previews={previews} />
 				)}
 			/>
 			<div class="composer">

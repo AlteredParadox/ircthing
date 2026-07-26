@@ -40,6 +40,56 @@ export const CLOCKS = ["24", "12"];
 // Longest allowed nick/message separator (e.g. ":"); a few chars is plenty
 // and bounds a hand-edited pref.
 export const MAX_NICK_SEP = 3;
+// Per-nick color overrides (prefs.nickColors). The map is keyed by the
+// LOWERCASED nick and is global rather than per-network: a nick is normally
+// the same person everywhere, and one flat map keeps the synced blob small.
+// Both bounds are belt-and-braces against a hand-edited or hostile prefs
+// blob — the real ceiling is MAX_PREFS_BYTES, which the user CSS is trimmed
+// to fit (see clampPrefsToBudget), so an unbounded nick map could otherwise
+// starve the CSS field entirely.
+export const MAX_NICK_COLORS = 200;
+export const MAX_NICK_LEN = 64;
+
+// Swatches offered by the nick color picker. Chosen mid-lightness so every
+// one of them stays legible on both the dark and the light theme — a single
+// stored hex is used verbatim under either (see nickColor).
+export const NICK_SWATCHES = [
+	"#e05561", "#d2691e", "#b58900", "#4caf50",
+	"#00a884", "#0ea5e9", "#4f7cff", "#8b5cf6",
+	"#c26bd6", "#ec4899", "#8d6e63", "#78909c",
+];
+
+// normalizeHexColor accepts "#rgb"/"#rrggbb" with or without the leading "#",
+// in any case, and returns the canonical lowercase "#rrggbb". Anything else
+// (including the empty string) yields "" — the caller reads that as "no
+// override". Only literal hex is accepted: the value lands in an inline
+// style, so named colors, var(), and url() never get the chance.
+export function normalizeHexColor(v) {
+	const s = String(v ?? "").trim().replace(/^#/, "").toLowerCase();
+	if (!/^[0-9a-f]+$/.test(s)) return "";
+	if (s.length === 3) return "#" + s[0] + s[0] + s[1] + s[1] + s[2] + s[2];
+	return s.length === 6 ? "#" + s : "";
+}
+
+// normalizeNickColors sanitizes the override map: lowercased plausible nicks
+// mapped to canonical hex, capped at MAX_NICK_COLORS. Entries past the cap
+// are dropped from the END of the insertion order, so writers that put the
+// nick they just edited first (see setNickColor in app.jsx) never lose it.
+export function normalizeNickColors(raw) {
+	const out = {};
+	if (!raw || typeof raw !== "object") return out;
+	let n = 0;
+	for (const [nick, color] of Object.entries(raw)) {
+		if (n >= MAX_NICK_COLORS) break;
+		const key = String(nick).toLowerCase();
+		if (!key || key.length > MAX_NICK_LEN || /[\s\0]/.test(key)) continue;
+		const hex = normalizeHexColor(color);
+		if (!hex) continue;
+		out[key] = hex;
+		n++;
+	}
+	return out;
+}
 // Must match hub.MaxPrefsBytes. This is the byte length of the inner prefs
 // JSON value, not JavaScript characters: non-ASCII CSS and JSON escaping can
 // make those differ substantially.
@@ -123,6 +173,9 @@ export const DEFAULTS = {
 	// polled while the tab is visible. An ops nicety for eyeballing the
 	// GOMEMLIMIT headroom; off by default.
 	showMemory: false,
+	// Per-nick color overrides, { "<lowercased nick>": "#rrggbb" }. Empty =
+	// every nick uses the deterministic hash (see nickColor).
+	nickColors: {},
 	css: "",
 };
 
@@ -152,6 +205,7 @@ export function normalizePrefs(raw) {
 		purgeOnClose: typeof p.purgeOnClose === "boolean" ? p.purgeOnClose : DEFAULTS.purgeOnClose,
 		mediaPlayers: typeof p.mediaPlayers === "boolean" ? p.mediaPlayers : DEFAULTS.mediaPlayers,
 		showMemory: typeof p.showMemory === "boolean" ? p.showMemory : DEFAULTS.showMemory,
+		nickColors: normalizeNickColors(p.nickColors),
 		css: typeof p.css === "string" ? p.css : DEFAULTS.css,
 	});
 }
