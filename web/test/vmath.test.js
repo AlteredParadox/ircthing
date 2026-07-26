@@ -592,6 +592,10 @@ test("estimateMsgHeight grows with wrapped length", () => {
 	const one = estimateMsgHeight("");
 	is(estimateMsgHeight(null), one, "no text is a single line");
 	is(estimateMsgHeight("x".repeat(40)), one, "short line does not wrap");
+	// An unmeasured Geometry passes metrics === null (and the harness passes
+	// nothing); both must land on DEFAULT_METRICS rather than NaN out.
+	is(estimateMsgHeight("", null), one, "null metrics falls back to the defaults");
+	is(estimateMsgHeight("", undefined), one, "so does an omitted metrics argument");
 	// Monotonic in length, and unbounded — a wall of text keeps growing rather
 	// than saturating at some clamp.
 	let prev = one;

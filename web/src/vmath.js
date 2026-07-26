@@ -499,7 +499,10 @@ const DEFAULT_METRICS = { width: 804, lineH: 18, padY: 6, charW: 6.5, prefixPx: 
 // Embedded newlines (draft/multiline) each start a fresh line, and only the
 // first line pays for the timestamp/nick prefix that leads the inline flow.
 export function estimateMsgHeight(text, metrics) {
-	const m = { ...DEFAULT_METRICS, ...(metrics || {}) };
+	// Spreading null/undefined in an object literal is a no-op, so an
+	// unmeasured Geometry (metrics === null) falls through to the defaults
+	// without a guard.
+	const m = { ...DEFAULT_METRICS, ...metrics };
 	const perLine = Math.max(1, Math.floor(m.width / m.charW));
 	const firstLine = Math.max(1, Math.floor((m.width - m.prefixPx) / m.charW));
 	const segments = text ? String(text).split("\n") : [""];
