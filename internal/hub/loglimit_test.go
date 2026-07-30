@@ -18,11 +18,16 @@ package hub
 
 import (
 	"bytes"
+	"context"
 	"log"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"ircthing/internal/irc"
+
+	ircv4 "gopkg.in/irc.v4"
 )
 
 // logLimitBase is a fixed synthetic clock origin: logLimiter.allow takes now, so the
@@ -168,4 +173,123 @@ func captureHubLog(t *testing.T) *bytes.Buffer {
 		log.SetFlags(prevFlags)
 	})
 	return &buf
+}
+
+// brokenStoreHub returns a hub whose store is closed, so every store call on
+// the inbound path fails. That is the shape of the fault this limiter exists
+// for — a store that is down for every message, not for one — without having
+// to fill a real filesystem.
+func brokenStoreHub(t *testing.T) *Hub {
+	t.Helper()
+	h := newTestHub(t)
+	if err := h.store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	return h
+}
+
+// TestStoreErrorLogsAreLimitedEndToEnd drives each inbound path that writes to
+// the store against a failed store and asserts the fault is reported exactly
+// once per kind — not once per message. This is the real amplifier: each of
+// these is called per remote IRC line.
+func TestStoreErrorLogsAreLimitedEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	msg := func(line string) irc.Event {
+		return irc.Event{
+			Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+			Msg: ircv4.MustParseMessage(line),
+		}
+	}
+
+	cases := []struct {
+		name string
+		want string
+		// drive performs one message's worth of work on a broken store.
+		drive func(h *Hub, c Conn)
+	}{
+		{
+			name: "persist",
+			want: "persist PRIVMSG",
+			drive: func(h *Hub, c Conn) {
+				_ = h.persistEvent(ctx, c, msg(":alice!u@h PRIVMSG #go :hi"), false, nil)
+			},
+		},
+		{
+			name: "membership",
+			want: "persist QUIT",
+			drive: func(h *Hub, c Conn) {
+				h.persistMembershipLine(ctx, c, msg(":alice!u@h QUIT :bye"), "#go", false)
+			},
+		},
+		{
+			name: "adopt",
+			want: "own-message dedup",
+			drive: func(h *Hub, c Conn) {
+				h.adoptReplayedOwn(ctx, c, msg("@msgid=abc :me!u@h PRIVMSG #go :mine"), "#go")
+			},
+		},
+		{
+			name: "marker",
+			want: "upstream read marker",
+			drive: func(h *Hub, c Conn) {
+				h.applyUpstreamMarker(ctx, c,
+					msg(":irc.libera.chat MARKREAD #go timestamp=2026-07-30T12:00:00.000Z"))
+			},
+		},
+		{
+			name: "redact",
+			want: "redact",
+			drive: func(h *Hub, c Conn) {
+				h.scrubRedaction(ctx, msg(":alice!u@h REDACT #go abc :spam"), "#go", "abc", "spam", false, nil)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := brokenStoreHub(t)
+			c := &fakeConn{name: "libera", nick: "me"}
+			buf := captureHubLog(t)
+			for i := 0; i < 200; i++ {
+				tc.drive(h, c)
+			}
+			got := strings.Count(buf.String(), tc.want)
+			if got == 0 {
+				t.Fatalf("store failure never logged; want a line containing %q:\n%s", tc.want, buf.String())
+			}
+			if got != 1 {
+				t.Fatalf("200 failed messages logged %d lines containing %q, want 1:\n%s",
+					got, tc.want, buf.String())
+			}
+		})
+	}
+}
+
+// TestStoreErrorLogKindsDoNotMaskEachOther is the end-to-end counterpart to
+// TestLogLimiterKindsAreIndependent: a persist storm must not hide the first
+// redaction or read-marker failure, since all of them fail together when the
+// store is down and the operator needs to see the whole picture.
+func TestStoreErrorLogKindsDoNotMaskEachOther(t *testing.T) {
+	ctx := context.Background()
+	h := brokenStoreHub(t)
+	c := &fakeConn{name: "libera", nick: "me"}
+	msg := func(line string) irc.Event {
+		return irc.Event{
+			Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+			Msg: ircv4.MustParseMessage(line),
+		}
+	}
+
+	buf := captureHubLog(t)
+	for i := 0; i < 200; i++ {
+		_ = h.persistEvent(ctx, c, msg(":alice!u@h PRIVMSG #go :hi"), false, nil)
+	}
+	h.scrubRedaction(ctx, msg(":alice!u@h REDACT #go abc :spam"), "#go", "abc", "spam", false, nil)
+	h.applyUpstreamMarker(ctx, c, msg(":irc.libera.chat MARKREAD #go timestamp=2026-07-30T12:00:00.000Z"))
+
+	for _, want := range []string{"persist PRIVMSG", "redact", "upstream read marker"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Fatalf("%q missing — a persist storm masked another kind:\n%s", want, buf.String())
+		}
+	}
 }
