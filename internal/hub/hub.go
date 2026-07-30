@@ -133,6 +133,11 @@ type Hub struct {
 	// persist — the casemapped-duplicate state the check exists to prevent.
 	monMu sync.Mutex
 
+	// errLog bounds the store-error logs on the inbound-message path: each
+	// of those writes is driven by a remote IRC line, so a sustained store
+	// fault would otherwise emit one log line per message (see logLimiter).
+	errLog storeErrLogs
+
 	mu                sync.Mutex
 	networks          map[string]Conn
 	states            map[string]string          // last known connection state per network
@@ -686,7 +691,7 @@ func (h *Hub) adoptReplayedOwn(ctx context.Context, c Conn, ev irc.Event, target
 		Text: searchText(ev.Msg), MsgID: mid, SinceMs: since,
 	}
 	if _, aerr := h.store.AdoptOwnMsgID(ctx, own, c.Fold); aerr != nil {
-		log.Printf("irc[%s]: own-message dedup for %q: %v", ev.Network, target, aerr)
+		h.errLog.adopt.printf("irc[%s]: own-message dedup for %q: %v", ev.Network, target, aerr)
 	}
 }
 
@@ -785,7 +790,7 @@ func (h *Hub) persistEvent(ctx context.Context, c Conn, ev irc.Event, replay boo
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
+		h.errLog.persist.printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
 		return nil
 	}
 	if stored.ID == 0 {
@@ -1059,7 +1064,7 @@ func (h *Hub) applyUpstreamMarker(ctx context.Context, c Conn, ev irc.Event) {
 	}
 	target = h.store.CanonicalBuffer(ctx, ev.Network, target, c.Fold)
 	if err := h.store.SetReadMarker(ctx, ev.Network, target, t); err != nil {
-		log.Printf("irc[%s]: upstream read marker for %q: %v", ev.Network, target, err)
+		h.errLog.marker.printf("irc[%s]: upstream read marker for %q: %v", ev.Network, target, err)
 		return
 	}
 	authoritative, err := h.store.ReadMarker(ctx, ev.Network, target)
@@ -1733,7 +1738,7 @@ func (h *Hub) scrubRedaction(ctx context.Context, ev irc.Event, buffer, msgid, r
 	// other server-derived log field.
 	ok, err := h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason)
 	if err != nil {
-		log.Printf("irc[%s]: redact %.100q in %q: %v", ev.Network, msgid, buffer, err)
+		h.errLog.redact.printf("irc[%s]: redact %.100q in %q: %v", ev.Network, msgid, buffer, err)
 		return false, buffer
 	}
 	if ok || !retryStar {
@@ -1742,7 +1747,7 @@ func (h *Hub) scrubRedaction(ctx context.Context, ev irc.Event, buffer, msgid, r
 	buffer = serverBufferTarget
 	ok, err = h.store.SetRedacted(ctx, ev.Network, buffer, msgid, reason)
 	if err != nil {
-		log.Printf("irc[%s]: redact %.100q in %q: %v", ev.Network, msgid, buffer, err)
+		h.errLog.redact.printf("irc[%s]: redact %.100q in %q: %v", ev.Network, msgid, buffer, err)
 		return false, buffer
 	}
 	// A replayed scrub that landed in "*": flag it so the batch close
@@ -1816,7 +1821,7 @@ func (h *Hub) persistMembershipLine(ctx context.Context, c Conn, ev irc.Event, t
 		func(bool) bool { return h.recentlyClosed(ev.Network, c.Fold(target)) },
 		false, storeMessage(ev))
 	if err != nil {
-		log.Printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
+		h.errLog.persist.printf("irc[%s]: persist %s to %q: %v", ev.Network, ev.Msg.Command, target, err)
 		return
 	}
 	if stored.ID == 0 {
