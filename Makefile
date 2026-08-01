@@ -108,7 +108,11 @@ notices: frontend
 # ORDERING: run this BEFORE anything that invokes `make build`. A build
 # rewrites THIRD_PARTY_LICENSES.md in the working tree, after which this
 # diff trivially passes and the gate is worthless.
-notices-check:
+#
+# Depends on `frontend` for the same reason `notices` does — the generator
+# probe-builds the binary and reads web/node_modules/preact. Both are absent
+# on a fresh clone, so without this the target only works on a warm tree.
+notices-check: frontend
 	@tmp=$$(mktemp); \
 	./scripts/gen-third-party-licenses.sh "$$tmp" >/dev/null; \
 	if ! diff -q THIRD_PARTY_LICENSES.md "$$tmp" >/dev/null; then \
