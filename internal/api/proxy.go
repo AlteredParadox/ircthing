@@ -286,8 +286,32 @@ func (s *Server) releaseMedia()                           { <-s.mediaSem }
 func (s *Server) acquirePreview(ctx context.Context) bool { return acquireSlot(ctx, s.previewSem) }
 func (s *Server) releasePreview()                         { <-s.previewSem }
 
-// acquireSlot takes a slot on sem, giving up after a short bounded wait (or when
-// the request dies) so waiters cannot pile up.
+// acquireSlot takes a slot on sem, giving up after a short bounded wait (or
+// when the request dies) so a saturated slot pool sheds load (503) instead of
+// queueing without limit.
+//
+// To be precise about what is and is not bounded: the WORK is bounded (by
+// mediaSlots/previewSlots) and each wait is bounded IN TIME, but the number of
+// concurrent WAITERS is not — every overflow request parks its own handler
+// goroutine and timer here for up to mediaAcquireWait, so waiter count scales
+// with excess request rate x that wait.
+//
+// ACCEPTED, deliberately (a security scan flagged it 2026-08-01; this comment
+// exists so the next one gets an answer instead of re-deriving it):
+//   - Both endpoints are behind requireAuth, so reaching this needs a valid
+//     owner session on a single-user deployment. An attacker who has that has
+//     strictly better things to do than park goroutines.
+//   - A parked waiter is a goroutine stack and a timer — single-digit KiB —
+//     and it self-clears within mediaAcquireWait. Costing MemoryMax anything
+//     meaningful takes thousands of concurrent authenticated requests.
+//   - The client bounds its own retries per (network, URL); see
+//     web/src/preview.jsx.
+//
+// The fix would be a waiter semaphore or a server-wide in-flight cap, i.e. a
+// second admission tier in front of this one. That is real complexity for a
+// threat that requires the session to already be compromised, so it is not
+// worth it here. Revisit if this ever grows multi-user, where one tenant's
+// burst could starve another.
 func acquireSlot(ctx context.Context, sem chan struct{}) bool {
 	t := time.NewTimer(mediaAcquireWait)
 	defer t.Stop()
