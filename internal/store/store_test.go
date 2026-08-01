@@ -962,3 +962,50 @@ func TestBufferCapIgnoresArchived(t *testing.T) {
 		t.Fatalf("active buffers = %+v, want just #fresh", bufs)
 	}
 }
+
+// NetworkBuffers must return exactly what Buffers returns for that network —
+// same rows, same activity and unread values. Backfill switched to it to keep
+// a reconnect's cost proportional to one network, so any drift between the
+// two would silently change what a reconnect replays.
+func TestNetworkBuffersMatchesBuffersPerNetwork(t *testing.T) {
+	st, _ := openTest(t, 16)
+	ctx := context.Background()
+
+	for _, n := range []string{"alpha", "beta"} {
+		for _, target := range []string{"#chan", "someone"} {
+			if _, err := st.Append(ctx, n, target, Message{
+				Time:    time.UnixMilli(1000),
+				Sender:  "them",
+				Command: "PRIVMSG",
+				Raw:     "hi",
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	all, err := st.Buffers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, network := range []string{"alpha", "beta", "missing"} {
+		var want []BufferInfo
+		for _, b := range all {
+			if b.Network == network {
+				want = append(want, b)
+			}
+		}
+		got, err := st.NetworkBuffers(ctx, network)
+		if err != nil {
+			t.Fatalf("NetworkBuffers(%q): %v", network, err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("NetworkBuffers(%q) returned %d rows, want %d", network, len(got), len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("NetworkBuffers(%q)[%d] = %+v, want %+v", network, i, got[i], want[i])
+			}
+		}
+	}
+}

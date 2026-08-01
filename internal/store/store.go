@@ -940,28 +940,49 @@ type BufferInfo struct {
 	Unread  int64 // messages newer than the marker
 }
 
+// bufferListSelect is the shared projection behind Buffers and
+// NetworkBuffers. It is split out so the two callers cannot drift on the
+// unread-count semantics: that count must match what the client counts as
+// unread live, or the two disagree the moment a client fetches buffers (the
+// badge jumps). The client counts only conversation lines (renderable kind !=
+// "system"), i.e. PRIVMSG/NOTICE — presence traffic
+// (JOIN/PART/QUIT/NICK/MODE/TOPIC/KICK) renders as a system row and never
+// bumps unread. (Non-ACTION CTCP is never persisted, and a redacted row keeps
+// its PRIVMSG/NOTICE command, so it counts consistently on both sides.)
+//
+// Concatenated with a constant predicate below — never with caller data.
+const bufferListSelect = `
+	SELECT n.name, b.name,
+		COALESCE((SELECT MAX(ts) FROM messages WHERE buffer_id = b.id), 0),
+		COALESCE((SELECT ts FROM read_markers WHERE buffer_id = b.id), 0),
+		(SELECT COUNT(*) FROM messages WHERE buffer_id = b.id
+			AND command IN ('PRIVMSG','NOTICE')
+			AND ts > COALESCE((SELECT ts FROM read_markers WHERE buffer_id = b.id), 0))
+	FROM buffers b
+	JOIN networks n ON n.id = b.network_id
+	WHERE b.archived = 0`
+
+const bufferListOrder = ` ORDER BY n.name, b.name`
+
 // Buffers lists every buffer with its activity and read state, ordered by
 // network then target. Archived buffers (close_buffer purge:false) are
 // excluded — hidden until real conversation clears the flag.
 func (s *Store) Buffers(ctx context.Context) ([]BufferInfo, error) {
-	// The unread count must match what the client counts as unread live, or the
-	// two disagree the moment a client fetches buffers (the badge jumps). The
-	// client counts only conversation lines (renderable kind != "system"), i.e.
-	// PRIVMSG/NOTICE — presence traffic (JOIN/PART/QUIT/NICK/MODE/TOPIC/KICK)
-	// renders as a system row and never bumps unread. Filter to the same set
-	// here. (Non-ACTION CTCP is never persisted, and a redacted row keeps its
-	// PRIVMSG/NOTICE command, so it counts consistently on both sides.)
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT n.name, b.name,
-			COALESCE((SELECT MAX(ts) FROM messages WHERE buffer_id = b.id), 0),
-			COALESCE((SELECT ts FROM read_markers WHERE buffer_id = b.id), 0),
-			(SELECT COUNT(*) FROM messages WHERE buffer_id = b.id
-				AND command IN ('PRIVMSG','NOTICE')
-				AND ts > COALESCE((SELECT ts FROM read_markers WHERE buffer_id = b.id), 0))
-		FROM buffers b
-		JOIN networks n ON n.id = b.network_id
-		WHERE b.archived = 0
-		ORDER BY n.name, b.name`)
+	return s.scanBuffers(s.db.QueryContext(ctx, bufferListSelect+bufferListOrder))
+}
+
+// NetworkBuffers is Buffers restricted to one network. Reconnect backfill runs
+// per network on every successful registration, and the correlated
+// latest-message/marker/unread subqueries in the projection are evaluated per
+// surviving row — so filtering in SQL rather than in Go keeps a reconnect's
+// cost proportional to THAT network's buffers instead of the whole store's. A
+// hostile server that can force repeated reconnects would otherwise make each
+// one re-aggregate every unrelated network's history.
+func (s *Store) NetworkBuffers(ctx context.Context, network string) ([]BufferInfo, error) {
+	return s.scanBuffers(s.db.QueryContext(ctx, bufferListSelect+` AND n.name = ?`+bufferListOrder, network))
+}
+
+func (s *Store) scanBuffers(rows *sql.Rows, err error) ([]BufferInfo, error) {
 	if err != nil {
 		return nil, err
 	}
