@@ -234,3 +234,25 @@ func TestPartialProxyResponsesRemainTransientIOErrors(t *testing.T) {
 		})
 	}
 }
+
+// A scoped IPv6 literal must not pass the shared host:port validator. The
+// zone names a LOCAL interface, so it is meaningless to a remote peer, and
+// net.ParseIP returns nil for the zoned form — which would make
+// socks5Request encode a link-local address as an ATYP domain for the proxy
+// to "resolve", and make the media layer's literal-IP check miss it.
+func TestValidHostPortRejectsIPv6Zone(t *testing.T) {
+	for _, addr := range []string{
+		"[fe80::1%eth0]:6697",
+		"[::1%lo]:80",
+	} {
+		if err := ValidHostPort(addr); err == nil {
+			t.Errorf("ValidHostPort(%q) = nil, want an error", addr)
+		}
+	}
+	// Unzoned literals and ordinary hostnames still pass.
+	for _, addr := range []string{"[fe80::1]:6697", "[::1]:80", "irc.example.net:6697"} {
+		if err := ValidHostPort(addr); err != nil {
+			t.Errorf("ValidHostPort(%q) = %v, want nil", addr, err)
+		}
+	}
+}

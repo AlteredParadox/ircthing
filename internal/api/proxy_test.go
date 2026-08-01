@@ -272,7 +272,13 @@ func TestFetcherUsesProxy(t *testing.T) {
 // the SSRF backstop.
 func TestProxiedFetcherBlocksLiteralPrivateIP(t *testing.T) {
 	f := newFetcher(maxHTMLBytes, fakeConnectProxy(t)) // default allowIP = netguard.IsPublicIP
-	for _, u := range []string{"http://10.0.0.1/x", "http://169.254.169.254/latest", "http://[::1]/"} {
+	for _, u := range []string{
+		"http://10.0.0.1/x", "http://169.254.169.254/latest", "http://[::1]/",
+		// Scoped IPv6 literals. url.Hostname() keeps the zone and
+		// net.ParseIP rejects that form, so these used to be classified
+		// as HOSTNAMES and skip the private-address check entirely.
+		"http://[fe80::1%25eth0]/", "http://[::1%25lo]/",
+	} {
 		if _, _, _, err := f.get(context.Background(), u); !errors.Is(err, errBlocked) {
 			t.Fatalf("get(%q) = %v, want errBlocked", u, err)
 		}

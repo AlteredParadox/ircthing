@@ -1012,14 +1012,18 @@ func (h *Hub) monitorList(ctx context.Context, network string) ([]MonitorEntry, 
 }
 
 func (h *Hub) backfill(ctx context.Context, c Conn) {
-	infos, err := h.store.Buffers(ctx)
+	// Scoped to THIS network in SQL: backfill runs on every successful
+	// registration, and the global Buffers() aggregated latest-message,
+	// marker and unread counts across every network before this loop threw
+	// all but one network's rows away.
+	infos, err := h.store.NetworkBuffers(ctx, c.Name())
 	if err != nil {
 		log.Printf("irc[%s]: backfill: %v", c.Name(), err)
 		return
 	}
 	markers := c.CapEnabled("draft/read-marker")
 	for _, b := range infos {
-		if b.Network != c.Name() || c.IsChannel(b.Target) || isServerBuffer(b.Target) {
+		if c.IsChannel(b.Target) || isServerBuffer(b.Target) {
 			// Channels resume on their own JOIN echo (+ MARKREAD from the
 			// server); the synthetic server buffer is local-only and must never
 			// emit CHATHISTORY */MARKREAD * upstream.

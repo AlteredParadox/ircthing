@@ -117,6 +117,15 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Bind the rest of this request to the session: the slot wait and the
+	// outbound fetch below both outlive the router's single requireAuth
+	// check, and must not continue past a logout or password rotation.
+	ctx, release, ok := s.sessionScopedContext(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	defer release()
 	// The link's network selects the proxy, so cache per (network, url): the
 	// same URL in a Tor'd network and a direct one must fetch independently.
 	ck := net + "\x00" + target
@@ -124,7 +133,7 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, pv)
 		return
 	}
-	if !s.acquirePreview(r.Context()) {
+	if !s.acquirePreview(ctx) {
 		http.Error(w, "busy, retry later", http.StatusServiceUnavailable)
 		return
 	}
@@ -155,27 +164,17 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	// the network while we were parked, and a stale (direct) resolution would
 	// leak the IP. A nil fetcher means the egress is UNRESOLVABLE (unknown/deleted
 	// network or unparseable proxy) — fail closed, 502.
-	f := s.htmlFetcherForNetwork(r.Context(), net)
+	f := s.htmlFetcherForNetwork(ctx, net)
 	if f == nil {
 		http.Error(w, "preview unavailable", http.StatusBadGateway)
 		return
 	}
-	// Classify the fetch error: a TRANSIENT failure (WireGuard tunnel still coming
-	// up, upstream 5xx) → 503 so the client retries a few times; a PERMANENT one
-	// (bad/blocked URL, over-size body, upstream 4xx) → 502 so it caches the
-	// failure and does NOT retry — retrying a dead link is four tracking hits and,
-	// for an over-size image, ~40 MiB re-downloaded to the same end. Fail closed
-	// either way: no direct fetch.
+	// Fail closed on any fetch error: no direct fetch fallback. See
+	// writePreviewFetchError for the transient/permanent status split.
 	start := time.Now()
-	ct, finalURL, body, err := f.get(r.Context(), target)
+	ct, finalURL, body, err := f.get(ctx, target)
 	if err != nil {
-		if fetchErrorRetryable(err) {
-			logMedia("preview", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), retryable: true, httpStatus: 503})
-			http.Error(w, "preview fetch failed", http.StatusServiceUnavailable)
-		} else {
-			logMedia("preview", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), httpStatus: 502})
-			http.Error(w, "preview unavailable", http.StatusBadGateway)
-		}
+		writePreviewFetchError(w, target, start, err)
 		return
 	}
 
@@ -198,6 +197,22 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 	s.previewCache.put(ck, pv)
 	writeJSON(w, pv)
+}
+
+// writePreviewFetchError maps a failed preview fetch onto a status the client
+// can act on, and logs it. A TRANSIENT failure (WireGuard tunnel still coming
+// up, upstream 5xx) → 503 so the client retries a few times; a PERMANENT one
+// (bad/blocked URL, over-size body, upstream 4xx) → 502 so it caches the
+// failure and does NOT retry — retrying a dead link is four tracking hits and,
+// for an over-size image, ~40 MiB re-downloaded to the same end.
+func writePreviewFetchError(w http.ResponseWriter, target string, start time.Time, err error) {
+	if fetchErrorRetryable(err) {
+		logMedia("preview", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), retryable: true, httpStatus: 503})
+		http.Error(w, "preview fetch failed", http.StatusServiceUnavailable)
+		return
+	}
+	logMedia("preview", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), httpStatus: 502})
+	http.Error(w, "preview unavailable", http.StatusBadGateway)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

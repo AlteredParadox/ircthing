@@ -265,7 +265,8 @@ Deliver the cert and key as additional systemd credentials — add
 `LoadCredential=` lines for them and set the JSON values to the env-var form
 `"cert_file": "$CREDENTIALS_DIRECTORY/client-cert.pem"` /
 `"key_file": "$CREDENTIALS_DIRECTORY/client-key.pem"` (ircthing expands
-`$VAR`/`${VAR}` in these two paths at load time) — or place them under the
+`$CREDENTIALS_DIRECTORY`/`${CREDENTIALS_DIRECTORY}` — and only that variable —
+in these two paths at load time) — or place them under the
 service-owned `StateDirectory` with appropriate ownership. A world-readable
 key is not an acceptable workaround.
 
