@@ -48,6 +48,20 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
+
+      # THIRD_PARTY_LICENSES.md is embedded in the binary, and the Dockerfile
+      # COPYs the committed copy rather than regenerating it — so a release
+      # must not ship notices that disagree with what is linked in. This is
+      # the release gate for it; `make check` deliberately does not run it, so
+      # that Dependabot's go.mod PRs aren't red for a file the bot can't
+      # regenerate (ci.yml).
+      #
+      # MUST stay ahead of `make check`: check runs `make build`, which
+      # regenerates this file in the working tree and would leave the diff
+      # below trivially empty.
+      - name: make notices-check
+        run: make notices-check
+
       - name: make check
         run: make check
 

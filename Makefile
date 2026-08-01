@@ -29,7 +29,7 @@ ESBUILD_FLAGS := --bundle --minify --format=esm \
 	--jsx=automatic --jsx-import-source=preact \
 	--target=es2022
 
-.PHONY: build build-debug frontend check vet gofmt-check staticcheck test frontend-test browser-test binary-size-gate bundle-size-gate go-version-gate notices-check integration irctest memcheck clean docker
+.PHONY: build build-debug frontend check vet gofmt-check staticcheck test frontend-test browser-test binary-size-gate bundle-size-gate go-version-gate notices notices-check integration irctest memcheck clean docker
 
 # The go.mod toolchain directive is the minimum Go patch level a release may
 # be built with (stdlib CVE fixes ship in patch releases; an older toolchain
@@ -44,7 +44,12 @@ go-version-gate:
 		exit 1; \
 	fi
 
-build: go-version-gate frontend
+# `notices` runs as a prerequisite: THIRD_PARTY_LICENSES.md is embedded into
+# the binary (notices.go), so regenerating it here means what ships always
+# matches what is actually linked in — there is no separate step to forget
+# after a dependency bump. The committed copy exists so that a bare `go build`
+# (and the Dockerfile, which COPYs it rather than regenerating) still works.
+build: go-version-gate frontend notices
 	CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN) ./cmd/ircd-web
 
 # Unstripped, race-enabled binary for debugging with delve. Never
@@ -83,20 +88,36 @@ web/node_modules: web/package.json web/package-lock.json
 	cd web && npm ci --no-fund --no-audit --ignore-scripts
 	touch web/node_modules
 
-check: vet gofmt-check staticcheck test frontend-test build binary-size-gate bundle-size-gate notices-check
+check: vet gofmt-check staticcheck test frontend-test build binary-size-gate bundle-size-gate
 	@echo "check: OK"
 
-# THIRD_PARTY_LICENSES.md is embedded in the binary and must stay in step with
-# the dependency graph. Regenerate to a temp file and diff, so a stale committed
-# copy (a dep add/bump without re-running the generator) fails the build.
+# Regenerate the third-party notices from the modules actually linked in.
+# Depends on `frontend`: the generator does a probe build (which embeds
+# web/dist) and reads the bundled npm packages out of web/node_modules.
+notices: frontend
+	@./scripts/gen-third-party-licenses.sh >/dev/null
+
+# Fail if the COMMITTED notices are stale. Deliberately NOT part of `check`:
+# Dependabot bumps go.mod but cannot regenerate this file, so gating every PR
+# on it makes each gomod PR red for a reason the bot can't fix — every bump
+# then needs a hand-pushed commit onto its branch. `build` regenerates instead,
+# so the artifact is always correct; this gate runs in the release workflow,
+# which is the point where the notice legally has to match what is published
+# (the Docker image COPYs this file rather than regenerating it).
+#
+# ORDERING: run this BEFORE anything that invokes `make build`. A build
+# rewrites THIRD_PARTY_LICENSES.md in the working tree, after which this
+# diff trivially passes and the gate is worthless.
 notices-check:
 	@tmp=$$(mktemp); \
 	./scripts/gen-third-party-licenses.sh "$$tmp" >/dev/null; \
 	if ! diff -q THIRD_PARTY_LICENSES.md "$$tmp" >/dev/null; then \
-		echo "FAIL: THIRD_PARTY_LICENSES.md is stale — run scripts/gen-third-party-licenses.sh"; \
+		echo "FAIL: THIRD_PARTY_LICENSES.md is stale — run 'make notices' and commit the result"; \
+		diff -u THIRD_PARTY_LICENSES.md "$$tmp" | head -40; \
 		rm -f "$$tmp"; exit 1; \
 	fi; \
-	rm -f "$$tmp"
+	rm -f "$$tmp"; \
+	echo "notices-check: THIRD_PARTY_LICENSES.md is current"
 
 # Pure frontend logic (parsers, formatting) tested with node's built-in
 # runner — no extra test dependencies.

@@ -39,6 +39,13 @@ jobs:
 
       # go vet, staticcheck, go test, frontend build + tests, and the
       # binary (30 MB) and bundle (100 KB gzipped) size gates.
+      #
+      # Not included: `make notices-check`. THIRD_PARTY_LICENSES.md is
+      # generated from the dependency graph, and Dependabot can't regenerate
+      # it — gating here would make every go.mod bump red for a reason the bot
+      # cannot fix. `make build` regenerates the file instead (so the artifact
+      # is always correct), and docker-release.yml gates the committed copy at
+      # the point it actually gets published.
       - name: make check
         run: make check
 
