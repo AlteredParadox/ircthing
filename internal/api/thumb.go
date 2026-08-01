@@ -366,6 +366,15 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Bind the rest of this request to the session: the slot wait, the fetch
+	// and the decode below all outlive the router's single requireAuth check,
+	// and must not continue past a logout or password rotation.
+	ctx, release, ok := s.sessionScopedContext(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	defer release()
 	ck := net + "\x00" + target
 	if t, ok := s.thumbCache.get(ck); ok {
 		writeThumb(w, t)
@@ -375,7 +384,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// One request-wide slot covers the whole memory-heavy span — the
 	// 10 MiB body fetch, the decode, and the re-encode — so in-flight
 	// bytes and bitmaps are bounded together, not just the decode.
-	if !s.acquireMedia(r.Context()) {
+	if !s.acquireMedia(ctx) {
 		http.Error(w, "busy, retry later", http.StatusServiceUnavailable)
 		return
 	}
@@ -396,13 +405,13 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	// while we were parked is honored (a stale direct resolution would leak the
 	// IP). A nil fetcher means the egress is UNRESOLVABLE (unknown/deleted network
 	// or unparseable proxy) — fail closed, 502 (see egressForNetwork).
-	f := s.imageFetcherForNetwork(r.Context(), net)
+	f := s.imageFetcherForNetwork(ctx, net)
 	if f == nil {
 		http.Error(w, "thumbnail unavailable", http.StatusBadGateway)
 		return
 	}
 	start := time.Now()
-	ct, _, body, err := f.get(r.Context(), target)
+	ct, _, body, err := f.get(ctx, target)
 	if err != nil {
 		thumbFetchFailed(w, target, start, err)
 		return

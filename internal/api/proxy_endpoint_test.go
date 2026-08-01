@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // permit rewires a Server's direct (no-proxy) fetchers to allow loopback so
@@ -303,5 +304,75 @@ func TestProxyRejectsBadURL(t *testing.T) {
 		if resp.StatusCode == 200 {
 			t.Fatalf("%s url=%q returned 200 for bad input", tc.path, tc.target)
 		}
+	}
+}
+
+// Revoking a session must tear down its IN-FLIGHT preview fetch. requireAuth
+// runs once in the router, before the handler reads its body, waits for a
+// media slot and fetches — so without registering the request under the
+// session token, a preview admitted a moment before logout keeps fetching
+// across the account-recovery boundary. The origin here never sends headers,
+// so an uncancelled fetch only unwinds at the 8s ResponseHeaderTimeout; a
+// cancelled one returns immediately.
+func TestPreviewFetchCancelledByLogout(t *testing.T) {
+	// Buffered + non-blocking: the client may open more than one connection,
+	// and a second close() would panic inside the handler.
+	entered := make(chan struct{}, 1)
+	stuck := make(chan struct{})
+	defer close(stuck)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		select {
+		case <-stuck:
+		case <-r.Context().Done():
+		}
+	}))
+	defer origin.Close()
+
+	ts, srvObj := newTestServerWithRef(t)
+	permit(srvObj)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	type result struct {
+		at     time.Time
+		status int
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp := mediaPost(t, ts, cookie, "/api/preview", origin.URL, testNet)
+		resp.Body.Close()
+		done <- result{time.Now(), resp.StatusCode}
+	}()
+
+	select {
+	case <-entered:
+	case r := <-done:
+		t.Fatalf("preview returned %d before reaching the origin", r.status)
+	case <-time.After(10 * time.Second):
+		t.Fatal("origin never reached")
+	}
+
+	req, _ := http.NewRequest("POST", ts.URL+"/api/logout", nil)
+	req.Header.Set("Origin", ts.URL)
+	req.AddCookie(cookie)
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	loggedOut := time.Now()
+
+	select {
+	case r := <-done:
+		// Generous margin against the 8s header timeout the unfixed path
+		// would have to burn through.
+		if d := r.at.Sub(loggedOut); d > 4*time.Second {
+			t.Errorf("preview finished %v after logout; fetch was not cancelled", d)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("preview never returned after logout")
 	}
 }

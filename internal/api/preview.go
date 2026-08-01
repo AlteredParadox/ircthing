@@ -117,6 +117,15 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Bind the rest of this request to the session: the slot wait and the
+	// outbound fetch below both outlive the router's single requireAuth
+	// check, and must not continue past a logout or password rotation.
+	ctx, release, ok := s.sessionScopedContext(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	defer release()
 	// The link's network selects the proxy, so cache per (network, url): the
 	// same URL in a Tor'd network and a direct one must fetch independently.
 	ck := net + "\x00" + target
@@ -124,7 +133,7 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, pv)
 		return
 	}
-	if !s.acquirePreview(r.Context()) {
+	if !s.acquirePreview(ctx) {
 		http.Error(w, "busy, retry later", http.StatusServiceUnavailable)
 		return
 	}
@@ -155,7 +164,7 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	// the network while we were parked, and a stale (direct) resolution would
 	// leak the IP. A nil fetcher means the egress is UNRESOLVABLE (unknown/deleted
 	// network or unparseable proxy) — fail closed, 502.
-	f := s.htmlFetcherForNetwork(r.Context(), net)
+	f := s.htmlFetcherForNetwork(ctx, net)
 	if f == nil {
 		http.Error(w, "preview unavailable", http.StatusBadGateway)
 		return
@@ -167,7 +176,7 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	// for an over-size image, ~40 MiB re-downloaded to the same end. Fail closed
 	// either way: no direct fetch.
 	start := time.Now()
-	ct, finalURL, body, err := f.get(r.Context(), target)
+	ct, finalURL, body, err := f.get(ctx, target)
 	if err != nil {
 		if fetchErrorRetryable(err) {
 			logMedia("preview", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), retryable: true, httpStatus: 503})

@@ -155,13 +155,15 @@ type Server struct {
 	wsConns   map[uint64]*websocket.Conn
 	wsNextID  uint64
 
-	// streamCancels tracks the cancel func of every in-flight media stream
-	// relay (/api/media/stream) by session token, mirroring wsCancels: every
-	// token deletion funnels through deleteTokenLocked, which cancels
-	// registered streams alongside sockets — so logout, password rotation,
-	// lazy expiry, and capacity eviction all tear down a session's streams
-	// instead of letting them relay until the track ends. Guarded by mu
-	// (paired with tokens).
+	// streamCancels tracks the cancel func of every in-flight session-scoped
+	// media request by session token, mirroring wsCancels: the stream relay
+	// (/api/media/stream) plus the preview and thumbnail fetches, which can
+	// each outlive the one requireAuth check while they read a body, wait for
+	// a slot, and fetch. Every token deletion funnels through
+	// deleteTokenLocked, which cancels these alongside sockets — so logout,
+	// password rotation, lazy expiry, and capacity eviction all tear down a
+	// session's outbound work instead of letting it run to completion.
+	// Guarded by mu (paired with tokens).
 	streamCancels map[string]map[uint64]context.CancelFunc
 	streamNextID  uint64
 
@@ -989,6 +991,33 @@ func (s *Server) registerWSCancel(token string, cancel context.CancelFunc, conn 
 		}
 		s.mu.Unlock()
 	}, true
+}
+
+// sessionScopedContext derives a cancelable context for an authenticated
+// media request and registers its cancel under the caller's session token, so
+// revocation tears the in-flight work down.
+//
+// requireAuth checks the session ONCE, in the router — before the handler
+// reads its body, waits for a media slot (up to mediaAcquireWait), and runs an
+// outbound fetch. Without this registration a request admitted a moment before
+// logout or a password rotation keeps fetching well past the account-recovery
+// boundary. Registration re-validates the token under the registry lock, so a
+// revocation that already ran its cancel sweep is caught here.
+//
+// ok=false means the session is gone and the handler must refuse. release
+// unregisters and cancels; defer it unconditionally.
+func (s *Server) sessionScopedContext(r *http.Request) (ctx context.Context, release func(), ok bool) {
+	ctx, cancel := context.WithCancel(r.Context())
+	var token string
+	if ck, err := r.Cookie(s.cookieName()); err == nil {
+		token = ck.Value
+	}
+	unregister, live := s.registerStreamCancel(token, cancel)
+	if !live {
+		cancel()
+		return nil, nil, false
+	}
+	return ctx, func() { unregister(); cancel() }, true
 }
 
 // registerStreamCancel records an in-flight media stream's cancel func under
