@@ -1390,3 +1390,55 @@ func TestLoginSourceKeyForwarded(t *testing.T) {
 		t.Fatalf("untrusted source = %q, want 10.0.0.1", got)
 	}
 }
+
+// Logout must revoke the session even when the auxiliary push-subscription
+// cleanup fails. Push deletion used to run FIRST and return on error, which
+// skipped token deletion, socket/stream cancellation and the cookie — so a
+// routine store hiccup left a copied token fully live after the owner
+// believed they had signed out. Fault-injected by closing the store, which
+// only the push delete touches.
+func TestLogoutRevokesSessionWhenPushCleanupFails(t *testing.T) {
+	ts, h := newTestServer(t)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	h.Store().Close() // every subsequent store call errors
+
+	body := strings.NewReader(`{"push_endpoint":"https://push.example/abc"}`)
+	req, _ := http.NewRequest("POST", ts.URL+"/api/logout", body)
+	req.Header.Set("Origin", ts.URL)
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(cookie)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// The failure is still reported — the user needs to know this device may
+	// keep receiving notifications — but it must not imply a live session.
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("logout status = %d, want 500", resp.StatusCode)
+	}
+	// The cookie is cleared even on the failure response.
+	var cleared bool
+	for _, c := range resp.Cookies() {
+		if c.Name == sessionCookie && c.Value == "" && c.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Errorf("no session-clearing cookie on the failure response: %v", resp.Cookies())
+	}
+
+	// The actual invariant: the token is dead.
+	req, _ = http.NewRequest("GET", ts.URL+"/api/ws", nil)
+	req.AddCookie(cookie)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("ws after failed-cleanup logout = %d, want 401 (session survived logout)", resp.StatusCode)
+	}
+}

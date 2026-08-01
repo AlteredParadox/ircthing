@@ -64,6 +64,12 @@ func init() { sessionRecheckInterval.Store(int64(30 * time.Second)) }
 // evicted at issue time. Generous for one user across devices/tabs.
 const maxSessions = 128
 
+// pushCleanupTimeout bounds the best-effort push-subscription delete that
+// runs AFTER logout has already revoked the session. It rides a detached
+// context (the client may well have hung up), so it needs its own deadline
+// rather than inheriting the request's.
+const pushCleanupTimeout = 5 * time.Second
+
 type Config struct {
 	Username     string
 	PasswordHash string        // bcrypt hash of the user's password
@@ -846,15 +852,15 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// must not resume after it and delete an endpoint a NEW session
 	// re-registered under the same string.
 	deletePush := body.PushEndpoint != "" && s.authed(r)
-	if deletePush {
-		if err := s.hub.Store().DeletePushSubscription(r.Context(), body.PushEndpoint); err != nil {
-			s.pushMutationMu.Unlock()
-			http.Error(w, "removing subscription failed", http.StatusInternalServerError)
-			return
-		}
-		// Abort any in-flight delivery to the just-deleted endpoint.
-		s.hub.BumpPushEpoch()
-	}
+
+	// Revoke FIRST, and unconditionally. Push cleanup is auxiliary and
+	// fallible (a store error, a canceled request context); when it ran first
+	// its error return skipped token deletion, socket/stream cancellation AND
+	// the cookie, so a routine database hiccup left a copied token fully live
+	// after the owner believed they had signed out. Revocation now cannot be
+	// skipped by an auxiliary failure. Both still happen under
+	// pushMutationMu, preserving the barrier: a concurrent registration
+	// cannot land between them with the about-to-be-revoked token.
 	var cancels []context.CancelFunc
 	if c, err := r.Cookie(s.cookieName()); err == nil {
 		// deleteTokenLocked tears down this token's live WebSockets NOW — the
@@ -865,19 +871,44 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		cancels = s.deleteTokenLocked(c.Value)
 		s.mu.Unlock()
 	}
+	var pushErr error
+	if deletePush {
+		// context.WithoutCancel: the session is already revoked, so this
+		// cleanup must not be abandoned just because the client hung up on
+		// the logout request — that would strand a subscription that keeps
+		// delivering IRC content to a signed-out (possibly shared) machine.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), pushCleanupTimeout)
+		pushErr = s.hub.Store().DeletePushSubscription(ctx, body.PushEndpoint)
+		cancel()
+		if pushErr == nil {
+			// Abort any in-flight delivery to the just-deleted endpoint.
+			s.hub.BumpPushEpoch()
+		}
+	}
 	s.pushMutationMu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
 	}
-	if deletePush {
+	if deletePush && pushErr == nil {
 		refreshPushCountDetached(s.hub)
 	}
 	// The deletion cookie carries the same attributes as the session
-	// cookie so every browser treats it as the same cookie.
+	// cookie so every browser treats it as the same cookie. Set before any
+	// status write, so it lands on the failure response below too — the
+	// session IS gone in both cases.
 	http.SetCookie(w, &http.Cookie{
 		Name: s.cookieName(), Value: "", Path: "/", MaxAge: -1, HttpOnly: true,
 		SameSite: http.SameSiteStrictMode, Secure: s.cfg.SecureCookies,
 	})
+	if pushErr != nil {
+		// Still reported as a failure: the sign-out succeeded, but this
+		// device may keep receiving notifications, which the user needs to
+		// know about. The status no longer implies the session survived.
+		log.Printf("logout: deleting push subscription: %v", pushErr)
+		http.Error(w, "signed out, but removing this device's push subscription failed",
+			http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
