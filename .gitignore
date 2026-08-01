@@ -26,8 +26,11 @@
 web/dist/*
 !web/dist/.gitkeep
 
-# Node
+# Node. All npm state belongs under web/ — a root-level package-lock.json is
+# always a stray npm invocation from the repo root (there is no root
+# package.json), so ignore it rather than let it get committed again.
 web/node_modules/
+/package-lock.json
 
 # Design-tool export artifact
 .thumbnail
