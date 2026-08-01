@@ -1657,7 +1657,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-## modernc.org/sqlite@v1.54.0
+## modernc.org/sqlite@v1.55.0
 
 ### AUTHORS
 
