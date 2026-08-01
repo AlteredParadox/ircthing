@@ -671,7 +671,17 @@ func (f *fetcher) checkRedirect(req *http.Request, via []*http.Request) error {
 // hostAllowed rejects a target whose host is a literal non-public IP. A
 // hostname passes: the direct path re-checks its resolved IP at dial via
 // the Control hook, and the proxied path defers resolution to the proxy.
+//
+// The zone strip is load-bearing. For "http://[fe80::1%25eth0]/",
+// url.Hostname() yields "fe80::1%eth0" — but net.ParseIP REJECTS the zoned
+// form and returns nil, so without this the link-local literal would fall
+// through the ip == nil branch as if it were a hostname and skip allowIP
+// entirely. '%' cannot appear in a DNS hostname, so cutting at it never
+// reclassifies a legitimate name.
 func (f *fetcher) hostAllowed(host string) bool {
+	if zone := strings.IndexByte(host, '%'); zone >= 0 {
+		host = host[:zone]
+	}
 	ip := net.ParseIP(host)
 	return ip == nil || f.allowIP(ip)
 }

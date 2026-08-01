@@ -72,7 +72,13 @@ func ValidHostPort(addr string) error {
 	if err != nil || host == "" {
 		return errors.New("must be host:port")
 	}
-	if len(host) > 255 || strings.ContainsAny(host, " \t\r\n/@\\?#") || hasControl(host) {
+	// '%' rejects a scoped IPv6 literal ("fe80::1%eth0"). A zone index names
+	// a LOCAL interface and is meaningless to a remote peer or proxy, and the
+	// form is a classification hazard: net.ParseIP returns nil for it, so
+	// every "is this an IP literal?" check downstream (the media
+	// private-address block, socks5Request's ATYP choice) would silently
+	// treat a link-local address as a hostname to be resolved.
+	if len(host) > 255 || strings.ContainsAny(host, " \t\r\n/@\\?#%") || hasControl(host) {
 		return errors.New("malformed host")
 	}
 	if _, ok := ParsePort(port); !ok {
