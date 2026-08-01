@@ -26,6 +26,8 @@ These are hard rules. If a task cannot be completed within them, stop and flag i
 6. **Dependency policy (frontend):** Preact (or Solid — pick one at project start and stick to it), esbuild for bundling. No Tailwind, no component libraries, no icon packs (inline SVG only). Hand-written CSS with custom properties for theming.
 7. **`make check` must pass before any task is considered done.** It runs: `go vet`, `staticcheck`, `go test ./...`, frontend build, binary size gate (30 MB), bundle size gate (100 KB gzipped). The binary size gate measures the **release build** (`-ldflags="-s -w"`); a separate `make build-debug` target produces an unstripped, `-race`-enabled binary for delve and is never size-gated. `make memcheck` (asserts on **RSS**, not GOMEMLIMIT, against the 72 MB target) is run before releases and after changes to buffering, caching, or the store.
 
+   Third-party notices are **not** part of `make check`. `THIRD_PARTY_LICENSES.md` is generated from the linked dependency graph and embedded in the binary; `make build` regenerates it (via `make notices`), so after a dependency change just commit what the build produced. `make notices-check` — which fails on a stale *committed* copy — runs only in the release workflow, because Dependabot can't regenerate the file and gating every PR on it makes each dependency bump red for a reason the bot cannot fix. Anything running `notices-check` must run it **before** any `make build`, which would otherwise rewrite the file out from under the diff.
+
 ## Architecture
 
 ```
