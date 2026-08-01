@@ -169,22 +169,12 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "preview unavailable", http.StatusBadGateway)
 		return
 	}
-	// Classify the fetch error: a TRANSIENT failure (WireGuard tunnel still coming
-	// up, upstream 5xx) → 503 so the client retries a few times; a PERMANENT one
-	// (bad/blocked URL, over-size body, upstream 4xx) → 502 so it caches the
-	// failure and does NOT retry — retrying a dead link is four tracking hits and,
-	// for an over-size image, ~40 MiB re-downloaded to the same end. Fail closed
-	// either way: no direct fetch.
+	// Fail closed on any fetch error: no direct fetch fallback. See
+	// writePreviewFetchError for the transient/permanent status split.
 	start := time.Now()
 	ct, finalURL, body, err := f.get(ctx, target)
 	if err != nil {
-		if fetchErrorRetryable(err) {
-			logMedia("preview", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), retryable: true, httpStatus: 503})
-			http.Error(w, "preview fetch failed", http.StatusServiceUnavailable)
-		} else {
-			logMedia("preview", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), httpStatus: 502})
-			http.Error(w, "preview unavailable", http.StatusBadGateway)
-		}
+		writePreviewFetchError(w, target, start, err)
 		return
 	}
 
@@ -207,6 +197,22 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 	s.previewCache.put(ck, pv)
 	writeJSON(w, pv)
+}
+
+// writePreviewFetchError maps a failed preview fetch onto a status the client
+// can act on, and logs it. A TRANSIENT failure (WireGuard tunnel still coming
+// up, upstream 5xx) → 503 so the client retries a few times; a PERMANENT one
+// (bad/blocked URL, over-size body, upstream 4xx) → 502 so it caches the
+// failure and does NOT retry — retrying a dead link is four tracking hits and,
+// for an over-size image, ~40 MiB re-downloaded to the same end.
+func writePreviewFetchError(w http.ResponseWriter, target string, start time.Time, err error) {
+	if fetchErrorRetryable(err) {
+		logMedia("preview", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), retryable: true, httpStatus: 503})
+		http.Error(w, "preview fetch failed", http.StatusServiceUnavailable)
+		return
+	}
+	logMedia("preview", target, start, mediaLogResult{event: "fetch_error", class: mediaErrorClass(err), httpStatus: 502})
+	http.Error(w, "preview unavailable", http.StatusBadGateway)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

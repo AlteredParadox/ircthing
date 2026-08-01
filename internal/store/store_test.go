@@ -971,22 +971,41 @@ func TestNetworkBuffersMatchesBuffersPerNetwork(t *testing.T) {
 	st, _ := openTest(t, 16)
 	ctx := context.Background()
 
+	// Mixed commands and a read marker, so Marker/LastTS/Unread all carry
+	// distinct non-trivial values: a divergence in either query's unread
+	// filter or marker subquery has to show up as a row mismatch below.
 	for _, n := range []string{"alpha", "beta"} {
 		for _, target := range []string{"#chan", "someone"} {
-			if _, err := st.Append(ctx, n, target, Message{
-				Time:    time.UnixMilli(1000),
-				Sender:  "them",
-				Command: "PRIVMSG",
-				Raw:     "hi",
-			}); err != nil {
-				t.Fatal(err)
+			for i, cmd := range []string{"PRIVMSG", "JOIN", "NOTICE", "PRIVMSG"} {
+				if _, err := st.Append(ctx, n, target, Message{
+					Time:    time.UnixMilli(int64(i+1) * 1000),
+					Sender:  "them",
+					Command: cmd,
+					Raw:     "hi",
+				}); err != nil {
+					t.Fatal(err)
+				}
 			}
 		}
+	}
+	// Marks the first two messages read in one buffer only, so the buffers
+	// do not all share the same unread count.
+	if err := st.SetReadMarker(ctx, "alpha", "#chan", time.UnixMilli(2000)); err != nil {
+		t.Fatal(err)
 	}
 
 	all, err := st.Buffers(ctx)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Guard the guard: if every row had identical values, a drifted query
+	// could still match row for row and this test would prove nothing.
+	seen := map[BufferInfo]bool{}
+	for _, b := range all {
+		seen[BufferInfo{Marker: b.Marker, Unread: b.Unread}] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("fixture is degenerate: every buffer has the same marker/unread (%+v)", all)
 	}
 	for _, network := range []string{"alpha", "beta", "missing"} {
 		var want []BufferInfo
