@@ -93,3 +93,55 @@ func TestParse(t *testing.T) {
 		t.Fatalf("oversized addr = %v, want addr error", err)
 	}
 }
+
+// A client-certificate path is caller-controlled over the authenticated
+// put_network protocol, and the resulting validation error is pushed straight
+// back to that session. So the error must never disclose the process
+// environment: only $CREDENTIALS_DIRECTORY expands, and no expanded path
+// appears in the message. Regression test for the env-disclosure finding.
+func TestIRCConfigCertPathsDoNotLeakEnvironment(t *testing.T) {
+	t.Setenv("IRCTHING_TEST_SECRET", "s3cr3t-value")
+	t.Setenv("CREDENTIALS_DIRECTORY", "/run/credentials/ircthing.service")
+
+	for _, probe := range []string{
+		"$IRCTHING_TEST_SECRET/probe.pem",
+		"${IRCTHING_TEST_SECRET}/probe.pem",
+		"$CREDENTIALS_DIRECTORY/missing.pem",
+	} {
+		n := &Network{Addr: "irc.x.net:6697", Nick: "me", SASL: &SASL{
+			Mechanism: "EXTERNAL", CertFile: probe, KeyFile: probe,
+		}}
+		_, err := n.IRCConfig()
+		if err == nil {
+			t.Fatalf("%s: IRCConfig() = nil error, want a load failure", probe)
+		}
+		msg := err.Error()
+		if strings.Contains(msg, "s3cr3t-value") {
+			t.Errorf("%s: error discloses the environment value: %s", probe, msg)
+		}
+		// No filesystem path at all — not the expanded credentials
+		// directory, and not the literal unexpanded reference.
+		if strings.Contains(msg, "/") {
+			t.Errorf("%s: error discloses a path: %s", probe, msg)
+		}
+	}
+}
+
+// The documented systemd LoadCredential form must still resolve, or SASL
+// EXTERNAL breaks for every hardened-unit deployment.
+func TestExpandCredentialsDir(t *testing.T) {
+	t.Setenv("CREDENTIALS_DIRECTORY", "/run/credentials/x.service")
+	t.Setenv("OTHER", "leaked")
+	cases := []struct{ in, want string }{
+		{"$CREDENTIALS_DIRECTORY/c.pem", "/run/credentials/x.service/c.pem"},
+		{"${CREDENTIALS_DIRECTORY}/c.pem", "/run/credentials/x.service/c.pem"},
+		{"/etc/ircthing/c.pem", "/etc/ircthing/c.pem"},
+		{"$OTHER/c.pem", "$OTHER/c.pem"},
+		{"${OTHER}/c.pem", "${OTHER}/c.pem"},
+	}
+	for _, c := range cases {
+		if got := expandCredentialsDir(c.in); got != c.want {
+			t.Errorf("expandCredentialsDir(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"strings"
 	"unicode"
@@ -36,6 +37,46 @@ import (
 	"ircthing/internal/proxydial"
 	"ircthing/internal/wgdial"
 )
+
+// expandCredentialsDir expands ONLY $CREDENTIALS_DIRECTORY (and the braced
+// form) in a client-certificate path.
+//
+// It deliberately does NOT use os.ExpandEnv, which expands EVERY variable in
+// the process environment. cert_file/key_file are caller-supplied over the
+// authenticated put_network protocol, so with a general expansion a session
+// could submit "$SOME_SECRET/x", fail the load on purpose, and read the
+// expanded value back out of the validation error — turning network
+// administration into a process-environment read primitive. Only the one
+// variable the systemd LoadCredential deployment documents is expanded; any
+// other reference is left as a literal (and simply fails to open).
+func expandCredentialsDir(p string) string {
+	dir := os.Getenv("CREDENTIALS_DIRECTORY")
+	if dir == "" {
+		return p
+	}
+	p = strings.ReplaceAll(p, "${CREDENTIALS_DIRECTORY}", dir)
+	return strings.ReplaceAll(p, "$CREDENTIALS_DIRECTORY", dir)
+}
+
+// redactCertPaths strips filesystem paths out of a client-certificate load
+// failure before it crosses back to the caller. tls.LoadX509KeyPair returns
+// an *fs.PathError naming the file it could not open, and that path is
+// caller-controlled and post-expansion — echoing it back leaks both the
+// expanded credentials directory and (with a crafted path) anything else the
+// expansion resolved. The underlying reason is kept; only the path is
+// dropped. Parse and pairing failures ("failed to find any PEM data",
+// "private key does not match public key") carry no path and pass through.
+func redactCertPaths(err error, keyPath string) error {
+	var pe *fs.PathError
+	if !errors.As(err, &pe) {
+		return err
+	}
+	which := "cert_file"
+	if pe.Path == keyPath {
+		which = "key_file"
+	}
+	return fmt.Errorf("%s: %s: %w", which, pe.Op, pe.Err)
+}
 
 // Network is one IRC network definition. Stored as JSON both in the
 // config file's networks[] and in the network_configs table; secrets
@@ -329,14 +370,17 @@ func (n *Network) IRCConfig() (irc.Config, error) {
 			Password:  n.SASL.Password,
 		}
 		// A client certificate (SASL EXTERNAL) is presented during the
-		// TLS handshake. Expand env references so a systemd unit can point
-		// cert_file/key_file at "$CREDENTIALS_DIRECTORY/..." (LoadCredential),
-		// as the README documents, rather than the literal string failing to
-		// open on every connect.
+		// TLS handshake. Expand $CREDENTIALS_DIRECTORY so a systemd unit can
+		// point cert_file/key_file at "$CREDENTIALS_DIRECTORY/..."
+		// (LoadCredential), as the README documents, rather than the literal
+		// string failing to open on every connect.
 		if n.SASL.CertFile != "" {
-			cert, err := tls.LoadX509KeyPair(os.ExpandEnv(n.SASL.CertFile), os.ExpandEnv(n.SASL.KeyFile))
+			certPath := expandCredentialsDir(n.SASL.CertFile)
+			keyPath := expandCredentialsDir(n.SASL.KeyFile)
+			cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 			if err != nil {
-				return irc.Config{}, fmt.Errorf("network %q: loading client certificate: %w", n.EffectiveName(), err)
+				return irc.Config{}, fmt.Errorf("network %q: loading client certificate: %w",
+					n.EffectiveName(), redactCertPaths(err, keyPath))
 			}
 			cfg.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
 		}
