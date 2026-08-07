@@ -4,10 +4,10 @@
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "dependencies": {
-    "preact": "^10.26.9"
+    "preact": "^10.29.8"
   },
   "devDependencies": {
     "esbuild": "^0.28.1",
-    "playwright": "^1.62.0"
+    "playwright": "^1.62.1"
   }
 }
