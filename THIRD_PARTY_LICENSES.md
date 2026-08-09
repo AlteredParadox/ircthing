@@ -1104,7 +1104,7 @@ Copyright 2018 The gVisor Authors.
 
 ---
 
-## modernc.org/libc@v1.74.1
+## modernc.org/libc@v1.74.4
 
 ### AUTHORS
 
@@ -1657,7 +1657,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-## modernc.org/sqlite@v1.55.0
+## modernc.org/sqlite@v1.56.0
 
 ### AUTHORS
 
@@ -1761,7 +1761,7 @@ uncontaminated with licensed code from other projects.
 
 ---
 
-## npm: preact@10.29.7
+## npm: preact@10.29.8
 
 ### LICENSE
 
