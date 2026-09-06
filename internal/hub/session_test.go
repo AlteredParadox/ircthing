@@ -2595,3 +2595,90 @@ func TestHubSessionCap(t *testing.T) {
 		s.Close()
 	}
 }
+
+// TestHubBudgetEvictsTheBacklogHolder: when the GLOBAL outbound budget is
+// exhausted, the session holding the backlog is the one disconnected as
+// "too slow" — not whichever session happened to ask for the next frame.
+// Before, the requester was dropped even with an empty queue: a session's
+// own response could kick it out for another tab's backlog, and broadcast
+// walked sessions in map order so the victim was random.
+func TestHubBudgetEvictsTheBacklogHolder(t *testing.T) {
+	frameLen := func(env Envelope) int64 {
+		b, err := json.Marshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return int64(len(b))
+	}
+	backlog := envelope("event", 0, strings.Repeat("x", 200))
+	small := envelope("event", 0, "small")
+	isDone := func(s *Session) bool {
+		select {
+		case <-s.Done():
+			return true
+		default:
+			return false
+		}
+	}
+
+	t.Run("own response", func(t *testing.T) {
+		h := newTestHub(t)
+		h.sessionQueueBytes = 1 << 20
+		h.hubQueueBytes = frameLen(backlog) + frameLen(small) - 1 // room for one, not both
+		slow := h.NewSession()
+		defer slow.Close()
+		fast := h.NewSession()
+		defer fast.Close()
+		slow.push(backlog) // never drained
+		fast.push(small)   // its own request's response
+		if isDone(fast) {
+			t.Fatal("the session with an empty queue was disconnected for another one's backlog")
+		}
+		if !isDone(slow) {
+			t.Fatal("the session holding the backlog survived")
+		}
+		q := <-fast.Outbound()
+		if int64(len(q.Data)) != frameLen(small) {
+			t.Fatalf("fast queued %d bytes, want its %d-byte response", len(q.Data), frameLen(small))
+		}
+		q.Release()
+		if got := h.queuedBytes.Load(); got != 0 {
+			t.Fatalf("hub bytes after eviction + release = %d, want 0 (release-once accounting broken)", got)
+		}
+	})
+
+	t.Run("broadcast", func(t *testing.T) {
+		h := newTestHub(t)
+		h.sessionQueueBytes = 1 << 20
+		// Room for the backlog plus small frames for every fast session but
+		// one: the last fast session to be visited is refused.
+		const fast = 8
+		h.hubQueueBytes = frameLen(backlog) + (fast-1)*frameLen(small)
+		slow := h.NewSession()
+		defer slow.Close()
+		var fasts []*Session
+		for i := 0; i < fast; i++ {
+			s := h.NewSession()
+			defer s.Close()
+			fasts = append(fasts, s)
+		}
+		slow.push(backlog)
+		h.broadcast(small)
+		if !isDone(slow) {
+			t.Fatal("the session holding the backlog survived the broadcast")
+		}
+		for i, s := range fasts {
+			if isDone(s) {
+				t.Fatalf("fast session %d was disconnected for the slow one's backlog", i)
+			}
+			q := <-s.Outbound()
+			if int64(len(q.Data)) != frameLen(small) {
+				t.Fatalf("fast session %d queued %d bytes, want the %d-byte broadcast", i, len(q.Data), frameLen(small))
+			}
+			q.Release()
+		}
+		if got := h.queuedBytes.Load(); got != 0 {
+			t.Fatalf("hub bytes after all releases = %d, want 0", got)
+		}
+	})
+}

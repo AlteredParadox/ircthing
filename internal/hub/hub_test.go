@@ -876,3 +876,50 @@ func TestHubPersistsEvents(t *testing.T) {
 		t.Fatal("hub did not stop on cancel")
 	}
 }
+
+// TestHubRunDrainsBufferedEventsOnCancel: events already buffered on the
+// network's channel when Run's context is canceled (SIGTERM cancels the root
+// of every network context before anything drains) must still reach the
+// store. Before the drain, Run returned on ctx.Done() with up to 256 events
+// per network unread, and the append in flight failed with context.Canceled.
+func TestHubRunDrainsBufferedEventsOnCancel(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"), store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	const n = 50
+	conn := &fakeConn{ch: make(chan irc.Event, n+1), name: "libera", nick: "AlteredParadox"}
+	for i := 0; i < n; i++ {
+		conn.ch <- irc.Event{
+			Network: "libera", Kind: irc.EventMessage, Time: time.Now(),
+			Msg: ircv4.MustParseMessage(fmt.Sprintf(":alice!u@h PRIVMSG #go :line %d", i)),
+		}
+	}
+	// A state change queued behind the messages must not disturb the drain.
+	conn.ch <- irc.Event{Network: "libera", Kind: irc.EventState, State: irc.StateDisconnected}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // shutdown lands before the loop gets to any of them
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		New(st).Run(ctx, conn)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownDrainBudget + 5*time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	msgs, err := st.Latest(context.Background(), "libera", "#go", n+10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != n {
+		t.Fatalf("persisted %d of %d events queued before cancel", len(msgs), n)
+	}
+	if msgs[0].Command != "PRIVMSG" || msgs[n-1].Command != "PRIVMSG" {
+		t.Fatalf("persisted rows lost their command: %+v", msgs[0])
+	}
+}

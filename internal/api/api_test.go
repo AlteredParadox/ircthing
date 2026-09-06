@@ -19,6 +19,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1507,5 +1508,67 @@ func TestLogoutRevokesSessionWhenPushCleanupFails(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("ws after failed-cleanup logout = %d, want 401 (session survived logout)", resp.StatusCode)
+	}
+}
+
+// TestShutdownSendsGoingAwayCloseFrame: canceling the server's base context
+// (what SIGTERM does in main) must end each WebSocket with a 1001 close
+// frame, not a bare TCP close (an abnormal 1006 in the browser). Before,
+// the read loop's context cancellation closed the socket from under the
+// write pump before it could say anything.
+func TestShutdownSendsGoingAwayCloseFrame(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"), store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	hash, err := bcrypt.GenerateFromPassword([]byte("hunter2"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{Username: "AlteredParadox", PasswordHash: string(hash)}, hub.New(st), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, stop := context.WithCancel(context.Background())
+	defer stop()
+	ts := httptest.NewUnstartedServer(srv)
+	ts.Config.BaseContext = func(net.Listener) context.Context { return base }
+	ts.Start()
+	t.Cleanup(ts.Close)
+	cookie := sessionCookieOf(t, login(t, ts, "AlteredParadox", "hunter2"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	header := http.Header{}
+	header.Set("Cookie", cookie.Name+"="+cookie.Value)
+	header.Set("Origin", ts.URL)
+	c, _, err := websocket.Dial(ctx, ts.URL+"/api/ws", &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.CloseNow()
+
+	stop() // SIGTERM
+	start := time.Now()
+	_, _, err = c.Read(ctx)
+	if err == nil {
+		t.Fatal("read succeeded after shutdown, want a close")
+	}
+	if got := websocket.CloseStatus(err); got != websocket.StatusGoingAway {
+		t.Fatalf("close status = %v (%v), want %v", got, err, websocket.StatusGoingAway)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("goodbye took %v, want prompt", took)
+	}
+	drained := make(chan struct{})
+	go func() {
+		srv.DrainSessions(3 * time.Second)
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(5 * time.Second):
+		t.Fatal("DrainSessions did not return after the close handshake")
 	}
 }
