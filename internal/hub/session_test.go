@@ -1951,11 +1951,13 @@ func TestRulesFlow(t *testing.T) {
 	}
 
 	// Setting from A acks A and pushes to B, not A. The in-progress empty
-	// pattern is dropped from the canonical set.
+	// pattern is dropped from the canonical set, and so is a blank one —
+	// stored, " " would match every message with a space on every device.
 	rules := []Rule{
 		{Pattern: "deploy", Network: "", ID: "r1"},
 		{Pattern: "", Network: "", ID: "r2"},
 		{Pattern: "release", Network: "libera", ID: "r3"},
+		{Pattern: " \t ", Network: "", ID: "r4"},
 	}
 	a.Handle(ctx, request(t, "set_rules", 2, RulesData{Rules: rules}))
 	recv(t, a, "ok")

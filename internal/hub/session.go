@@ -1574,8 +1574,11 @@ func (s *Session) handleSetRules(ctx context.Context, env Envelope) {
 			return
 		}
 		// The settings UI keeps a row while its pattern is still being
-		// typed; storing it is harmless (matching skips empty patterns)
-		// but dropping it here keeps the synced set canonical.
+		// typed; storing it is harmless (matching skips blank patterns)
+		// but dropping it here keeps the synced set canonical. Patterns
+		// are stored trimmed: a whitespace-only one would match every
+		// message with a space on every device.
+		r.Pattern = strings.TrimSpace(r.Pattern)
 		if r.Pattern == "" {
 			continue
 		}

@@ -41,6 +41,11 @@ test("highlightText: network-scoped rules", () => {
 
 test("highlightText: empty and blank patterns ignored", () => {
 	is(highlightText("hello", "AlteredParadox", [{ pattern: "", network: "" }], "libera"), false);
+	// A whitespace-only rule must not match every message with a space.
+	is(highlightText("hello world", "AlteredParadox", [{ pattern: " ", network: "" }], "libera"), false);
+	is(highlightText("hello world", "AlteredParadox", [{ pattern: " \t ", network: "" }], "libera"), false);
+	// Padding around a real keyword is ignored, not matched literally.
+	is(highlightText("deploy!", "AlteredParadox", [{ pattern: " deploy ", network: "" }], "libera"), true);
 	is(highlightText("", "AlteredParadox", [{ pattern: "x", network: "" }], "libera"), false);
 	is(highlightText("hi", "", [], "libera"), false, "no nick, no rules");
 });

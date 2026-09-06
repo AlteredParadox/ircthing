@@ -40,9 +40,14 @@ export function highlightText(text, nick, rules, network) {
 		// Guard the type: this runs in the message hot path (event handler AND
 		// row render), so a corrupt non-string pattern must not throw and blank
 		// the chat. loadRules also sanitizes; this is defense in depth.
-		if (typeof r.pattern !== "string" || !r.pattern) continue;
+		if (typeof r.pattern !== "string") continue;
+		// Match the TRIMMED pattern and skip blank ones: a " " rule would
+		// otherwise match every message containing a space — on every device,
+		// since rules sync (internal/hub/highlight.go mirrors this).
+		const p = r.pattern.trim();
+		if (!p) continue;
 		if (r.network && r.network !== network) continue;
-		if (lower.includes(r.pattern.toLowerCase())) return true;
+		if (lower.includes(p.toLowerCase())) return true;
 	}
 	return false;
 }
@@ -76,10 +81,14 @@ export function loadRules() {
 export function sanitizeRulesForSync(rules) {
 	const bytes = (s) => new TextEncoder().encode(s).length;
 	const kept = [];
-	for (const r of rules) {
+	for (let r of rules) {
 		if (kept.length >= 64) break;
 		if (typeof r.pattern !== "string" || bytes(r.pattern) > 256) continue;
 		if (typeof r.network === "string" && bytes(r.network) > 300) continue;
+		// Sync the trimmed pattern (matching ignores the padding anyway); a
+		// row that is blank after trimming still syncs as "" — the server
+		// drops it, and the editor keeps its half-typed row.
+		if (r.pattern !== r.pattern.trim()) r = { ...r, pattern: r.pattern.trim() };
 		if (typeof r.id !== "string" || !r.id || bytes(r.id) > 64) {
 			kept.push({ ...r, id: uuid() });
 			continue;

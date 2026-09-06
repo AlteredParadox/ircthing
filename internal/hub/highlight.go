@@ -103,13 +103,18 @@ func highlightText(text, nick string, rules []Rule, network string) bool {
 	}
 	lower := strings.ToLower(clean)
 	for _, r := range rules {
-		if r.Pattern == "" {
+		// Match the TRIMMED pattern and skip blank ones (notify.js does the
+		// same): a " " rule would otherwise match every message containing
+		// a space and push a notification for each. set_rules canonicalizes
+		// stored rules the same way; this guards legacy blobs.
+		p := strings.TrimSpace(r.Pattern)
+		if p == "" {
 			continue
 		}
 		if r.Network != "" && r.Network != network {
 			continue
 		}
-		if strings.Contains(lower, strings.ToLower(r.Pattern)) {
+		if strings.Contains(lower, strings.ToLower(p)) {
 			return true
 		}
 	}
