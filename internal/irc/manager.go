@@ -1392,8 +1392,19 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	// closes the socket, which unblocks both loops.
 	cctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	writerDone := make(chan struct{})
 	go func() {
 		<-cctx.Done()
+		// A deliberate teardown (shutdown, or the network stopped from the
+		// UI) says goodbye first: hold the socket open while the writer puts
+		// its QUIT on the wire (see sayQuit), bounded by quitTimeout. Any
+		// other cause is a dead or poisoned socket — close it at once.
+		if ctx.Err() != nil {
+			select {
+			case <-writerDone:
+			case <-time.After(quitTimeout):
+			}
+		}
 		conn.Close()
 	}()
 
@@ -1417,7 +1428,10 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	rejoins := m.rejoinList()
 	internal := make(chan *ircv4.Message, 16+len(rejoins))
 	urgent := make(chan *ircv4.Message, 8)
-	go m.writeLoop(cctx, cancel, conn, w, urgent, internal)
+	go func() {
+		defer close(writerDone)
+		m.writeLoop(ctx, cctx, cancel, conn, w, urgent, internal)
+	}()
 
 	send := func(msgs []*ircv4.Message) error {
 		for _, out := range msgs {
@@ -2055,7 +2069,7 @@ func summarizeIRCLine(line string) string {
 // handshake/PONG traffic and user messages onto the socket through the
 // flood-protection token bucket. On write failure it cancels the
 // connection context with the error, which the read loop reports.
-func (m *Manager) writeLoop(ctx context.Context, cancel context.CancelCauseFunc, conn net.Conn, w *ircv4.Writer, urgent, internal <-chan *ircv4.Message) {
+func (m *Manager) writeLoop(parent, ctx context.Context, cancel context.CancelCauseFunc, conn net.Conn, w *ircv4.Writer, urgent, internal <-chan *ircv4.Message) {
 	tb := newTokenBucket(m.cfg.SendBurst, m.cfg.SendInterval)
 	// writeOne emits one message and returns false on a fatal error (the loop
 	// then exits). throttle applies the flood token bucket — NEVER to urgent
@@ -2092,8 +2106,35 @@ func (m *Manager) writeLoop(ctx context.Context, cancel context.CancelCauseFunc,
 	for {
 		out, throttle, ok := nextOutbound(ctx, urgent, internal, m.out)
 		if !ok || !writeOne(out, throttle) {
-			return
+			break
 		}
+	}
+	m.sayQuit(parent, ctx, conn, w)
+}
+
+// quitTimeout bounds the goodbye on a deliberate teardown: the QUIT write's
+// deadline, and how long runOnce's closer holds the socket open for it.
+const quitTimeout = time.Second
+
+// quitReason is the QUIT message sent on a deliberate teardown.
+const quitReason = "ircthing: disconnecting"
+
+// sayQuit sends "QUIT :<reason>" (RFC 2812 §3.1.7) when the connection is
+// being torn down deliberately — the network's own context ended (process
+// shutdown, or the network stopped/edited from the UI) rather than the
+// socket failing. It runs as the writer's last act, so it never races
+// another write and needs no lane or throttle; the closer goroutine in
+// runOnce keeps the socket open for it. Without it the server saw a bare
+// TCP close and announced a read error to every shared channel. A socket
+// error (any non-Canceled cause) or a same-connection teardown after a read
+// failure (parent still live) has nothing to say and nowhere to say it.
+func (m *Manager) sayQuit(parent, cctx context.Context, conn net.Conn, w *ircv4.Writer) {
+	if parent.Err() == nil || !errors.Is(context.Cause(cctx), context.Canceled) {
+		return
+	}
+	conn.SetWriteDeadline(time.Now().Add(quitTimeout))
+	if err := w.WriteMessage(newMsg("QUIT", quitReason)); err != nil {
+		log.Printf("irc[%s]: QUIT not sent: %v", m.cfg.Name, err)
 	}
 }
 
