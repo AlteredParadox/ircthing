@@ -1632,7 +1632,7 @@ func (h *Hub) broadcast(env Envelope) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for s := range h.sessions {
-		s.pushFrame(frame)
+		h.pushLocked(s, frame)
 	}
 }
 
@@ -1647,7 +1647,7 @@ func (h *Hub) broadcastExcept(except *Session, env Envelope) {
 	defer h.mu.Unlock()
 	for s := range h.sessions {
 		if s != except {
-			s.pushFrame(frame)
+			h.pushLocked(s, frame)
 		}
 	}
 }

@@ -141,30 +141,72 @@ func (s *Session) push(env Envelope) {
 	if err != nil {
 		return // all envelopes are composed from JSON-safe application types
 	}
-	s.pushFrame(frame)
+	if s.pushFrame(frame) {
+		return
+	}
+	// Global budget exhausted: relieving it needs the session list.
+	s.hub.mu.Lock()
+	s.hub.pushLocked(s, frame)
+	s.hub.mu.Unlock()
+}
+
+// pushLocked admits frame to s, relieving an exhausted global budget by
+// evicting the session holding the most queued bytes — the slow consumer —
+// rather than s, which merely asked next (a broadcast walks sessions in map
+// order, so that was effectively random, and a session with an empty queue
+// could be dropped as "too slow" for another one's backlog). Freeing that
+// backlog normally makes room; when it does not — s is itself the slow one,
+// or the frame alone is over budget — s goes, as before. Caller holds h.mu.
+func (h *Hub) pushLocked(s *Session, frame []byte) {
+	if s.pushFrame(frame) {
+		return
+	}
+	if v := h.slowestLocked(); v != nil && v != s {
+		v.disconnect()
+		if s.pushFrame(frame) {
+			return
+		}
+	}
+	s.disconnect()
+}
+
+// slowestLocked is the session with the most queued bytes, or nil when no
+// session has anything queued. Caller holds h.mu.
+func (h *Hub) slowestLocked() *Session {
+	var slowest *Session
+	var most int64
+	for s := range h.sessions {
+		if q := s.queuedBytes.Load(); q > most {
+			slowest, most = s, q
+		}
+	}
+	return slowest
 }
 
 // pushFrame admits one immutable, fully encoded frame. Broadcasts share the
 // same backing allocation between sessions, while accounting it
 // conservatively once per session so the cap remains safe even if that sharing
-// changes later.
-func (s *Session) pushFrame(frame []byte) {
+// changes later. It reports false — with nothing reserved and s left
+// connected — only when the GLOBAL budget refused the frame; the caller
+// decides who pays for that (see pushLocked). A session over its own budget
+// or with a full queue is the slow consumer by definition and is
+// disconnected here.
+func (s *Session) pushFrame(frame []byte) bool {
 	n := int64(len(frame))
 	if !reserveBytes(&s.queuedBytes, n, s.hub.sessionQueueBytes) {
 		s.disconnect()
-		return
+		return true
 	}
 	if !reserveBytes(&s.hub.queuedBytes, n, s.hub.hubQueueBytes) {
 		s.queuedBytes.Add(-n)
-		s.disconnect()
-		return
+		return false
 	}
 	q := &OutboundFrame{Data: frame, session: s, bytes: n}
 	s.queueMu.Lock()
 	if s.closed {
 		s.queueMu.Unlock()
 		q.Release()
-		return
+		return true
 	}
 	full := false
 	select {
@@ -177,6 +219,7 @@ func (s *Session) pushFrame(frame []byte) {
 	if full {
 		s.disconnect()
 	}
+	return true
 }
 
 func (s *Session) disconnect() {
