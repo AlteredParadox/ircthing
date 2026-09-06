@@ -50,6 +50,9 @@ import (
 	"ircthing/web"
 )
 
+// configWarnPrefix prefixes startup warnings about the config file.
+const configWarnPrefix = "config: "
+
 func main() {
 	// Drop the log package's own date/time prefix: the service runs under
 	// systemd/journald (or another supervisor) which timestamps every
@@ -61,6 +64,8 @@ func main() {
 	configFlag := flag.String("config", "config.json", "path to the JSON config file")
 	hashPassword := flag.Bool("hash-password", false,
 		"read a password from stdin, print its bcrypt hash for user.password_hash, and exit")
+	resetPassword := flag.Bool("reset-password", false,
+		"delete the password set in Settings from the database so user.password_hash in the config file applies again (stop the service first), and exit")
 	flag.Parse()
 
 	if *hashPassword {
@@ -70,10 +75,20 @@ func main() {
 		return
 	}
 
-	configPath := resolveConfigPath(*configFlag, flagPassed("config"), os.Getenv("CREDENTIALS_DIRECTORY"))
+	credDir := os.Getenv("CREDENTIALS_DIRECTORY")
+	configPath := resolveConfigPath(*configFlag, flagPassed("config"), credDir)
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatalf("config: %v", err)
+	}
+	if *resetPassword {
+		if err := runResetPassword(cfg.Database); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if w := configFilePermWarning(configPath, credDir); w != "" {
+		log.Print(configWarnPrefix + w)
 	}
 	if err := run(cfg); err != nil {
 		log.Fatal(err)
@@ -159,10 +174,10 @@ func logStartupWarnings(cfg *config, st *store.Store) {
 		log.Print("retention: disabled (retention_days and retention_max_messages both 0) — stored history grows without bound; set a limit or place the database on a quota'd filesystem")
 	}
 	if w := cfg.proxyConfigWarning(); w != "" {
-		log.Print("config: " + w)
+		log.Print(configWarnPrefix + w)
 	}
 	if w := cfg.cookieConfigWarning(); w != "" {
-		log.Print("config: " + w)
+		log.Print(configWarnPrefix + w)
 	}
 	if w := api.MediaDebugURLsWarning(); w != "" {
 		log.Print("env: " + w)
@@ -444,5 +459,37 @@ func runHashPassword() error {
 		return err
 	}
 	fmt.Println(string(hash))
+	return nil
+}
+
+// runResetPassword drops the Settings-rotated password so user.password_hash
+// in the config file applies again — the recovery lever for an owner locked
+// out after an attacker rotated the password through a stolen session
+// (editing the config alone does nothing, because the stored override wins).
+// Push subscriptions are revoked in the same transaction, as they are by an
+// in-UI rotation: a stolen session may have planted one. The running
+// service caches the hash, so this is meant to run with the service stopped
+// and takes effect at the next start.
+func runResetPassword(dbPath string) error {
+	// Never create a database just to reset nothing in it.
+	if _, err := os.Stat(dbPath); err != nil {
+		return fmt.Errorf("database %s: %w (nothing to reset: user.password_hash from the config file already applies)", dbPath, err)
+	}
+	st, err := store.Open(dbPath, store.Options{})
+	if err != nil {
+		return fmt.Errorf("store: %w", err)
+	}
+	defer st.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	removed, err := api.ResetPasswordOverride(ctx, st)
+	if err != nil {
+		return err
+	}
+	if !removed {
+		fmt.Println("no stored password override; user.password_hash from the config file already applies")
+		return nil
+	}
+	fmt.Println("stored password override removed: user.password_hash from the config file applies at the next start (push subscriptions were revoked too; devices re-register on their next login)")
 	return nil
 }

@@ -32,10 +32,12 @@ import (
 // (small requests cannot pin the CPU), and a per-source failure tracker
 // imposes exponential backoff (1s doubling to a 60s cap).
 //
-// The source is the connection's remote IP. Behind the expected reverse
-// proxy all attempts share the proxy's IP, so a sustained attack also
-// briefly locks out the legitimate user — an accepted trade-off for a
-// single-user daemon; the proxy should rate-limit /api/login as well.
+// The source is the connection's remote IP, bucketed by loginBucket: an
+// IPv4 address is its own bucket, an IPv6 address shares one with its
+// /64 (see loginBucket for why). Behind the expected reverse proxy all
+// attempts share the proxy's IP, so a sustained attack also briefly locks
+// out the legitimate user — an accepted trade-off for a single-user
+// daemon; the proxy should rate-limit /api/login as well.
 type loginLimiter struct {
 	sem chan struct{}
 
@@ -68,8 +70,12 @@ const (
 	// Global attempt budget. Per-source backoff alone cannot stop an
 	// attacker rotating source addresses — every fresh source gets a free
 	// first attempt, enough to keep both bcrypt slots pinned on the 1-vCPU
-	// target. One token per second (burst 5) is far above any human login
-	// cadence and bounds worst-case bcrypt CPU to a few percent of a core.
+	// target. Rotation is cheap for IPv6 (a single /64 holds 2^64
+	// addresses, which is why loginBucket keys on the /64) and merely
+	// costs a botnet for IPv4; either way this bucket, not the per-source
+	// table, is the bound. One token per second (burst 5) is far above any
+	// human login cadence and bounds worst-case bcrypt CPU to a few percent
+	// of a core.
 	loginGlobalRate  = 1.0 // tokens per second
 	loginGlobalBurst = 5.0
 )
@@ -105,7 +111,7 @@ func (l *loginLimiter) globalAllow(now time.Time) time.Duration {
 func (l *loginLimiter) retryAfter(source string, now time.Time) time.Duration {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if s := l.sources[source]; s != nil && now.Before(s.blockedUntil) {
+	if s := l.sources[loginBucket(source)]; s != nil && now.Before(s.blockedUntil) {
 		return s.blockedUntil.Sub(now)
 	}
 	return 0
@@ -118,7 +124,7 @@ func (l *loginLimiter) retryAfter(source string, now time.Time) time.Duration {
 func (l *loginLimiter) retryAfterLogged(source string, now time.Time) (wait time.Duration, firstThisWindow bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	s := l.sources[source]
+	s := l.sources[loginBucket(source)]
 	if s == nil || !now.Before(s.blockedUntil) {
 		return 0, false
 	}
@@ -132,7 +138,8 @@ func (l *loginLimiter) retryAfterLogged(source string, now time.Time) (wait time
 func (l *loginLimiter) fail(source string, now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	s := l.sources[source]
+	key := loginBucket(source)
+	s := l.sources[key]
 	if s == nil {
 		// A full table only prunes expired entries — an attacker
 		// spreading across sources cannot evict active blocks.
@@ -147,7 +154,7 @@ func (l *loginLimiter) fail(source string, now time.Time) {
 			return
 		}
 		s = &loginSource{}
-		l.sources[source] = s
+		l.sources[key] = s
 	}
 	shift := min(s.failures, 6) // 1s .. 64s, clamped below
 	s.failures++
@@ -160,7 +167,28 @@ func (l *loginLimiter) fail(source string, now time.Time) {
 func (l *loginLimiter) ok(source string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.sources, source)
+	delete(l.sources, loginBucket(source))
+}
+
+// loginBucket maps a source address to its backoff-table key. An IPv4
+// address (including the IPv4-mapped IPv6 form) is its own bucket. An
+// IPv6 address is keyed on its /64: the smallest prefix an end site is
+// assigned (RFC 6177 §3 / RFC 4291 §2.5.4), and one a single host
+// controls entirely — keying on the full address let an attacker with one
+// /64 fabricate 2^64 fresh sources, each with a free first attempt, and
+// once loginSourcesMax unexpired entries piled up fail() stopped recording
+// at all, so those sources never entered backoff. Only the KEY changes:
+// callers keep logging the real address (fail2ban matches on it).
+// A non-IP source (odd RemoteAddr) is used verbatim.
+func loginBucket(source string) string {
+	ip := net.ParseIP(source)
+	if ip == nil {
+		return source
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
 // acquire takes a bcrypt slot, giving up after a short bounded wait so

@@ -27,7 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
+	"log"
 	"os"
 	"strings"
 	"unicode"
@@ -58,25 +58,15 @@ func expandCredentialsDir(p string) string {
 	return strings.ReplaceAll(p, "$CREDENTIALS_DIRECTORY", dir)
 }
 
-// redactCertPaths strips filesystem paths out of a client-certificate load
-// failure before it crosses back to the caller. tls.LoadX509KeyPair returns
-// an *fs.PathError naming the file it could not open, and that path is
-// caller-controlled and post-expansion — echoing it back leaks both the
-// expanded credentials directory and (with a crafted path) anything else the
-// expansion resolved. The underlying reason is kept; only the path is
-// dropped. Parse and pairing failures ("failed to find any PEM data",
-// "private key does not match public key") carry no path and pass through.
-func redactCertPaths(err error, keyPath string) error {
-	var pe *fs.PathError
-	if !errors.As(err, &pe) {
-		return err
-	}
-	which := "cert_file"
-	if pe.Path == keyPath {
-		which = "key_file"
-	}
-	return fmt.Errorf("%s: %s: %w", which, pe.Op, pe.Err)
-}
+// ErrClientCert is the ONLY client-certificate load failure IRCConfig
+// returns. cert_file/key_file are caller-controlled over the authenticated
+// put_network protocol and the validation error is pushed straight back to
+// that session, so the message must be a fixed string: earlier versions
+// stripped the path but kept the OS reason, and "no such file" vs
+// "permission denied" vs "is a directory" vs "failed to find any PEM data"
+// let an authenticated caller probe arbitrary paths — a filesystem oracle.
+// The detailed error goes to the server log, where the operator can read it.
+var ErrClientCert = errors.New("client certificate could not be loaded")
 
 // Network is one IRC network definition. Stored as JSON both in the
 // config file's networks[] and in the network_configs table; secrets
@@ -379,8 +369,10 @@ func (n *Network) IRCConfig() (irc.Config, error) {
 			keyPath := expandCredentialsDir(n.SASL.KeyFile)
 			cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 			if err != nil {
-				return irc.Config{}, fmt.Errorf("network %q: loading client certificate: %w",
-					n.EffectiveName(), redactCertPaths(err, keyPath))
+				// Full detail (path, OS reason) server-side only; the
+				// caller gets the fixed ErrClientCert — see its doc.
+				log.Printf("network %q: loading client certificate: %v", n.EffectiveName(), err)
+				return irc.Config{}, fmt.Errorf("network %q: %w", n.EffectiveName(), ErrClientCert)
 			}
 			cfg.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
 		}

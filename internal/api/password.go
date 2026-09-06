@@ -40,24 +40,47 @@ const (
 )
 
 // loadPasswordHash resolves the effective login hash: a valid stored override
-// wins over the config seed. It fails CLOSED — a store read error or a corrupt
-// override returns an error rather than silently falling back to the config
-// seed. Rotation deliberately leaves the seed untouched, so a silent fallback
-// would resurrect the pre-rotation password on the next restart. Only a
-// genuinely-absent override (empty value, no error) uses the seed, so first
-// boot still works.
-func loadPasswordHash(ctx context.Context, st *store.Store, cfg Config) (string, error) {
+// wins over the config seed, and overridden reports that it did. It fails
+// CLOSED — a store read error or a corrupt override returns an error rather
+// than silently falling back to the config seed. Rotation deliberately
+// leaves the seed untouched, so a silent fallback would resurrect the
+// pre-rotation password on the next restart. Only a genuinely-absent
+// override (empty value, no error) uses the seed, so first boot still works.
+func loadPasswordHash(ctx context.Context, st *store.Store, cfg Config) (hash string, overridden bool, err error) {
 	v, present, err := st.SettingValue(ctx, passwordHashKey)
 	if err != nil {
-		return "", fmt.Errorf("reading stored password override: %w", err)
+		return "", false, fmt.Errorf("reading stored password override: %w", err)
 	}
 	if !present {
-		return cfg.PasswordHash, nil // no override set yet (first boot)
+		return cfg.PasswordHash, false, nil // no override set yet (first boot)
 	}
 	if _, err := bcrypt.Cost([]byte(v)); err != nil {
-		return "", fmt.Errorf("stored password override is not a valid bcrypt hash (refusing to fall back to the config seed)")
+		return "", false, fmt.Errorf("stored password override is not a valid bcrypt hash (refusing to fall back to the config seed)")
 	}
-	return v, nil
+	return v, true, nil
+}
+
+// passwordOverrideNotice is logged at every start while a Settings-rotated
+// password is in effect. Without it the override shadowed user.password_hash
+// silently: an owner locked out by an attacker who rotated the password
+// through a stolen session would edit config.json, restart, stay locked
+// out, and find nothing in the journal explaining why. Not prefixed
+// "login:" — the fail2ban filter anchors its failregex on that.
+const passwordOverrideNotice = "password: the password set in Settings → Change password is active and user.password_hash in the config file is IGNORED; to make the config-file hash apply again, stop the service and run ircd-web -reset-password"
+
+// ResetPasswordOverride deletes the Settings-rotated login hash so the
+// config file's user.password_hash applies at the next start, and revokes
+// every push subscription in the same transaction (the same compromise-
+// recovery semantics as an in-UI rotation: a stolen session may have
+// planted an endpoint). Reports whether an override existed. Meant for
+// the -reset-password CLI path with the service stopped — a running
+// process keeps its cached hash until restart.
+func ResetPasswordOverride(ctx context.Context, st *store.Store) (removed bool, err error) {
+	removed, err = st.DeleteSettingAndWipePushSubscriptions(ctx, passwordHashKey)
+	if err != nil {
+		return false, fmt.Errorf("resetting stored password override: %w", err)
+	}
+	return removed, nil
 }
 
 // handleChangePassword verifies the current password and stores a new bcrypt

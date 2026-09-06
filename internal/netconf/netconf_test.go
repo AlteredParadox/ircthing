@@ -17,6 +17,11 @@
 package netconf
 
 import (
+	"bytes"
+	"errors"
+	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -143,5 +148,60 @@ func TestExpandCredentialsDir(t *testing.T) {
 		if got := expandCredentialsDir(c.in); got != c.want {
 			t.Errorf("expandCredentialsDir(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// The client-visible certificate error must be ONE fixed string whatever
+// went wrong. The previous redaction kept the OS reason, so an
+// authenticated caller could distinguish missing / unreadable / directory /
+// not-PEM for any path it named — a filesystem oracle. The detail must still
+// reach the server log, or the operator cannot debug a real misconfiguration.
+func TestIRCConfigCertErrorIsOpaque(t *testing.T) {
+	dir := t.TempDir()
+	notPEM := filepath.Join(dir, "garbage.pem")
+	if err := os.WriteFile(notPEM, []byte("this is not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	probes := map[string]string{
+		"missing":   filepath.Join(dir, "missing.pem"),
+		"directory": dir,
+		"not PEM":   notPEM,
+	}
+	if os.Geteuid() != 0 { // root reads a 0000 file, so the case is void there
+		unreadable := filepath.Join(dir, "unreadable.pem")
+		if err := os.WriteFile(unreadable, []byte("x"), 0o000); err != nil {
+			t.Fatal(err)
+		}
+		probes["unreadable"] = unreadable
+	}
+
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	const want = `network "x": client certificate could not be loaded`
+	for name, path := range probes {
+		n := &Network{Name: "x", Addr: "irc.x.net:6697", Nick: "me", SASL: &SASL{
+			Mechanism: "EXTERNAL", CertFile: path, KeyFile: path,
+		}}
+		_, err := n.IRCConfig()
+		if err == nil {
+			t.Fatalf("%s: IRCConfig() = nil error, want a load failure", name)
+		}
+		if !errors.Is(err, ErrClientCert) {
+			t.Errorf("%s: error does not wrap ErrClientCert: %v", name, err)
+		}
+		if got := err.Error(); got != want {
+			t.Errorf("%s: error = %q, want the fixed %q", name, got, want)
+		}
+		for _, leak := range []string{"no such file", "permission denied", "is a directory", "PEM", dir} {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("%s: error discloses %q: %v", name, leak, err)
+			}
+		}
+	}
+	// The operator still gets the detail, server-side only.
+	if !strings.Contains(logged.String(), dir) {
+		t.Errorf("server log lacks the failing path; got:\n%s", logged.String())
 	}
 }

@@ -22,6 +22,7 @@ package netguard
 import (
 	"net"
 	"net/netip"
+	"strings"
 )
 
 // specialPurposePrefixes are the IANA special-purpose registry blocks
@@ -119,3 +120,84 @@ func IsPublicIP(ip net.IP) bool {
 // backs the IsPublicIP allowlist so non-global IPv6 space (site-local,
 // ULA, link-local, multicast) is rejected regardless of the denylist.
 var globalUnicastV6 = netip.MustParsePrefix("2000::/3")
+
+// HostAllowed reports whether a client-supplied URL host may be handed to
+// an outbound fetcher: HostAllowedBy with the IsPublicIP policy.
+func HostAllowed(host string) bool { return HostAllowedBy(host, IsPublicIP) }
+
+// HostAllowedBy is the shared admission check for a URL host on every
+// path that may forward it UNRESOLVED to a proxy (the per-network
+// SOCKS5/HTTP proxy resolves it with the proxy's libc). A literal IP is
+// judged by allowIP. A hostname passes UNLESS it is one that resolves to
+// loopback without any DNS: "localhost" / "*.localhost" (RFC 6761 §6.3
+// — resolvers answer these locally), or a numeric spelling that
+// net.ParseIP rejects but inet_aton(3)/getaddrinfo accept — "127.1",
+// "2130706433", "0x7f000001", "0177.0.0.1". Without this the proxied
+// media path classified those as hostnames, skipped the literal-IP
+// block, and the proxy connected them to its own loopback.
+//
+// The zone strip is load-bearing. For "http://[fe80::1%25eth0]/",
+// url.Hostname() yields "fe80::1%eth0" — but net.ParseIP REJECTS the
+// zoned form and returns nil, so without this the link-local literal
+// would fall through as if it were a hostname and skip allowIP entirely.
+// '%' cannot appear in a DNS hostname, so cutting at it never
+// reclassifies a legitimate name.
+func HostAllowedBy(host string, allowIP func(net.IP) bool) bool {
+	if zone := strings.IndexByte(host, '%'); zone >= 0 {
+		host = host[:zone]
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return allowIP(ip)
+	}
+	return !IsLocalName(host)
+}
+
+// IsLocalName reports whether a non-IP host string names the local host
+// without DNS: "localhost"/"*.localhost" (any case, optional FQDN dot),
+// or an inet_aton(3) numeric form — dot-separated labels that are each
+// decimal, 0x-hex, or 0-octal ("127.1", "0x7f.1", "0177.0.0.1",
+// "2130706433"). Real hostnames never consist solely of numeric labels
+// (RFC 3696 §2: the TLD is never all-numeric), so "1e100.net" and
+// "3.example.com" stay allowed.
+func IsLocalName(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	if host == "" {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !numericLabel(label) {
+			return false
+		}
+	}
+	return true
+}
+
+// numericLabel matches the per-part grammar of inet_aton(3): "0x"/"0X"
+// followed by hex digits (glibc accepts a bare "0x" as zero), or a run of
+// decimal digits (a leading 0 makes it octal — still all digits).
+func numericLabel(s string) bool {
+	if s == "" {
+		return false
+	}
+	if len(s) >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		for _, c := range s[2:] {
+			if !isHexDigit(c) {
+				return false
+			}
+		}
+		return true
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isHexDigit(c rune) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}

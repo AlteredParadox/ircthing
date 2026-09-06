@@ -99,6 +99,38 @@ func (s *Store) SetSettingAndWipePushSubscriptions(ctx context.Context, key, val
 	return tx.Commit()
 }
 
+// DeleteSettingAndWipePushSubscriptions is the delete-side twin of
+// SetSettingAndWipePushSubscriptions: it removes key and clears every push
+// subscription in ONE transaction, reporting whether the key existed. Used
+// by -reset-password, which drops the Settings-rotated login hash so the
+// config-file seed applies again — the same compromise-recovery lever as a
+// rotation, so the push grants a stolen session may have planted go with it.
+func (s *Store) DeleteSettingAndWipePushSubscriptions(ctx context.Context, key string) (existed bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, key)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM push_subscriptions`); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // DeletePushSubscription removes an endpoint; deleting an unknown one is
 // a no-op (unsubscribe must be idempotent).
 func (s *Store) DeletePushSubscription(ctx context.Context, endpoint string) error {

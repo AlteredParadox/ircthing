@@ -169,6 +169,13 @@ func TestMediaTokenEndpoint(t *testing.T) {
 		"http://127.0.0.1/a.mp3",
 		"http://169.254.169.254/a.mp3",
 		"http://[::1]/a.mp3",
+		// DNS-free loopback spellings net.ParseIP rejects: the proxied
+		// stream path would otherwise hand them to the proxy's resolver.
+		"http://localhost/a.mp3",
+		"http://127.1/a.mp3",
+		"http://2130706433/a.mp3",
+		"http://0x7f000001/a.mp3",
+		"http://0177.0.0.1/a.mp3",
 		"not a url",
 	} {
 		if _, _, status := mintMediaToken(t, ts, cookie, bad, testNet); status != http.StatusBadRequest {

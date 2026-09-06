@@ -278,6 +278,12 @@ func TestProxiedFetcherBlocksLiteralPrivateIP(t *testing.T) {
 		// net.ParseIP rejects that form, so these used to be classified
 		// as HOSTNAMES and skip the private-address check entirely.
 		"http://[fe80::1%25eth0]/", "http://[::1%25lo]/",
+		// DNS-free loopback spellings. net.ParseIP returns nil for all of
+		// these, so they used to be classified as HOSTNAMES and forwarded
+		// unresolved to the proxy, whose libc (inet_aton / RFC 6761) maps
+		// them to loopback — bypassing the literal-IP block entirely.
+		"http://localhost/x", "http://foo.localhost/x", "http://LOCALHOST./x",
+		"http://127.1/x", "http://2130706433/x", "http://0x7f000001/x", "http://0177.0.0.1/x",
 	} {
 		if _, _, _, err := f.get(context.Background(), u); !errors.Is(err, errBlocked) {
 			t.Fatalf("get(%q) = %v, want errBlocked", u, err)
