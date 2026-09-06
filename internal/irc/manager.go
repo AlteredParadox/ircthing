@@ -122,18 +122,26 @@ type Manager struct {
 	capVals atomic.Value // map[string]string: values of enabled caps
 	isup    *isupport
 	roster  *roster
-	// joined is the set of channels to (re)join after registration:
-	// the configured ones plus runtime JOINs, minus runtime PARTs (a KICK
-	// deliberately does not remove the intent — bouncers rejoin). Only
-	// the run goroutine touches it.
 	// joined is the rejoin set: channels to (re)join on every
-	// registration, seeded from the configured autojoin list and kept
-	// in step with our own JOIN/PART. Keyed by the channel's raw
-	// spelling, NOT a folded name: the server's CASEMAPPING is unknown
-	// at construction (005 arrives only in the read loop), so folding
-	// here would wrongly merge distinct channels like #[x] and #{x} on
-	// an ascii-casemapping server. Only the run goroutine touches it.
-	joined map[string]string // raw channel -> original casing (identity)
+	// registration (the configured ones plus runtime JOINs, minus runtime
+	// PARTs — a KICK deliberately does not remove the intent; bouncers
+	// rejoin), each with its channel key ("" for none) so a +k channel
+	// comes back too. Keyed by the channel's raw spelling, NOT a folded
+	// name: the server's CASEMAPPING is unknown at construction (005
+	// arrives only in the read loop), so folding here would wrongly merge
+	// distinct channels like #[x] and #{x} on an ascii-casemapping server.
+	// Only the run goroutine touches it.
+	joined map[string]string // raw channel -> key ("" = none)
+
+	// keysMu guards joinKeys: FOLDED channel -> the key of our most recent
+	// outgoing JOIN for it this connection ("" when that JOIN carried
+	// none). Recorded by sendAll (hub goroutine) — the key is only ever on
+	// the wire in OUR command, never in the server's echo — and consumed
+	// by the self-JOIN echo (rememberJoinIntent, read loop) to stamp the
+	// rejoin set; the hub reads it via ChannelKey to persist the key.
+	// Cleared by our self-PART and reset per connection.
+	keysMu   sync.Mutex
+	joinKeys map[string]string
 
 	// namesMu guards namesReq: channels for which we have already sent an
 	// explicit NAMES this connection (draft/no-implicit-names). Touched by
@@ -257,13 +265,14 @@ func NewManager(cfg Config) (*Manager, error) {
 		isup:           isup,
 		roster:         newRoster(isup),
 		joined:         make(map[string]string),
+		joinKeys:       make(map[string]string),
 		namesReq:       make(map[string]bool),
 		whoxDone:       make(map[string]bool),
 		monActive:      make(map[string]string),
 		pendingCapVals: make(map[string]string),
 	}
 	for _, ch := range cfg.Channels {
-		m.joined[ch] = ch // raw key; see the joined field comment
+		m.joined[ch] = cfg.ChannelKeys[ch] // raw key; see the joined field comment
 	}
 	return m, nil
 }
@@ -1094,6 +1103,9 @@ func (m *Manager) sendAll(msgs []*ircv4.Message) error {
 	}
 	for _, msg := range msgs {
 		m.out <- msg
+		if msg.Command == "JOIN" {
+			m.noteJoinKeys(msg)
+		}
 	}
 	return nil
 }
@@ -1433,23 +1445,38 @@ func (m *Manager) applyCaps(hs *handshake) {
 	m.pendingCapVals = make(map[string]string)
 }
 
-// rejoinList snapshots the rejoin set into a sorted slice, pruning entries
-// that could never be sent (bad framing / over the line limit) from
-// m.joined so one bad stored channel never wedges every reconnect. It must
-// run BEFORE serveLoop starts, which is the only other writer of m.joined
-// (trackJoinIntent) — the caller then sends the JOINs from the returned
-// snapshot, concurrently with the read loop, touching no shared state.
-func (m *Manager) rejoinList() []string {
-	rejoin := make([]string, 0, len(m.joined))
-	for _, ch := range m.joined {
-		if !m.rejoinable(ch) {
+// rejoinList snapshots the rejoin set into JOIN messages sorted by channel
+// — one JOIN per channel, carrying its key when set (RFC 2812 §3.2.1; the
+// parallel-list form would tie every channel's fate to one line) — pruning
+// entries that could never be sent (bad framing / over the line limit)
+// from m.joined so one bad stored channel never wedges every reconnect. It
+// must run BEFORE serveLoop starts, which is the only other writer of
+// m.joined (trackJoinIntent) — the caller then sends the JOINs from the
+// returned snapshot, concurrently with the read loop, touching no shared
+// state.
+func (m *Manager) rejoinList() []*ircv4.Message {
+	chans := make([]string, 0, len(m.joined))
+	for ch, key := range m.joined {
+		if !m.rejoinable(ch, key) {
 			delete(m.joined, ch)
 			continue
 		}
-		rejoin = append(rejoin, ch)
+		chans = append(chans, ch)
 	}
-	sort.Strings(rejoin)
+	sort.Strings(chans)
+	rejoin := make([]*ircv4.Message, 0, len(chans))
+	for _, ch := range chans {
+		rejoin = append(rejoin, joinMsg(ch, m.joined[ch]))
+	}
 	return rejoin
+}
+
+// joinMsg builds "JOIN <channel> [<key>]".
+func joinMsg(ch, key string) *ircv4.Message {
+	if key == "" {
+		return newMsg("JOIN", ch)
+	}
+	return newMsg("JOIN", ch, key)
 }
 
 func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
@@ -1471,6 +1498,9 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	m.resetNames()
 	m.whoxDone = make(map[string]bool)
 	m.ownMask.Store(ownIdent{})
+	m.keysMu.Lock()
+	m.joinKeys = make(map[string]string)
+	m.keysMu.Unlock()
 	// New connection: bump the generation (so a 734 buffered from the previous
 	// connection is ignored), and reset the server's MONITOR list to empty with
 	// no 734-limit (ReconcileMonitored re-establishes on registration).
@@ -1555,8 +1585,8 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	// right at registration overtook the still-unqueued JOINs: sent to a
 	// channel we hadn't rejoined yet, and a PART could be undone by its
 	// channel's later JOIN.
-	for _, ch := range rejoins {
-		if err := send([]*ircv4.Message{newMsg("JOIN", ch)}); err != nil {
+	for _, join := range rejoins {
+		if err := send([]*ircv4.Message{join}); err != nil {
 			return err // connection scope canceled; nothing started yet
 		}
 	}
@@ -2021,16 +2051,16 @@ func (m *Manager) maybeWHOX(channel string) *ircv4.Message {
 	return msg
 }
 
-// rejoinable reports whether a JOIN for ch could be sent at rejoin time —
-// so a stored rejoin intent can never fatally fail the writer. It checks
-// the exact bytes the writer emits: framing on the message, and length on
-// the UTF8ONLY-scrubbed form (invalid bytes inflate to U+FFFD, 3x). Without
-// the scrub, an invalid-UTF-8 channel name passes here but overflows the
-// writer's fatal post-scrub check under UTF8ONLY, bricking the network on
-// every reconnect. Against the default limit, since isup resets before
-// rejoin.
-func (m *Manager) rejoinable(ch string) bool {
-	msg := newMsg("JOIN", ch)
+// rejoinable reports whether a JOIN for ch (with key, if any) could be
+// sent at rejoin time — so a stored rejoin intent can never fatally fail
+// the writer. It checks the exact bytes the writer emits: framing on the
+// message, and length on the UTF8ONLY-scrubbed form (invalid bytes inflate
+// to U+FFFD, 3x). Without the scrub, an invalid-UTF-8 channel name passes
+// here but overflows the writer's fatal post-scrub check under UTF8ONLY,
+// bricking the network on every reconnect. Against the default limit,
+// since isup resets before rejoin.
+func (m *Manager) rejoinable(ch, key string) bool {
+	msg := joinMsg(ch, key)
 	return checkFraming(msg) == nil && checkLineLen(m.scrubUTF8(msg), defaultLineLen) == nil
 }
 
@@ -2059,14 +2089,53 @@ func (m *Manager) trackJoinIntent(in *ircv4.Message) error {
 // bypasses sendAll and hits the writer's FATAL length/framing guard, brick the
 // network on every reconnect (validated against the default line limit, since
 // isup is reset before rejoin). The set is bounded against a self-JOIN flood.
+//
+// The channel key comes from OUR outgoing JOIN (joinKeys), never from the
+// echo: an explicit outgoing key (or an explicitly keyless JOIN) replaces
+// what the rejoin set held, while a JOIN we did not send this way — the
+// rejoin itself, a forward, SVSJOIN — leaves the stored key alone.
 func (m *Manager) rememberJoinIntent(ch string) error {
-	if ch == "" || !m.isup.IsChannel(ch) || !m.rejoinable(ch) {
+	if ch == "" || !m.isup.IsChannel(ch) {
 		return nil
 	}
-	if _, known := m.joined[ch]; !known && len(m.joined) >= maxJoinedChannels {
+	key, known := m.joined[ch]
+	explicit := false
+	m.keysMu.Lock()
+	if k, ok := m.joinKeys[m.isup.Fold(ch)]; ok {
+		key, explicit = k, true
+	}
+	m.keysMu.Unlock()
+	if !explicit && !known {
+		// A new spelling of a seeded channel ("#Cfg" configured, "#cfg"
+		// echoed by the rejoin) inherits its key, or the keyless duplicate
+		// would 475 on the next reconnect. Only for a spelling not yet in
+		// the set, so the scan cost is bounded by maxJoinedChannels.
+		for other, k := range m.joined {
+			if k != "" && m.isup.FoldEqual(other, ch) {
+				key = k
+				break
+			}
+		}
+	}
+	if !m.rejoinable(ch, key) {
+		if key == "" || !m.rejoinable(ch, "") {
+			return nil
+		}
+		key = "" // an unsendable key must not cost the channel its rejoin
+	}
+	if !known && len(m.joined) >= maxJoinedChannels {
 		return fmt.Errorf("irc: joined-channel set exceeded %d", maxJoinedChannels)
 	}
-	m.joined[ch] = ch
+	if explicit {
+		// The configured spelling may differ from the echo's ("#Foo" seeded,
+		// "#foo" echoed): both entries rejoin, so both must carry the key.
+		for other := range m.joined {
+			if m.isup.FoldEqual(other, ch) {
+				m.joined[other] = key
+			}
+		}
+	}
+	m.joined[ch] = key
 	// A fresh self-JOIN invalidates any prior NAMES fetch: under
 	// no-implicit-names the server sends no membership on JOIN, so after a
 	// part/rejoin (or a forward/cycle) EnsureNames must re-request when the
@@ -2094,6 +2163,67 @@ func (m *Manager) forgetJoinIntent(list string) {
 			delete(m.joined, key)
 		}
 	}
+	m.keysMu.Lock()
+	for folded := range parted {
+		delete(m.joinKeys, folded)
+	}
+	m.keysMu.Unlock()
+}
+
+// maxJoinKeyBytes bounds a channel key we track and persist. Real KEYLEN is
+// 23 (Solanum/Charybdis) to 32 (InspIRCd); mirrored by netconf's
+// maxChannelKeyLen so a key the manager tracks is always storable.
+const maxJoinKeyBytes = 64
+
+// noteJoinKeys records the keys of an outgoing "JOIN <chans> [<keys>]" we
+// just enqueued — the parallel comma lists of RFC 2812 §3.2.1, key i for
+// channel i, none for the rest — so the self-JOIN echo (which never carries
+// the key) can stamp it into the rejoin set, and the hub can persist it.
+// A JOIN without keys records "" for each channel: an explicitly keyless
+// join clears a stale key. Only channel names are recorded ("JOIN 0" is
+// not one), and a key with separator/framing bytes or over the size cap
+// is treated as absent (it could not be persisted or rejoined anyway).
+func (m *Manager) noteJoinKeys(msg *ircv4.Message) {
+	if msg.Command != "JOIN" || len(msg.Params) == 0 {
+		return
+	}
+	chans := strings.Split(msg.Params[0], ",")
+	var keys []string
+	if len(msg.Params) > 1 {
+		keys = strings.Split(msg.Params[1], ",")
+	}
+	m.keysMu.Lock()
+	defer m.keysMu.Unlock()
+	for i, ch := range chans {
+		if ch == "" || !m.isup.IsChannel(ch) || len(ch) > maxChannelNameBytes {
+			continue
+		}
+		key := ""
+		if i < len(keys) && validJoinKey(keys[i]) {
+			key = strings.Clone(keys[i])
+		}
+		folded := m.isup.Fold(ch)
+		if _, known := m.joinKeys[folded]; !known && len(m.joinKeys) >= maxJoinedChannels {
+			continue
+		}
+		m.joinKeys[folded] = key
+	}
+}
+
+// validJoinKey reports whether key can ride as one JOIN parameter and be
+// persisted: non-empty, no separator or framing bytes (space, comma, CR,
+// LF, NUL), within maxJoinKeyBytes.
+func validJoinKey(key string) bool {
+	return key != "" && len(key) <= maxJoinKeyBytes && !strings.ContainsAny(key, " ,\r\n\x00")
+}
+
+// ChannelKey returns the key of our most recent outgoing JOIN for channel
+// on this connection ("" when it carried none or there was none). The hub
+// calls it on our JOIN echo to persist the key with the autojoin entry.
+func (m *Manager) ChannelKey(channel string) string {
+	m.keysMu.Lock()
+	defer m.keysMu.Unlock()
+	return m.joinKeys[m.isup.Fold(channel)]
 }
 
 // maxJoinedChannels bounds the rejoin-intent set (see trackJoinIntent).

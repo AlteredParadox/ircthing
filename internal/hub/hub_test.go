@@ -48,8 +48,8 @@ func TestPersistAutojoinMirrorsMembership(t *testing.T) {
 	if err := h.store.PutNetworkConfig(ctx, "libera", string(raw)); err != nil {
 		t.Fatal(err)
 	}
-	c := &fakeConn{name: "libera", nick: "AlteredParadox"}
-	channels := func() []string {
+	c := &fakeConn{name: "libera", nick: "AlteredParadox", keys: map[string]string{}}
+	parsedConfig := func() netconf.Network {
 		got, ok, err := h.store.NetworkConfig(ctx, "libera")
 		if err != nil || !ok {
 			t.Fatalf("read config: ok=%v err=%v", ok, err)
@@ -58,11 +58,37 @@ func TestPersistAutojoinMirrorsMembership(t *testing.T) {
 		if err := json.Unmarshal([]byte(got.Config), &parsed); err != nil {
 			t.Fatal(err)
 		}
-		return parsed.Channels
+		return parsed
 	}
+	channels := func() []string { return parsedConfig().Channels }
 	feed := func(line string) {
 		h.persistAutojoin(ctx, c, irc.Event{Network: "libera", Msg: ircv4.MustParseMessage(line)})
 	}
+
+	// A keyed JOIN persists the key under the stored spelling; the rejoin
+	// echo (no outgoing key) keeps it; an explicitly keyless JOIN of an
+	// already-stored channel leaves it too (see editChannelKeys); a PART
+	// drops it with the channel; a new key replaces the old.
+	c.keys["#Sec"] = "sesame"
+	feed(":AlteredParadox!u@h JOIN #Sec")
+	if nc := parsedConfig(); len(nc.Channels) != 1 || nc.ChannelKeys["#Sec"] != "sesame" {
+		t.Fatalf("after keyed JOIN: %v / %v", nc.Channels, nc.ChannelKeys)
+	}
+	delete(c.keys, "#Sec")
+	feed(":AlteredParadox!u@h JOIN #sec")
+	if nc := parsedConfig(); nc.ChannelKeys["#Sec"] != "sesame" || len(nc.ChannelKeys) != 1 {
+		t.Fatalf("rejoin echo disturbed the key: %v", nc.ChannelKeys)
+	}
+	c.keys["#sec"] = "opensesame" // echo spelled differently: keyed under the stored entry
+	feed(":AlteredParadox!u@h JOIN #sec")
+	if nc := parsedConfig(); nc.ChannelKeys["#Sec"] != "opensesame" || len(nc.ChannelKeys) != 1 {
+		t.Fatalf("new key not stored under the stored spelling: %v", nc.ChannelKeys)
+	}
+	feed(":AlteredParadox!u@h PART #SEC")
+	if nc := parsedConfig(); len(nc.Channels) != 0 || len(nc.ChannelKeys) != 0 {
+		t.Fatalf("after PART of a keyed channel: %v / %v", nc.Channels, nc.ChannelKeys)
+	}
+	c.keys = map[string]string{}
 
 	feed(":AlteredParadox!u@h JOIN #go")
 	if ch := channels(); len(ch) != 1 || ch[0] != "#go" {
@@ -612,6 +638,8 @@ type fakeConn struct {
 	// pageSize is HistoryPageSize; 0 means the default 100.
 	pageSize int
 
+	keys map[string]string // ChannelKey answers, by exact channel spelling
+
 	mu          sync.Mutex
 	sent        []*ircv4.Message
 	sendErr     error
@@ -630,6 +658,7 @@ func (f *fakeConn) IsChannel(target string) bool { return defaultIsChannel(targe
 func (f *fakeConn) ChanTypes() string            { return "#&" }
 func (f *fakeConn) StatusPrefixes() string       { return "~&@%+" }
 func (f *fakeConn) Fold(name string) string      { return foldRFC1459(name) }
+func (f *fakeConn) ChannelKey(ch string) string  { return f.keys[ch] }
 
 // foldRFC1459 mirrors the default IRC casemapping for test fakes.
 func foldRFC1459(name string) string {

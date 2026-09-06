@@ -105,6 +105,11 @@ type Network struct {
 	Pass      string     `json:"pass,omitempty"`
 	SASL      *SASL      `json:"sasl,omitempty"`
 	Channels  []string   `json:"channels,omitempty"`
+	// ChannelKeys maps an entry of Channels (exact spelling) to its channel
+	// key (+k), so a keyed channel is rejoined after a restart; the hub
+	// records the key from the user's own JOIN. A secret of the same class
+	// as Pass, stored alongside it.
+	ChannelKeys map[string]string `json:"channel_keys,omitempty"`
 }
 
 type SASL struct {
@@ -155,6 +160,9 @@ func (n *Network) EffectiveName() string {
 const (
 	maxChannels   = 4096
 	maxChannelLen = 200
+	// maxChannelKeyLen mirrors internal/irc's maxJoinKeyBytes: a key the
+	// manager tracks is always storable. Real KEYLEN is 23-32.
+	maxChannelKeyLen = 64
 	// maxNetworkNameBytes is mirrored by store.MaxNetworkNameBytes: sized so
 	// any addr proxydial.ValidHostPort accepts (255-byte host + ":65535",
 	// ~262 bytes) can serve as the EffectiveName fallback.
@@ -295,7 +303,29 @@ func (n *Network) validateFraming() error {
 			return fmt.Errorf("channels[%d] too long (%d bytes, max %d)", i, len(ch), maxChannelLen)
 		}
 	}
+	// Keys ride as one JOIN parameter each ("JOIN <channel> <key>"), so the
+	// same framing rules apply, plus no comma (the RFC 2812 list separator).
+	// The key itself never appears in an error: it is a secret.
+	if len(n.ChannelKeys) > maxChannels {
+		return fmt.Errorf("too many channel_keys (%d, max %d)", len(n.ChannelKeys), maxChannels)
+	}
+	for ch, key := range n.ChannelKeys {
+		if ch == "" || strings.ContainsAny(ch, " \r\n\x00") || len(ch) > maxChannelLen {
+			return errors.New("channel_keys has an invalid channel name")
+		}
+		if !ValidChannelKey(key) {
+			return fmt.Errorf("channel_keys[%s] must be 1-%d bytes without spaces, commas, CR, LF, or NUL", ch, maxChannelKeyLen)
+		}
+	}
 	return nil
+}
+
+// ValidChannelKey reports whether key can be stored and sent as one JOIN
+// parameter: non-empty, no separator or framing bytes (space, comma, CR,
+// LF, NUL), within maxChannelKeyLen. The hub applies it before persisting
+// a key learned from a live JOIN.
+func ValidChannelKey(key string) bool {
+	return key != "" && len(key) <= maxChannelKeyLen && !strings.ContainsAny(key, " ,\r\n\x00")
 }
 
 // validateSASLExternal requires the client-certificate keypair whenever the
@@ -351,6 +381,7 @@ func (n *Network) IRCConfig() (irc.Config, error) {
 		Realname:            n.Realname,
 		Pass:                n.Pass,
 		Channels:            n.Channels,
+		ChannelKeys:         n.ChannelKeys,
 	}
 	if n.WireGuard != nil {
 		cfg.WireGuard = &wgdial.Config{

@@ -36,6 +36,7 @@ import (
 	"unicode/utf8"
 
 	"ircthing/internal/irc"
+	"ircthing/internal/netconf"
 	"ircthing/internal/store"
 
 	ircv4 "gopkg.in/irc.v4"
@@ -75,6 +76,10 @@ type Conn interface {
 	// (rfc1459 folds []\^ to {}|~ pairs); every nick/channel comparison
 	// must use it — ASCII-only folding misroutes on rfc1459 networks.
 	Fold(name string) string
+	// ChannelKey is the key of our most recent outgoing JOIN for channel on
+	// this connection ("" when none): the JOIN echo never carries it, so
+	// persisting a +k channel's key has to ask the connection.
+	ChannelKey(channel string) string
 	// RequestChatHistory backfills target with messages newer than the
 	// resume point (msgid preferred over sinceMs when non-empty); a
 	// no-op on networks without draft/chathistory.
@@ -614,6 +619,7 @@ func (h *Hub) persistAutojoin(ctx context.Context, c Conn, ev irc.Event) {
 	// (add) nor fold-match any stored ≤200-byte name (remove), so oversized junk
 	// is dropped before the fold, defusing the self-PART fold amplifier (F1).
 	var chans []string
+	var keys map[string]string
 	for _, ch := range strings.Split(list, ",") {
 		if ch == "" || !c.IsChannel(ch) || len(ch) > maxPersistedChannelLen {
 			continue
@@ -632,11 +638,23 @@ func (h *Hub) persistAutojoin(ctx context.Context, c Conn, ev irc.Event) {
 			continue
 		}
 		chans = append(chans, ch)
+		// The key of a +k channel is only ever in OUR JOIN command (the echo
+		// omits it): the connection remembers it for exactly this purpose. A
+		// JOIN we did not send with a key (the rejoin, a forward) yields ""
+		// and leaves any stored key alone.
+		if add {
+			if key := c.ChannelKey(ch); key != "" && netconf.ValidChannelKey(key) {
+				if keys == nil {
+					keys = make(map[string]string)
+				}
+				keys[ch] = key
+			}
+		}
 	}
 	if len(chans) == 0 {
 		return
 	}
-	if err := h.updateAutojoinLocked(ctx, ev.Network, chans, add, c.Fold); err != nil {
+	if err := h.updateAutojoinLocked(ctx, ev.Network, chans, keys, add, c.Fold); err != nil {
 		log.Printf("irc[%s]: persist autojoin %s %d chans: %v", ev.Network, ev.Msg.Command, len(chans), err)
 	}
 }

@@ -1735,15 +1735,15 @@ func TestRejoinableRejectsUTF8Inflation(t *testing.T) {
 	}
 	bad := "#" + strings.Repeat("a\xff", 200) // ~401 raw bytes, ~801 scrubbed
 	// Without UTF8ONLY there is no inflation, so it fits and is rejoinable.
-	if !m.rejoinable(bad) {
+	if !m.rejoinable(bad, "") {
 		t.Fatal("pre-UTF8ONLY: channel fits unscrubbed, want rejoinable")
 	}
 	// Under UTF8ONLY the scrubbed form overflows, so it must be rejected.
 	m.isup.applyToken("UTF8ONLY", "")
-	if m.rejoinable(bad) {
+	if m.rejoinable(bad, "") {
 		t.Fatal("UTF8ONLY: invalid-UTF-8 channel must not be rejoinable")
 	}
-	if !m.rejoinable("#go") {
+	if !m.rejoinable("#go", "") {
 		t.Fatal("normal channel must remain rejoinable")
 	}
 }
@@ -2115,4 +2115,152 @@ func TestSendBudgetsRelayPrefix(t *testing.T) {
 	s2.register("AlteredParadox")
 	waitState(t, m, StateRegistered)
 	waitPrefix(91)
+}
+
+// A +k channel must come back after a reconnect: the key of our own
+// outgoing JOIN (the echo never carries it) rides on the rejoin JOIN, a
+// configured key is sent from the first connect, an explicitly keyless
+// JOIN clears it, and a PART forgets it. ChannelKey exposes the outgoing
+// key to the hub so it can be persisted with the autojoin entry.
+func TestManagerRejoinsWithChannelKey(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	cfg := testCfg(ln.Addr().String())
+	cfg.Channels = []string{"#cfg", "#open"}
+	cfg.ChannelKeys = map[string]string{"#cfg": "cfgkey"}
+	m := startManager(t, cfg)
+
+	expectJoins := func(s *srvConn, want ...string) {
+		t.Helper()
+		for _, w := range want {
+			if got := s.readCmd("JOIN").String(); got != w {
+				t.Fatalf("rejoin = %q, want %q", got, w)
+			}
+		}
+	}
+	waitKey := func(ch, want string) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for m.ChannelKey(ch) != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("ChannelKey(%q) = %q, want %q", ch, m.ChannelKey(ch), want)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+	expectJoins(s, "JOIN #cfg cfgkey", "JOIN #open")
+
+	// The user joins a keyed channel; the server echoes it without the key.
+	if err := m.Send(newMsg("JOIN", "#Dyn", "dynkey")); err != nil {
+		t.Fatal(err)
+	}
+	s.readCmd("JOIN")
+	s.send(":AlteredParadox!u@h JOIN #dyn")
+	waitKey("#DYN", "dynkey") // folded lookup, for the hub's persist path
+
+	s.c.Close()
+	waitState(t, m, StateDisconnected)
+	s2 := accept(t, conns)
+	s2.register("AlteredParadox")
+	expectJoins(s2, "JOIN #cfg cfgkey", "JOIN #dyn dynkey", "JOIN #open")
+	// The rejoin echo does not disturb the stored keys (not an outgoing
+	// key), and a new connection starts with no outgoing keys.
+	s2.send(":AlteredParadox!u@h JOIN #cfg")
+	s2.send(":AlteredParadox!u@h JOIN #dyn")
+	if got := m.ChannelKey("#dyn"); got != "" {
+		t.Fatalf("ChannelKey after reconnect = %q, want empty", got)
+	}
+
+	// An explicitly keyless JOIN clears the key; a PART forgets the channel.
+	if err := m.Send(newMsg("JOIN", "#dyn")); err != nil {
+		t.Fatal(err)
+	}
+	s2.readCmd("JOIN")
+	s2.send(":AlteredParadox!u@h JOIN #dyn")
+	if err := m.Send(newMsg("JOIN", "#cfg", "newkey")); err != nil {
+		t.Fatal(err)
+	}
+	s2.readCmd("JOIN")
+	s2.send(":AlteredParadox!u@h JOIN #cfg")
+	waitKey("#cfg", "newkey")
+	s2.send(":AlteredParadox!u@h JOIN #open")
+	s2.send(":AlteredParadox!u@h PART #open")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, _, ok := m.Channel("#open"); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("PART never processed")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	s2.c.Close()
+	waitState(t, m, StateDisconnected)
+	s3 := accept(t, conns)
+	s3.register("AlteredParadox")
+	expectJoins(s3, "JOIN #cfg newkey", "JOIN #dyn")
+	s3.c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if msg, err := s3.r.ReadMessage(); err == nil && msg.Command == "JOIN" {
+		t.Fatalf("unexpected extra join: %s", msg.String())
+	}
+}
+
+// noteJoinKeys follows RFC 2812 §3.2.1's parallel lists (key i for channel
+// i), ignores non-channels and unusable keys, and a self-JOIN echo the
+// user did not send (a forward, the rejoin) keeps the configured key.
+func TestJoinKeyBookkeeping(t *testing.T) {
+	m, err := NewManager(Config{Addr: "x:1", Nick: "AlteredParadox", AllowPlaintext: true,
+		Channels: []string{"#Cfg"}, ChannelKeys: map[string]string{"#Cfg": "cfgkey"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.nick.Store("AlteredParadox")
+	m.noteJoinKeys(newMsg("JOIN", "#a,#b,#c,0,#d", "k1,k2,,bad key"))
+	for ch, want := range map[string]string{"#a": "k1", "#b": "k2", "#c": "", "#d": "", "0": "", "#A": "k1"} {
+		if got := m.ChannelKey(ch); got != want {
+			t.Fatalf("ChannelKey(%q) = %q, want %q", ch, got, want)
+		}
+	}
+	m.noteJoinKeys(newMsg("JOIN", "#long", strings.Repeat("k", maxJoinKeyBytes+1)))
+	if got := m.ChannelKey("#long"); got != "" {
+		t.Fatalf("over-long key recorded: %q", got)
+	}
+
+	// Echoes stamp the outgoing keys into the rejoin set; a JOIN with no
+	// outgoing record (the forward to #cfg) keeps the seeded key — on every
+	// fold-equal spelling when the key is explicit.
+	for _, ch := range []string{"#a", "#c", "#cfg"} {
+		if err := m.trackJoinIntent(ircv4.MustParseMessage(":AlteredParadox!u@h JOIN " + ch)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if m.joined["#a"] != "k1" || m.joined["#c"] != "" || m.joined["#cfg"] != "cfgkey" || m.joined["#Cfg"] != "cfgkey" {
+		t.Fatalf("joined = %v", m.joined)
+	}
+	m.noteJoinKeys(newMsg("JOIN", "#CFG", "k3"))
+	if err := m.trackJoinIntent(ircv4.MustParseMessage(":AlteredParadox!u@h JOIN #cfg")); err != nil {
+		t.Fatal(err)
+	}
+	if m.joined["#cfg"] != "k3" || m.joined["#Cfg"] != "k3" {
+		t.Fatalf("explicit key not applied to every spelling: %v", m.joined)
+	}
+	// PART forgets both the intent and the outgoing key.
+	if err := m.trackJoinIntent(ircv4.MustParseMessage(":AlteredParadox!u@h PART #a,#CFG")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.joined["#a"]; ok || m.ChannelKey("#a") != "" || m.ChannelKey("#cfg") != "" {
+		t.Fatalf("PART left state behind: joined=%v key=%q", m.joined, m.ChannelKey("#a"))
+	}
+	if len(m.joined) != 1 || m.joined["#c"] != "" {
+		t.Fatalf("joined after PART = %v, want just #c", m.joined)
+	}
 }
