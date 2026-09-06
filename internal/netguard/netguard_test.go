@@ -88,3 +88,58 @@ func TestIsPublicIP(t *testing.T) {
 		}
 	}
 }
+
+// HostAllowed must refuse every spelling that a proxy's libc resolves to
+// loopback WITHOUT DNS — net.ParseIP returns nil for all of these, so they
+// used to be classified as hostnames and forwarded unresolved to the
+// per-network SOCKS/HTTP proxy, bypassing the literal-IP block. Legitimate
+// names with digits, and IDNA names, must stay allowed.
+func TestHostAllowed(t *testing.T) {
+	cases := []struct {
+		host string
+		ok   bool
+	}{
+		// Literal IPs: judged by IsPublicIP as before.
+		{"8.8.8.8", true},
+		{"2606:4700:4700::1111", true},
+		{"127.0.0.1", false},
+		{"::1", false},
+		{"fe80::1%eth0", false}, // zoned link-local (url.Hostname keeps the zone)
+		{"169.254.169.254", false},
+		// inet_aton spellings that ParseIP rejects.
+		{"127.1", false},
+		{"127.0.1", false},
+		{"2130706433", false},
+		{"0x7f000001", false},
+		{"0X7F000001", false},
+		{"0x7f.1", false},
+		{"0177.0.0.1", false},
+		{"0177.0000.0000.0001", false},
+		{"0", false},
+		{"0x", false},
+		// RFC 6761 localhost, in every spelling a resolver honours.
+		{"localhost", false},
+		{"LocalHost", false},
+		{"localhost.", false},
+		{"foo.localhost", false},
+		{"a.b.localhost.", false},
+		// Legitimate hostnames, including digit-heavy and IDNA forms.
+		{"example.com", true},
+		{"1e100.net", true},
+		{"3.example.com", true},
+		{"1.2.3.example.com", true},
+		{"0x.example.com", true},
+		{"deadbeef.cafe", true},
+		{"xn--bcher-kva.example", true},
+		{"bücher.example", true},
+		{"localhost.example.com", true},
+		{"notlocalhost", true},
+		{"example.com.", true},
+		{"", true}, // no host: callers reject that themselves
+	}
+	for _, tc := range cases {
+		if got := HostAllowed(tc.host); got != tc.ok {
+			t.Errorf("HostAllowed(%q) = %v, want %v", tc.host, got, tc.ok)
+		}
+	}
+}

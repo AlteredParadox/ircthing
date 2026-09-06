@@ -50,7 +50,9 @@ type Subscription struct {
 // ValidateEndpoint vets a subscription endpoint URL at registration time.
 // The endpoint is client-supplied, so it gets the media proxy's SSRF
 // posture: https only, a real hostname, a sane port, and literal IPs must
-// be public (hostnames are re-validated at dial time by the Sender).
+// be public — including the DNS-free loopback spellings ("localhost",
+// "127.1") netguard.HostAllowed refuses (other hostnames are re-validated
+// at dial time by the Sender).
 func ValidateEndpoint(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -71,7 +73,7 @@ func ValidateEndpoint(raw string) error {
 	if u.User != nil {
 		return errors.New("webpush: endpoint must not carry credentials")
 	}
-	if ip := net.ParseIP(u.Hostname()); ip != nil && !netguard.IsPublicIP(ip) {
+	if !netguard.HostAllowed(u.Hostname()) {
 		return errors.New("webpush: endpoint IP is not public")
 	}
 	return nil

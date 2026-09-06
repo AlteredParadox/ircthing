@@ -185,11 +185,12 @@ func (s *Server) handleMediaToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad url", http.StatusBadRequest)
 		return
 	}
-	// Literal non-public IP: refuse at mint time, matching hostAllowed. A
-	// hostname is not resolved here — the stream fetch re-validates it at
-	// dial time (direct) or defers DNS to the proxy/tunnel, exactly like
+	// Literal non-public IP (or a DNS-free loopback spelling such as
+	// "localhost" / "127.1"): refuse at mint time, matching hostAllowed. A
+	// real hostname is not resolved here — the stream fetch re-validates it
+	// at dial time (direct) or defers DNS to the proxy/tunnel, exactly like
 	// preview/thumb fetches.
-	if ip := net.ParseIP(u.Hostname()); ip != nil && !netguard.IsPublicIP(ip) {
+	if !netguard.HostAllowed(u.Hostname()) {
 		http.Error(w, "bad url", http.StatusBadRequest)
 		return
 	}

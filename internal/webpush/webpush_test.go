@@ -255,6 +255,15 @@ func TestValidateEndpoint(t *testing.T) {
 		{"https://10.0.0.5/push", false},                  // private literal
 		{"https://[fe80::1]/push", false},                 // link-local literal
 		{"https://169.254.169.254/latest/meta-data", false},
+		// DNS-free loopback spellings that net.ParseIP rejects (so they
+		// used to pass as hostnames).
+		{"https://localhost/push", false},
+		{"https://push.localhost/push", false},
+		{"https://127.1/push", false},
+		{"https://2130706433/push", false},
+		{"https://0x7f000001/push", false},
+		{"https://0177.0.0.1/push", false},
+		{"https://3.push.example.com/push", true}, // digits in a label stay fine
 		{"https://example.com:99999/push", false}, // bad port
 		{"https://user:pw@example.com/push", false},
 		{"https:///push", false}, // no host
