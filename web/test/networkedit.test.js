@@ -16,7 +16,7 @@
 
 import { match, strictEqual as is, throws } from "node:assert";
 import { test } from "node:test";
-import { editableNetwork, networkEditError } from "../src/networkedit.js";
+import { editableNetwork, formDirty, networkEditError } from "../src/networkedit.js";
 
 test("editableNetwork accepts only the exact usable definition", () => {
 	const item = { name: "wanted", state: "registered", config: { addr: "x:1" } };
@@ -48,4 +48,14 @@ test("networkEditError gives recovery rows an actionable path", () => {
 	match(networkEditError("legacy", { code: "invalid_name" }), /invalid.*Remove network/s);
 	match(networkEditError("broken", { code: "invalid" }), /invalid.*Remove network/s);
 	is(networkEditError("gone", { code: "unknown_network" }), "gone: network no longer exists.");
+});
+
+test("formDirty compares the form state structurally", () => {
+	const pristine = { cfg: { tls: true, addr: "irc.example:6697", wireguard: { dns: "1.1.1.1" } }, channels: "#go", egress: "direct" };
+	is(formDirty(pristine, { ...pristine }), false, "same content, new object");
+	is(formDirty(pristine, { ...pristine, channels: "#go #rust" }), true);
+	is(formDirty(pristine, { ...pristine, cfg: { ...pristine.cfg, wireguard: { dns: "9.9.9.9" } } }), true, "nested edit");
+	is(formDirty(pristine, { ...pristine, egress: "proxy" }), true);
+	// Typed then reverted: clean again, so a scrim click closes the form.
+	is(formDirty(pristine, { ...pristine, cfg: { ...pristine.cfg, addr: "irc.example:6697" } }), false);
 });
