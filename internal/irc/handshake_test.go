@@ -266,6 +266,23 @@ func TestHandshake(t *testing.T) {
 			wantNick: "AlteredParado2",
 		},
 		{
+			// 437 ERR_UNAVAILRESOURCE (RFC 2812 §5.2): the nick is held by a
+			// nick-delay (Solanum/Charybdis after a split or a recent
+			// change). It is not "in use" but is equally unusable right now,
+			// so it takes the same fallback path as 433 — otherwise
+			// registration hangs until HandshakeTimeout and the reconnect
+			// retries the very same nick.
+			name: "nick temporarily unavailable (437) falls back like 433",
+			cfg:  baseCfg,
+			steps: []step{
+				{in: ":irc.test 437 * AlteredParadox :Nick/channel is temporarily unavailable", want: []string{"NICK AlteredParado1"}},
+				{in: ":irc.test 433 * AlteredParado1 :Nickname is already in use", want: []string{"NICK AlteredParado2"}},
+				{in: "CAP * LS :example/none", want: []string{"CAP END"}},
+				{in: ":irc.test 001 AlteredParado2 :Welcome", done: true},
+			},
+			wantNick: "AlteredParado2",
+		},
+		{
 			name: "nick fallbacks exhausted fails",
 			cfg:  baseCfg,
 			steps: []step{
