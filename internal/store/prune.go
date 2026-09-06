@@ -158,10 +158,24 @@ func (s *Store) startPruner(interval time.Duration) {
 // The first prune after enabling retention on a large existing database can
 // delete millions of rows; doing it in one statement would hold the store
 // lock (blocking every append and history page) for the whole operation.
-// Chunking re-acquires the lock per batch so real traffic interleaves. 2000
-// rows keeps each batch's lock-hold to a few ms on the deployment target.
+// Chunking re-acquires the lock per batch so real traffic interleaves.
+//
+// The per-row cost is dominated by FTS5 'secure-delete' (migration 0009)
+// rewriting index segments: measured ~0.3 ms/row for short lines on a fast
+// box and ~1.4 ms/row for realistic lines, so 200 rows holds the lock for
+// roughly 60–300 ms per chunk (the earlier 2000-row chunk held it for up to
+// ~3 s, which stalled every network's hub goroutine and filled the manager's
+// event channel until the IRC read loop blocked). A first-time prune of a
+// million rows still finishes in well under an hour (the pruner's period).
 // var (not const) so a test can shrink it to exercise the multi-chunk loop.
-var pruneChunk = 2000
+var pruneChunk = 200
+
+// pruneChunkPause is slept between chunks with s.mu released. sync.Mutex only
+// hands the lock to a waiter directly once it has starved for >1 ms, so an
+// immediate re-Lock could still win the race against an append that just
+// arrived; the pause makes the interleave deterministic and spreads the
+// delete's I/O. At ~10 ms per 60–300 ms chunk it costs <15 % throughput.
+var pruneChunkPause = 10 * time.Millisecond
 
 // pruneOnce deletes messages that exceed the retention policy: those older
 // than the age cutoff, and those beyond the newest maxPerBuffer in each
@@ -242,14 +256,16 @@ func (s *Store) pruneByAge(ctx context.Context, now time.Time, days int) (n int6
 }
 
 // deleteChunked runs a `DELETE ... id IN (SELECT ... LIMIT ?)` statement
-// repeatedly — re-acquiring s.mu for each chunk — until a short batch signals
-// the last rows are gone. args are the query parameters BEFORE the trailing
+// repeatedly — re-acquiring s.mu for each chunk, and pausing pruneChunkPause
+// between chunks with the lock released — until a short batch signals the
+// last rows are gone. args are the query parameters BEFORE the trailing
 // LIMIT. Returns the total rows deleted. guard (if non-nil) reads the LIVE
 // retention policy and is called UNDER the same s.mu hold as the chunk's
 // DELETE (guards must therefore not lock s.mu themselves): SetRetention also
 // installs policy under s.mu, so a mid-prune loosen/disable is either seen by
 // the guard (loop stops) or strictly follows the chunk — never a stale chunk
-// deleted after the new policy landed.
+// deleted after the new policy landed. Also the engine behind buffer and
+// network purges (guard nil).
 func (s *Store) deleteChunked(ctx context.Context, guard func() bool, query string, args ...any) (int64, error) {
 	var total int64
 	chunkArgs := append(append(make([]any, 0, len(args)+1), args...), pruneChunk)
@@ -270,10 +286,14 @@ func (s *Store) deleteChunked(ctx context.Context, guard func() bool, query stri
 		if n < int64(pruneChunk) {
 			return total, nil // last (partial) batch
 		}
+		// Yield to waiting appends/history reads; Close (or a cancelled
+		// request) ends the loop here rather than after one more chunk.
+		pause := time.NewTimer(pruneChunkPause)
 		select {
 		case <-ctx.Done():
+			pause.Stop()
 			return total, ctx.Err()
-		default:
+		case <-pause.C:
 		}
 	}
 }

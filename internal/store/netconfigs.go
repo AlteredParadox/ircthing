@@ -384,18 +384,27 @@ func moveNetworkHistory(ctx context.Context, tx *sql.Tx, oldName, name string) e
 
 // DeleteNetwork removes a network entirely — its definition row and its
 // stored history (the networks row; buffers, messages with their FTS
-// rows, read markers, and monitors follow via cascades) — in one
-// transaction. Caches are evicted only after commit.
+// rows, read markers, and monitors follow via cascades). The message rows
+// are purged first in bounded chunks (PurgeNetworkMessages); the definition
+// and the networks row then go in one transaction, cascading whatever
+// arrived in between. Caches are evicted only after commit.
 func (s *Store) DeleteNetwork(ctx context.Context, name string) error {
 	return s.DeleteNetworkWithSettings(ctx, name, nil)
 }
 
 // DeleteNetworkWithSettings is DeleteNetwork plus settings writes in the
-// SAME transaction — used to roll back a failed network CREATE: deleting
-// the network and restoring the pre-create rename-map snapshot commit
-// together, so a rolled-back create cannot leave the map cleared for a
-// name that no longer exists. settings may be nil.
+// SAME (final) transaction — used to roll back a failed network CREATE:
+// deleting the network and restoring the pre-create rename-map snapshot
+// commit together, so a rolled-back create cannot leave the map cleared for
+// a name that no longer exists. settings may be nil.
 func (s *Store) DeleteNetworkWithSettings(ctx context.Context, name string, settings map[string]string) error {
+	// The bulk delete must not run inside the transaction below: a cascade
+	// through every message row holds s.mu — and with it every network's
+	// appends and all history reads — for the whole operation (~0.3–1.4 ms
+	// per row under FTS secure-delete: minutes for a large network).
+	if err := s.PurgeNetworkMessages(ctx, name); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -434,6 +443,30 @@ func (s *Store) DeleteNetworkByPageID(ctx context.Context, id int64) error {
 	if id <= 0 {
 		return errors.New("store: invalid network recovery id")
 	}
+	// Chunked bulk delete of the history first (see DeleteNetworkWithSettings),
+	// resolving the networks row through SQL so the name never surfaces. The
+	// small caches are cleared afterwards either way: the name is not
+	// available to evict by, and a failed purge may have left rings serving
+	// rows that are gone from disk.
+	s.mu.Lock()
+	var netID int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id FROM networks
+		WHERE user_id = ? AND name =
+			(SELECT name FROM network_configs WHERE rowid = ?)`, defaultUserID, id).Scan(&netID)
+	s.mu.Unlock()
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if netID != 0 {
+		err := s.purgeNetworkMessages(ctx, netID)
+		s.mu.Lock()
+		s.dropAllCachesLocked()
+		s.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -460,11 +493,102 @@ func (s *Store) DeleteNetworkByPageID(ctx context.Context, id int64) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.dropAllCachesLocked()
+	return nil
+}
+
+// dropAllCachesLocked evicts every in-memory id and ring cache (all re-warm
+// from SQLite on next access). Caller holds s.mu.
+func (s *Store) dropAllCachesLocked() {
 	clear(s.networks)
 	clear(s.buffers)
 	clear(s.rings)
 	s.ringBytes = 0
-	return nil
+}
+
+// PurgeNetworkMessages chunk-deletes every stored message of a network's
+// buffers, releasing s.mu between chunks so appends and history reads on
+// other networks interleave; the buffers and the networks row stay (the
+// buffers are then empty). DeleteNetwork runs it first, so the final
+// transaction cascades only what arrived in between. It is also exported for
+// the hub, which serializes the row delete under its own lifecycle gate and
+// must not hold that across the bulk delete. The network's hot rings are
+// dropped afterwards — on failure too — so memory never keeps serving rows
+// that are gone from disk. A network with no stored history is a no-op.
+func (s *Store) PurgeNetworkMessages(ctx context.Context, name string) error {
+	s.mu.Lock()
+	netID, err := s.networkID(ctx, name, false)
+	s.mu.Unlock()
+	if err != nil || netID == 0 {
+		return err
+	}
+	err = s.purgeNetworkMessages(ctx, netID)
+	s.mu.Lock()
+	s.dropNetworkCachesLocked(name)
+	s.mu.Unlock()
+	return err
+}
+
+// purgeNetworkMessages is the chunk loop behind PurgeNetworkMessages: the
+// subselect walks the network's buffers (their UNIQUE (network_id, name)
+// index) and each buffer's rows through the (buffer_id, ts, id) index, so a
+// chunk costs its LIMIT rows and nothing more. Caller must NOT hold s.mu
+// (deleteChunked takes it per chunk).
+func (s *Store) purgeNetworkMessages(ctx context.Context, netID int64) error {
+	_, err := s.deleteChunked(ctx, nil, `
+		DELETE FROM messages WHERE id IN (
+			SELECT m.id FROM messages m JOIN buffers b ON b.id = m.buffer_id
+			WHERE b.network_id = ? LIMIT ?)`, netID)
+	return err
+}
+
+// PurgeBufferMessages is the per-buffer counterpart of PurgeNetworkMessages:
+// target resolves under fold to the stored spelling, and its message rows
+// are chunk-deleted with s.mu released between chunks; the buffer row stays.
+// DeleteBufferFolded runs it first; the hub also calls it ahead of that so
+// its own append/close serialization (bufferMutationMu) is held only across
+// the final row delete + tombstone, not the bulk. New messages that land
+// meanwhile are legitimate (there is no tombstone yet) and are removed by
+// the row delete's cascade. A buffer with no stored row is a no-op.
+func (s *Store) PurgeBufferMessages(ctx context.Context, network, target string, fold func(string) string) error {
+	s.mu.Lock()
+	_, bufID, err := s.resolveBufferLocked(ctx, network, target, fold)
+	s.mu.Unlock()
+	if err != nil || bufID == 0 {
+		return err
+	}
+	return s.purgeBufferMessages(ctx, bufID)
+}
+
+// purgeBufferMessages chunk-deletes one buffer's rows (s.mu taken per chunk;
+// caller must not hold it), then drops the buffer's hot ring — on failure
+// too — so nothing deleted on disk is still served from memory; the next
+// read re-warms from whatever remains. During the loop a ring re-warmed by
+// an interleaving append can transiently hold rows a later chunk removes,
+// the same window the retention pruner accepts (it reconciles rings once
+// at the end, see pruneOnce).
+func (s *Store) purgeBufferMessages(ctx context.Context, bufID int64) error {
+	_, err := s.deleteChunked(ctx, nil,
+		`DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE buffer_id = ? LIMIT ?)`, bufID)
+	s.mu.Lock()
+	s.dropRingLocked(bufID)
+	s.mu.Unlock()
+	return err
+}
+
+// resolveBufferLocked resolves target to its stored spelling under fold and
+// that buffer's row id (0 when no row exists; the canonical spelling is
+// still returned, as target). Caller holds s.mu.
+func (s *Store) resolveBufferLocked(ctx context.Context, network, target string, fold func(string) string) (string, int64, error) {
+	canonical, err := s.canonicalBufferLocked(ctx, network, target, fold)
+	if err != nil {
+		return "", 0, err
+	}
+	bufID, err := s.bufferID(ctx, network, canonical, false)
+	if err != nil {
+		return "", 0, err
+	}
+	return canonical, bufID, nil
 }
 
 // DeleteBuffer removes one stored buffer and, via cascades, its
@@ -477,38 +601,51 @@ func (s *Store) DeleteBuffer(ctx context.Context, network, target string) error 
 }
 
 // DeleteBufferFolded resolves target to the stored spelling under the
-// connection's casemapping and deletes it while holding the same store lock as
-// AppendFoldedGuarded. afterDelete runs after a successful database operation
-// but before that lock is released; the hub uses it to install its close
-// tombstone, making delete+tombstone atomic with respect to every append.
-// The canonical spelling is returned even when no row exists.
+// connection's casemapping, purges its messages in bounded chunks
+// (PurgeBufferMessages — the lock is released between chunks, so a large
+// buffer's delete does not stall every other buffer's appends and reads),
+// then deletes the buffer row while holding the same store lock as
+// AppendFoldedGuarded. afterDelete runs after that final delete but before
+// the lock is released; the hub uses it to install its close tombstone,
+// making row-delete+tombstone atomic with respect to every append: a message
+// appended during the chunked purge is cascaded by the row delete, one
+// appended after it sees the tombstone. The canonical spelling is returned
+// even when no row exists.
 func (s *Store) DeleteBufferFolded(ctx context.Context, network, target string, fold func(string) string, afterDelete func(canonical string)) (string, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	canonical, err := s.canonicalBufferLocked(ctx, network, target, fold)
+	canonical, bufID, err := s.resolveBufferLocked(ctx, network, target, fold)
 	if err != nil {
+		s.mu.Unlock()
+		return "", err
+	}
+	if bufID == 0 {
+		// Closing a purely client-side buffer: nothing stored, but the
+		// tombstone still goes in so a straggler cannot mint the row now.
+		if afterDelete != nil {
+			afterDelete(canonical)
+		}
+		s.mu.Unlock()
+		return canonical, nil
+	}
+	s.mu.Unlock()
+
+	if err := s.purgeBufferMessages(ctx, bufID); err != nil {
 		return "", err
 	}
 
-	res, err := s.db.ExecContext(ctx, `
-		DELETE FROM buffers WHERE name = ? AND network_id =
-			(SELECT id FROM networks WHERE user_id = ? AND name = ?)`,
-		canonical, defaultUserID, network)
-	if err != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// By id: the row resolved above is the one being closed even if the
+	// network was renamed meanwhile (cascades the rows appended since the
+	// last chunk; a row already gone is not an error).
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM buffers WHERE id = ?`, bufID); err != nil {
 		return "", err
 	}
 	if afterDelete != nil {
 		afterDelete(canonical)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return canonical, nil // closing a purely client-side buffer
-	}
-	k := bufKey{network: network, target: canonical}
-	if id, ok := s.buffers[k]; ok {
-		s.dropRingLocked(id)
-		delete(s.buffers, k)
-	}
+	s.dropRingLocked(bufID)
+	delete(s.buffers, bufKey{network: network, target: canonical})
 	return canonical, nil
 }
 
