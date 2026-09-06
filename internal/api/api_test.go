@@ -1053,6 +1053,69 @@ func TestLoginBackoffGrows(t *testing.T) {
 	}
 }
 
+// The backoff table keys IPv6 sources on their /64 — one end-site prefix,
+// which a single attacker controls entirely — and IPv4 per address.
+func TestLoginBucket(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"10.0.0.1", "10.0.0.1"},
+		{"203.0.113.9", "203.0.113.9"},
+		{"::ffff:203.0.113.9", "203.0.113.9"}, // IPv4-mapped is IPv4
+		{"2001:db8:1:2::1", "2001:db8:1:2::/64"},
+		{"2001:db8:1:2:ffff:ffff:ffff:ffff", "2001:db8:1:2::/64"},
+		{"2001:db8:1:3::1", "2001:db8:1:3::/64"}, // neighbouring /64 is distinct
+		{"::1", "::/64"},
+		{"not-an-ip", "not-an-ip"}, // odd RemoteAddr: verbatim
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := loginBucket(tc.in); got != tc.want {
+			t.Errorf("loginBucket(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Failures from any address in a /64 must land in ONE bucket: keyed on
+// the full address, an attacker with a /64 minted 2^64 fresh sources, each
+// with a free first attempt, and after loginSourcesMax unexpired entries
+// fail() stopped recording — so those sources never entered backoff.
+func TestLoginBackoffKeysIPv6OnSlash64(t *testing.T) {
+	l := newLoginLimiter()
+	now := time.Now()
+	l.fail("2001:db8:1:2::1", now)
+	if l.retryAfter("2001:db8:1:2:ffff::9", now) == 0 {
+		t.Fatal("a sibling in the same /64 escaped the backoff")
+	}
+	if l.retryAfter("2001:db8:1:3::1", now) != 0 {
+		t.Fatal("a neighbouring /64 was blocked")
+	}
+	// The backoff keeps growing across rotated addresses within the /64.
+	l.fail("2001:db8:1:2::2", now)
+	l.fail("2001:db8:1:2::3", now)
+	if got := l.retryAfter("2001:db8:1:2::4", now); got != 4*time.Second {
+		t.Fatalf("third failure across rotated addresses: retryAfter = %v, want 4s", got)
+	}
+	// One success from anywhere in the /64 clears it.
+	l.ok("2001:db8:1:2::9")
+	if l.retryAfter("2001:db8:1:2::1", now) != 0 {
+		t.Fatal("success did not clear the /64 bucket")
+	}
+	// IPv4 stays per-address.
+	l.fail("10.0.0.1", now)
+	if l.retryAfter("10.0.0.2", now) != 0 {
+		t.Fatal("IPv4 neighbour was blocked")
+	}
+	// Rotating through a /64 fills ONE table slot, not loginSourcesMax.
+	for i := 0; i < loginSourcesMax+10; i++ {
+		l.fail("2001:db8:1:2::"+strconv.FormatInt(int64(i+16), 16), now)
+	}
+	l.mu.Lock()
+	n := len(l.sources)
+	l.mu.Unlock()
+	if n != 2 { // the /64 and 10.0.0.1
+		t.Fatalf("sources = %d entries after rotating within one /64, want 2", n)
+	}
+}
+
 // The global bucket caps total attempt rate regardless of source: rotating
 // source addresses (each getting a free first attempt from the per-source
 // tracker) must not buy unlimited bcrypt work.
