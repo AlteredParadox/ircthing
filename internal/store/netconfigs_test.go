@@ -896,3 +896,218 @@ func TestAppendGuarded(t *testing.T) {
 		t.Fatalf("existing buffer has %d rows after dropped straggler, want 2", len(m))
 	}
 }
+
+// seedRows bulk-loads n indexed (FTS-triggered) rows straight into a buffer
+// in one transaction — creating the buffer through Append first so the id
+// rows exist — and returns the buffer's row id. Seeding through Append would
+// commit n transactions and warm a ring; this is the "large existing
+// history" fixture the purge paths are measured against.
+func seedRows(t *testing.T, s *Store, network, target string, n int) int64 {
+	t.Helper()
+	if _, err := s.Append(ctx, network, target, Message{Sender: "a", Command: "PRIVMSG", Raw: "seed", Text: "seed"}); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	bufID, err := s.bufferID(ctx, network, target, false)
+	if err != nil || bufID == 0 {
+		t.Fatalf("bufferID = %d, %v", bufID, err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for i := 0; i < n; i++ {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO messages (buffer_id, ts, sender, command, raw, text) VALUES (?, ?, 'alice', 'PRIVMSG', ?, ?)`,
+			bufID, int64(1_700_000_000_000)+int64(i)*1000,
+			fmt.Sprintf(":alice!a@b PRIVMSG %s :hello there number %d", target, i),
+			fmt.Sprintf("hello there number %d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return bufID
+}
+
+// TestPurgeDeletesYieldToConcurrentAppends is the lock-hold regression for
+// the destructive paths: a buffer or network purge, and the retention
+// pruner, must delete in bounded chunks with the store lock released between
+// them, so an append on ANOTHER buffer waits for at most one chunk — never
+// the whole delete. Before the fix a single cascading DELETE (or a 2000-row
+// prune chunk) held s.mu for the entire operation — measured 4m24s for a
+// 100k-row buffer under FTS secure-delete — and every network's hub
+// goroutine queued behind it until the IRC read loops backed up. The check
+// is a ratio (longest append wait vs. the purge's total duration) so it is
+// independent of how fast the box deletes; both sides run at the default
+// chunk size, which is what the finding was about.
+func TestPurgeDeletesYieldToConcurrentAppends(t *testing.T) {
+	const rows = 6000 // 30 chunks at the default pruneChunk
+	var closed atomic.Bool
+	cases := []struct {
+		name string
+		// alsoAppendToPurged additionally appends INTO the buffer being
+		// purged, hub-style (guarded by the close tombstone that afterDelete
+		// installs), to prove a buffer that keeps receiving traffic during its
+		// chunked purge still ends up deleted.
+		alsoAppendToPurged bool
+		run                func(s *Store, pageID int64) error
+		wantLeft           int // rows left in the purged buffer
+	}{
+		{"buffer", true, func(s *Store, _ int64) error {
+			_, err := s.DeleteBufferFolded(ctx, "big", "#BIG", strings.ToLower, func(string) { closed.Store(true) })
+			return err
+		}, 0},
+		{"network", false, func(s *Store, _ int64) error { return s.DeleteNetwork(ctx, "big") }, 0},
+		{"network_by_page_id", false, func(s *Store, pageID int64) error { return s.DeleteNetworkByPageID(ctx, pageID) }, 0},
+		{"prune", false, func(s *Store, _ int64) error {
+			s.mu.Lock()
+			s.retention = retentionPolicy{maxPerBuffer: 1}
+			s.mu.Unlock()
+			_, err := s.pruneOnce(ctx, time.Now())
+			return err
+		}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			closed.Store(false)
+			s, _ := openTest(t, 10)
+			bufID := seedRows(t, s, "big", "#big", rows)
+			s.mu.Lock()
+			_, err := s.db.ExecContext(ctx, `INSERT INTO network_configs (name, config) VALUES ('big', '{}')`)
+			s.mu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defs, _, err := s.NetworkConfigsPage(ctx, 0, 10)
+			if err != nil || len(defs) != 1 {
+				t.Fatalf("definitions = %+v, %v", defs, err)
+			}
+			if _, err := s.Append(ctx, "other", "#o", Message{Sender: "a", Command: "PRIVMSG", Raw: "first"}); err != nil {
+				t.Fatal(err)
+			}
+
+			done := make(chan error, 1)
+			start := time.Now()
+			go func() { done <- tc.run(s, defs[0].PageID) }()
+			var (
+				appends int
+				maxWait time.Duration
+				runErr  error
+			)
+		loop:
+			for {
+				select {
+				case runErr = <-done:
+					break loop
+				default:
+				}
+				t0 := time.Now()
+				if _, err := s.Append(ctx, "other", "#o", Message{Sender: "b", Command: "PRIVMSG", Raw: "during"}); err != nil {
+					t.Fatal(err)
+				}
+				if w := time.Since(t0); w > maxWait {
+					maxWait = w
+				}
+				appends++
+				if tc.alsoAppendToPurged {
+					if _, err := s.AppendFoldedGuarded(ctx, "big", "#BIG", strings.ToLower,
+						func(bool) bool { return closed.Load() },
+						Message{Sender: "b", Command: "PRIVMSG", Raw: "straggler", Text: "straggler"}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			total := time.Since(start)
+			if runErr != nil {
+				t.Fatal(runErr)
+			}
+			t.Logf("purge took %v; %d concurrent appends, longest wait %v", total, appends, maxWait)
+			if maxWait > total/4 {
+				t.Fatalf("an append waited %v of the %v purge: the delete held the store lock across the whole operation", maxWait, total)
+			}
+
+			var left int
+			if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE buffer_id = ?`, bufID).Scan(&left); err != nil {
+				t.Fatal(err)
+			}
+			if left != tc.wantLeft {
+				t.Fatalf("%d rows left in the purged buffer, want %d", left, tc.wantLeft)
+			}
+			bufs, err := s.Buffers(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, b := range bufs {
+				if b.Network == "big" && tc.wantLeft == 0 {
+					t.Fatalf("purged buffer survived: %+v", b)
+				}
+			}
+			if got, _ := s.Latest(ctx, "other", "#o", 10); tc.name != "prune" && len(got) != min(appends+1, 10) {
+				t.Fatalf("other buffer lost history: %d of the newest 10 (%d appended)", len(got), appends)
+			}
+		})
+	}
+}
+
+// TestCanonicalLockedScanErrorIsAnError guards the folded resolve against
+// turning a transient read failure into a permanent case-variant duplicate:
+// a scan that dies mid-way must surface as an error, never as "no such
+// buffer" (which lets the append create #Other beside #other). The fold
+// callback cancels the query's context between rows, which is exactly how
+// a failure lands mid-scan.
+func TestCanonicalLockedScanErrorIsAnError(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	for _, name := range []string{"#one", "#two", "#other"} {
+		if _, err := s.Append(ctx, "net", name, Message{Sender: "a", Command: "PRIVMSG", Raw: "seed"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Forget the cached spellings so the resolve has to scan the table.
+	s.mu.Lock()
+	clear(s.buffers)
+	s.mu.Unlock()
+
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fold := func(name string) string {
+		cancel()
+		// Give database/sql's context watcher time to close the rows, so
+		// the next Next() fails the way an interrupted scan does.
+		time.Sleep(100 * time.Millisecond)
+		return strings.ToLower(name)
+	}
+	s.mu.Lock()
+	name, ok, err := s.canonicalLocked(cctx, "net", "#OTHER", fold)
+	s.mu.Unlock()
+	if err == nil {
+		t.Fatalf("interrupted scan reported (%q, %v) with no error", name, ok)
+	}
+	if ok {
+		t.Fatalf("interrupted scan reported a match %q alongside error %v", name, err)
+	}
+
+	// Through the public path the error fails the append outright — and no
+	// buffer was minted for the unresolved spelling.
+	cctx, cancel = context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := s.AppendFolded(cctx, "net", "#OTHER", fold, Message{Sender: "b", Command: "PRIVMSG", Raw: "late"}); err == nil {
+		t.Fatal("AppendFolded succeeded on an interrupted canonical scan")
+	}
+	bufs, err := s.Buffers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range bufs {
+		if b.Target == "#OTHER" {
+			t.Fatalf("interrupted scan minted a case-variant duplicate: %+v", bufs)
+		}
+	}
+	if len(bufs) != 3 {
+		t.Fatalf("buffers = %+v, want the 3 seeded", bufs)
+	}
+}

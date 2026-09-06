@@ -622,7 +622,10 @@ func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
 		// The real legacy name is intentionally never materialized. Delete its
 		// definition+history by opaque rowid inside SQLite, and clear the
 		// synthetic placeholder only after commit. On failure the mapping stays
-		// live so the owner can retry.
+		// live so the owner can retry. The store chunks the history delete
+		// (releasing its lock between chunks, so event appends flow); the
+		// lifecycle gate — which only session create-on-demand writes wait on —
+		// stays held throughout, accepted for this rare recovery path.
 		s.hub.lifecycleGate.Lock()
 		err := s.hub.store.DeleteNetworkByPageID(ctx, recoveryID)
 		s.hub.lifecycleGate.Unlock()
@@ -659,6 +662,24 @@ func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
 		prev = &copy
 	}
 	s.hub.StopNetwork(d.Network)
+	fail := func() {
+		s.hub.restartNetwork(prev)
+		if found && prev == nil {
+			s.hub.NoteStoppedNetwork(d.Network)
+		}
+		s.push(errEnvelope(env.Seq, "internal", "deleting network failed"))
+	}
+	// The bulk of the history goes first, OUTSIDE the lifecycle gate: session
+	// sends on other networks take the gate's read side, and the store
+	// releases its lock between delete chunks so they (and every network's
+	// event appends) interleave instead of waiting out a minutes-long delete.
+	// The network is stopped, so nothing of its own arrives; a
+	// create-on-demand write that slips in is cascaded by the gated row
+	// delete below.
+	if err := s.hub.store.PurgeNetworkMessages(ctx, d.Network); err != nil {
+		fail()
+		return
+	}
 	// One transaction: the definition and the stored history (that is
 	// what "delete" means) go together or not at all. Under the
 	// lifecycle gate so no session create-on-demand write interleaves
@@ -667,11 +688,7 @@ func (s *Session) handleDeleteNetwork(ctx context.Context, env Envelope) {
 	err = s.hub.store.DeleteNetwork(ctx, d.Network)
 	s.hub.lifecycleGate.Unlock()
 	if err != nil {
-		s.hub.restartNetwork(prev)
-		if found && prev == nil {
-			s.hub.NoteStoppedNetwork(d.Network)
-		}
-		s.push(errEnvelope(env.Seq, "internal", "deleting network failed"))
+		fail()
 		return
 	}
 	log.Printf("network %q deleted", d.Network)
@@ -769,6 +786,20 @@ func (s *Session) handleCloseBuffer(ctx context.Context, env Envelope) {
 	fold := asciiFold
 	if c := s.hub.network(d.Network); c != nil {
 		fold = c.Fold
+	}
+	if purge {
+		// The bulk of the history goes first, WITHOUT bufferMutationMu: every
+		// network's live appends hold that mutex, and the store releases its
+		// own lock between delete chunks precisely so they can interleave —
+		// holding the hub mutex across the purge would stall them all for the
+		// whole delete (minutes for a 100k-row buffer under FTS secure-delete,
+		// long enough to back up the IRC read loops). Lines that land meanwhile
+		// are ordinary traffic (no tombstone yet); the row delete below, still
+		// under the mutex with the tombstone, cascades them.
+		if err := s.hub.store.PurgeBufferMessages(ctx, d.Network, d.Buffer, fold); err != nil {
+			s.push(errEnvelope(env.Seq, "internal", "closing buffer failed"))
+			return
+		}
 	}
 	// Mutation+tombstone+publication is one observable mutation. Live append
 	// paths hold the same mutex through their event publication, preventing an

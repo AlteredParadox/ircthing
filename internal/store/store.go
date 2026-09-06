@@ -522,7 +522,12 @@ func (s *Store) append(ctx context.Context, network, target string, m Message, o
 	defer s.mu.Unlock()
 
 	if opts.fold != nil {
-		target, _ = s.canonicalLocked(ctx, network, target, opts.fold)
+		// A resolve failure fails the append rather than falling through to
+		// create-on-demand, which would mint a case-variant duplicate.
+		var err error
+		if target, _, err = s.canonicalLocked(ctx, network, target, opts.fold); err != nil {
+			return Message{}, false, err
+		}
 	}
 	m.Network, m.Target = network, target
 	if opts.guardCreate != nil {
@@ -653,10 +658,15 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 	// its indexed body, purge the FTS entry, then scrub raw/text — keeping
 	// only the tombstone (sender/time/command + redacted flag + reason). The
 	// content is then gone from queries, search, the hot ring, and the wire.
-	// This is NOT forensic erasure: freed bytes/tokens may still persist in
-	// SQLite free pages, FTS segments, and WAL frames until a vacuum, and in
-	// any existing backups (enable PRAGMA secure_delete / FTS5 'secure-delete'
-	// if that matters for the deployment).
+	// PRAGMA secure_delete (DSN, see Open) zeroes the freed page content and
+	// FTS5 'secure-delete' (migration 0009) rewrites the affected index
+	// segments instead of leaving zero-length placeholders, so neither the
+	// bytes nor the tokens linger in the file — at a price: the FTS segment
+	// rewrite makes each deleted/updated row cost ~0.3–1.4 ms (it dominates
+	// the per-row cost of retention pruning and buffer purges, which is why
+	// those delete in bounded chunks). It is still not forensic erasure: WAL
+	// frames until the next checkpoint, and any existing backups, keep the
+	// original.
 	var id int64
 	var text sql.NullString
 	err = s.db.QueryRowContext(ctx,
@@ -755,7 +765,10 @@ func (s *Store) AdoptOwnMsgID(ctx context.Context, msg OwnMsg, fold func(string)
 
 	target := msg.Target
 	if fold != nil {
-		target, _ = s.canonicalLocked(ctx, msg.Network, target, fold)
+		var err error
+		if target, _, err = s.canonicalLocked(ctx, msg.Network, target, fold); err != nil {
+			return false, err
+		}
 	}
 	bufID, err := s.bufferID(ctx, msg.Network, target, false)
 	if err != nil || bufID == 0 {
@@ -1308,39 +1321,49 @@ func reverse(msgs []Message) {
 func (s *Store) CanonicalBuffer(ctx context.Context, network, target string, fold func(string) string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	name, _ := s.canonicalLocked(ctx, network, target, fold)
+	// Advisory: on a scan error the caller gets target unchanged (the
+	// resolve is only a spelling hint here; the append it precedes does its
+	// own locked resolve and fails properly).
+	name, _, _ := s.canonicalLocked(ctx, network, target, fold)
 	return name
 }
 
 // canonicalLocked resolves target to an existing buffer's stored
 // spelling under fold, returning (name, true) on a match or
-// (target, false) when none exists. Caller holds s.mu.
-func (s *Store) canonicalLocked(ctx context.Context, network, target string, fold func(string) string) (string, bool) {
+// (target, false) when none exists. A failed scan is an ERROR, not "no
+// match": a transient read failure (a cancelled context, an I/O error mid
+// scan) would otherwise report the case-variant buffer as absent and let
+// the caller create a permanent duplicate (#Go beside #go). Caller holds
+// s.mu.
+func (s *Store) canonicalLocked(ctx context.Context, network, target string, fold func(string) string) (string, bool, error) {
 	if _, ok := s.buffers[bufKey{network: network, target: target}]; ok {
-		return target, true // exact spelling already known
+		return target, true, nil // exact spelling already known
 	}
 	if fold == nil {
-		return target, false
+		return target, false, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT b.name FROM buffers b
 		JOIN networks n ON n.id = b.network_id
 		WHERE n.user_id = ? AND n.name = ?`, defaultUserID, network)
 	if err != nil {
-		return target, false
+		return target, false, err
 	}
 	defer rows.Close()
 	want := fold(target)
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			return target, false
+			return target, false, err
 		}
 		if fold(name) == want {
-			return name, true
+			return name, true, nil
 		}
 	}
-	return target, false
+	if err := rows.Err(); err != nil {
+		return target, false, err
+	}
+	return target, false, nil
 }
 
 // FindBuffer returns the stored buffer whose name matches target under
