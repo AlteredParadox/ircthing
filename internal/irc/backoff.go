@@ -22,10 +22,16 @@ import (
 )
 
 // BackoffConfig controls reconnect delays. Zero values pick the defaults:
-// 2s initial, 5m cap.
+// 2s initial, 5m cap, 30s stable uptime.
 type BackoffConfig struct {
 	Min time.Duration
 	Max time.Duration
+	// Stable is how long a connection must stay registered before the
+	// delay ladder resets to Min. Resetting on 001 alone let a server that
+	// registers us and then drops the link (post-welcome K-line, excess
+	// flood during the rejoin burst, bouncer eviction) hold the client in
+	// a minimum-delay reconnect loop forever.
+	Stable time.Duration
 }
 
 // backoff produces exponentially growing reconnect delays with jitter:
@@ -49,6 +55,9 @@ func newBackoff(cfg BackoffConfig) *backoff {
 	if cfg.Max < cfg.Min {
 		cfg.Max = cfg.Min
 	}
+	if cfg.Stable <= 0 {
+		cfg.Stable = 30 * time.Second
+	}
 	return &backoff{
 		cfg: cfg,
 		rnd: func(d time.Duration) time.Duration { return rand.N(d) },
@@ -70,8 +79,18 @@ func (b *backoff) next() time.Duration {
 	return half + b.rnd(half)
 }
 
-// reset is called after a successful registration so the next disconnect
-// starts from the minimum delay again.
+// reset restarts the ladder so the next delay is the minimum again.
 func (b *backoff) reset() {
 	b.attempt = 0
+}
+
+// settle is called when a registered connection ends, with how long it
+// stayed registered: only an uptime of at least Stable counts as a
+// recovery that earns a reset. A shorter one — registered, then dropped —
+// keeps climbing the ladder, so a server that welcomes and immediately
+// kills us is retried at a growing interval rather than hammered.
+func (b *backoff) settle(uptime time.Duration) {
+	if uptime >= b.cfg.Stable {
+		b.reset()
+	}
 }

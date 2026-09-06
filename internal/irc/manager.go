@@ -1464,7 +1464,10 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	// ErrNotConnected, a silent history gap until the next reconnect.
 	defer m.setRegistered(false)
 	m.setRegistered(true)
-	bo.reset()
+	// The backoff ladder is NOT reset here: a registration that the server
+	// drops right away must keep the delay growing (see backoff.settle).
+	registeredAt := time.Now()
+	defer func() { bo.settle(time.Since(registeredAt)) }()
 	m.emit(ctx, Event{Kind: EventState, State: StateRegistered})
 
 	readDone := make(chan error, 1)

@@ -1944,3 +1944,67 @@ func TestEnsureNamesRetriesOnDroppedSend(t *testing.T) {
 		t.Fatalf("NAMES sends after retry = %d, want 1 (dropped request retried)", got)
 	}
 }
+
+// A server that registers us and then drops the link (a post-welcome
+// K-line, excess flood during the rejoin burst, a bouncer evicting us)
+// must not pin the client in a minimum-delay reconnect loop: the backoff
+// ladder resets only after the connection stayed registered for
+// Backoff.Stable, not the instant 001 arrives.
+func TestBackoffGrowsWhenRegistrationDoesNotStick(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	cfg := testCfg(ln.Addr().String())
+	cfg.Backoff = BackoffConfig{Min: 50 * time.Millisecond, Max: 2 * time.Second}
+	startManager(t, cfg)
+
+	// Six register-then-drop cycles. The delay before attempt n is uniform
+	// in [Min<<n/2, Min<<n): 25-50ms, 50-100ms, 100-200ms, 200-400ms,
+	// 400-800ms — while a backoff reset on every 001 keeps each at 25-50ms.
+	var accepted []time.Time
+	for i := 0; i < 6; i++ {
+		s := accept(t, conns)
+		accepted = append(accepted, time.Now())
+		s.register("AlteredParadox")
+		s.c.Close()
+	}
+	// The 5th gap includes the 5th delay (attempt 4 -> >= 400ms).
+	if gap := accepted[5].Sub(accepted[4]); gap < 200*time.Millisecond {
+		t.Fatalf("reconnect delay after five register-then-drop cycles = %v, want >= 200ms (backoff reset on 001?)", gap)
+	}
+}
+
+// A connection that stays registered past Backoff.Stable does reset the
+// ladder, so the next drop reconnects from the minimum delay.
+func TestBackoffResetsAfterStableUptime(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	cfg := testCfg(ln.Addr().String())
+	cfg.Backoff = BackoffConfig{Min: 50 * time.Millisecond, Max: 2 * time.Second, Stable: 20 * time.Millisecond}
+	m := startManager(t, cfg)
+
+	// Four short-lived registrations climb the ladder.
+	for i := 0; i < 4; i++ {
+		s := accept(t, conns)
+		s.register("AlteredParadox")
+		s.c.Close()
+	}
+	// One that outlives Stable resets it.
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+	time.Sleep(3 * cfg.Backoff.Stable)
+	s.c.Close()
+	dropped := time.Now()
+	accept(t, conns)
+	// Attempt 0 again: 25-50ms, not the 200-400ms of attempt 3 (or the
+	// 400-800ms of attempt 4). Loose upper bound for a loaded box.
+	if gap := time.Since(dropped); gap >= 150*time.Millisecond {
+		t.Fatalf("reconnect delay after a stable connection = %v, want < 150ms (ladder not reset)", gap)
+	}
+}
