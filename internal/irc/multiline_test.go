@@ -163,18 +163,24 @@ func TestValidateMultiline(t *testing.T) {
 		lines  []string
 		lim    multilineLimits
 		len    int
+		prefix int    // our relayed ":nick!user@host " prefix length
 		errSub string // "" = must pass
 	}{
-		{"within limits", []string{"a", "b"}, multilineLimits{maxLines: 4, maxBytes: 100}, 0, ""},
-		{"no limits advertised", []string{"a", "b", "c"}, multilineLimits{}, 0, ""},
-		{"too many lines", []string{"1", "2", "3"}, multilineLimits{maxLines: 2}, 0, "at most 2 per message"},
-		{"too many bytes", []string{"aaaa", "bbbb"}, multilineLimits{maxBytes: 8}, 0, "at most 8 per multiline"},
-		{"line over LINELEN default", []string{long}, multilineLimits{}, 0, "line limit"},
-		{"line fits larger LINELEN", []string{long}, multilineLimits{}, 1024, ""},
+		{"within limits", []string{"a", "b"}, multilineLimits{maxLines: 4, maxBytes: 100}, 0, 0, ""},
+		{"no limits advertised", []string{"a", "b", "c"}, multilineLimits{}, 0, 0, ""},
+		{"too many lines", []string{"1", "2", "3"}, multilineLimits{maxLines: 2}, 0, 0, "at most 2 per message"},
+		{"too many bytes", []string{"aaaa", "bbbb"}, multilineLimits{maxBytes: 8}, 0, 0, "at most 8 per multiline"},
+		{"line over LINELEN default", []string{long}, multilineLimits{}, 0, 0, "line limit"},
+		{"line fits larger LINELEN", []string{long}, multilineLimits{}, 1024, 0, ""},
+		// 460 + the 45-byte batch framing = 505 fits the 512 limit on our
+		// socket, but not once the server prepends a 60-byte source prefix
+		// for the recipients (RFC 2812 §2.3 bounds the relayed line).
+		{"line fits socket but not relayed with prefix", []string{strings.Repeat("y", 460)}, multilineLimits{}, 0, 60, "line limit"},
+		{"line fits with prefix", []string{strings.Repeat("y", 400)}, multilineLimits{}, 0, 60, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateMultiline("#go", tc.lines, tc.lim, tc.len)
+			err := validateMultiline("#go", tc.lines, tc.lim, tc.len, tc.prefix)
 			if tc.errSub == "" {
 				if err != nil {
 					t.Fatalf("validateMultiline: %v", err)

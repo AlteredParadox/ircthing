@@ -787,9 +787,10 @@ func (f *fakeConn) IsChannel(t string) bool {
 	return t != "" && (t[0] == '#' || t[0] == '&')
 }
 
-func (f *fakeConn) ChanTypes() string       { return "#&" }
-func (f *fakeConn) StatusPrefixes() string  { return "~&@%+" }
-func (f *fakeConn) Fold(name string) string { return strings.ToLower(name) }
+func (f *fakeConn) ChanTypes() string        { return "#&" }
+func (f *fakeConn) StatusPrefixes() string   { return "~&@%+" }
+func (f *fakeConn) Fold(name string) string  { return strings.ToLower(name) }
+func (f *fakeConn) ChannelKey(string) string { return "" }
 
 func (f *fakeConn) RequestChatHistory(string, int64, string) {}
 func (f *fakeConn) HistoryPageSize() int                     { return 100 }

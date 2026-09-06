@@ -73,7 +73,7 @@ var wantedCapSet = func() map[string]bool {
 // Connection registration: PASS/NICK/USER, capability negotiation, and
 // SASL PLAIN. Implements:
 //
-//   - RFC 2812 §3.1 registration, with fallback nicks on 433/436.
+//   - RFC 2812 §3.1 registration, with fallback nicks on 433/436/437.
 //   - IRCv3 Capability Negotiation, version 302
 //     (https://ircv3.net/specs/extensions/capability-negotiation, fetched
 //     2026-07-14): CAP LS 302, multiline replies (an "*" parameter before
@@ -103,7 +103,7 @@ type handshake struct {
 	phase      hsPhase
 	caps       map[string]string // accumulated across multiline CAP LS
 	enabled    map[string]bool   // caps the server ACKed
-	nick       string            // current nick, updated by 433/436 fallback and 001
+	nick       string            // current nick, updated by 433/436/437 fallback and 001
 	nickTries  int
 	saslDone   bool
 	nakRetried bool // one sasl-only retry after a NAK of the full set
@@ -210,7 +210,12 @@ func (h *handshake) handle(m *ircv4.Message) (out []*ircv4.Message, done bool, e
 	case "001": // RPL_WELCOME: registration accepted
 		return h.handleWelcome(m)
 
-	case "433", "436": // ERR_NICKNAMEINUSE, ERR_NICKCOLLISION
+	case "433", "436", "437": // ERR_NICKNAMEINUSE, ERR_NICKCOLLISION, ERR_UNAVAILRESOURCE
+		// 437 (RFC 2812 §5.2) is the nick-delay reply: the nick is held
+		// after a split or a recent change (Solanum/Charybdis family), not
+		// owned by anyone, but it is just as unusable right now. Fall back
+		// like 433 — passing it through left registration hanging until
+		// HandshakeTimeout, and the reconnect retried the same held nick.
 		return h.handleNickInUse()
 
 	case "432": // ERR_ERRONEUSNICKNAME
@@ -305,16 +310,17 @@ func (h *handshake) handleWelcome(m *ircv4.Message) (out []*ircv4.Message, done 
 	return nil, true, nil
 }
 
-// handleNickInUse processes ERR_NICKNAMEINUSE/ERR_NICKCOLLISION (433/436) with
-// fallbacks that are NEVER longer than the rejected nick. A 433 means the nick
-// is already in use — an INVALID (e.g. over-NICKLEN) nick is a 432 — so the
-// rejected nick is a valid length for this server. We therefore REPLACE its
+// handleNickInUse processes ERR_NICKNAMEINUSE/ERR_NICKCOLLISION/
+// ERR_UNAVAILRESOURCE (433/436/437) with fallbacks that are NEVER longer than
+// the rejected nick. These mean the nick is in use or held — an INVALID (e.g.
+// over-NICKLEN) nick is a 432 — so the rejected nick is a valid length for
+// this server. We therefore REPLACE its
 // last rune with the attempt's digit rather than appending, which could push a
 // max-length nick past a small NICKLEN and loop forever (NICKLEN isn't known
 // until 005, after registration). Gives up after three tries.
 func (h *handshake) handleNickInUse() (out []*ircv4.Message, done bool, err error) {
 	// No NICK was sent on an insecure credentialed STS-discovery leg. A forged
-	// 433/436 must not trick us into revealing a derived fallback before the
+	// 433/436/437 must not trick us into revealing a derived fallback before the
 	// secure redial.
 	if !h.secure && (h.cfg.Pass != "" || h.cfg.SASL != nil) {
 		return nil, false, errors.New("server requested a nickname retry before the secure STS redial")

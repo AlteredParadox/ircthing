@@ -1748,15 +1748,15 @@ func TestRejoinableRejectsUTF8Inflation(t *testing.T) {
 	}
 	bad := "#" + strings.Repeat("a\xff", 200) // ~401 raw bytes, ~801 scrubbed
 	// Without UTF8ONLY there is no inflation, so it fits and is rejoinable.
-	if !m.rejoinable(bad) {
+	if !m.rejoinable(bad, "") {
 		t.Fatal("pre-UTF8ONLY: channel fits unscrubbed, want rejoinable")
 	}
 	// Under UTF8ONLY the scrubbed form overflows, so it must be rejected.
 	m.isup.applyToken("UTF8ONLY", "")
-	if m.rejoinable(bad) {
+	if m.rejoinable(bad, "") {
 		t.Fatal("UTF8ONLY: invalid-UTF-8 channel must not be rejoinable")
 	}
-	if !m.rejoinable("#go") {
+	if !m.rejoinable("#go", "") {
 		t.Fatal("normal channel must remain rejoinable")
 	}
 }
@@ -1955,5 +1955,325 @@ func TestEnsureNamesRetriesOnDroppedSend(t *testing.T) {
 	}
 	if got != 1 {
 		t.Fatalf("NAMES sends after retry = %d, want 1 (dropped request retried)", got)
+	}
+}
+
+// A server that registers us and then drops the link (a post-welcome
+// K-line, excess flood during the rejoin burst, a bouncer evicting us)
+// must not pin the client in a minimum-delay reconnect loop: the backoff
+// ladder resets only after the connection stayed registered for
+// Backoff.Stable, not the instant 001 arrives.
+func TestBackoffGrowsWhenRegistrationDoesNotStick(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	cfg := testCfg(ln.Addr().String())
+	cfg.Backoff = BackoffConfig{Min: 50 * time.Millisecond, Max: 2 * time.Second}
+	startManager(t, cfg)
+
+	// Six register-then-drop cycles. The delay before attempt n is uniform
+	// in [Min<<n/2, Min<<n): 25-50ms, 50-100ms, 100-200ms, 200-400ms,
+	// 400-800ms — while a backoff reset on every 001 keeps each at 25-50ms.
+	var accepted []time.Time
+	for i := 0; i < 6; i++ {
+		s := accept(t, conns)
+		accepted = append(accepted, time.Now())
+		s.register("AlteredParadox")
+		s.c.Close()
+	}
+	// The 5th gap includes the 5th delay (attempt 4 -> >= 400ms).
+	if gap := accepted[5].Sub(accepted[4]); gap < 200*time.Millisecond {
+		t.Fatalf("reconnect delay after five register-then-drop cycles = %v, want >= 200ms (backoff reset on 001?)", gap)
+	}
+}
+
+// A connection that stays registered past Backoff.Stable does reset the
+// ladder, so the next drop reconnects from the minimum delay.
+func TestBackoffResetsAfterStableUptime(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	cfg := testCfg(ln.Addr().String())
+	cfg.Backoff = BackoffConfig{Min: 50 * time.Millisecond, Max: 2 * time.Second, Stable: 20 * time.Millisecond}
+	m := startManager(t, cfg)
+
+	// Four short-lived registrations climb the ladder.
+	for i := 0; i < 4; i++ {
+		s := accept(t, conns)
+		s.register("AlteredParadox")
+		s.c.Close()
+	}
+	// One that outlives Stable resets it.
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+	time.Sleep(3 * cfg.Backoff.Stable)
+	s.c.Close()
+	dropped := time.Now()
+	accept(t, conns)
+	// Attempt 0 again: 25-50ms, not the 200-400ms of attempt 3 (or the
+	// 400-800ms of attempt 4). Loose upper bound for a loaded box.
+	if gap := time.Since(dropped); gap >= 150*time.Millisecond {
+		t.Fatalf("reconnect delay after a stable connection = %v, want < 150ms (ladder not reset)", gap)
+	}
+}
+
+// A PRIVMSG/NOTICE is relayed with our ":nick!user@host " prefix in front,
+// and RFC 2812 §2.3's 512-byte limit bounds THAT line for the recipients:
+// a line that fits our socket but not theirs is silently truncated for
+// everyone. sendAll must budget the prefix — from the actual mask once a
+// self-prefixed line / 396 / CHGHOST revealed it, else a conservative
+// fallback — and forget it on reconnect.
+func TestSendBudgetsRelayPrefix(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	// text(n) yields a PRIVMSG whose bare wire line (+CRLF) is n bytes.
+	text := func(n int) *ircv4.Message {
+		msg := newMsg("PRIVMSG", "#go", "x")
+		msg.Params[1] = strings.Repeat("x", n-len(msg.String())+1-2)
+		if got := len(msg.String()) + 2; got != n {
+			t.Fatalf("text(%d) built a %d-byte line", n, got)
+		}
+		return msg
+	}
+	waitPrefix := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for m.ownPrefixLen() != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("ownPrefixLen = %d, want %d", m.ownPrefixLen(), want)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+
+	// Unknown mask: ":AlteredParadox!" + 10 + "@" + 63 + " " = 91 bytes,
+	// so 421 is the budget.
+	waitPrefix(1 + 14 + 1 + fallbackUserLen + 1 + fallbackHostLen + 1)
+	if err := m.Send(text(500)); err == nil {
+		t.Fatal("500-byte PRIVMSG accepted with an unknown 91-byte prefix budget")
+	} else if !strings.Contains(err.Error(), "prefix") {
+		t.Fatalf("rejection should name the relayed prefix: %v", err)
+	}
+	if err := m.Send(text(421)); err != nil {
+		t.Fatalf("421-byte PRIVMSG rejected under the fallback budget: %v", err)
+	}
+	if err := m.Send(newMsg("WHOIS", strings.Repeat("n", 500))); err != nil {
+		t.Fatalf("non-relayed 509-byte command rejected: %v", err)
+	}
+
+	// ISUPPORT USERLEN/HOSTLEN refine the fallback: 1+14+1+8+1+20+1 = 46.
+	s.send(":irc.test 005 AlteredParadox USERLEN=8 HOSTLEN=20 :are supported")
+	waitPrefix(46)
+	if err := m.Send(text(466)); err != nil {
+		t.Fatalf("466-byte PRIVMSG rejected under USERLEN/HOSTLEN budget: %v", err)
+	}
+	if err := m.Send(text(467)); err == nil {
+		t.Fatal("467-byte PRIVMSG accepted under a 46-byte prefix budget")
+	}
+
+	// The JOIN echo reveals the real mask: ":AlteredParadox!~ap@example.org " = 32.
+	s.send(":AlteredParadox!~ap@example.org JOIN #go")
+	waitPrefix(32)
+	if err := m.Send(text(480)); err != nil {
+		t.Fatalf("480-byte PRIVMSG rejected with a 32-byte prefix: %v", err)
+	}
+	if err := m.Send(text(481)); err == nil {
+		t.Fatal("481-byte PRIVMSG accepted with a 32-byte prefix")
+	}
+	// The relayed check applies to NOTICE too.
+	if err := m.Send(newMsg("NOTICE", "#go", strings.Repeat("x", 481-len("NOTICE #go ")-2))); err == nil {
+		t.Fatal("481-byte NOTICE accepted with a 32-byte prefix")
+	}
+
+	// A cloak via 396 replaces the host (user kept): 1+14+1+3+1+37+1 = 58.
+	s.send(":irc.test 396 AlteredParadox a-much-longer-cloak-name-for-the-test :is now your visible host")
+	waitPrefix(58)
+	if err := m.Send(text(480)); err == nil {
+		t.Fatal("480-byte PRIVMSG accepted after a 396 grew the prefix to 58")
+	}
+
+	// CHGHOST replaces both: 1+14+1+2+1+8+1 = 28.
+	s.send(":AlteredParadox!~ap@a-much-longer-cloak-name-for-the-test CHGHOST ap new.host")
+	waitPrefix(28)
+	if err := m.Send(text(484)); err != nil {
+		t.Fatalf("484-byte PRIVMSG rejected after CHGHOST shrank the prefix to 28: %v", err)
+	}
+
+	// Multiline goes through the same budget (framing 45 + prefix 28).
+	if err := m.SendMultiline("#go", []string{strings.Repeat("y", 439), "b"}); err != nil {
+		t.Fatalf("multiline within budget rejected: %v", err)
+	}
+	if err := m.SendMultiline("#go", []string{strings.Repeat("y", 440), "b"}); err == nil {
+		t.Fatal("multiline line over the relayed budget accepted")
+	}
+
+	// A reconnect forgets the mask: back to the fallback until re-learned.
+	s.c.Close()
+	waitState(t, m, StateDisconnected)
+	s2 := accept(t, conns)
+	s2.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+	waitPrefix(91)
+}
+
+// A +k channel must come back after a reconnect: the key of our own
+// outgoing JOIN (the echo never carries it) rides on the rejoin JOIN, a
+// configured key is sent from the first connect, an explicitly keyless
+// JOIN clears it, and a PART forgets it. ChannelKey exposes the outgoing
+// key to the hub so it can be persisted with the autojoin entry.
+func TestManagerRejoinsWithChannelKey(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	cfg := testCfg(ln.Addr().String())
+	cfg.Channels = []string{"#cfg", "#open"}
+	cfg.ChannelKeys = map[string]string{"#cfg": "cfgkey"}
+	m := startManager(t, cfg)
+
+	expectJoins := func(s *srvConn, want ...string) {
+		t.Helper()
+		for _, w := range want {
+			if got := s.readCmd("JOIN").String(); got != w {
+				t.Fatalf("rejoin = %q, want %q", got, w)
+			}
+		}
+	}
+	waitKey := func(ch, want string) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for m.ChannelKey(ch) != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("ChannelKey(%q) = %q, want %q", ch, m.ChannelKey(ch), want)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+	expectJoins(s, "JOIN #cfg cfgkey", "JOIN #open")
+
+	// The user joins a keyed channel; the server echoes it without the key.
+	if err := m.Send(newMsg("JOIN", "#Dyn", "dynkey")); err != nil {
+		t.Fatal(err)
+	}
+	s.readCmd("JOIN")
+	s.send(":AlteredParadox!u@h JOIN #dyn")
+	waitKey("#DYN", "dynkey") // folded lookup, for the hub's persist path
+
+	s.c.Close()
+	waitState(t, m, StateDisconnected)
+	s2 := accept(t, conns)
+	s2.register("AlteredParadox")
+	expectJoins(s2, "JOIN #cfg cfgkey", "JOIN #dyn dynkey", "JOIN #open")
+	// The rejoin echo does not disturb the stored keys (not an outgoing
+	// key), and a new connection starts with no outgoing keys.
+	s2.send(":AlteredParadox!u@h JOIN #cfg")
+	s2.send(":AlteredParadox!u@h JOIN #dyn")
+	if got := m.ChannelKey("#dyn"); got != "" {
+		t.Fatalf("ChannelKey after reconnect = %q, want empty", got)
+	}
+
+	// An explicitly keyless JOIN clears the key; a PART forgets the channel.
+	if err := m.Send(newMsg("JOIN", "#dyn")); err != nil {
+		t.Fatal(err)
+	}
+	s2.readCmd("JOIN")
+	s2.send(":AlteredParadox!u@h JOIN #dyn")
+	if err := m.Send(newMsg("JOIN", "#cfg", "newkey")); err != nil {
+		t.Fatal(err)
+	}
+	s2.readCmd("JOIN")
+	s2.send(":AlteredParadox!u@h JOIN #cfg")
+	waitKey("#cfg", "newkey")
+	s2.send(":AlteredParadox!u@h JOIN #open")
+	s2.send(":AlteredParadox!u@h PART #open")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, _, ok := m.Channel("#open"); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("PART never processed")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	s2.c.Close()
+	waitState(t, m, StateDisconnected)
+	s3 := accept(t, conns)
+	s3.register("AlteredParadox")
+	expectJoins(s3, "JOIN #cfg newkey", "JOIN #dyn")
+	s3.c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if msg, err := s3.r.ReadMessage(); err == nil && msg.Command == "JOIN" {
+		t.Fatalf("unexpected extra join: %s", msg.String())
+	}
+}
+
+// noteJoinKeys follows RFC 2812 §3.2.1's parallel lists (key i for channel
+// i), ignores non-channels and unusable keys, and a self-JOIN echo the
+// user did not send (a forward, the rejoin) keeps the configured key.
+func TestJoinKeyBookkeeping(t *testing.T) {
+	m, err := NewManager(Config{Addr: "x:1", Nick: "AlteredParadox", AllowPlaintext: true,
+		Channels: []string{"#Cfg"}, ChannelKeys: map[string]string{"#Cfg": "cfgkey"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.nick.Store("AlteredParadox")
+	m.noteJoinKeys(newMsg("JOIN", "#a,#b,#c,0,#d", "k1,k2,,bad key"))
+	for ch, want := range map[string]string{"#a": "k1", "#b": "k2", "#c": "", "#d": "", "0": "", "#A": "k1"} {
+		if got := m.ChannelKey(ch); got != want {
+			t.Fatalf("ChannelKey(%q) = %q, want %q", ch, got, want)
+		}
+	}
+	m.noteJoinKeys(newMsg("JOIN", "#long", strings.Repeat("k", maxJoinKeyBytes+1)))
+	if got := m.ChannelKey("#long"); got != "" {
+		t.Fatalf("over-long key recorded: %q", got)
+	}
+
+	// Echoes stamp the outgoing keys into the rejoin set; a JOIN with no
+	// outgoing record (the forward to #cfg) keeps the seeded key — on every
+	// fold-equal spelling when the key is explicit.
+	for _, ch := range []string{"#a", "#c", "#cfg"} {
+		if err := m.trackJoinIntent(ircv4.MustParseMessage(":AlteredParadox!u@h JOIN " + ch)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if m.joined["#a"] != "k1" || m.joined["#c"] != "" || m.joined["#cfg"] != "cfgkey" || m.joined["#Cfg"] != "cfgkey" {
+		t.Fatalf("joined = %v", m.joined)
+	}
+	m.noteJoinKeys(newMsg("JOIN", "#CFG", "k3"))
+	if err := m.trackJoinIntent(ircv4.MustParseMessage(":AlteredParadox!u@h JOIN #cfg")); err != nil {
+		t.Fatal(err)
+	}
+	if m.joined["#cfg"] != "k3" || m.joined["#Cfg"] != "k3" {
+		t.Fatalf("explicit key not applied to every spelling: %v", m.joined)
+	}
+	// PART forgets both the intent and the outgoing key.
+	if err := m.trackJoinIntent(ircv4.MustParseMessage(":AlteredParadox!u@h PART #a,#CFG")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.joined["#a"]; ok || m.ChannelKey("#a") != "" || m.ChannelKey("#cfg") != "" {
+		t.Fatalf("PART left state behind: joined=%v key=%q", m.joined, m.ChannelKey("#a"))
+	}
+	if len(m.joined) != 1 || m.joined["#c"] != "" {
+		t.Fatalf("joined after PART = %v, want just #c", m.joined)
 	}
 }

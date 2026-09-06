@@ -84,8 +84,11 @@ type Config struct {
 	STS STSStore
 
 	// Channels are joined after every successful registration, so they
-	// come back automatically on reconnect.
-	Channels []string
+	// come back automatically on reconnect. ChannelKeys holds the key (+k)
+	// for an entry of Channels, matched by its exact spelling; the JOIN
+	// carries it (RFC 2812 §3.2.1 "JOIN <channel> <key>").
+	Channels    []string
+	ChannelKeys map[string]string
 
 	// Backoff controls reconnect delays; zero values pick defaults.
 	Backoff BackoffConfig

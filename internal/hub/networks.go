@@ -838,14 +838,15 @@ const maxPersistedChannels = 4096
 func (h *Hub) updateAutojoin(ctx context.Context, network string, channels []string, add bool, fold func(string) string) error {
 	h.netOps.Lock()
 	defer h.netOps.Unlock()
-	return h.updateAutojoinLocked(ctx, network, channels, add, fold)
+	return h.updateAutojoinLocked(ctx, network, channels, nil, add, fold)
 }
 
 // updateAutojoinLocked is the read-modify-write body; the caller holds netOps.
 // It applies the WHOLE channels slice in one read+write (one store round-trip
 // regardless of comma-list length), so a hostile JOIN/PART flood cannot drive
-// one full-table read-modify-write per token.
-func (h *Hub) updateAutojoinLocked(ctx context.Context, network string, channels []string, add bool, fold func(string) string) error {
+// one full-table read-modify-write per token. keys (channel -> key, nil for
+// none) are the channel keys to store with added channels.
+func (h *Hub) updateAutojoinLocked(ctx context.Context, network string, channels []string, keys map[string]string, add bool, fold func(string) string) error {
 	stored, found, err := h.store.NetworkConfig(ctx, network)
 	if err != nil {
 		return err
@@ -861,10 +862,12 @@ func (h *Hub) updateAutojoinLocked(ctx context.Context, network string, channels
 		return err
 	}
 	out, changed := editChannelList(nc.Channels, channels, add, fold)
-	if !changed {
+	outKeys, keysChanged := editChannelKeys(nc.ChannelKeys, out, channels, keys, add, fold)
+	if !changed && !keysChanged {
 		return nil
 	}
 	nc.Channels = out
+	nc.ChannelKeys = outKeys
 	canonical, err := json.Marshal(nc)
 	if err != nil {
 		return err
@@ -917,6 +920,67 @@ func editChannelList(chans []string, wanted []string, add bool, fold func(string
 		have[fw] = true
 		out = append(out, wantFold[fw])
 		changed = true
+	}
+	return out, changed
+}
+
+// editChannelKeys keeps a definition's channel_keys in step with an autojoin
+// edit of its channel list: on add, each wanted channel that has a key gets
+// it stored under the STORED spelling of its entry in chans (the post-edit
+// list, fold-matched — a "#Foo" entry keyed by a "#foo" echo restarts as
+// "JOIN #Foo key", since the manager matches keys to entries by exact
+// spelling); on remove, the keys of the removed channels go with them. A
+// wanted channel WITHOUT a key leaves any stored key alone: the rejoin echo
+// of a stored +k channel carries no outgoing key, and clearing on it would
+// lose the key at every reconnect. The result is nil when empty so the
+// stored JSON omits the field. Reports whether anything changed.
+func editChannelKeys(stored map[string]string, chans, wanted []string, keys map[string]string, add bool, fold func(string) string) (map[string]string, bool) {
+	changed := false
+	var out map[string]string
+	if !add {
+		dropFold := make(map[string]bool, len(wanted))
+		for _, w := range wanted {
+			dropFold[fold(w)] = true
+		}
+		for ch, key := range stored {
+			if dropFold[fold(ch)] {
+				changed = true
+				continue
+			}
+			if out == nil {
+				out = make(map[string]string, len(stored))
+			}
+			out[ch] = key
+		}
+		return out, changed
+	}
+	if len(keys) == 0 {
+		if len(stored) == 0 {
+			return nil, false
+		}
+		return stored, false
+	}
+	storedName := make(map[string]string, len(chans))
+	for _, ch := range chans {
+		storedName[fold(ch)] = ch
+	}
+	out = make(map[string]string, len(stored)+len(keys))
+	for ch, key := range stored {
+		out[ch] = key
+	}
+	for _, w := range wanted {
+		key := keys[w]
+		if key == "" {
+			continue
+		}
+		name, ok := storedName[fold(w)]
+		if !ok {
+			continue // not stored (list at the cap): nothing to key
+		}
+		if out[name] != key {
+			out[name] = key
+			changed = true
+		}
 	}
 	return out, changed
 }

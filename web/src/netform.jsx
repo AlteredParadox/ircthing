@@ -131,6 +131,17 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 			if (!out[k]) delete out[k];
 		}
 		if (!out.channels.length) delete out.channels;
+		// Channel keys are stored by the server from /join <chan> <key> and
+		// never shown here; carry them through, minus those whose channel was
+		// removed from the list.
+		if (out.channel_keys) {
+			const keep = {};
+			for (const ch of out.channels || []) {
+				if (out.channel_keys[ch]) keep[ch] = out.channel_keys[ch];
+			}
+			if (Object.keys(keep).length) out.channel_keys = keep;
+			else delete out.channel_keys;
+		}
 		if (!out.trusted_fingerprints.length) delete out.trusted_fingerprints;
 		// SASL follows the same rule as egress: the form keeps typed values
 		// across mechanism toggles, so submit is the SOLE authority on what gets

@@ -53,6 +53,24 @@ func TestBackoffReset(t *testing.T) {
 	}
 }
 
+// settle resets the ladder only for a connection that stayed registered at
+// least Stable; a shorter registered life keeps climbing.
+func TestBackoffSettle(t *testing.T) {
+	b := newBackoff(BackoffConfig{Min: 2 * time.Second, Max: 30 * time.Second, Stable: 10 * time.Second})
+	b.rnd = func(time.Duration) time.Duration { return 0 }
+
+	b.next()
+	b.next()
+	b.settle(9 * time.Second)
+	if got := b.next(); got != 4*time.Second {
+		t.Fatalf("next() after a short-lived registration = %v, want 4s (ladder kept)", got)
+	}
+	b.settle(10 * time.Second)
+	if got := b.next(); got != time.Second {
+		t.Fatalf("next() after a stable registration = %v, want 1s (ladder reset)", got)
+	}
+}
+
 func TestBackoffJitterBounds(t *testing.T) {
 	b := newBackoff(BackoffConfig{Min: 8 * time.Second, Max: time.Minute})
 	for i := 0; i < 200; i++ {
@@ -66,8 +84,8 @@ func TestBackoffJitterBounds(t *testing.T) {
 
 func TestBackoffDefaults(t *testing.T) {
 	b := newBackoff(BackoffConfig{})
-	if b.cfg.Min != 2*time.Second || b.cfg.Max != 5*time.Minute {
-		t.Fatalf("defaults = %v/%v, want 2s/5m", b.cfg.Min, b.cfg.Max)
+	if b.cfg.Min != 2*time.Second || b.cfg.Max != 5*time.Minute || b.cfg.Stable != 30*time.Second {
+		t.Fatalf("defaults = %v/%v/%v, want 2s/5m/30s", b.cfg.Min, b.cfg.Max, b.cfg.Stable)
 	}
 	// Max below Min is clamped rather than producing a shrinking delay.
 	b = newBackoff(BackoffConfig{Min: 10 * time.Second, Max: time.Second})
