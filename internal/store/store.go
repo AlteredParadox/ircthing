@@ -653,10 +653,15 @@ func (s *Store) SetRedacted(ctx context.Context, network, target, msgid, reason 
 	// its indexed body, purge the FTS entry, then scrub raw/text — keeping
 	// only the tombstone (sender/time/command + redacted flag + reason). The
 	// content is then gone from queries, search, the hot ring, and the wire.
-	// This is NOT forensic erasure: freed bytes/tokens may still persist in
-	// SQLite free pages, FTS segments, and WAL frames until a vacuum, and in
-	// any existing backups (enable PRAGMA secure_delete / FTS5 'secure-delete'
-	// if that matters for the deployment).
+	// PRAGMA secure_delete (DSN, see Open) zeroes the freed page content and
+	// FTS5 'secure-delete' (migration 0009) rewrites the affected index
+	// segments instead of leaving zero-length placeholders, so neither the
+	// bytes nor the tokens linger in the file — at a price: the FTS segment
+	// rewrite makes each deleted/updated row cost ~0.3–1.4 ms (it dominates
+	// the per-row cost of retention pruning and buffer purges, which is why
+	// those delete in bounded chunks). It is still not forensic erasure: WAL
+	// frames until the next checkpoint, and any existing backups, keep the
+	// original.
 	var id int64
 	var text sql.NullString
 	err = s.db.QueryRowContext(ctx,
