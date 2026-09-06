@@ -264,6 +264,7 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 	for {
 		select {
 		case <-ctx.Done():
+			h.drainEvents(ctx, c, nil, histBatches, backfillPages, whois)
 			return ctx.Err()
 		case ev := <-c.Events():
 			switch ev.Kind {
@@ -304,9 +305,59 @@ func (h *Hub) Run(ctx context.Context, c Conn) error {
 					h.maybeStartSync(ctx, c, reg)
 				}
 				if err := h.onMessage(ctx, c, ev, histBatches, backfillPages, whois); err != nil {
+					// Only a canceled context surfaces here, from an append
+					// that failed before it committed (database/sql refuses to
+					// commit on a done context): the event was dequeued but not
+					// stored, so it heads the shutdown drain.
+					h.drainEvents(ctx, c, []irc.Event{ev}, histBatches, backfillPages, whois)
 					return err
 				}
 			}
+		}
+	}
+}
+
+// shutdownDrainBudget bounds how long Run keeps persisting a network's
+// already-buffered events after its context is canceled. Shutdown cancels
+// the root of every network context before anything is drained, so this is
+// the only window those events get; it must stay well inside systemd's stop
+// timeout and main's own shutdown sequence (network goroutines are waited
+// for before the store closes).
+const shutdownDrainBudget = 3 * time.Second
+
+// drainEvents persists the events already buffered on c's channel when Run's
+// context is canceled — up to the channel's capacity (256 per network) of
+// lines the server delivered before the signal landed. They are processed with a
+// detached, bounded context: the canceled one would fail every append with
+// context.Canceled (that is how the append in flight when the signal landed
+// used to be lost). Only message events are handled — a state change here
+// concerns a connection that is going away, and acting on it could start
+// post-registration sync work against a dying manager. pending holds events
+// the loop had already dequeued but could not store (see Run); they go
+// first. The drain stops at the first empty poll: there is no signal for
+// "the producer is done", and the manager's emit gives up on a canceled
+// context anyway, so waiting longer would buy nothing.
+func (h *Hub) drainEvents(ctx context.Context, c Conn, pending []irc.Event, histBatches map[string]*histBatch, backfillPages map[string]int, whois map[string]*WhoisData) {
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownDrainBudget)
+	defer cancel()
+	for _, ev := range pending {
+		if err := h.onMessage(dctx, c, ev, histBatches, backfillPages, whois); err != nil {
+			return
+		}
+	}
+	for {
+		select {
+		case ev := <-c.Events():
+			if ev.Kind != irc.EventMessage {
+				continue
+			}
+			if err := h.onMessage(dctx, c, ev, histBatches, backfillPages, whois); err != nil {
+				return // the budget ran out mid-append
+			}
+		case <-dctx.Done():
+			return
+		default:
+			return
 		}
 	}
 }
