@@ -1104,7 +1104,7 @@ Copyright 2018 The gVisor Authors.
 
 ---
 
-## modernc.org/libc@v1.74.4
+## modernc.org/libc@v1.75.6
 
 ### AUTHORS
 
@@ -1533,7 +1533,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-## modernc.org/memory@v1.11.0
+## modernc.org/memory@v1.12.1
 
 ### AUTHORS
 
@@ -1657,7 +1657,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-## modernc.org/sqlite@v1.57.0
+## modernc.org/sqlite@v1.58.0
 
 ### AUTHORS
 
