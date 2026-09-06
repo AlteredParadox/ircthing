@@ -281,6 +281,11 @@ func run(cfg *config) error {
 	// races the store shutdown. The graceful wait is bounded; after it expires,
 	// tracked sockets are force-closed and the final wait is definitive.
 	handler.DrainSessions(3 * time.Second)
+	// Network goroutines: each manager sends QUIT (bounded, irc.quitTimeout)
+	// and each hub loop persists the events it still had buffered (bounded,
+	// hub.shutdownDrainBudget) — both under the stop() above, in parallel
+	// with the HTTP drain — so this wait, too, is a few seconds at most, and
+	// the store is closed only once every writer is gone.
 	wg.Wait()
 	return runErr
 }

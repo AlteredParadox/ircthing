@@ -244,7 +244,11 @@ func (s *Server) WaitSessions(timeout time.Duration) bool {
 
 // DrainSessions permits graceful cancellation first, then force-closes every
 // still-tracked hijacked connection and waits definitively. Store.Close may
-// run only after this returns.
+// run only after this returns. The graceful phase is the write pumps' 1001
+// close handshake (see wsWritePump); a socket whose handshake is still
+// waiting on a silent peer when the grace expires is closed by the
+// library's own 5s handshake bound rather than instantly, so the total stays
+// bounded at a few seconds either way.
 func (s *Server) DrainSessions(grace time.Duration) {
 	// Close admission before the first Wait. Any handler that won the lock is
 	// already represented in wsWG; every later request receives a 503.
@@ -1108,13 +1112,24 @@ func (s *Server) cancelSocketsLocked(token string) []context.CancelFunc {
 // wsWritePump writes the session's outbound envelopes to the socket,
 // periodically re-validating the session token (revoking the socket on
 // logout/expiry) and closing on a slow consumer. Returns when the
-// context is canceled or a write fails.
+// context is canceled or a write fails. It owns the socket's fate: every
+// exit closes the connection, which is what unblocks handleWS's read loop
+// (that loop deliberately reads without a cancelable context — see there).
 func (s *Server) wsWritePump(ctx context.Context, c *websocket.Conn, sess *hub.Session, token string) {
+	defer c.CloseNow() // no-op after a Close below; the backstop for a write error
 	revoke := time.NewTicker(time.Duration(sessionRecheckInterval.Load()))
 	defer revoke.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			// Shutdown (the server's base context) or the read side ended:
+			// say goodbye with a close frame, so a browser sees 1001 (going
+			// away) and reconnects on its normal schedule rather than an
+			// abnormal 1006. The library's handshake is bounded (5s to write,
+			// 5s for the peer's reply, which a live browser sends at once);
+			// DrainSessions' force-close after its grace period rides on the
+			// same bound for a peer that never answers.
+			c.Close(websocket.StatusGoingAway, "shutdown")
 			return
 		case <-revoke.C:
 			if !s.tokenValid(token) {
@@ -1211,8 +1226,15 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		s.wsWritePump(ctx, c, sess, token)
 	}()
 
+	// Read WITHOUT the cancelable context: coder/websocket closes the whole
+	// socket the instant a Read's context is canceled, which on shutdown
+	// tore the connection down under the write pump before it could send a
+	// close frame. The pump closes the socket on every exit path (a
+	// cancellation included), and that is what ends this loop; handlers
+	// still get the cancelable ctx so their store work stops on shutdown.
+	readCtx := context.WithoutCancel(ctx)
 	for {
-		_, data, err := c.Read(ctx)
+		_, data, err := c.Read(readCtx)
 		if err != nil {
 			return
 		}
