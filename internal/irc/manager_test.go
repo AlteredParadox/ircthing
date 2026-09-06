@@ -116,10 +116,16 @@ func (s *srvConn) readCmd(cmd string) *ircv4.Message {
 
 func (s *srvConn) send(line string) {
 	s.t.Helper()
-	s.c.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if err := s.w.Write(line); err != nil {
+	if err := s.trySend(line); err != nil {
 		s.t.Fatalf("server write %q: %v", line, err)
 	}
+}
+
+// trySend is send for lines the client may legitimately refuse: it
+// returns the write error instead of failing the test.
+func (s *srvConn) trySend(line string) error {
+	s.c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return s.w.Write(line)
 }
 
 // register plays the server side of a minimal CAP + registration
@@ -1487,7 +1493,14 @@ func TestManagerDisconnectsOversizedBatch(t *testing.T) {
 	s.send(":srv BATCH +b draft/multiline #go")
 	line := "@batch=b;draft/multiline-concat :a!u@h PRIVMSG #go :" + strings.Repeat("z", 500)
 	for i := 0; i < maxMLBatchBytes/500+4; i++ {
-		s.send(line)
+		// The manager drops the connection as soon as the batch crosses
+		// the cap — while this loop is still writing. A write error here
+		// is that disconnect arriving early (broken pipe / reset), which
+		// is the behaviour under test, not a failure; the reconnect
+		// below is the assertion.
+		if err := s.trySend(line); err != nil {
+			break
+		}
 	}
 
 	// The manager tears the connection down and reconnects (testCfg
