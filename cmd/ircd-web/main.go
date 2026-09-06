@@ -50,6 +50,9 @@ import (
 	"ircthing/web"
 )
 
+// configWarnPrefix prefixes startup warnings about the config file.
+const configWarnPrefix = "config: "
+
 func main() {
 	// Drop the log package's own date/time prefix: the service runs under
 	// systemd/journald (or another supervisor) which timestamps every
@@ -85,7 +88,7 @@ func main() {
 		return
 	}
 	if w := configFilePermWarning(configPath, credDir); w != "" {
-		log.Print("config: " + w)
+		log.Print(configWarnPrefix + w)
 	}
 	if err := run(cfg); err != nil {
 		log.Fatal(err)
@@ -171,10 +174,10 @@ func logStartupWarnings(cfg *config, st *store.Store) {
 		log.Print("retention: disabled (retention_days and retention_max_messages both 0) — stored history grows without bound; set a limit or place the database on a quota'd filesystem")
 	}
 	if w := cfg.proxyConfigWarning(); w != "" {
-		log.Print("config: " + w)
+		log.Print(configWarnPrefix + w)
 	}
 	if w := cfg.cookieConfigWarning(); w != "" {
-		log.Print("config: " + w)
+		log.Print(configWarnPrefix + w)
 	}
 	if w := api.MediaDebugURLsWarning(); w != "" {
 		log.Print("env: " + w)
