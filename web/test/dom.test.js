@@ -16,7 +16,7 @@
 
 import { strictEqual as is } from "node:assert";
 import { test } from "node:test";
-import { isEditable, modalScrimOpen } from "../src/dom.js";
+import { isEditable, modalScrimOpen, typeAnywhereKey } from "../src/dom.js";
 
 // Stub the two DOM globals modalScrimOpen touches. scrims is a list of
 // {display} objects; querySelectorAll returns them and getComputedStyle
@@ -52,4 +52,47 @@ test("isEditable", () => {
 	is(isEditable({ tagName: "DIV", isContentEditable: true }), true);
 	is(isEditable({ tagName: "DIV", isContentEditable: false }), false);
 	is(isEditable({ tagName: "BODY", isContentEditable: false }), false);
+});
+
+// typeAnywhereKey runs against a stubbed document: it only reads
+// document.body, and `closest` is stubbed per focused element as the
+// selector-matching answer.
+function withBody(fn) {
+	const prevDoc = globalThis.document;
+	const body = { tagName: "BODY" };
+	globalThis.document = { body };
+	try {
+		return fn(body);
+	} finally {
+		globalThis.document = prevDoc;
+	}
+}
+const key = (k, mods = {}) => ({ key: k, ...mods });
+const button = { tagName: "BUTTON", closest: (sel) => (sel.includes("button") ? button : null) };
+const roleRow = { tagName: "DIV", closest: (sel) => (sel.includes("[role=button]") ? roleRow : null) };
+const plainDiv = { tagName: "DIV", closest: () => null };
+
+test("typeAnywhereKey routes printable keys from non-editable focus", () => {
+	withBody((body) => {
+		is(typeAnywhereKey(key("a"), body), true);
+		is(typeAnywhereKey(key("a"), null), true);
+		is(typeAnywhereKey(key("a"), plainDiv), true);
+		is(typeAnywhereKey(key(" "), plainDiv), true, "space on a plain element still types");
+		is(typeAnywhereKey(key("a"), button), true, "letters on a button still type");
+		is(typeAnywhereKey(key("a"), { tagName: "INPUT" }), false);
+		is(typeAnywhereKey(key("a"), { tagName: "DIV", isContentEditable: true }), false);
+		is(typeAnywhereKey(key("Enter"), body), false);
+		is(typeAnywhereKey(key("a", { ctrlKey: true }), body), false);
+		is(typeAnywhereKey(key("a", { isComposing: true }), body), false);
+	});
+});
+
+test("typeAnywhereKey leaves Space to a focused button-like element", () => {
+	// Space is a native <button>'s activation key (fires on keyup) and the
+	// pressable/menuTrigger rows' keydown activation; yanking focus into
+	// the composer on keydown dropped the activation and typed a space.
+	withBody(() => {
+		is(typeAnywhereKey(key(" "), button), false);
+		is(typeAnywhereKey(key(" "), roleRow), false);
+	});
 });
