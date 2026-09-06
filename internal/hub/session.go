@@ -324,7 +324,7 @@ func (s *Session) handleSend(ctx context.Context, env Envelope) {
 	// none). Per-line sends could fail midway — an oversized later line, a
 	// filled queue — after earlier lines already went out; the composer still
 	// holds the whole draft, so a retry would duplicate the delivered prefix.
-	lines := nonEmptyLines(d.Text)
+	lines := fallbackLines(d.Text)
 	msgs := make([]*ircv4.Message, len(lines))
 	for i, line := range lines {
 		msgs[i] = newPrivmsg(d.Target, line)
@@ -383,6 +383,25 @@ func nonEmptyLines(text string) []string {
 		}
 	}
 	return out
+}
+
+// fallbackLines splits text into the per-PRIVMSG fallback lines. A
+// multi-line CTCP ACTION — "/me" over a multi-line draft arrives as
+// "\x01ACTION a\nb\x01" — is re-wrapped so every line is a complete
+// ACTION: split naively, the first line lost its closing delimiter and
+// each later line went out as a plain message ending in a stray \x01.
+// (Sent as one draft/multiline batch the body reassembles intact, so only
+// this path needs it.) A single-line ACTION round-trips unchanged.
+func fallbackLines(text string) []string {
+	const prefix, delim = "\x01ACTION ", "\x01"
+	if !strings.HasPrefix(text, prefix) || !strings.HasSuffix(text, delim) {
+		return nonEmptyLines(text)
+	}
+	lines := nonEmptyLines(strings.TrimSuffix(strings.TrimPrefix(text, prefix), delim))
+	for i, line := range lines {
+		lines[i] = prefix + line + delim
+	}
+	return lines
 }
 
 // persistOwn stores and broadcasts one of our own sent messages, used
@@ -1555,8 +1574,11 @@ func (s *Session) handleSetRules(ctx context.Context, env Envelope) {
 			return
 		}
 		// The settings UI keeps a row while its pattern is still being
-		// typed; storing it is harmless (matching skips empty patterns)
-		// but dropping it here keeps the synced set canonical.
+		// typed; storing it is harmless (matching skips blank patterns)
+		// but dropping it here keeps the synced set canonical. Patterns
+		// are stored trimmed: a whitespace-only one would match every
+		// message with a space on every device.
+		r.Pattern = strings.TrimSpace(r.Pattern)
 		if r.Pattern == "" {
 			continue
 		}

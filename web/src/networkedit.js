@@ -66,3 +66,11 @@ export function networkEditError(name, error) {
 			return error?.message || "loading network failed";
 	}
 }
+
+// formDirty reports whether the network form's state differs from its
+// pristine snapshot (structurally, so an edit typed and then reverted is
+// clean again). Both are built from the same initial object, so key order
+// is stable; undefined fields compare equal to absent ones.
+export function formDirty(pristine, current) {
+	return JSON.stringify(pristine) !== JSON.stringify(current);
+}

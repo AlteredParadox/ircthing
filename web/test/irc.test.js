@@ -402,6 +402,14 @@ test("linkify", () => {
 		link: true,
 		text: "https://en.example.org/wiki/Go_(language)",
 	});
+	// The scheme is case-insensitive (RFC 3986 §3.1); the text stays as typed.
+	eq(linkify("try HTTP://UPPER.example/Path or Https://x.example/"), [
+		{ link: false, text: "try " },
+		{ link: true, text: "HTTP://UPPER.example/Path" },
+		{ link: false, text: " or " },
+		{ link: true, text: "Https://x.example/" },
+	]);
+	is(firstURL("see HTTPS://Example.com/x"), "HTTPS://Example.com/x", "upper-case scheme previews");
 });
 
 test("hash routing round-trips", () => {

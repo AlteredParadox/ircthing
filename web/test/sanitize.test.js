@@ -48,6 +48,19 @@ test("sanitizeRulesForSync drops only the over-cap offenders", () => {
 	is(sanitizeRulesForSync(many).length, 64);
 });
 
+test("sanitizeRulesForSync trims patterns; a blank row syncs as empty, not dropped", () => {
+	// Padding is not part of the keyword; a whitespace-only pattern would
+	// match every message containing a space on every synced device. The
+	// blank row is kept (as "") so the editor's half-typed row is not
+	// adopted away locally; the server drops empty patterns.
+	const padded = { pattern: "  deploy ", network: "", id: "a" };
+	const blank = { pattern: " \t", network: "", id: "b" };
+	eq(sanitizeRulesForSync([padded, blank]), [
+		{ pattern: "deploy", network: "", id: "a" },
+		{ pattern: "", network: "", id: "b" },
+	]);
+});
+
 test("sanitizeFiltersForSync drops offenders, keeps the rest", () => {
 	const { ignores, mutes } = sanitizeFiltersForSync(
 		{

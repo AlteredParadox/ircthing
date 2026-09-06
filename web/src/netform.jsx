@@ -14,9 +14,19 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { proxyCredsExposed } from "./irc.js";
+import { formDirty } from "./networkedit.js";
 import { canonicalSASL } from "./sasl.js";
+
+// useEscape closes a modal on Escape, the pattern the settings modal uses.
+function useEscape(onClose) {
+	useEffect(() => {
+		const onKey = (e) => e.key === "Escape" && onClose();
+		globalThis.addEventListener("keydown", onKey);
+		return () => globalThis.removeEventListener("keydown", onKey);
+	}, []);
+}
 
 // NetworkForm: add/edit a network (The Lounge-style form). `initial` is
 // the stored config object when editing (spread so any field this form does
@@ -79,6 +89,13 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 	const set = (patch) => setCfg((c) => ({ ...c, ...patch }));
 	const setWG = (patch) => setCfg((c) => ({ ...c, wireguard: { ...c.wireguard, ...patch } }));
 	const [sasl, setSasl] = useState(() => saslChoice(initial || {}));
+	useEscape(onClose);
+	// A click on the scrim closes the form only while it is untouched: a
+	// stray click outside a half-filled form silently discarded it. The
+	// close button and Escape always close.
+	const formState = { cfg, channels, fingerprints, egress, sasl };
+	const pristine = useRef(formState);
+	const dirty = formDirty(pristine.current, formState);
 
 	// pickEgress switches egress mode. It does NOT clear the other block, so a
 	// typed proxy URL or WireGuard config survives toggling away and back; submit()
@@ -131,7 +148,7 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 		(wg.private_key && wg.peer_public_key && wg.endpoint && wg.address && wg.dns);
 	const valid = (cfg.addr || "").includes(":") && (cfg.nick || "").trim() && wgReady;
 	return (
-		<div class="search-scrim" aria-hidden="true" onClick={(e) => e.target === e.currentTarget && onClose()}>
+		<div class="search-scrim" aria-hidden="true" onClick={(e) => e.target === e.currentTarget && !dirty && onClose()}>
 			<form class="settings-panel net-form" onSubmit={submit}>
 				<div class="settings-head">
 					<div class="settings-title">{oldName ? `Edit ${oldName}` : "Add network"}</div>
@@ -301,6 +318,7 @@ export function NetworkForm({ initial, oldName, error, busy, onSave, onDelete, o
 // missing chantype prefix is added on submit instead.
 export function ChannelPrompt({ network, chantypes, error, busy, onJoin, onClose }) {
 	const [name, setName] = useState("");
+	useEscape(onClose);
 	function submit(e) {
 		e.preventDefault();
 		let n = name.trim();

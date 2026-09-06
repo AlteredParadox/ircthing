@@ -960,6 +960,13 @@ export function Settings({ networks, rules, onRules, prefs, prefsError, onPrefs,
 										}
 										updateRule(i, { pattern: v });
 									}}
+									onBlur={(e) => {
+										// Trim on blur, not per keystroke (which would eat the
+										// space of a multi-word keyword mid-typing); a
+										// whitespace-only keyword matches nothing (notify.js).
+										const v = e.currentTarget.value;
+										if (v !== v.trim()) updateRule(i, { pattern: v.trim() });
+									}}
 								/>
 								<select
 									class="rule-net"

@@ -16,7 +16,7 @@
 
 import { deepStrictEqual as eq, strictEqual as is } from "node:assert";
 import { test } from "node:test";
-import { Completer, completions } from "../src/complete.js";
+import { Completer, completions, tabKey } from "../src/complete.js";
 
 const nicks = ["alice", "Alfred", "bob", "alice"]; // dupe on purpose
 
@@ -73,4 +73,38 @@ test("Completer: shift+tab first starts from the last candidate", () => {
 	const c = new Completer();
 	const r = c.next("al", 2, -1, { nicks });
 	eq(r, { text: "Alfred: ", caret: 8 });
+});
+
+// A keydown stub over a textarea value; `prevented` records preventDefault.
+function tabEvent(value, { shift = false, key = "Tab" } = {}) {
+	const e = {
+		key,
+		shiftKey: shift,
+		prevented: false,
+		currentTarget: { value, selectionStart: value.length },
+		preventDefault() {
+			this.prevented = true;
+		},
+	};
+	return e;
+}
+
+test("tabKey consumes Tab only when there is a completion", () => {
+	const c = new Completer();
+	let e = tabEvent("al");
+	eq(tabKey(e, c, { nicks }), { text: "alice: ", caret: 7 });
+	is(e.prevented, true, "a candidate consumes the key");
+
+	// Empty composer / no candidate: Tab and Shift+Tab must be left to move
+	// focus, so a keyboard-only user can leave the textarea.
+	for (const value of ["", "zz", "hello world "]) {
+		for (const shift of [false, true]) {
+			e = tabEvent(value, { shift });
+			is(tabKey(e, new Completer(), { nicks }), null, JSON.stringify({ value, shift }));
+			is(e.prevented, false, "no candidate leaves the key alone " + JSON.stringify({ value, shift }));
+		}
+	}
+	e = tabEvent("al", { key: "a" });
+	is(tabKey(e, c, { nicks }), null);
+	is(e.prevented, false, "non-Tab keys are ignored");
 });

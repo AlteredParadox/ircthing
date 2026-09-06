@@ -853,6 +853,28 @@ func TestMultilineSendFallbackWithoutCap(t *testing.T) {
 	}
 }
 
+func TestFallbackLinesRewrapsMultilineAction(t *testing.T) {
+	cases := []struct {
+		text string
+		want []string
+	}{
+		{"a\nb", []string{"a", "b"}},
+		{"\x01ACTION waves\x01", []string{"\x01ACTION waves\x01"}},
+		// A multi-line /me: each line becomes its own complete ACTION —
+		// the naive split sent "b\x01" as a plain message.
+		{"\x01ACTION a\nb\x01", []string{"\x01ACTION a\x01", "\x01ACTION b\x01"}},
+		{"\x01ACTION a\r\n\r\nb\n\x01", []string{"\x01ACTION a\x01", "\x01ACTION b\x01"}},
+		// Other CTCP and an unterminated ACTION are left to the plain split.
+		{"\x01VERSION\x01", []string{"\x01VERSION\x01"}},
+		{"\x01ACTION a\nb", []string{"\x01ACTION a", "b"}},
+	}
+	for _, c := range cases {
+		if got := fallbackLines(c.text); !reflect.DeepEqual(got, c.want) {
+			t.Errorf("fallbackLines(%q) = %q, want %q", c.text, got, c.want)
+		}
+	}
+}
+
 func TestMonitorFlow(t *testing.T) {
 	h := newTestHub(t)
 	conn := &fakeConn{ch: make(chan irc.Event, 8), name: "libera", nick: "AlteredParadox"}
@@ -1929,11 +1951,13 @@ func TestRulesFlow(t *testing.T) {
 	}
 
 	// Setting from A acks A and pushes to B, not A. The in-progress empty
-	// pattern is dropped from the canonical set.
+	// pattern is dropped from the canonical set, and so is a blank one —
+	// stored, " " would match every message with a space on every device.
 	rules := []Rule{
 		{Pattern: "deploy", Network: "", ID: "r1"},
 		{Pattern: "", Network: "", ID: "r2"},
 		{Pattern: "release", Network: "libera", ID: "r3"},
+		{Pattern: " \t ", Network: "", ID: "r4"},
 	}
 	a.Handle(ctx, request(t, "set_rules", 2, RulesData{Rules: rules}))
 	recv(t, a, "ok")

@@ -15,8 +15,8 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
-import { Completer } from "./complete.js";
-import { isEditable, modalScrimOpen } from "./dom.js";
+import { Completer, tabKey } from "./complete.js";
+import { modalScrimOpen, typeAnywhereKey } from "./dom.js";
 import { menuTrigger } from "./menu.jsx";
 import { applyFormat, BOLD, ITALIC, UNDERLINE } from "./format.js";
 import { FormatPanel } from "./formatpanel.jsx";
@@ -453,10 +453,10 @@ export function Chat({ buf, msgs, selfNick, theme, nickColors, tailNav, connecte
 	// (no preventDefault), so it lands in the now-focused textarea.
 	useEffect(() => {
 		const onKey = (e) => {
-			if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return; // shortcuts / IME
-			if (e.key.length !== 1) return; // Tab/Enter/Escape/arrows/F-keys: ignore
 			const el = taRef.current;
 			if (!el || el.disabled) return;
+			const active = document.activeElement;
+			if (active === el || !typeAnywhereKey(e, active)) return;
 			// A modal overlay (settings, search, switcher, network form,
 			// context menu, mobile drawer) is open — don't yank focus into the
 			// composer behind it and silently accumulate a hidden draft. Test
@@ -465,8 +465,6 @@ export function Chat({ buf, msgs, selfNick, theme, nickColors, tailNav, connecte
 			// modal only at mobile breakpoints), and querySelector ignores CSS
 			// display — matching them would kill type-anywhere on desktop.
 			if (modalScrimOpen()) return;
-			const active = document.activeElement;
-			if (active === el || (active && active !== document.body && isEditable(active))) return;
 			el.focus();
 		};
 		document.addEventListener("keydown", onKey);
@@ -571,18 +569,14 @@ export function Chat({ buf, msgs, selfNick, theme, nickColors, tailNav, connecte
 	}
 
 	// Tab completes commands/emoji/nicks and cycles on repeat; Shift+Tab
-	// cycles backwards.
+	// cycles backwards. With nothing to complete the key is NOT consumed,
+	// so Tab/Shift+Tab still move focus out of the box (tabKey).
 	function handleTabComplete(e) {
-		if (e.key !== "Tab") return false;
-		e.preventDefault();
 		const ta = e.currentTarget;
-		const r = completer.next(ta.value, ta.selectionStart, e.shiftKey ? -1 : 1, {
-			nicks: completionNicks || [],
-		});
-		if (r) {
-			draftChanged(r.text);
-			requestAnimationFrame(() => ta.setSelectionRange(r.caret, r.caret));
-		}
+		const r = tabKey(e, completer, { nicks: completionNicks || [] });
+		if (!r) return false;
+		draftChanged(r.text);
+		requestAnimationFrame(() => ta.setSelectionRange(r.caret, r.caret));
 		return true;
 	}
 

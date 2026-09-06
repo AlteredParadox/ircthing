@@ -25,6 +25,27 @@ export function isEditable(el) {
 	return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el.isContentEditable;
 }
 
+// SPACE_ACTIVATES matches elements (or ancestors of the focused node) for
+// which Space is an activation key rather than typing: native buttons
+// activate on keyup (HTML "activation behavior"), the pressable/menuTrigger
+// rows and context-menu items handle it on keydown, and <summary> toggles.
+const SPACE_ACTIVATES = "button, [role=button], [role=menuitem], a[href], summary";
+
+// typeAnywhereKey reports whether a keydown that fired with `active`
+// focused (and NOT the composer) should be routed into the composer: a
+// plain printable key outside a text field. Space on a button-like element
+// is left alone — stealing focus on keydown would drop the button's
+// activation (a native button activates on keyup, which now lands in the
+// textarea) and insert a stray space into the draft.
+export function typeAnywhereKey(e, active) {
+	if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return false; // shortcuts / IME
+	if (e.key.length !== 1) return false; // Tab/Enter/Escape/arrows/F-keys: ignore
+	if (!active || active === document.body) return true;
+	if (isEditable(active)) return false;
+	if (e.key === " " && typeof active.closest === "function" && active.closest(SPACE_ACTIVATES)) return false;
+	return true;
+}
+
 export const MODAL_SCRIMS = ".search-scrim, .ctx-scrim, .side-scrim, .right-scrim";
 
 // modalScrimOpen reports whether a *visible* modal overlay is present. It

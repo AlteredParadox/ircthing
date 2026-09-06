@@ -106,3 +106,16 @@ export class Completer {
 		return this.applied;
 	}
 }
+
+// tabKey handles a Tab keydown on the composer textarea: the completion to
+// apply (the key consumed), or null when it is not Tab or there is nothing
+// to complete. The key is consumed ONLY with a candidate — an unconditional
+// preventDefault trapped keyboard-only users in the box, since Tab and
+// Shift+Tab are also how focus leaves it.
+export function tabKey(e, completer, ctx) {
+	if (e.key !== "Tab") return null;
+	const ta = e.currentTarget;
+	const r = completer.next(ta.value, ta.selectionStart, e.shiftKey ? -1 : 1, ctx);
+	if (r) e.preventDefault();
+	return r;
+}

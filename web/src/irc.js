@@ -270,7 +270,11 @@ export function mentionsMe(text, nick) {
 // carrying a control byte fails the preview endpoint's url.Parse (silently no
 // preview) and the image fast-path; inside Body, linkify sees per-run text that
 // parseFormatting already stripped, so it is unaffected either way.
-const URL_RE = /https?:\/\/[^\s<>"'`\x00-\x08\x0e-\x1f]+/g;
+// The scheme is case-insensitive (RFC 3986 §3.1: "HTTP://" is the same
+// scheme); the match keeps the text as typed and the server's url.Parse
+// lowercases the scheme before the http/https check, so an upper-case link
+// is both clickable and previewed.
+const URL_RE = /https?:\/\/[^\s<>"'`\x00-\x08\x0e-\x1f]+/gi;
 export function linkify(text) {
 	const out = [];
 	let last = 0;
