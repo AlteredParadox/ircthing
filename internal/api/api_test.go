@@ -530,9 +530,12 @@ func TestChangePassword(t *testing.T) {
 	}
 
 	// The override is persisted and read back over the config hash.
-	h, err := loadPasswordHash(context.Background(), srv.hub.Store(), Config{PasswordHash: "seed-ignored"})
+	h, overridden, err := loadPasswordHash(context.Background(), srv.hub.Store(), Config{PasswordHash: "seed-ignored"})
 	if err != nil {
 		t.Fatalf("loadPasswordHash: %v", err)
+	}
+	if !overridden {
+		t.Fatal("loadPasswordHash did not report the override (startup notice would be skipped)")
 	}
 	if bcrypt.CompareHashAndPassword([]byte(h), []byte("newpassword1")) != nil {
 		t.Fatal("stored override does not verify the new password")

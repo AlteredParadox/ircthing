@@ -151,7 +151,7 @@ loudly. See `config.example.json` for a complete example.
 |---|---|
 | `listen` | HTTP listen address. Default `127.0.0.1:8067` (loopback only — see Deployment). |
 | `database` | SQLite path, created on first run. Default `ircthing.db`. Created mode 0600 (it holds plaintext network credentials and message history); an existing group/world-readable file is tightened to 0600 on start. |
-| `user.username`, `user.password_hash` | Web login. Generate the bcrypt hash with `ircd-web -hash-password`. |
+| `user.username`, `user.password_hash` | Web login. Generate the bcrypt hash with `ircd-web -hash-password`. This hash is a **seed**: changing the password in **Settings → Change password** stores the new hash in the database, which then wins over this field (the file may be a read-only systemd credential), and the binary logs a `password:` line at every start while that is the case. To make the config-file hash apply again — e.g. after a lockout — stop the service and run `ircd-web -config config.json -reset-password`; it deletes the stored hash and, like an in-UI change, revokes every Web Push subscription. |
 | `session_ttl_days` | Login cookie lifetime. Default 30. |
 | `ring_size` | Hot scrollback kept in memory per buffer. Default 200; older history is read from SQLite. |
 | `retention_days` | Prune stored messages older than this many days. Default 0 (keep forever). Pruning runs hourly and keeps the search index in step; each hot buffer's in-memory ring is reconciled in the same pass, so pruned messages stop showing immediately. |

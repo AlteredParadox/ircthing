@@ -131,13 +131,13 @@ func TestLoadPasswordHashFailsClosed(t *testing.T) {
 	if err := st.SetSetting(ctx, passwordHashKey, "not-a-bcrypt-hash"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadPasswordHash(ctx, st, cfg); err == nil {
+	if _, _, err := loadPasswordHash(ctx, st, cfg); err == nil {
 		t.Fatal("corrupt override: loadPasswordHash returned no error (would fall back to the seed)")
 	}
 	if err := st.SetSetting(ctx, passwordHashKey, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loadPasswordHash(ctx, st, cfg); err == nil {
+	if _, _, err := loadPasswordHash(ctx, st, cfg); err == nil {
 		t.Fatal("present-empty override fell back to the seed")
 	}
 
@@ -145,8 +145,8 @@ func TestLoadPasswordHashFailsClosed(t *testing.T) {
 	if err := st.SetSetting(ctx, passwordHashKey, string(override)); err != nil {
 		t.Fatal(err)
 	}
-	h, err := loadPasswordHash(ctx, st, cfg)
-	if err != nil || h != string(override) {
-		t.Fatalf("valid override: got (%q, %v), want the stored override", h, err)
+	h, overridden, err := loadPasswordHash(ctx, st, cfg)
+	if err != nil || h != string(override) || !overridden {
+		t.Fatalf("valid override: got (%q, %v, %v), want the stored override, reported", h, overridden, err)
 	}
 }

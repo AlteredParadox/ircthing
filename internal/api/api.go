@@ -318,9 +318,12 @@ func New(cfg Config, h *hub.Hub, assets fs.FS) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	initHash, err := loadPasswordHash(context.Background(), h.Store(), cfg)
+	initHash, overridden, err := loadPasswordHash(context.Background(), h.Store(), cfg)
 	if err != nil {
 		return nil, err
+	}
+	if overridden {
+		log.Print(passwordOverrideNotice)
 	}
 	s.passwordHash.Store(&initHash)
 	// State-changing and media endpoints require a same-origin request (the
