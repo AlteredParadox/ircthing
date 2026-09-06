@@ -2008,3 +2008,111 @@ func TestBackoffResetsAfterStableUptime(t *testing.T) {
 		t.Fatalf("reconnect delay after a stable connection = %v, want < 150ms (ladder not reset)", gap)
 	}
 }
+
+// A PRIVMSG/NOTICE is relayed with our ":nick!user@host " prefix in front,
+// and RFC 2812 §2.3's 512-byte limit bounds THAT line for the recipients:
+// a line that fits our socket but not theirs is silently truncated for
+// everyone. sendAll must budget the prefix — from the actual mask once a
+// self-prefixed line / 396 / CHGHOST revealed it, else a conservative
+// fallback — and forget it on reconnect.
+func TestSendBudgetsRelayPrefix(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conns := listen(t, ln)
+	m := startManager(t, testCfg(ln.Addr().String()))
+
+	s := accept(t, conns)
+	s.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+
+	// text(n) yields a PRIVMSG whose bare wire line (+CRLF) is n bytes.
+	text := func(n int) *ircv4.Message {
+		msg := newMsg("PRIVMSG", "#go", "x")
+		msg.Params[1] = strings.Repeat("x", n-len(msg.String())+1-2)
+		if got := len(msg.String()) + 2; got != n {
+			t.Fatalf("text(%d) built a %d-byte line", n, got)
+		}
+		return msg
+	}
+	waitPrefix := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for m.ownPrefixLen() != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("ownPrefixLen = %d, want %d", m.ownPrefixLen(), want)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+
+	// Unknown mask: ":AlteredParadox!" + 10 + "@" + 63 + " " = 91 bytes,
+	// so 421 is the budget.
+	waitPrefix(1 + 14 + 1 + fallbackUserLen + 1 + fallbackHostLen + 1)
+	if err := m.Send(text(500)); err == nil {
+		t.Fatal("500-byte PRIVMSG accepted with an unknown 91-byte prefix budget")
+	} else if !strings.Contains(err.Error(), "prefix") {
+		t.Fatalf("rejection should name the relayed prefix: %v", err)
+	}
+	if err := m.Send(text(421)); err != nil {
+		t.Fatalf("421-byte PRIVMSG rejected under the fallback budget: %v", err)
+	}
+	if err := m.Send(newMsg("WHOIS", strings.Repeat("n", 500))); err != nil {
+		t.Fatalf("non-relayed 509-byte command rejected: %v", err)
+	}
+
+	// ISUPPORT USERLEN/HOSTLEN refine the fallback: 1+14+1+8+1+20+1 = 46.
+	s.send(":irc.test 005 AlteredParadox USERLEN=8 HOSTLEN=20 :are supported")
+	waitPrefix(46)
+	if err := m.Send(text(466)); err != nil {
+		t.Fatalf("466-byte PRIVMSG rejected under USERLEN/HOSTLEN budget: %v", err)
+	}
+	if err := m.Send(text(467)); err == nil {
+		t.Fatal("467-byte PRIVMSG accepted under a 46-byte prefix budget")
+	}
+
+	// The JOIN echo reveals the real mask: ":AlteredParadox!~ap@example.org " = 32.
+	s.send(":AlteredParadox!~ap@example.org JOIN #go")
+	waitPrefix(32)
+	if err := m.Send(text(480)); err != nil {
+		t.Fatalf("480-byte PRIVMSG rejected with a 32-byte prefix: %v", err)
+	}
+	if err := m.Send(text(481)); err == nil {
+		t.Fatal("481-byte PRIVMSG accepted with a 32-byte prefix")
+	}
+	// The relayed check applies to NOTICE too.
+	if err := m.Send(newMsg("NOTICE", "#go", strings.Repeat("x", 481-len("NOTICE #go ")-2))); err == nil {
+		t.Fatal("481-byte NOTICE accepted with a 32-byte prefix")
+	}
+
+	// A cloak via 396 replaces the host (user kept): 1+14+1+3+1+37+1 = 58.
+	s.send(":irc.test 396 AlteredParadox a-much-longer-cloak-name-for-the-test :is now your visible host")
+	waitPrefix(58)
+	if err := m.Send(text(480)); err == nil {
+		t.Fatal("480-byte PRIVMSG accepted after a 396 grew the prefix to 58")
+	}
+
+	// CHGHOST replaces both: 1+14+1+2+1+8+1 = 28.
+	s.send(":AlteredParadox!~ap@a-much-longer-cloak-name-for-the-test CHGHOST ap new.host")
+	waitPrefix(28)
+	if err := m.Send(text(484)); err != nil {
+		t.Fatalf("484-byte PRIVMSG rejected after CHGHOST shrank the prefix to 28: %v", err)
+	}
+
+	// Multiline goes through the same budget (framing 45 + prefix 28).
+	if err := m.SendMultiline("#go", []string{strings.Repeat("y", 439), "b"}); err != nil {
+		t.Fatalf("multiline within budget rejected: %v", err)
+	}
+	if err := m.SendMultiline("#go", []string{strings.Repeat("y", 440), "b"}); err == nil {
+		t.Fatal("multiline line over the relayed budget accepted")
+	}
+
+	// A reconnect forgets the mask: back to the fallback until re-learned.
+	s.c.Close()
+	waitState(t, m, StateDisconnected)
+	s2 := accept(t, conns)
+	s2.register("AlteredParadox")
+	waitState(t, m, StateRegistered)
+	waitPrefix(91)
+}

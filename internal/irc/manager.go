@@ -113,10 +113,15 @@ type Manager struct {
 	pendingCapVals map[string]string
 	registered     atomic.Bool
 	nick           atomic.Value // string: current nick once registered
-	caps           atomic.Value // map[string]bool, copy-on-write: enabled capabilities
-	capVals        atomic.Value // map[string]string: values of enabled caps
-	isup           *isupport
-	roster         *roster
+	// ownMask is the user@host of our own hostmask as the server shows it
+	// to others (ownIdent), learned from our self-prefixed lines, CHGHOST
+	// and 396; zero until then. Written by the read loop, read by sendAll
+	// on the hub goroutine (see ownPrefixLen).
+	ownMask atomic.Value // ownIdent
+	caps    atomic.Value // map[string]bool, copy-on-write: enabled capabilities
+	capVals atomic.Value // map[string]string: values of enabled caps
+	isup    *isupport
+	roster  *roster
 	// joined is the set of channels to (re)join after registration:
 	// the configured ones plus runtime JOINs, minus runtime PARTs (a KICK
 	// deliberately does not remove the intent — bouncers rejoin). Only
@@ -305,6 +310,97 @@ func checkLineLen(msg *ircv4.Message, limit int) error {
 	return nil
 }
 
+// relayedCommand reports whether the server forwards our msg to other
+// users with our own ":nick!user@host " source prefix prepended.
+func relayedCommand(cmd string) bool {
+	switch cmd {
+	case "PRIVMSG", "NOTICE", "TAGMSG":
+		return true
+	}
+	return false
+}
+
+// checkRelayedLen is checkLineLen for a line the server relays: the RFC
+// 2812 §2.3 limit (512 bytes, or ISUPPORT LINELEN) bounds the line as the
+// RECIPIENTS receive it, i.e. including the ":nick!user@host " prefix the
+// server prepends — so an outbound PRIVMSG that fits our socket but not
+// theirs is silently truncated for every recipient. Budgeting the prefix
+// here keeps the "nothing is silently truncated" guarantee end to end.
+func checkRelayedLen(msg *ircv4.Message, limit, prefix int) error {
+	bare := *msg
+	bare.Tags = nil
+	if n := len(bare.String()) + 2; n+prefix > limit {
+		return fmt.Errorf("irc: line is %d bytes; the server's %d-byte limit leaves %d after the %d-byte nick!user@host prefix it relays", n, limit, limit-prefix, prefix)
+	}
+	return nil
+}
+
+// ownIdent is the user@host half of our own hostmask (see Manager.ownMask).
+type ownIdent struct {
+	user, host string
+}
+
+// Fallback ident/host budget while ownMask is unknown on a connection (no
+// self-prefixed line yet — e.g. a DM sent before any JOIN echo) and the
+// server advertises no ISUPPORT USERLEN/HOSTLEN: the caps of the
+// Solanum/Charybdis family (USERLEN 10 incl. the "~", HOSTLEN 63, one DNS
+// label / a typical cloak). Conservative for ident, generous for host.
+const (
+	fallbackUserLen = 10
+	fallbackHostLen = 63
+)
+
+// ownPrefixLen returns the byte length of the ":nick!user@host " source
+// prefix the server prepends when relaying one of our lines. The nick is
+// authoritative (Nick); user/host come from ownMask when learned, else
+// from ISUPPORT USERLEN/HOSTLEN (InspIRCd, Ergo), else the fallback caps.
+func (m *Manager) ownPrefixLen() int {
+	id, _ := m.ownMask.Load().(ownIdent)
+	user, host := len(id.user), len(id.host)
+	if user == 0 {
+		user = m.isupInt("USERLEN", fallbackUserLen)
+	}
+	if host == 0 {
+		host = m.isupInt("HOSTLEN", fallbackHostLen)
+	}
+	return len(":") + len(m.Nick()) + len("!") + user + len("@") + host + len(" ")
+}
+
+// isupInt returns an ISUPPORT parameter as a positive integer, or def when
+// it is unadvertised or not a positive number.
+func (m *Manager) isupInt(name string, def int) int {
+	if v, ok := m.isup.Raw(name); ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// noteOwnIdent learns our user@host from a live line: the prefix of any
+// self-originated line the server relays back (the JOIN echo, echo-message
+// PRIVMSGs, MODE, TOPIC, ...), a CHGHOST for us (chghost), and 396
+// RPL_HOSTHIDDEN ("<nick> <host> :is now your visible host", the classic
+// cloak notice; host only). Values are clamped and detached from the line
+// buffer (clampRoster) like every other retained server string.
+func (m *Manager) noteOwnIdent(in *ircv4.Message) {
+	if in.Command == "396" {
+		if host := in.Param(1); host != "" && m.isup.FoldEqual(in.Param(0), m.Nick()) {
+			cur, _ := m.ownMask.Load().(ownIdent)
+			m.ownMask.Store(ownIdent{user: cur.user, host: clampRoster(host)})
+		}
+		return
+	}
+	if in.Prefix == nil || in.Prefix.User == "" || in.Prefix.Host == "" || !m.isup.FoldEqual(in.Prefix.Name, m.Nick()) {
+		return
+	}
+	user, host := in.Prefix.User, in.Prefix.Host
+	if in.Command == "CHGHOST" && len(in.Params) >= 2 {
+		user, host = in.Param(0), in.Param(1)
+	}
+	m.ownMask.Store(ownIdent{user: clampRoster(user), host: clampRoster(host)})
+}
+
 // ErrUnsafeFraming reports a message carrying CR, LF, or NUL — the
 // characters that frame IRC lines. Enforced centrally on every outbound
 // message so a client-supplied parameter can never inject extra protocol
@@ -447,7 +543,7 @@ func (m *Manager) resetNames() {
 // otherwise send one PRIVMSG per line.
 func (m *Manager) SendMultiline(target string, lines []string) error {
 	lim := parseMultilineLimits(m.CapValue("draft/multiline"))
-	if err := validateMultiline(target, lines, lim, m.lineLen()); err != nil {
+	if err := validateMultiline(target, lines, lim, m.lineLen(), m.ownPrefixLen()); err != nil {
 		return err
 	}
 	ref := "ml" + strconv.FormatUint(m.batchSeq.Add(1), 10)
@@ -966,6 +1062,7 @@ func (m *Manager) SendAll(msgs []*ircv4.Message) error {
 // enqueue happen atomically with respect to disconnect and drain.
 func (m *Manager) sendAll(msgs []*ircv4.Message) error {
 	limit := m.lineLen()
+	prefix := m.ownPrefixLen()
 	for _, msg := range msgs {
 		if err := checkFraming(msg); err != nil {
 			return err
@@ -976,8 +1073,15 @@ func (m *Manager) sendAll(msgs []*ircv4.Message) error {
 		// connection down. A server-derived echo (e.g. a CTCP auto-reply
 		// whose target is a hostile, invalid-UTF-8 nick) must be rejected
 		// here rather than reach that fatal guard and loop the connection.
+		// A line the server RELAYS is also checked as its recipients will
+		// see it, with our source prefix in front (see ownPrefixLen).
 		if err := checkLineLen(m.scrubUTF8(msg), limit); err != nil {
 			return err
+		}
+		if relayedCommand(msg.Command) {
+			if err := checkRelayedLen(m.scrubUTF8(msg), limit, prefix); err != nil {
+				return err
+			}
 		}
 	}
 	m.sendMu.Lock()
@@ -1366,6 +1470,7 @@ func (m *Manager) runOnce(ctx context.Context, bo *backoff) error {
 	defer m.roster.clear()
 	m.resetNames()
 	m.whoxDone = make(map[string]bool)
+	m.ownMask.Store(ownIdent{})
 	// New connection: bump the generation (so a 734 buffered from the previous
 	// connection is ignored), and reset the server's MONITOR list to empty with
 	// no 734-limit (ReconcileMonitored re-establishes on registration).
@@ -1838,6 +1943,7 @@ func (m *Manager) onLiveLine(in *ircv4.Message, send func([]*ircv4.Message) erro
 			m.nick.Store(strings.Clone(n)) // detach from the parsed line (retained)
 		}
 	}
+	m.noteOwnIdent(in)
 	m.roster.handle(m.Nick(), in)
 	if err := m.trackJoinIntent(in); err != nil {
 		return affected, err

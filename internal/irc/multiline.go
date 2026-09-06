@@ -191,9 +191,11 @@ func parseMultilineLimits(value string) multilineLimits {
 // server's advertised limits BEFORE anything is enqueued: max-lines and
 // max-bytes from the draft/multiline cap value, and each line against
 // the line length (ISUPPORT LINELEN, default 512) minus the batch
-// framing overhead. Nothing is ever silently truncated — an oversized
-// message is rejected whole, with an error naming the limit.
-func validateMultiline(target string, lines []string, lim multilineLimits, lineLen int) error {
+// framing overhead and prefixLen, the ":nick!user@host " source prefix
+// the server prepends when it relays each line to the recipients (see
+// Manager.ownPrefixLen). Nothing is ever silently truncated — an
+// oversized message is rejected whole, with an error naming the limit.
+func validateMultiline(target string, lines []string, lim multilineLimits, lineLen, prefixLen int) error {
 	if lim.maxLines > 0 && len(lines) > lim.maxLines {
 		return fmt.Errorf("message is %d lines; the server allows at most %d per message", len(lines), lim.maxLines)
 	}
@@ -202,7 +204,7 @@ func validateMultiline(target string, lines []string, lim multilineLimits, lineL
 	}
 	// Worst-case per-line framing: "@batch=<ref> PRIVMSG <target> :" +
 	// CRLF, with the ref up to ~22 bytes ("ml" + uint64).
-	overhead := len("@batch=ml18446744073709551615 PRIVMSG ") + len(target) + len(" :\r\n")
+	overhead := prefixLen + len("@batch=ml18446744073709551615 PRIVMSG ") + len(target) + len(" :\r\n")
 	total := 0
 	for _, line := range lines {
 		if len(line)+overhead > lineLen {
