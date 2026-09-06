@@ -896,3 +896,62 @@ func TestAppendGuarded(t *testing.T) {
 		t.Fatalf("existing buffer has %d rows after dropped straggler, want 2", len(m))
 	}
 }
+
+// TestCanonicalLockedScanErrorIsAnError guards the folded resolve against
+// turning a transient read failure into a permanent case-variant duplicate:
+// a scan that dies mid-way must surface as an error, never as "no such
+// buffer" (which lets the append create #Other beside #other). The fold
+// callback cancels the query's context between rows, which is exactly how
+// a failure lands mid-scan.
+func TestCanonicalLockedScanErrorIsAnError(t *testing.T) {
+	s, _ := openTest(t, 10)
+	defer s.Close()
+	for _, name := range []string{"#one", "#two", "#other"} {
+		if _, err := s.Append(ctx, "net", name, Message{Sender: "a", Command: "PRIVMSG", Raw: "seed"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Forget the cached spellings so the resolve has to scan the table.
+	s.mu.Lock()
+	clear(s.buffers)
+	s.mu.Unlock()
+
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fold := func(name string) string {
+		cancel()
+		// Give database/sql's context watcher time to close the rows, so
+		// the next Next() fails the way an interrupted scan does.
+		time.Sleep(100 * time.Millisecond)
+		return strings.ToLower(name)
+	}
+	s.mu.Lock()
+	name, ok, err := s.canonicalLocked(cctx, "net", "#OTHER", fold)
+	s.mu.Unlock()
+	if err == nil {
+		t.Fatalf("interrupted scan reported (%q, %v) with no error", name, ok)
+	}
+	if ok {
+		t.Fatalf("interrupted scan reported a match %q alongside error %v", name, err)
+	}
+
+	// Through the public path the error fails the append outright — and no
+	// buffer was minted for the unresolved spelling.
+	cctx, cancel = context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := s.AppendFolded(cctx, "net", "#OTHER", fold, Message{Sender: "b", Command: "PRIVMSG", Raw: "late"}); err == nil {
+		t.Fatal("AppendFolded succeeded on an interrupted canonical scan")
+	}
+	bufs, err := s.Buffers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range bufs {
+		if b.Target == "#OTHER" {
+			t.Fatalf("interrupted scan minted a case-variant duplicate: %+v", bufs)
+		}
+	}
+	if len(bufs) != 3 {
+		t.Fatalf("buffers = %+v, want the 3 seeded", bufs)
+	}
+}
