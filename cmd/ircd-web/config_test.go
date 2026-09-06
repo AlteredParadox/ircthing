@@ -272,3 +272,46 @@ func TestResolveConfigPath(t *testing.T) {
 		})
 	}
 }
+
+// A group/world-readable config file (login hash, SASL/proxy/WireGuard
+// secrets) must draw a startup warning — the store already tightens the
+// database to 0600, and the file next to it loaded silently. A file under
+// $CREDENTIALS_DIRECTORY is systemd's to protect and is exempt.
+func TestConfigFilePermWarning(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(validConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name    string
+		mode    os.FileMode
+		credDir string
+		want    string // substring; "" = no warning
+	}{
+		{"private", 0o600, "", ""},
+		{"owner-only rw-x", 0o700, "", ""},
+		{"group-readable", 0o640, "", "0640"},
+		{"world-readable", 0o644, "", "0644"},
+		{"world-writable", 0o666, "", "0666"},
+		{"world-readable under credentials dir", 0o644, dir, ""},
+		{"world-readable outside credentials dir", 0o644, filepath.Join(dir, "elsewhere"), "0644"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.Chmod(path, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			got := configFilePermWarning(path, tc.credDir)
+			if tc.want == "" && got != "" {
+				t.Fatalf("unexpected warning: %s", got)
+			}
+			if tc.want != "" && (!strings.Contains(got, tc.want) || !strings.Contains(got, "chmod 600")) {
+				t.Fatalf("warning = %q, want it to name mode %s and the chmod fix", got, tc.want)
+			}
+		})
+	}
+	if got := configFilePermWarning(filepath.Join(dir, "missing.json"), ""); got != "" {
+		t.Fatalf("missing file: warning = %q, want none (loadConfig reports that)", got)
+	}
+}

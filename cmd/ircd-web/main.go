@@ -70,10 +70,14 @@ func main() {
 		return
 	}
 
-	configPath := resolveConfigPath(*configFlag, flagPassed("config"), os.Getenv("CREDENTIALS_DIRECTORY"))
+	credDir := os.Getenv("CREDENTIALS_DIRECTORY")
+	configPath := resolveConfigPath(*configFlag, flagPassed("config"), credDir)
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		log.Fatalf("config: %v", err)
+	}
+	if w := configFilePermWarning(configPath, credDir); w != "" {
+		log.Print("config: " + w)
 	}
 	if err := run(cfg); err != nil {
 		log.Fatal(err)

@@ -23,6 +23,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -136,6 +137,33 @@ func loadConfig(path string) (*config, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &cfg, nil
+}
+
+// configFilePermWarning flags a config file that group or others can read,
+// "" when its mode is private (or it cannot be stat'ed — loadConfig already
+// failed loudly in that case). The file holds the login hash and every
+// IRC/SASL/proxy/WireGuard secret; the store tightens the database to 0600
+// on start, and a world-readable config next to it deserves at least a log
+// line. A file under $CREDENTIALS_DIRECTORY (systemd LoadCredential) is
+// exempt: systemd owns that directory's modes and it is service-private.
+// Warning only — refusing to start would turn a permissions slip into an
+// outage.
+func configFilePermWarning(path, credDir string) string {
+	if credDir != "" {
+		if rel, err := filepath.Rel(credDir, path); err == nil &&
+			rel != ".." && !strings.HasPrefix(rel, "../") {
+			return ""
+		}
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	perm := fi.Mode().Perm()
+	if perm&0o077 == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s is mode %04o (readable by group/others) — it holds the password hash and IRC/SASL/proxy/WireGuard secrets; run chmod 600 on it, or load it via systemd LoadCredential", path, perm)
 }
 
 // proxyConfigWarning flags a behind_proxy setting that disagrees with the
