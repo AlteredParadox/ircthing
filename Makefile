@@ -12,7 +12,7 @@ GOFLAGS       := -trimpath -ldflags="-s -w -X main.version=$(VERSION)"
 # staticcheck is run via `go run` (pinned) so it needs no global install
 # and stays out of go.mod. GOTOOLCHAIN pins its build to the same Go
 # version the module resolves, or it refuses to analyze the module.
-STATICCHECK   := GOTOOLCHAIN=$(shell $(GO) env GOVERSION) $(GO) run honnef.co/go/tools/cmd/staticcheck@v0.7.0
+STATICCHECK   := GOTOOLCHAIN=$(shell $(GO) env GOVERSION) $(GO) run honnef.co/go/tools/cmd/staticcheck@v0.8.1
 
 # Size gates. Budgets are hard rules from CLAUDE.md — fix the size,
 # never raise these numbers.
