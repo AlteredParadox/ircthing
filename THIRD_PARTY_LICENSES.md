@@ -1788,7 +1788,7 @@ SOFTWARE.
 
 ---
 
-## npm: preact@10.29.8
+## npm: preact@11.0.0
 
 ### LICENSE
 

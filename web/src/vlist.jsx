@@ -861,13 +861,13 @@ export function VirtualList({
 	return (
 		<div class="msgs scroll" ref={scroller} onScroll={handleScroll}>
 			<div ref={headerEl}>{header}</div>
-			<div style={{ height: topPad }} />
+			<div style={{ height: topPad + "px" }} />
 			{items.slice(start, end).map((item, j) => (
 				<div key={item.id} data-vid={item.id} ref={rowRef(item.id)}>
 					{renderItem(item, start + j)}
 				</div>
 			))}
-			<div style={{ height: bottomPad }} />
+			<div style={{ height: bottomPad + "px" }} />
 		</div>
 	);
 }
