@@ -54,7 +54,7 @@ export function ContextMenu({ menu, onClose }) {
 				onClose();
 			}}
 		>
-			<div class="ctx-menu" ref={ref} role="menu" style={{ left: pos.x, top: pos.y }}>
+			<div class="ctx-menu" ref={ref} role="menu" style={{ left: pos.x + "px", top: pos.y + "px" }}>
 				{menu.title && <div class="ctx-title">{menu.title}</div>}
 				{menu.items.map((it, i) => (
 					it.divider ? <div class="ctx-div" key={"d" + i} /> :
