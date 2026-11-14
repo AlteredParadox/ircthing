@@ -415,7 +415,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-## golang.org/x/crypto@v0.55.0
+## golang.org/x/crypto@v0.57.0
 
 ### LICENSE
 
@@ -478,7 +478,7 @@ shall terminate as of the date such litigation is filed.
 
 ---
 
-## golang.org/x/image@v0.45.0
+## golang.org/x/image@v0.46.0
 
 ### LICENSE
 
@@ -541,7 +541,7 @@ shall terminate as of the date such litigation is filed.
 
 ---
 
-## golang.org/x/net@v0.57.0
+## golang.org/x/net@v0.58.0
 
 ### LICENSE
 
@@ -604,7 +604,7 @@ shall terminate as of the date such litigation is filed.
 
 ---
 
-## golang.org/x/sys@v0.47.0
+## golang.org/x/sys@v0.48.0
 
 ### LICENSE
 
@@ -667,7 +667,7 @@ shall terminate as of the date such litigation is filed.
 
 ---
 
-## golang.org/x/term@v0.45.0
+## golang.org/x/term@v0.46.0
 
 ### LICENSE
 
@@ -1104,7 +1104,7 @@ Copyright 2018 The gVisor Authors.
 
 ---
 
-## modernc.org/libc@v1.75.6
+## modernc.org/libc@v1.75.7
 
 ### AUTHORS
 
@@ -1657,7 +1657,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-## modernc.org/sqlite@v1.58.0
+## modernc.org/sqlite@v1.59.0
 
 ### AUTHORS
 
@@ -1689,6 +1689,7 @@ Logan Snow <logansnow@protonmail.com>
 Michael Hoffmann <mhoffm@posteo.de>
 Michael Rykov <mrykov@gmail.com>
 Morgan Bazalgette <morgan@howl.moe>
+Nathan Herring <nherring@google.com>
 Ross Light <ross@zombiezen.com>
 SUSE LLC <moio@suse.com>
 Saed SayedAhmed <saadmtsa@gmail.com>
